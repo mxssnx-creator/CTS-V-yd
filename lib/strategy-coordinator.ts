@@ -1887,7 +1887,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────�����─────────��─��─��─
+      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────�����─────────��─���─��─
       // The cumulative `strategies_base_total` hincrby above answers
       // "how many Base Sets have been created EVER", but the dashboard
       // Overview asks "how many are alive RIGHT NOW for this symbol".
@@ -2924,7 +2924,7 @@ export class StrategyCoordinator {
     realQualifying.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
     const realSorted = realQualifying   // alias — hedge-net reads realSorted
 
-    // ── HEDGE NETTING (operator spec: Real stage only) ───────────────────
+    // ── HEDGE NETTING (operator spec: Real stage only) ─────────���─────────
     //
     // The Main-stage Position-Count Cartesian emits a long/short pair for
     // every (prev × last × cont × outcome) tuple. Real collapses that to
@@ -4085,7 +4085,6 @@ export class StrategyCoordinator {
         const connData = await getConn(this.connectionId)
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
         const isLiveTrade = isTruthyFlag(connData?.is_live_trade) || isTruthyFlag(connData?.live_trade_enabled)
-        console.log(`[v0] [DispatchGate] ${symbol} qualifying=${qualifying.length} is_live_trade=${connData?.is_live_trade} live_trade_enabled=${connData?.live_trade_enabled} => isLiveTrade=${isLiveTrade}`)
         if (isLiveTrade) {
           const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
@@ -4591,7 +4590,7 @@ export class StrategyCoordinator {
 
         for (const h of hashes) {
           if (!h) continue
-          // ── P2-1: Strict closed-only gate ───────────────────��──────────
+          // ── P2-1: Strict closed-only gate ───────────────────��──��───────
           // Positions in the closed_index are always closed by construction
           // (closePosition writes to the index). We still enforce the
           // status check as a defence against stale/corrupted rows.
