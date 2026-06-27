@@ -610,20 +610,27 @@ export async function GET() {
         if (isProd && process.env.DISABLE_PROD_CRON_STRATEGIES !== "1") {
           // Production deployments may not keep a long-lived engine loop hot,
           // so cron must advance a bounded slice of the canonical strategy
-          // pipeline through Base/Main/Real too. Use the historical-mode flag so
-          // this cron pass skips live exchange dispatch and uses neutral
-          // position context; live execution remains owned by the running
-          // engine/live sync loop. Keep it small (top two symbols per tick) to avoid
-          // blocking HTTP cron windows; set DISABLE_PROD_CRON_STRATEGIES=1 for
-          // dedicated-worker deployments where another process owns strategy
-          // evaluation.
+          // pipeline through Base/Main/Real too.
+          //
+          // CHANGED: previously this ran with isPrehistoric=true, which forced
+          // a NEUTRAL position context — meaning only the always-on `default`
+          // variant was ever produced, so trailing/block/dca stayed permanently
+          // dead on serverless-only deployments. We now run with REAL position
+          // context (isPrehistoric=false) so those gated variants fire, while
+          // passing skipLiveDispatch=true to keep the cron from placing real
+          // exchange orders. Live order placement remains SOLELY owned by the
+          // running engine/live-sync loop, so there is no double-dispatch even
+          // though the cron now produces the full variant set + pseudo-positions
+          // + stats. Keep it small (top two symbols per tick) to avoid blocking
+          // HTTP cron windows; set DISABLE_PROD_CRON_STRATEGIES=1 for
+          // dedicated-worker deployments where another process owns evaluation.
           const strategyItems = cycleResults
             .map((r, idx) => ({ symbol: symbolsToProcess[idx], indications: r.payload }))
             .filter((item) => item.indications.length > 0)
           if (strategyItems.length > 0) {
             try {
               const coordinator = new StrategyCoordinator(connection.id)
-              await coordinator.executeStrategyFlowBatch(strategyItems.slice(0, 2), true)
+              await coordinator.executeStrategyFlowBatch(strategyItems.slice(0, 2), false, true)
             } catch (e: any) {
               console.warn(`[v0] [Cron] Real strategy flow batch failed for ${connection.id}:`, e?.message || e)
             }

@@ -1418,6 +1418,14 @@ export class StrategyCoordinator {
     indications: any[],
     isPrehistoric: boolean = false,
     sharedContext?: PositionContext,
+    // skipLiveDispatch decouples "generate variants + pseudo-positions + stats"
+    // from "place real exchange orders". When true, the flow runs the full
+    // BASE→MAIN→REAL→LIVE pipeline with REAL position context (so trailing/
+    // block/dca variants fire and their pseudo-positions + stats are written),
+    // but createLiveSets skips the executeLivePosition exchange-dispatch block.
+    // The serverless cron uses this so it can drive variant generation without
+    // double-placing orders that the engine/live-sync loop already owns.
+    skipLiveDispatch: boolean = false,
   ): Promise<StrategyEvaluation[]> {
     const results: StrategyEvaluation[] = []
     this._stratCycleCount++
@@ -1481,7 +1489,7 @@ export class StrategyCoordinator {
       // Axis-entry hydration uses coordIndex.base.byKey.get(parentKey) — O(1)
       // instead of the prior O(N) realSets.find() scan.
       if (!isPrehistoric) {
-        const { result: liveResult } = await this.createLiveSets(symbol, realSets, coordIndex)
+        const { result: liveResult } = await this.createLiveSets(symbol, realSets, coordIndex, skipLiveDispatch)
         results.push(liveResult)
       }
 
@@ -1502,6 +1510,9 @@ export class StrategyCoordinator {
   async executeStrategyFlowBatch(
     items: Array<{ symbol: string; indications: any[] }>,
     isPrehistoric: boolean = false,
+    // See executeStrategyFlow: generate variants + stats but skip real
+    // exchange-order placement. Forwarded to every per-symbol flow.
+    skipLiveDispatch: boolean = false,
   ): Promise<Record<string, StrategyEvaluation[]>> {
     const ctx = isPrehistoric ? this.neutralPositionContext() : await this.getPositionContext()
     // Refresh per-cycle caches so a Settings save in the dashboard takes
@@ -1519,7 +1530,7 @@ export class StrategyCoordinator {
       while (queue.length > 0) {
         const item = queue.shift()
         if (!item) break
-        out[item.symbol] = await this.executeStrategyFlow(item.symbol, item.indications, isPrehistoric, ctx)
+        out[item.symbol] = await this.executeStrategyFlow(item.symbol, item.indications, isPrehistoric, ctx, skipLiveDispatch)
       }
     })
     await Promise.all(workers)
@@ -2273,7 +2284,7 @@ export class StrategyCoordinator {
       if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, set)
       if (cachedSet) reused++
 
-      // ── Register SetCoordRecord for this variant (O(1) per set) ──���───
+      // ── Register SetCoordRecord for this variant (O(1) per set) ──�����───
       // CoordIndex is the per-cycle performance index; registering here
       // avoids a second full scan of mainSets downstream. Stores only
       // scalars — quality fields are resolved from BaseRegistry on demand.
@@ -2694,14 +2705,28 @@ export class StrategyCoordinator {
     symbol: string,
     realSets: StrategySet[],
   ): Promise<void> {
-    // DEV-MODE BYPASS: pseudo_position hashes are only used by the dashboard
-    // "Positions" tile. Writing up to 3000 hashes per symbol per cycle (3 writes
-    // each = 9000 InlineLocalRedis operations per symbol) is the single largest
-    // heap allocator in the 20-symbol dev run, causing OOM at ~30s. The engine
-    // pipeline decisions use the in-memory coordIndex, not Redis pseudo_positions.
-    if (process.env.NODE_ENV === "development") return
     try {
       if (!realSets || realSets.length === 0) return
+
+      // DEV-MODE CAP (was a blanket early-return): pseudo_position hashes are
+      // the single largest heap allocator in the 20-symbol dev run (up to 3000
+      // sets/symbol × 3 writes = 9000 ops/symbol/cycle → OOM at ~30s). But
+      // returning entirely starved getPositionContext() of open-position data,
+      // so the `block` variant gate (needs ≥1 open position) could NEVER fire
+      // in dev — leaving block/dca/trailing permanently at 0.
+      //
+      // Compromise: in dev, write only the TOP-N Real Sets by profit factor.
+      // That gives the gates real open positions + populates the dashboard tile
+      // while keeping the write volume bounded (N×3 ops, not 3000×3). Prod is
+      // uncapped. Sorting is cheap relative to the avoided write amplification.
+      const isDev = process.env.NODE_ENV === "development"
+      const DEV_PSEUDO_CAP = 25
+      let workingSets = realSets
+      if (isDev && realSets.length > DEV_PSEUDO_CAP) {
+        workingSets = [...realSets]
+          .sort((a, b) => (b.avgProfitFactor || 0) - (a.avgProfitFactor || 0))
+          .slice(0, DEV_PSEUDO_CAP)
+      }
 
       const client = getRedisClient()
       // PERFORMANCE: previous implementation looped serially with one GET
@@ -2712,7 +2737,8 @@ export class StrategyCoordinator {
       // collapsing per-set latency to one RTT window each.
 
       // Pre-compute every set's deterministic identifiers once.
-      const setMeta = realSets.map((set) => {
+      // (workingSets == realSets in prod; capped top-N by PF in dev.)
+      const setMeta = workingSets.map((set) => {
         const setKey     = set.setKey || `${symbol}:${set.direction || "long"}`
         const existingKey = `pseudo_position_set_mapping:${this.connectionId}:${setKey}`
         return { set, setKey, existingKey }
@@ -3787,6 +3813,9 @@ export class StrategyCoordinator {
     symbol: string,
     inputSets?: StrategySet[],
     coordIndex?: CoordIndex,
+    // When true, build the live mirror + pseudo-positions + stats but DO NOT
+    // place real exchange orders (see executeStrategyFlow docstring).
+    skipLiveDispatch: boolean = false,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     let realSets: StrategySet[]
     if (inputSets) {
@@ -4137,7 +4166,7 @@ export class StrategyCoordinator {
     // The real pipeline now produces qualifying sets reliably (REAL bootstrap relaxes
     // minProfitFactor to 0.75 on first run), so this workaround is no longer needed.
 
-    if (qualifying.length > 0) {
+    if (qualifying.length > 0 && !skipLiveDispatch) {
       try {
         // Use getConnection() as authoritative source — it reads connection:{id} hash via parseHash
         // which handles boolean/string coercion. Raw hgetall may miss "true" vs "1" vs boolean true.
@@ -4686,12 +4715,46 @@ export class StrategyCoordinator {
         lastN.length = Math.min(lastN.length, 8)
       } catch { /* best-effort; fall through with zeros */ }
 
+      let lastWins   = lastN.filter((r) => r.pnl > 0).length
+      let lastLosses = lastN.filter((r) => r.pnl < 0).length
+
+      // ── P-CTX-2: Recorded-trade fallback for win/loss signal ─────────
+      // The pseudo `closed_index` is the primary source, but it can be
+      // sparse — proxy pseudo-positions close at noisy PnL, and in dev the
+      // pseudo-position writes are capped (top-N), so few closes land in the
+      // index. The `trailing` gate (≥2 recent wins + flat) and `dca` gate
+      // (≥1 recent loss) then never fire even when the connection has a real
+      // track record. lib/pos-history maintains the AUTHORITATIVE rolling
+      // window of genuinely closed trades (recordPosClosed, fired from the
+      // live + config-set close paths). When the pseudo window has < 2
+      // samples, derive wins/losses from that overall window instead so the
+      // gates exercise on real outcomes in BOTH dev and prod. Open-position
+      // fields (continuousCount / perSymbolOpen) stay pseudo-sourced — the
+      // recorded history has no notion of "currently open".
+      if (lastN.length < 2) {
+        try {
+          const { getPosWindowOverall } = await import("@/lib/pos-history")
+          const win = await getPosWindowOverall(this.connectionId, 8)
+          if (win.count > 0) {
+            const winsFromHistory   = Math.round(win.successRate * win.count)
+            const lossesFromHistory = Math.max(0, win.count - winsFromHistory)
+            // Only adopt when it provides MORE signal than the pseudo window.
+            if (win.count > lastN.length) {
+              lastWins   = winsFromHistory
+              lastLosses = lossesFromHistory
+              prevPosCount = Math.max(prevPosCount, win.count)
+              prevLosses   = Math.max(prevLosses, lossesFromHistory)
+            }
+          }
+        } catch { /* best-effort; keep pseudo-derived values */ }
+      }
+
       const ctx: PositionContext = {
         continuousCount: active.length,
-        lastPosCount:    lastN.length,
+        lastPosCount:    Math.max(lastN.length, lastWins + lastLosses),
         prevPosCount,
-        lastWins:        lastN.filter((r) => r.pnl > 0).length,
-        lastLosses:      lastN.filter((r) => r.pnl < 0).length,
+        lastWins,
+        lastLosses,
         prevLosses,
         perSymbolOpen,
         perSymbolOpenByDir,
@@ -4916,7 +4979,7 @@ export class StrategyCoordinator {
       if (prevMeanPF !== null && prevMeanPF < minPF) continue // gate engaged → skip whole prev row
 
       for (const last of AXIS_LAST) {
-        // ── last OUTCOME SPLIT ───────────────────────────────────────
+        // ── last OUTCOME SPLIT ───────────────────────────���───────────
         // Spec: emit ONE Set per `last` value tagged with the realised
         // pos/neg outcome based on parent's last M completed entries'
         // meanPF. When parent does not yet have M completed entries
