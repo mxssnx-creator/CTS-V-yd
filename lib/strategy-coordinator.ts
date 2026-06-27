@@ -816,7 +816,7 @@ export class StrategyCoordinator {
     variants: {
       trailing: true,
       block:    true, // ← ENABLED by default (per spec)
-      dca:      true,
+      dca:      false, // ← OFF by default (per spec); parser also defaults false
       pause:    true,
     },
     blockVolumeRatio: 1.0,
@@ -907,8 +907,6 @@ export class StrategyCoordinator {
    * returned record explicitly.
    */
   private static readonly _FP_LRU_MAX = 4_096
-  static _variantDbgLogged = 0 // [v0] TEMP DEBUG counter
-  static _ctxDbgLogged = 0 // [v0] TEMP DEBUG counter
   private static _fpLru: Map<string, StrategySet> = new Map()
   private static _fpLruGet(fp: string): StrategySet | undefined {
     const hit = StrategyCoordinator._fpLru.get(fp)
@@ -1493,6 +1491,27 @@ export class StrategyCoordinator {
       if (!isPrehistoric) {
         const { result: liveResult } = await this.createLiveSets(symbol, realSets, coordIndex, skipLiveDispatch)
         results.push(liveResult)
+
+        // DEV/SIM bounded rolling lifecycle. The simulated connector marks a
+        // constant price so live positions never hit TP/SL and pile up
+        // unbounded per symbol — which starves the `block` variant gate
+        // (window [1, blockMaxStack)) and produces no realistic win/loss
+        // closed history for `trailing`/`dca`. Cap the per-symbol open book
+        // just below blockMaxStack and roll the oldest excess to realistic
+        // TP/SL outcomes (writes closed-index + pos-history that the gates
+        // read). No-op in production — real positions close via real prices.
+        if (process.env.NODE_ENV !== "production") {
+          try {
+            const posMgr = new PseudoPositionManager(this.connectionId)
+            await posMgr.enforceSimBoundedLifecycle(symbol, {
+              // Keep open in [.., blockMaxStack-1] so `n < blockMaxStack` holds.
+              maxOpenPerSymbol: Math.max(1, this._coordinationSettings.blockMaxStack - 1),
+              // Let a position live at least one flow interval before it can be
+              // rolled, so freshly-dispatched entries aren't closed instantly.
+              minAgeMs: 2000,
+            })
+          } catch { /* best-effort; sim aid only */ }
+        }
       }
 
       await this.logStrategyProgression(symbol, results)
@@ -1516,9 +1535,6 @@ export class StrategyCoordinator {
     // exchange-order placement. Forwarded to every per-symbol flow.
     skipLiveDispatch: boolean = false,
   ): Promise<Record<string, StrategyEvaluation[]>> {
-    // [v0] TEMP DEBUG — give realtime batches a fresh debug budget so the
-    // prehistoric pass doesn't exhaust the one-shot counters.
-    if (!isPrehistoric) { StrategyCoordinator._variantDbgLogged = 0; StrategyCoordinator._ctxDbgLogged = 0 }
     const ctx = isPrehistoric ? this.neutralPositionContext() : await this.getPositionContext()
     // Refresh per-cycle caches so a Settings save in the dashboard takes
     // effect on the very next cycle (no engine restart required).
@@ -1879,7 +1895,7 @@ export class StrategyCoordinator {
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_base_current", String(baseSets.length)),
         client.hset(detailKey, {
-          // ── Legacy per-cycle aggregate fields ─────────────────────────
+          // ── Legacy per-cycle aggregate fields ─��───────────────────────
           // These hold THIS-symbol's values and are overwritten on every
           // (symbol, cycle). They remain for backwards compatibility but
           // the /stats route prefers the cross-symbol sums it computes
@@ -2120,15 +2136,6 @@ export class StrategyCoordinator {
       continuousCount: ctx.perSymbolOpen[symbol] ?? 0,
     }
     const activeVariants = this.selectActiveVariants(symbolCtx)
-    // [v0] TEMP DEBUG — diagnose why trailing/block/dca stay at 0. Only log
-    // NON-NEUTRAL contexts (realtime, post-prehistoric) since prehistoric
-    // always uses neutral ctx (default-only) and would exhaust the counter.
-    {
-      if (StrategyCoordinator._variantDbgLogged < 12) {
-        StrategyCoordinator._variantDbgLogged += 1
-        console.log(`[v0] [VARIANT-DBG] ${symbol} perSymOpen=${symbolCtx.continuousCount} wins=${symbolCtx.lastWins} losses=${symbolCtx.lastLosses} prevLosses=${symbolCtx.prevLosses} lastPosCount=${symbolCtx.lastPosCount} | toggles=${JSON.stringify(this._coordinationSettings.variants)} | active=[${activeVariants.map((v) => v.name).join(",")}]`)
-      }
-    }
 
     // Track the freshly-built `default` Main Set per Base so we can fan it
     // out into the operator-spec'd Position-Count Cartesian (prev × last ×
@@ -2902,7 +2909,7 @@ export class StrategyCoordinator {
           if (relaxed !== realMinPF) {
             console.log(
               `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
-              `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount→${realMinPos} ` +
+              `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount���${realMinPos} ` +
               `to allow first Real→Live escalation while history builds.`
             )
             realMinPF = relaxed
@@ -3437,7 +3444,7 @@ export class StrategyCoordinator {
       const realAvgPosPerSet = n > 0 ? _sumEC   / n : 0
       // passRatioReal = fraction of ELIGIBLE Main Sets that passed into Real.
       const passRatioReal = mainPFEligible > 0 ? n / mainPFEligible : 0
-      // Average entryCount per Real Set — identical to realAvgPosPerSet.
+      // Average entryCount per Real Set ��� identical to realAvgPosPerSet.
       // The previous formula used Math.max(1, entryCount||1) which biased
       // Sets with entryCount=0 upward. Reuse the already-correct value.
       const realAvgPosEval = realAvgPosPerSet
@@ -4774,13 +4781,6 @@ export class StrategyCoordinator {
         perSymbolOpenByDir,
       }
 
-      // [v0] TEMP DEBUG — show what context realtime actually computes.
-      if (StrategyCoordinator._ctxDbgLogged < 6) {
-        StrategyCoordinator._ctxDbgLogged += 1
-        const symKeys = Object.keys(perSymbolOpen)
-        console.log(`[v0] [CTX-DBG] active=${active.length} perSymbolOpen=${JSON.stringify(perSymbolOpen)} symKeys=[${symKeys.join(",")}] lastWins=${lastWins} lastLosses=${lastLosses} prevLosses=${prevLosses} lastN=${lastN.length}`)
-      }
-
       this.positionContextCache = { ctx, ts: now }
       return ctx
     } catch (err) {
@@ -4823,14 +4823,24 @@ export class StrategyCoordinator {
    */
   private selectActiveVariants(ctx: PositionContext): Array<ReturnType<StrategyCoordinator["variantProfiles"]>[number]> {
     const all = this.variantProfiles()
-    // Filter to only enabled variants per coordination settings. "default"
-    // is always on regardless of toggle (it's the operator's fallback).
+    // ── P-VARIANT-ACT: activation toggle is the SOLE inclusion gate ───────
+    // Operator spec ("handle only if activated"): an enabled variant runs
+    // INDEPENDENTLY on every cycle. `trailing` emits its own dedicated sets
+    // (own configs / SL behaviour); `block` and `dca` layer ADDITIVELY on top
+    // of all sets. `default` is always on (operator fallback / Base mirror).
+    //
+    // We deliberately no longer require the transient position-context gate
+    // (`p.gate(ctx)`) to pass for inclusion. Those conditions (recent wins for
+    // trailing, live open-position count for block, recent losses for dca)
+    // rarely align with the pseudo-position lifecycle and were silently
+    // suppressing activated variants — leaving trailing/block/dca permanently
+    // at 0 even when the operator had turned them on. Activation is now the
+    // single source of truth: toggle ON ⇒ the variant is emitted; toggle OFF
+    // ⇒ it contributes nothing. The position context still PARAMETERISES
+    // `block`'s volume-ratio scaling below; it just no longer blocks emission.
     const filtered = all.filter((p) => {
-      const gatePass = p.gate(ctx)
-      if (!gatePass) return false
       if (p.name === "default") return true
-      const enabled = this._coordinationSettings.variants[p.name]
-      return enabled === true
+      return this._coordinationSettings.variants[p.name] === true
     })
 
     // ── Block: live position × vol-ratio scaling ──────────────��──����───
@@ -4851,7 +4861,13 @@ export class StrategyCoordinator {
     // We patch the variant in-place inside a *fresh* clone so the shared
     // `variantProfiles()` array (built per-call but referenced by other
     // emit paths in the same flow) is never mutated.
-    const n = Math.max(1, ctx.continuousCount | 0)
+    // `n` = live block depth, CLAMPED to [1, blockMaxStack]. Because activation
+    // no longer gates on depth, continuousCount can be 0 (→ n=1, raw base size)
+    // or arbitrarily large (e.g. the pseudo-model piling up 90 stubs → clamped
+    // down to the operator's max stack). Clamping keeps the vol-ratio multiplier
+    // bounded and correct: it never explodes past blockMaxStack steps.
+    const maxStack = Math.max(1, this._coordinationSettings.blockMaxStack | 0)
+    const n = Math.min(Math.max(1, ctx.continuousCount | 0), maxStack)
     const ratio = this._coordinationSettings.blockVolumeRatio
     const blockMul = 1 + (n - 1) * ratio
     if (blockMul !== 1) {

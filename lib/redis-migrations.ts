@@ -3011,6 +3011,58 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "54")
     },
   },
+  {
+    version: 56,
+    name: "056-normalize-variant-toggles",
+    // Establish a CONSISTENT, explicit strategy-variant toggle map across the
+    // whole system. The coordinator resolves toggles as app_settings (global
+    // fallback) overlaid with connection_settings:{id}. Migration 040 seeded
+    // these only into connection_settings:bingx-x01, leaving (a) the global
+    // app_settings fallback and (b) the later-added bybit-x03 connection with
+    // NO explicit toggles — so they silently relied on code defaults. This
+    // migration seeds the canonical map (trailing=on, block=on, dca=OFF,
+    // pause=on + block tuning) wherever a key is ABSENT, so the state is
+    // explicit and uniform. SET-IF-ABSENT: an operator's deliberate override
+    // is never clobbered (we only fill in keys that don't exist yet).
+    up: async (client: any) => {
+      const canonical: Record<string, string> = {
+        variantTrailingEnabled: "true",
+        variantBlockEnabled:    "true",
+        variantDcaEnabled:      "false", // spec: DCA OFF by default
+        variantPauseEnabled:    "true",
+        blockVolumeRatio:       "1.0",
+        blockMaxStack:          "3",
+      }
+      const seedIfAbsent = async (hashKey: string) => {
+        const existing = ((await client.hgetall(hashKey).catch(() => ({}))) || {}) as Record<string, string>
+        const toWrite: Record<string, string> = {}
+        for (const [k, v] of Object.entries(canonical)) {
+          const cur = existing[k]
+          if (cur === undefined || cur === null || cur === "") toWrite[k] = v
+        }
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset(hashKey, toWrite).catch(() => 0)
+        }
+        return Object.keys(toWrite)
+      }
+
+      const appSeeded = await seedIfAbsent("app_settings")
+      const targets = ["bingx-x01", "bybit-x03"]
+      const connSeeded: Record<string, string[]> = {}
+      for (const id of targets) {
+        connSeeded[id] = await seedIfAbsent(`connection_settings:${id}`)
+      }
+
+      console.log(
+        `[v0] Migration 056: normalized variant toggles (dca OFF by default) — ` +
+          `app_settings seeded [${appSeeded.join(",") || "none"}]; ` +
+          targets.map((id) => `${id} seeded [${connSeeded[id].join(",") || "none"}]`).join("; "),
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "55")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

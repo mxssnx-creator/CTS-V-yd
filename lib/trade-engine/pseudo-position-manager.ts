@@ -819,6 +819,96 @@ export class PseudoPositionManager {
   }
 
   /**
+   * DEV/SIM-ONLY — realistic bounded rolling lifecycle.
+   *
+   * The simulated connector returns a CONSTANT mark price per symbol, so live
+   * positions opened during a dev run never hit TP/SL and pile up unbounded
+   * (per-symbol open → dozens). That has two downstream effects that keep the
+   * strategy VARIANTS permanently dead in dev:
+   *   1. `block` variant gate is `1 <= perSymbolOpen < blockMaxStack` — an open
+   *      count of ~90 fails `< blockMaxStack` forever.
+   *   2. No realistic CLOSED history accrues (and what little does closes at a
+   *      stub price → pnl<=0), so `trailing` (needs >=2 recent wins) and `dca`
+   *      (needs >=1 recent loss) never see the win/loss mix they gate on.
+   *
+   * This caps the per-symbol open book at `maxOpenPerSymbol` and rolls the
+   * OLDEST excess positions to a realistic outcome — a TP-hit (win) or SL-hit
+   * (loss) derived from each position's own profit factor — routing them
+   * through `closePosition()` so they land in the closed index + pos-history
+   * (which `getPositionContext` and the win/loss gates read). The result is a
+   * realistic, continuously-cycling book: block sees 1..stack-1 open, and
+   * trailing/dca see a genuine win/loss stream.
+   *
+   * No-op in PRODUCTION: there the real exchange marks live prices and closes
+   * positions via real TP/SL, so the book bounds itself and these gates get
+   * real data. We must never force-close real exchange positions.
+   */
+  async enforceSimBoundedLifecycle(
+    symbol: string,
+    opts: { maxOpenPerSymbol: number; minAgeMs?: number },
+  ): Promise<{ closed: number; wins: number; losses: number }> {
+    if (process.env.NODE_ENV === "production") return { closed: 0, wins: 0, losses: 0 }
+    try {
+      const minAgeMs = Math.max(0, opts.minAgeMs ?? 0)
+      const cap = Math.max(0, Math.floor(opts.maxOpenPerSymbol))
+      const now = Date.now()
+      // Oldest-first so we roll the longest-held positions, like a real book.
+      const open = (await this.listPositions({ status: "open", symbol })).sort(
+        (a, b) => new Date(a.opened_at || 0).getTime() - new Date(b.opened_at || 0).getTime(),
+      )
+      const eligible = open.filter(
+        (p) => now - new Date(p.opened_at || p.created_at || 0).getTime() >= minAgeMs,
+      )
+      const excess = Math.max(0, eligible.length - cap)
+      if (excess <= 0) return { closed: 0, wins: 0, losses: 0 }
+
+      let wins = 0
+      let losses = 0
+      for (let i = 0; i < excess; i++) {
+        const pos = eligible[i]
+        const entry = parseFloat(pos.entry_price || "0")
+        if (!(entry > 0)) continue
+        const side = pos.side === "short" ? "short" : "long"
+        const pf = parseFloat(pos.profit_factor || "1") || 1
+        // Win probability scales with the set's edge (PF). Clamp to a sane
+        // band so even a PF=1 set produces a realistic mix, never all-or-none.
+        const winProb = Math.max(0.2, Math.min(0.8, 0.45 + (pf - 1) * 0.3))
+        // Deterministic per-position roll (stable across retries; varies by id).
+        const roll = this.deterministicUnit(pos.id)
+        const isWin = roll < winProb
+        const tp = parseFloat(pos.takeprofit_price || pos.take_profit || "0")
+        const sl = parseFloat(pos.stoploss_price || pos.stop_loss || "0")
+        // Realistic exit: a winner exits at its take-profit, a loser at its
+        // stop-loss. Fall back to a small side-correct move if TP/SL absent.
+        let closePrice: number
+        if (isWin) closePrice = tp > 0 ? tp : entry * (side === "long" ? 1.01 : 0.99)
+        else closePrice = sl > 0 ? sl : entry * (side === "long" ? 0.99 : 1.01)
+        await this.closePosition(pos.id, isWin ? "sim_tp_hit" : "sim_sl_hit", {
+          ...pos,
+          side,
+          current_price: String(closePrice),
+        })
+        if (isWin) wins++
+        else losses++
+      }
+      return { closed: excess, wins, losses }
+    } catch (e) {
+      console.warn(`[v0] enforceSimBoundedLifecycle failed for ${symbol}:`, e)
+      return { closed: 0, wins: 0, losses: 0 }
+    }
+  }
+
+  /** Deterministic uniform value in [0,1) derived from a string (FNV-1a). */
+  private deterministicUnit(s: string): number {
+    let h = 2166136261
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i)
+      h = Math.imul(h, 16777619)
+    }
+    return ((h >>> 0) % 100000) / 100000
+  }
+
+  /**
    * Update active positions count in engine state (Redis).
    *
    * ── Atomic single-field write (P0-3 race fix) ─────────────────────
