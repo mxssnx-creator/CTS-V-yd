@@ -402,7 +402,10 @@ export class InlineLocalRedis {
     // Trigger eviction at 400 MB heapUsed (reduced from 600).  Real Redis clients run off-heap;
     // Very aggressive for dev mode to prevent OOM on 4GB VM with 15+ symbols.
     // Total safe limit: 400MB heap + 1.6GB persistent = 2GB, leaving 2GB system buffer.
-    const HEAP_PRESSURE_MB = 400
+    // 4 GB VM: RSS at boot is ~2.3 GB (Next.js + InlineLocalRedis migrations).
+    // Evict aggressively at 250 MB heap / 1400 MB RSS so the prehistoric
+    // burst (which adds ~300-400 MB) never pushes RSS past the kernel OOM limit.
+    const HEAP_PRESSURE_MB = 250
 
     // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
     // to clear volatile key families that accumulate across hot-reload cycles
@@ -579,7 +582,7 @@ export class InlineLocalRedis {
         const rssMB      = mem.rss      / 1024 / 1024
         // RSS trigger: evict when process RSS exceeds 3 GB (leaves 3 GB+ for OS/other).
         // heapUsed trigger: evict when V8 heap exceeds 800 MB.
-    const RSS_PRESSURE_MB      = 2_000 // Reduced from 2500 for 4GB VM safety (aggressive eviction)
+    const RSS_PRESSURE_MB      = 1_400 // 4GB VM: fire well before kernel OOM (~2.3 GB boot + ~400 MB engine)
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         const MAX_TOTAL_KEYS = 8_000
@@ -1262,7 +1265,7 @@ export class InlineLocalRedis {
   /**
    * Remove `count` occurrences of `value` from the list at `key`.
    * Semantics match Redis `LREM`:
-   *   count > 0 — remove head→tail
+   *   count > 0 — remove head��tail
    *   count < 0 — remove tail→head
    *   count = 0 — remove every occurrence
    *

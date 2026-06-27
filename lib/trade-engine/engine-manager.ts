@@ -3171,7 +3171,9 @@ export class TradeEngineManager {
         // work each symbol can do in one cycle, so a cold start with a
         // 50-hour range (180 000 candles) doesn't monopolize the event
         // loop. The remaining candles replay on subsequent cycles.
-        const MAX_REPLAY_STEPS_PER_SYMBOL = 80
+        // 4 GB VM: each step materialises axis Sets + pseudo-position hashes.
+        // 30 steps keeps the per-cycle heap burst under ~100 MB before eviction.
+        const MAX_REPLAY_STEPS_PER_SYMBOL = process.env.NODE_ENV === "development" ? 30 : 80
         const client = getRedisClient()
 
         const replayOneSymbol = async (
@@ -3323,7 +3325,9 @@ export class TradeEngineManager {
         // candle step (each step can materialise thousands of axis Sets +
         // pseudo-position writes). At 20 symbols we drop back to 2 concurrent
         // to keep peak prehistoric-replay heap below the 1200 MB eviction floor.
-        const REPLAY_CONCURRENCY = 2
+        // 4 GB VM: run one symbol at a time in dev to prevent concurrent
+        // axis fan-out from spiking RSS past the kernel OOM threshold.
+        const REPLAY_CONCURRENCY = process.env.NODE_ENV === "development" ? 1 : 2
         const results = await withCycleDeadline(
           mapWithConcurrency(symbols, REPLAY_CONCURRENCY, replayOneSymbol),
           `Engine ${connId} prehistoric-progression`,
