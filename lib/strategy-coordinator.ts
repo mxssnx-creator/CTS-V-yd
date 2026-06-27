@@ -907,6 +907,7 @@ export class StrategyCoordinator {
    * returned record explicitly.
    */
   private static readonly _FP_LRU_MAX = 4_096
+  static _variantDbgLogged = 0 // [v0] TEMP DEBUG counter
   private static _fpLru: Map<string, StrategySet> = new Map()
   private static _fpLruGet(fp: string): StrategySet | undefined {
     const hit = StrategyCoordinator._fpLru.get(fp)
@@ -1967,7 +1968,7 @@ export class StrategyCoordinator {
       await Promise.all(writes)
     } catch { /* non-critical */ }
 
-    // ── Build BaseRegistry + seed CoordIndex for downstream stages ───────
+    // ── Build BaseRegistry + seed CoordIndex for downstream stages ─────���─
     // This is the SINGLE allocation point for base data. All downstream stages
     // reference baseSets via coordIndex.base.byKey — no copies made.
     const baseRegistry: BaseRegistry = {
@@ -2115,6 +2116,16 @@ export class StrategyCoordinator {
       continuousCount: ctx.perSymbolOpen[symbol] ?? 0,
     }
     const activeVariants = this.selectActiveVariants(symbolCtx)
+    // [v0] TEMP DEBUG — diagnose why trailing/block/dca stay at 0. Only log
+    // NON-NEUTRAL contexts (realtime, post-prehistoric) since prehistoric
+    // always uses neutral ctx (default-only) and would exhaust the counter.
+    {
+      const nonNeutral = symbolCtx.continuousCount > 0 || symbolCtx.lastWins > 0 || symbolCtx.lastLosses > 0
+      if (nonNeutral && StrategyCoordinator._variantDbgLogged < 12) {
+        StrategyCoordinator._variantDbgLogged += 1
+        console.log(`[v0] [VARIANT-DBG] ${symbol} perSymOpen=${symbolCtx.continuousCount} wins=${symbolCtx.lastWins} losses=${symbolCtx.lastLosses} prevLosses=${symbolCtx.prevLosses} lastPosCount=${symbolCtx.lastPosCount} | toggles=${JSON.stringify(this._coordinationSettings.variants)} | active=[${activeVariants.map((v) => v.name).join(",")}]`)
+      }
+    }
 
     // Track the freshly-built `default` Main Set per Base so we can fan it
     // out into the operator-spec'd Position-Count Cartesian (prev × last ×
@@ -5016,7 +5027,7 @@ export class StrategyCoordinator {
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
               //   �� per-axis Pos-acc ledger has a non-zero delta to record
-              // ── Axis-Set LRU cache ────────��──────────────────────────────
+              // ── Axis-Set LRU cache ────────��──���───────────────────────────
               // Axis Set objects are now pure value objects (the Real-stage tuner
               // writes sizeDelta onto the CoordRecord instead of mutating entries).
               // They can be safely reused across cycles without cloning.
