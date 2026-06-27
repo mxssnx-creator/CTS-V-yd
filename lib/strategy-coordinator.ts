@@ -1369,6 +1369,50 @@ export class StrategyCoordinator {
    * pseudo-position reads. Callers may also pass a precomputed context
    * (e.g. when running multiple symbols in the same cycle) — we'll reuse it.
    */
+  /**
+   * Memory circuit-breaker — keeps the dev server alive on the 4.39 GB VM.
+   *
+   * The BASE→MAIN→REAL pipeline allocates thousands of StrategySet objects per
+   * symbol per cycle. On a low-RAM box with no swap the kernel issues a GLOBAL
+   * OOM-kill (SIGKILL) the moment total system RAM is exhausted — V8 never gets
+   * a chance to GC because the process heap limit (3 GB) is higher than the
+   * physical ceiling the kernel enforces (~2 GB anon-rss).
+   *
+   * This guard runs BEFORE each symbol's allocation burst. When process RSS
+   * crosses a soft threshold it forces a synchronous `global.gc()` (the dev
+   * script runs with `--expose-gc`) and yields the event loop so the
+   * InlineLocalRedis eviction timer can reclaim keys. If RSS is still above a
+   * hard threshold after GC it throttles with a short delay, trading a slower
+   * prehistoric pass for a process that stays alive instead of being killed.
+   */
+  private async memoryCircuitBreaker(symbol: string): Promise<void> {
+    if (process.env.NODE_ENV !== "development") return
+    try {
+      const SOFT_RSS_MB = 1500 // force GC above this
+      const HARD_RSS_MB = 1750 // throttle above this (kernel kills ~2000)
+      let rssMB = process.memoryUsage().rss / 1024 / 1024
+      if (rssMB < SOFT_RSS_MB) return
+
+      const gc = (globalThis as any).gc
+      if (typeof gc === "function") {
+        gc()
+        // Yield so eviction/finalizers run, then re-measure.
+        await new Promise((r) => setTimeout(r, 0))
+        rssMB = process.memoryUsage().rss / 1024 / 1024
+      }
+
+      if (rssMB >= HARD_RSS_MB) {
+        console.warn(
+          `[v0] [MemGuard] ${symbol}: RSS=${rssMB.toFixed(0)}MB >= ${HARD_RSS_MB}MB after GC — throttling 250ms to avoid kernel OOM`,
+        )
+        await new Promise((r) => setTimeout(r, 250))
+        if (typeof gc === "function") gc()
+      }
+    } catch {
+      // Never let the guard itself break the pipeline.
+    }
+  }
+
   async executeStrategyFlow(
     symbol: string,
     indications: any[],
@@ -1377,6 +1421,9 @@ export class StrategyCoordinator {
   ): Promise<StrategyEvaluation[]> {
     const results: StrategyEvaluation[] = []
     this._stratCycleCount++
+
+    // Reclaim memory before this symbol's BASE→MAIN→REAL allocation burst.
+    await this.memoryCircuitBreaker(symbol)
 
     try {
       // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
@@ -1887,7 +1934,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────�����─────────��─���─��─
+      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────�����─────────��─����─��─
       // The cumulative `strategies_base_total` hincrby above answers
       // "how many Base Sets have been created EVER", but the dashboard
       // Overview asks "how many are alive RIGHT NOW for this symbol".
@@ -2948,7 +2995,7 @@ export class StrategyCoordinator {
     //     other.
     //   • Within bucket: keep |L − S| Sets in the dominant direction
     //     (PF-sorted by parent `realSorted` order). If L == S → drop
-    //     both sides (perfect hedge → no exchange exposure for this
+    //     both sides (perfect hedge ��� no exchange exposure for this
     //     bucket).
     //
     // Per-bucket net target is persisted to `live_net_target:{conn}` so
@@ -5032,7 +5079,7 @@ export class StrategyCoordinator {
    * Deterministic fingerprint of {base Set × variant × position context}.
    * Drives the "IF NOT ALREADY CREATED" dedup check.
    *
-   * ── Bucket ranges (P0-3, spec-aligned) ─��────────��───────────��──────
+   * ── Bucket ranges (P0-3, spec-aligned) ─��────────��───���───────��──────
    * Spec ranges:
    *   - Prev Positions         1-12   (13 buckets 0-12)
    *   - Last Positions W/L     1-4    (5 buckets each 0-4)
