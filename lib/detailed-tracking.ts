@@ -100,6 +100,7 @@ export interface StrategyStageTracking {
     setsProgressing: number          // Sets currently in calculation
     avgProfitFactor: number
     avgDrawdownTime: number
+    avgPosPerSet: number             // entries ÷ all created Main Sets (overall, not open-only)
     minProfitFactor: number           // gate threshold (e.g. 1.2)
     maxDrawdownTime: number           // gate threshold (e.g. 1440 min)
     // Variant breakdown — Main CLONES Base's positions and strategically
