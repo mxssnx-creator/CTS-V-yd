@@ -148,7 +148,6 @@ interface LivePosition {
   // dca=0.5, others=1.0). Stored so accumulation can match original sizing.
   sizeMultiplier?: number
   parentSetKey?: string
-  setVariant?: "default" | "trailing" | "block" | "dca"
   setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
   accumulatedSetKeys?: string[]
   
@@ -1304,7 +1303,7 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
   if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
 
-  // ── Trailing stop: use the ratcheted absolute price directly ─���──────────
+  // ── Trailing stop: use the ratcheted absolute price directly ─�����──────────
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
   // with the latest ratcheted absolute stop level. Using that absolute price
   // directly avoids the percentage-anchored re-derivation below which would
@@ -3090,10 +3089,6 @@ export async function executeLivePosition(
       if (await closeIfProtectionTriggerAlreadyCrossed(exchangeConnector, livePosition, slPrice, tpPrice, "initial_placement")) {
         return livePosition
       }
-      liveOrderAudit.intendedStopLossPrice = slPrice || 0
-      liveOrderAudit.intendedTakeProfitPrice = tpPrice || 0
-      await persistLiveOrderAudit(liveOrderAudit)
-      livePosition.protectionState = "unprotected"
       // Duplicate-prevention is handled inside the Promise.all below:
       // each leg resolves to the existing orderId when an order is already
       // present (`!livePosition.stopLossOrderId` guard on the ternary),
@@ -5053,7 +5048,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       return
     }
 
-    // ── Batch pre-loop fetches in parallel ───────────────────────────────
+    // ── Batch pre-loop fetches in parallel ─────────────────────────────��─
     // Three independent I/O calls are needed before the per-position loop:
     //   1. getPositions()    — exchange position list (adoption + map)
     //   2. getOpenOrders()   — live order id set for liveness verification

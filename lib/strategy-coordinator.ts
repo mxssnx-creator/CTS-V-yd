@@ -94,7 +94,6 @@ export interface StrategySet {
   
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
-  variant?: "default" | "trailing" | "block" | "dca"
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
@@ -1888,7 +1887,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────���─────────��─��─��─
+      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────�����─────────��─��─��─
       // The cumulative `strategies_base_total` hincrby above answers
       // "how many Base Sets have been created EVER", but the dashboard
       // Overview asks "how many are alive RIGHT NOW for this symbol".

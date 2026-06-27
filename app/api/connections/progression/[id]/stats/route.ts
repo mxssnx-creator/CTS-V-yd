@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient, getSettings, getConnection, getAppSettings } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
+import { aggregateLastXClosedPositions } from "@/lib/trade-engine/closed-position-aggregation"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -1937,7 +1938,7 @@ export async function GET(
       indWindow60m = Math.round(ratePerMin * Math.min(60, elapsedMin))
     }
 
-    // ── METADATA section ─────────────────────────────────────────────��───────
+    // ── METADATA section ─────────────────────────────────────────────�����──────
     // ── STAGE EVAL PERCENT ───────────────────────────────────────────────────
     // Cascade survival rates: same logic as detailed-tracking.ts so the stats
     // endpoint exposes the same values without a second full Redis round-trip.
