@@ -124,18 +124,36 @@ export async function recoordinateAfterSettingsChange(
   // progression becomes semantically invalid. Trigger a full archive + new
   // progression so the UI shows progress against the CORRECT new symbol count.
   // ALSO invalidate the engine's symbol cache so it re-reads from Redis immediately.
-  const symbolsChanged = changedFields.includes("symbol_count") || changedFields.includes("force_symbols")
+  // Broadened detection: the symbol list can be persisted under any of
+  // these field names depending on which dialog/route saved it. Missing
+  // `active_symbols`/`symbols`/`symbol_order` here is exactly why a symbol
+  // change sometimes failed to reset progress telemetry.
+  const symbolsChanged =
+    changedFields.includes("symbol_count") ||
+    changedFields.includes("force_symbols") ||
+    changedFields.includes("active_symbols") ||
+    changedFields.includes("symbols") ||
+    changedFields.includes("symbol_order")
   if (symbolsChanged) {
     try {
       const { ProgressionStateManager } = await import("@/lib/progression-state-manager")
-      const newEpoch = Date.now()
-      const newSessionNum = await ProgressionStateManager.archiveAndStartNewProgression(id, newEpoch)
+      // Use the COUPLED recoordinate path (not the bare archive). It
+      // clears the `progression:{id}` hash, the `prehistoric:{id}` stats
+      // hash + `prehistoric:{id}:symbols`/`:done` gates, AND the
+      // `realtime:{id}` cycle counters together — the stats route reads
+      // its primary progress numbers from those sibling namespaces, so a
+      // bare `progression:{id}` reset left them stale (0/N forever or a
+      // mismatched total). recoordinateForActualOne is idempotent: it
+      // no-ops (logs `changed:false`) when the persisted symbol set
+      // already matches, which neutralizes the previous double-archive
+      // churn when the PATCH route also recoordinates.
+      const result = await ProgressionStateManager.recoordinateForActualOne(id)
       console.log(
-        `[v0] [${opts.logTag}] ${changedFields.includes("force_symbols") ? "Force symbols" : "Symbol count"} changed for ${id} → archived old progression, started new session ${newSessionNum}`,
+        `[v0] [${opts.logTag}] Symbol set changed for ${id} → recoordinated progression (changed:${result?.changed ?? "?"}, symbols:${result?.symbolCount ?? "?"})`,
       )
     } catch (archiveErr) {
       console.warn(
-        `[v0] [${opts.logTag}] Failed to archive progression after symbol change for ${id}:`,
+        `[v0] [${opts.logTag}] Failed to recoordinate progression after symbol change for ${id}:`,
         archiveErr instanceof Error ? archiveErr.message : String(archiveErr),
       )
       // Continue — progression will still update under the old schema,
