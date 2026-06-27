@@ -2311,7 +2311,11 @@ export class StrategyCoordinator {
       // Raised from 400 so 15-symbol test sessions exercise the same code paths
       // as prod (400 was hitting the ceiling every cycle and masking correct behaviour).
       // Still well below the prod 2500 × 20 symbol × 6 concurrency = 300k worst-case.
-      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 1500 : 2500
+      // Dev lowered 1500→500 per symbol: on the 4.39 GB v0 sandbox VM the
+      // engine OOM-crashes during live_trading when peak in-memory StrategySet
+      // count is high. 500 × SYMBOL_CONCURRENCY(3) = 1500 in-flight keeps the
+      // full pipeline (BASE→MAIN→REAL→LIVE) working with ample headroom.
+      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 500 : 2500
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3091,7 +3095,10 @@ export class StrategyCoordinator {
     // In dev: 600 ceiling × SYMBOL_CONCURRENCY(3) = 1800 Real sets peak vs
     // 9000 at 3000 ceiling — cuts per-cycle V8 heap pressure by 5x while
     // keeping the full Real-stage pipeline exercised.
-    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development" ? 600 : 3000
+    // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
+    // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
+    // candidates for the live dispatch to find qualifying PF-positive sets.
+    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development" ? 200 : 3000
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
