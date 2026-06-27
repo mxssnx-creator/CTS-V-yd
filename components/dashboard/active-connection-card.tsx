@@ -404,21 +404,34 @@ export function ActiveConnectionCard({
           // progression.prehistoricProgress (Symbols X/N, candles, percent)
           // silently reads undefined and the numbers vanish from the UI.
           const h = data.historic
-          const nextProgression = {
-            phase: data.metadata?.phase || "idle",
-            isRunning: data.metadata?.engineRunning || false,
-            started_at: data.metadata?.startedAt,
-            ...data,
+          const meta = data.metadata ?? {}
+          const nextProgression: ProgressionData = {
+            phase:     String(meta.phase    || data.phase    || "idle"),
+            progress:  Number(meta.progress ?? data.progress ?? 0),
+            message:   String(data.message  || meta.message  || ""),
+            subPhase:  data.subPhase  != null ? String(data.subPhase)  : null,
+            startedAt: data.startedAt != null ? String(data.startedAt) : null,
+            updatedAt: data.updatedAt != null ? String(data.updatedAt) : null,
+            error:     data.error     != null && typeof data.error !== "object"
+                         ? String(data.error)
+                         : null,
+            details: {
+              historicalDataLoaded:  toBoolean(data.details?.historicalDataLoaded),
+              indicationsCalculated: toBoolean(data.details?.indicationsCalculated),
+              strategiesProcessed:   toBoolean(data.details?.strategiesProcessed),
+              liveProcessingActive:  toBoolean(data.details?.liveProcessingActive),
+              liveTradingActive:     toBoolean(data.details?.liveTradingActive),
+            },
             prehistoricProgress: h
               ? {
-                  symbolsProcessed: Number(h.symbolsProcessed) || 0,
-                  symbolsTotal: Number(h.symbolsTotal) || 0,
-                  candlesLoaded: Number(h.candlesLoaded ?? h.framesProcessed) || 0,
-                  candlesTotal: Number(h.candlesTotal) || 0,
-                  indicatorsCalculated: Number(h.indicatorsCalculated) || 0,
-                  currentSymbol: String(h.currentSymbol || ""),
-                  duration: Number(h.duration) || 0,
-                  percentComplete: Number(h.progressPercent) || 0,
+                  symbolsProcessed:    Number(h.symbolsProcessed)    || 0,
+                  symbolsTotal:        Number(h.symbolsTotal)        || 0,
+                  candlesLoaded:       Number(h.candlesLoaded ?? h.framesProcessed) || 0,
+                  candlesTotal:        Number(h.candlesTotal)        || 0,
+                  indicatorsCalculated:Number(h.indicatorsCalculated)|| 0,
+                  currentSymbol:       String(h.currentSymbol || ""),
+                  duration:            Number(h.duration)            || 0,
+                  percentComplete:     Number(h.progressPercent)     || 0,
                 }
               : undefined,
           }
@@ -1204,44 +1217,42 @@ export function ActiveConnectionCard({
                     Indications / Strategies / Sets live in the Realtime Execution panel.
                     When liveStats hasn't loaded yet we render with 0-fallbacks so the
                     tiles are always visible once we leave prehistoric_data phase. */}
-                {phase !== "prehistoric_data" && (
-                  <div className="flex items-center gap-3 mt-1.5 flex-wrap">
-                    {(() => {
-                      const symbolsProcessed = progression?.prehistoricProgress?.symbolsProcessed ?? 0
-                      const symbolsTotal     = progression?.prehistoricProgress?.symbolsTotal     ?? 0
-                      const tiles: Array<{ label: string; value: string | number; title?: string }> = []
-                      if (symbolsProcessed > 0 || symbolsTotal > 0) {
-                        tiles.push({
-                          label: "Symbols",
-                          value: symbolsTotal > 0 ? `${symbolsProcessed}/${symbolsTotal}` : symbolsProcessed,
-                          title: "Prehistoric backfill coverage — symbols processed vs total.",
-                        })
-                      }
+                <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                  {(() => {
+                    const symbolsProcessed = progression?.prehistoricProgress?.symbolsProcessed ?? 0
+                    const symbolsTotal     = progression?.prehistoricProgress?.symbolsTotal     ?? 0
+                    const tiles: Array<{ label: string; value: string | number; title?: string }> = []
+                    if (symbolsProcessed > 0 || symbolsTotal > 0) {
                       tiles.push({
-                        label: "Cycles",
-                        value: liveStats?.indicationCycles ?? 0,
-                        title: "Realtime indication processor ticks since engine start.",
+                        label: "Symbols",
+                        value: symbolsTotal > 0 ? `${symbolsProcessed}/${symbolsTotal}` : symbolsProcessed,
+                        title: "Prehistoric backfill coverage — symbols processed vs total.",
                       })
-                      tiles.push({
-                        label: (prehistoricStats?.liveOpenPositions ?? 0) > 0 ? "Live" : "Pseudo",
-                        value: liveStats?.positions ?? 0,
-                        title: (prehistoricStats?.liveOpenPositions ?? 0) > 0
-                          ? "Open exchange positions (live)."
-                          : "Open pseudo positions (evaluation stage).",
-                      })
-                      return tiles.map(({ label, value, title }) => (
-                        <div key={label} className="flex items-center gap-1 text-[10px]" title={title}>
-                          <span className="text-muted-foreground">{label}</span>
-                          <span className="font-semibold tabular-nums">
-                            {typeof value === "number" && value >= 1000
-                              ? `${(value / 1000).toFixed(1)}K`
-                              : value}
-                          </span>
-                        </div>
-                      ))
-                    })()}
-                  </div>
-                )}
+                    }
+                    tiles.push({
+                      label: "Cycles",
+                      value: liveStats?.indicationCycles ?? 0,
+                      title: "Realtime indication processor ticks since engine start.",
+                    })
+                    tiles.push({
+                      label: (prehistoricStats?.liveOpenPositions ?? 0) > 0 ? "Live" : "Pseudo",
+                      value: liveStats?.positions ?? 0,
+                      title: (prehistoricStats?.liveOpenPositions ?? 0) > 0
+                        ? "Open exchange positions (live)."
+                        : "Open pseudo positions (evaluation stage).",
+                    })
+                    return tiles.map(({ label, value, title }) => (
+                      <div key={label} className="flex items-center gap-1 text-[10px]" title={title}>
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-semibold tabular-nums">
+                          {typeof value === "number" && value >= 1000
+                            ? `${(value / 1000).toFixed(1)}K`
+                            : value}
+                        </span>
+                      </div>
+                    ))
+                  })()}
+                </div>
 
                 {/* ── Mirroring pipeline counts ──────────────────────
                     Base → Main → Real → Exchange flow. Pseudo/Real
