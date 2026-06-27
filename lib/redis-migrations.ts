@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ──
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ��─
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -2777,6 +2777,44 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "49")
+    },
+  },
+  {
+    // Fix bingx-x01 operational state so the quickstart engine start works
+    // correctly from a fresh DB:
+    //   1. live_volume_factor: QUICKSTART_LIVE_VOLUME_FACTOR=0.1 is set by the
+    //      quick-start route on every engine start. Migration 040 set it to 2.2
+    //      but quick-start resets it to 0.1 each run. Setting it to 2.2 here is
+    //      the resting default; quick-start will override during active sessions.
+    //   2. is_assigned: "1" — marks bingx-x01 as a "Main Connection". The
+    //      quick-start auto-discovery fallback requires this when no explicit
+    //      connectionId is provided. Without it the engine start returns
+    //      "No BingX connections found in Main Connections".
+    //   3. is_enabled_dashboard: "1" — marks bingx-x01 as enabled in the
+    //      dashboard panel so coordinator.startAll() includes it when called
+    //      from /api/trade-engine/start (the Engine section header button).
+    version: 51,
+    name: "051-bingx-x01-operational-state",
+    up: async (client: any) => {
+      const connId = "bingx-x01"
+      const hashes = [
+        `connection:${connId}`,
+        `settings:trade_engine_state:${connId}`,
+        `settings:connection_settings:${connId}`,
+      ]
+      for (const h of hashes) {
+        await client.hset(h, {
+          live_volume_factor:   "2.2",
+          volume_factor_live:   "2.2",
+          is_assigned:          "1",
+          is_enabled_dashboard: "1",
+          is_active_inserted:   "1",
+        }).catch(() => 0)
+      }
+      console.log("[v0] Migration 051: bingx-x01 operational state fixed (vol=2.2, is_assigned=1, is_enabled_dashboard=1)")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "50")
     },
   },
 ]

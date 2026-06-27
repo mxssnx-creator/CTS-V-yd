@@ -449,13 +449,22 @@ export class InlineLocalRedis {
           // 2. indication:{conn}:{symbol} — per-symbol indication strings/hashes
           //    (200 keys × ~3 KB each = 0.6 MB). Written every indication cycle;
           //    stale copies from hot-reload cycles remain.
+          // 2a. indication_set:{conn}:* — the #1 OOM driver: IndicationProcessor v5
+          //    writes ~4700 hashes per symbol per cycle (14,184 keys = 93.9 MB for 3
+          //    symbols). These are transient; flush entirely on startup and cap to 300
+          //    via eviction CAPS during runtime.
+          // 2b. indication_outcomes_pending:{conn} — pending outcome resolution hashes.
+          // 2c. axis_pos_acc:{conn} — axis position accumulator (~200 KB each).
           for (const key of this.data.strings.keys()) {
-            if (key.startsWith("indication:") || key.startsWith("indications:")) {
+            if (key.startsWith("indication:") || key.startsWith("indications:") ||
+                key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) {
               this.data.strings.delete(key); flushed++
             }
           }
           for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("indication:") || key.startsWith("indications:")) {
+            if (key.startsWith("indication:") || key.startsWith("indications:") ||
+                key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
+                key.startsWith("axis_pos_acc:")) {
               this.data.hashes.delete(key); flushed++
             }
           }
@@ -730,23 +739,34 @@ export class InlineLocalRedis {
       // follow-up real/live decisions. Keep a bounded active window instead:
       // small enough for the in-memory Redis emulator, large enough for the
       // current quickstart fan-out to remain observable and evaluable.
-      pseudo_position:     isDev ? 500 : 2000,
-      s_pseudo_position:   isDev ? 500 : 1500,  // settings:pseudo_position
-      strategies:          isDev ? 250 : 100,
-      s_strategies:        isDev ? 100 : 20,    // settings:strategies
-      config_set:          isDev ? 200 : 1500,
-      strategy_positions:  isDev ? 100 : 1000,
-      strategy_detail:     isDev ? 100 : 1000,
-      real_stage:          isDev ? 100 : 1000,
-      indication:          isDev ? 500 : 500,
-      indications:         isDev ? 100 : 100,
-      prehistoric:         20,
-      live_history:        isDev ? 100 : 500,
+      pseudo_position:              isDev ? 500  : 2000,
+      s_pseudo_position:            isDev ? 500  : 1500,  // settings:pseudo_position
+      strategies:                   isDev ? 250  : 100,
+      s_strategies:                 isDev ? 100  : 20,    // settings:strategies
+      config_set:                   isDev ? 200  : 1500,
+      strategy_positions:           isDev ? 100  : 1000,
+      strategy_detail:              isDev ? 100  : 1000,
+      real_stage:                   isDev ? 100  : 1000,
+      indication:                   isDev ? 500  : 500,
+      indications:                  isDev ? 100  : 100,
+      // indication_set:* — per-cycle per-symbol indication set hashes produced by
+      // IndicationProcessor v5. With 3 symbols × ~4700 sets each = ~14,100 keys
+      // at ~6.6 KB each = 93 MB — the primary OOM driver. Cap tightly in dev:
+      // 300 keys keeps the most-recent evaluation window, older ones re-derive.
+      indication_set:               isDev ? 300  : 5000,
+      // indication_outcomes_pending:* — pending outcome resolution hashes (one
+      // per active indication). Cap at 30 in dev (3 symbols × ~10 active each).
+      indication_outcomes_pending:  isDev ? 30   : 200,
+      // axis_pos_acc:* — axis position accumulator hashes written per-cycle.
+      // Each entry is ~200 KB (one per connection). Cap at 5 to be safe.
+      axis_pos_acc:                 5,
+      prehistoric:                  20,
+      live_history:                 isDev ? 100  : 500,
       // string-only
-      indications_str:     50,
-      dedup:               isDev ? 500 : 3000,
-      candle_cache:        20,
-      candles:             20,
+      indications_str:              50,
+      dedup:                        isDev ? 500  : 3000,
+      candle_cache:                 20,
+      candles:                      20,
     }
 
     // Classify a key into a bucket name; returns null for protected/untracked keys.
@@ -764,8 +784,11 @@ export class InlineLocalRedis {
             k.startsWith("strategies:metadata")) return null
         return "strategies"
       }
-      if (k.startsWith("indication:"))          return "indication"
-      if (k.startsWith("indications:"))         return "indications"
+      if (k.startsWith("indication_set:"))                 return "indication_set"
+      if (k.startsWith("indication_outcomes_pending:"))   return "indication_outcomes_pending"
+      if (k.startsWith("axis_pos_acc:"))                  return "axis_pos_acc"
+      if (k.startsWith("indication:"))                    return "indication"
+      if (k.startsWith("indications:"))                   return "indications"
       if (k.startsWith("config_set:") ||
           k.includes(":config_set:"))            return "config_set"
       if (k.startsWith("strategy:")) {

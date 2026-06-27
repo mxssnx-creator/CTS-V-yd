@@ -652,8 +652,15 @@ export function QuickstartSection() {
       // even after a page reload or when another tab stopped the engine.
       // Use strict boolean check: skip update when the field is absent
       // (undefined) to avoid flicker during the first boot poll.
-      if (s.metadata?.engineRunning === true)  setIsRunning(true)
-      if (s.metadata?.engineRunning === false) setIsRunning(false)
+      //
+      // RACE GUARD: do NOT apply the server's engineRunning=false during the
+      // first 10 seconds after the user clicks "Start Engine". The start API
+      // call sets isRunning=true immediately, but the server needs 3-8 seconds
+      // to initialise Redis and write engineRunning=true. Without this guard,
+      // the polling fetchStats returns false during that window and flips the
+      // button back to "Start Engine" mid-initialisation.
+      if (s.metadata?.engineRunning === true) setIsRunning(true)
+      if (s.metadata?.engineRunning === false && !starting) setIsRunning(false)
     } catch { /* non-critical */ }
     finally { if (!silent) setLoadingStats(false) }
   }, [connectionId])

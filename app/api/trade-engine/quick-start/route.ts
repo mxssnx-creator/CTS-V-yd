@@ -121,10 +121,16 @@ export async function POST(request: Request) {
       ? allConnections.find((c: any) => c.id === requestedConnectionId)
       : null
 
-    // Fall back to auto-discovery only if the requested connection is
-    // missing or lacks credentials.
-    if (!connection || !(connection.api_key && connection.api_secret &&
-        connection.api_key.length >= 10 && connection.api_secret.length >= 10)) {
+    // Fall back to auto-discovery only if the requested connection is MISSING
+    // entirely. Simulated / template connections intentionally have no API
+    // credentials — do not fall through to auto-discovery just because
+    // credentials are absent when the caller explicitly picked a connection.
+    const isSimulated = connection &&
+      (connection.connector_type === "simulated" ||
+       connection.exchange_type === "simulated" ||
+       String(connection.api_key || "").length < 10)
+    if (!connection || (!isSimulated && !(connection.api_key && connection.api_secret &&
+        connection.api_key.length >= 10 && connection.api_secret.length >= 10))) {
       if (requestedConnectionId && connection) {
         console.log(`${LOG_PREFIX}: Requested connection ${requestedConnectionId} has no credentials — falling back to auto-discovery`)
       } else if (requestedConnectionId) {
