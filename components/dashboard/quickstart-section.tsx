@@ -638,8 +638,16 @@ export function QuickstartSection() {
           )
         }
       } catch { /* sessionStorage unavailable */ }
-      // NOTE: do NOT auto-set isRunning here — isRunning tracks user-initiated sessions only.
-      // engineRunning in stats reflects the server state independently.
+      // Sync isRunning from server truth on every stats fetch.
+      // isRunning MUST match engineRunning so the Start/Stop button and
+      // status dot always reflect the actual server state — not just whether
+      // the user clicked Start in this browser tab.
+      if (s.metadata?.engineRunning) {
+        setIsRunning(true)
+      } else if (!s.metadata?.engineRunning && s.metadata?.engineRunning !== undefined) {
+        // Only force-clear if the server explicitly says stopped (not just absent)
+        setIsRunning(false)
+      }
     } catch { /* non-critical */ }
     finally { if (!silent) setLoadingStats(false) }
   }, [connectionId])
