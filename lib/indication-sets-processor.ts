@@ -636,9 +636,44 @@ export class IndicationSetsProcessor {
     type: string
   ): Promise<void> {
     if (writes.length === 0) return
-    
+
     try {
       const client = await getCachedClient()
+
+      // DEV MODE: overwrite each indication_set key with only the LATEST single
+      // entry instead of appending to a growing 250-item JSON array.
+      // Full grid:  250 entries × ~300 B/entry × 144 keys = ~11 MB per cycle.
+      // Dev  mode:  1 entry     × ~300 B/entry × 144 keys =  43 KB per cycle.
+      // The strategy-coordinator reads these keys to build Real-stage sets; it
+      // only needs the most-recent entry (it re-evaluates from scratch each cycle)
+      // so overwriting loses no functional data.
+      if (process.env.NODE_ENV === "development") {
+        const now = Date.now()
+        const timestamp = new Date().toISOString()
+        await Promise.all(
+          writes.map(async ({ setKey, indication, config }, idx) => {
+            const direction: "long" | "short" =
+              indication.direction === "short" ? "short"
+              : indication.direction === "long" ? "long"
+              : indication?.metadata?.firstDir < 0 ? "short"
+              : "long"
+            const entry = {
+              id: `${type}_${now}_${idx}`,
+              timestamp,
+              type,
+              direction,
+              profitFactor: indication.profitFactor,
+              signalScore: indication.signalScore,
+              rawSignalStrength: indication.rawSignalStrength,
+              confidence: indication.confidence,
+              config,
+              metadata: indication.metadata,
+            }
+            await client.set(setKey, JSON.stringify([entry]))
+          })
+        )
+        return
+      }
       const now = Date.now()
       const timestamp = new Date().toISOString()
 

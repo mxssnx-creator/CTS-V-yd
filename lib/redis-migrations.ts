@@ -2809,12 +2809,40 @@ const migrations: Migration[] = [
           is_assigned:          "1",
           is_enabled_dashboard: "1",
           is_active_inserted:   "1",
+          // is_live_trade=1 enables the live-stage order placement gate.
+          // Without this the simulated connector places no orders, placed=0
+          // forever and trade history stays empty.
+          is_live_trade:        "1",
+          live_trade_enabled:   "1",
         }).catch(() => 0)
       }
-      console.log("[v0] Migration 051: bingx-x01 operational state fixed (vol=2.2, is_assigned=1, is_enabled_dashboard=1)")
+      console.log("[v0] Migration 051: bingx-x01 operational state fixed (vol=2.2, is_live_trade=1, is_assigned=1)")
     },
     down: async (client: any) => {
       await client.set("_schema_version", "50")
+    },
+  },
+  {
+    // Enable live-order placement on bingx-x01 (simulated connector).
+    // Migration 051 set vol/is_assigned/is_enabled_dashboard but omitted
+    // is_live_trade — without it the live-stage skips order placement
+    // entirely (isLiveTradeEnabled=false), placed=0 forever.
+    version: 52,
+    name: "052-bingx-x01-enable-live-trade",
+    up: async (client: any) => {
+      const connId = "bingx-x01"
+      const hashes = [
+        `connection:${connId}`,
+        `settings:trade_engine_state:${connId}`,
+        `settings:connection_settings:${connId}`,
+      ]
+      for (const h of hashes) {
+        await client.hset(h, { is_live_trade: "1", live_trade_enabled: "1" }).catch(() => 0)
+      }
+      console.log("[v0] Migration 052: bingx-x01 is_live_trade=1 live_trade_enabled=1")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "51")
     },
   },
 ]

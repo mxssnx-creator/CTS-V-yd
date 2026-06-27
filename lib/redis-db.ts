@@ -398,7 +398,8 @@ export class InlineLocalRedis {
     // more keys per second than a 5-symbol run. 2s catches bursts before they
     // compound across multiple intervals. The handler is cheap (~ms) when
     // heap is below threshold so the extra polling is negligible.
-    const CLEANUP_INTERVAL_MS = 2_000
+    // Dev: 1 second interval to catch indication_set bursts before they compound.
+    const CLEANUP_INTERVAL_MS = process.env.NODE_ENV === "development" ? 1_000 : 2_000
     // Trigger eviction at 400 MB heapUsed (reduced from 600).  Real Redis clients run off-heap;
     // Very aggressive for dev mode to prevent OOM on 4GB VM with 15+ symbols.
     // Total safe limit: 400MB heap + 1.6GB persistent = 2GB, leaving 2GB system buffer.
@@ -594,7 +595,9 @@ export class InlineLocalRedis {
     const RSS_PRESSURE_MB      = 1_400 // 4GB VM: fire well before kernel OOM (~2.3 GB boot + ~400 MB engine)
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        const MAX_TOTAL_KEYS = 8_000
+        // Dev: lower threshold so eviction fires before indication_set keys accumulate.
+        // 144 indication_set keys/cycle × 3 cycles = 432; 5000 fires after ~10 cycles.
+        const MAX_TOTAL_KEYS = process.env.NODE_ENV === "development" ? 5_000 : 8_000
         const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
           if (rssMB > RSS_PRESSURE_MB) {
