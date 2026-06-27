@@ -908,6 +908,7 @@ export class StrategyCoordinator {
    */
   private static readonly _FP_LRU_MAX = 4_096
   static _variantDbgLogged = 0 // [v0] TEMP DEBUG counter
+  static _ctxDbgLogged = 0 // [v0] TEMP DEBUG counter
   private static _fpLru: Map<string, StrategySet> = new Map()
   private static _fpLruGet(fp: string): StrategySet | undefined {
     const hit = StrategyCoordinator._fpLru.get(fp)
@@ -1515,6 +1516,9 @@ export class StrategyCoordinator {
     // exchange-order placement. Forwarded to every per-symbol flow.
     skipLiveDispatch: boolean = false,
   ): Promise<Record<string, StrategyEvaluation[]>> {
+    // [v0] TEMP DEBUG — give realtime batches a fresh debug budget so the
+    // prehistoric pass doesn't exhaust the one-shot counters.
+    if (!isPrehistoric) { StrategyCoordinator._variantDbgLogged = 0; StrategyCoordinator._ctxDbgLogged = 0 }
     const ctx = isPrehistoric ? this.neutralPositionContext() : await this.getPositionContext()
     // Refresh per-cycle caches so a Settings save in the dashboard takes
     // effect on the very next cycle (no engine restart required).
@@ -2120,8 +2124,7 @@ export class StrategyCoordinator {
     // NON-NEUTRAL contexts (realtime, post-prehistoric) since prehistoric
     // always uses neutral ctx (default-only) and would exhaust the counter.
     {
-      const nonNeutral = symbolCtx.continuousCount > 0 || symbolCtx.lastWins > 0 || symbolCtx.lastLosses > 0
-      if (nonNeutral && StrategyCoordinator._variantDbgLogged < 12) {
+      if (StrategyCoordinator._variantDbgLogged < 12) {
         StrategyCoordinator._variantDbgLogged += 1
         console.log(`[v0] [VARIANT-DBG] ${symbol} perSymOpen=${symbolCtx.continuousCount} wins=${symbolCtx.lastWins} losses=${symbolCtx.lastLosses} prevLosses=${symbolCtx.prevLosses} lastPosCount=${symbolCtx.lastPosCount} | toggles=${JSON.stringify(this._coordinationSettings.variants)} | active=[${activeVariants.map((v) => v.name).join(",")}]`)
       }
@@ -3814,7 +3817,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────�����───��──────────────────���───────��
+  // ─── STAGE 4: LIVE ─────────����──────────��─────�����───��───────────��──────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -4769,6 +4772,13 @@ export class StrategyCoordinator {
         prevLosses,
         perSymbolOpen,
         perSymbolOpenByDir,
+      }
+
+      // [v0] TEMP DEBUG — show what context realtime actually computes.
+      if (StrategyCoordinator._ctxDbgLogged < 6) {
+        StrategyCoordinator._ctxDbgLogged += 1
+        const symKeys = Object.keys(perSymbolOpen)
+        console.log(`[v0] [CTX-DBG] active=${active.length} perSymbolOpen=${JSON.stringify(perSymbolOpen)} symKeys=[${symKeys.join(",")}] lastWins=${lastWins} lastLosses=${lastLosses} prevLosses=${prevLosses} lastN=${lastN.length}`)
       }
 
       this.positionContextCache = { ctx, ts: now }
