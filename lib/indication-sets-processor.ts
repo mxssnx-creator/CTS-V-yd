@@ -127,13 +127,24 @@ export class IndicationSetsProcessor {
    * settings hash on every fill.
    */
   private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
-  private directionMoveRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
-  private optimalRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
-  private drawdownRatios: number[] = [0.5, 1.0, 1.5]
-  private lastPartRatios: number[] = [0.25, 0.5]
-  private factorMultipliers: number[] = [0.9, 1.0, 1.1]
-  private activeThresholds: number[] = [0.5, 1.0, 1.5, 2.0, 2.5]
-  private activeTimeRatios: number[] = [0.5, 1.0]
+  // Dev mode uses a minimal range grid so the 4-GB v0 sandbox VM can run the
+  // full indication → strategy → live pipeline without OOM.
+  //   Full grid: 29 ranges × 3 dd × 2 lp × 3 fm = 522 keys/type/symbol
+  //              × 4 types × 3 symbols = 6,264 keys/cycle → accumulates fast
+  //   Dev  grid:  3 ranges × 2 dd × 1 lp × 2 fm = 12  keys/type/symbol
+  //              × 4 types × 3 symbols = 144 keys/cycle — easily evictable
+  private readonly _isDev = process.env.NODE_ENV === "development"
+  private directionMoveRanges: number[] = this._isDev
+    ? [5, 15, 25]                                        // 3 representative dev ranges
+    : Array.from({ length: 29 }, (_, i) => i + 2)       // 2..30 prod
+  private optimalRanges: number[] = this._isDev
+    ? [5, 15, 25]
+    : Array.from({ length: 29 }, (_, i) => i + 2)
+  private drawdownRatios: number[] = this._isDev ? [0.5, 1.5]           : [0.5, 1.0, 1.5]
+  private lastPartRatios: number[] = this._isDev ? [0.5]                : [0.25, 0.5]
+  private factorMultipliers: number[] = this._isDev ? [0.9, 1.1]        : [0.9, 1.0, 1.1]
+  private activeThresholds: number[] = this._isDev ? [0.5, 2.5]         : [0.5, 1.0, 1.5, 2.0, 2.5]
+  private activeTimeRatios: number[] = this._isDev ? [1.0]              : [0.5, 1.0]
   private shortPriceHistoryWarnings: Set<string> = new Set()
   private outcomeHorizonCandles = 12
   private outcomeTakeProfitPct = 0.01
