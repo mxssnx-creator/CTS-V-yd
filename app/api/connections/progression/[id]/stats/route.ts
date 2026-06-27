@@ -1780,6 +1780,9 @@ export async function GET(
         const pnl = Number(pos.realizedPnL ?? pos.realized_pnl ?? 0) || 0
         const qty = Number(pos.executedQuantity ?? pos.quantity ?? 0) || 0
         const avgP = Number(pos.averageExecutionPrice ?? pos.entryPrice ?? 0) || 0
+        // Skip rejected / zero-fill positions that have no valid entry data.
+        // These are orders that were placed but never filled (qty=0 or price=0).
+        if (qty <= 0 || avgP <= 0) continue
         const created = Number(pos.createdAt ?? 0) || 0
         const closedAt = Number(pos.closedAt ?? pos.updatedAt ?? 0) || 0
         const notional = qty * avgP
@@ -1788,18 +1791,38 @@ export async function GET(
         const sym = String(pos.symbol || "").trim().toUpperCase()
         const dirRaw = String(pos.direction || "").trim().toLowerCase()
         if (!sym || !["long", "short"].includes(dirRaw)) continue
+
+        // Resolve exit price. Priority:
+        //   1. pos.closePrice — written by closeLivePosition() after this fix.
+        //   2. Back-derive from realizedPnL — for positions closed before the
+        //      fix was deployed (closePrice was not persisted). This is exact:
+        //      LONG:  exitPrice = entryPrice + pnl / qty
+        //      SHORT: exitPrice = entryPrice - pnl / qty
+        //   3. 0 — signals the UI to display "—" (no reliable exit price).
+        let exitPrice = 0
+        const storedClose = Number(pos.closePrice ?? pos.lastPrice ?? 0) || 0
+        if (storedClose > 0) {
+          exitPrice = Math.round(storedClose * 1e8) / 1e8
+        } else if (pnl !== 0 && qty > 0 && avgP > 0) {
+          // Back-derive from P&L: pnl = qty * (exit - entry) * direction_sign
+          const derived = dirRaw === "long"
+            ? avgP + pnl / qty
+            : avgP - pnl / qty
+          if (derived > 0) exitPrice = Math.round(derived * 1e8) / 1e8
+        }
+
         closedPositionsForHistory.push({
-          id:       String(pos.id || ""),
-          symbol:   sym,
-          direction: dirRaw as "long" | "short",
-          entryPrice: Math.round(avgP * 1e8) / 1e8,
-          exitPrice:  Math.round((Number(pos.closePrice ?? pos.lastPrice ?? avgP) || 0) * 1e8) / 1e8,
+          id:          String(pos.id || ""),
+          symbol:      sym,
+          direction:   dirRaw as "long" | "short",
+          entryPrice:  Math.round(avgP * 1e8) / 1e8,
+          exitPrice,
           realizedPnl: Math.round(pnl * 100) / 100,
           pnlPct,
           holdMinutes: holdMin,
-          openedAt: created,
+          openedAt:    created,
           closedAt,
-          volumeUsd: Math.round(notional * 100) / 100,
+          volumeUsd:   Math.round(notional * 100) / 100,
         })
       }
       // Sort newest-first
@@ -2403,11 +2426,18 @@ export async function GET(
           const cappedReal = Math.min(realRun, cappedMain)
           const cappedLive = Math.min(liveRun, cappedReal)
 
-          const livePositions = Math.max(
+          // Prefer key-scan (liveOpenScanned) as it survives server restarts.
+          // Counter arithmetic (created-closed) drifts when InlineLocalRedis
+          // resets on restart. Include pending-fill placed-but-not-filled orders
+          // only when both sources show 0 open filled positions.
+          const counterOpen = Math.max(
             0,
-            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
-            Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count)),
+            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count),
           )
+          const pendingFills = Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count))
+          const livePositions = liveOpenScanned > 0
+            ? liveOpenScanned + pendingFills
+            : Math.max(0, counterOpen + pendingFills)
 
           // Pipeline-aware total — the deepest active stage is canonical.
           const totalRun = Math.max(baseRun, cappedMain, cappedReal, cappedLive)
@@ -2591,11 +2621,21 @@ export async function GET(
         // to always show 0 even when there were genuine open positions.
         // `pseudoOpen` and `realOpen` already hold the correct scan-derived counts.
         const mainOpen = 0  // Main has no independent open-position store (uses pseudo ledger)
-        const liveOpen = Math.max(
+        // liveOpenScanned is the authoritative count: it reflects the actual
+        // number of open live:position:{id} keys in Redis at this moment.
+        // Counter arithmetic (created - closed) drifts after a server restart
+        // because InlineLocalRedis counters reset while position keys persist.
+        // Prefer liveOpenScanned; fall back to counter arithmetic only when
+        // the scan returned 0 but counters suggest positions exist (e.g. the
+        // scan ran before positions were written on a fresh first cycle).
+        const liveCounterOpen = Math.max(
           0,
           n(progHash.live_positions_created_count) -
             n(progHash.live_positions_closed_count),
         )
+        const liveOpen = liveOpenScanned > 0
+          ? liveOpenScanned
+          : liveCounterOpen
         const liveVolumeUsd = n(progHash.live_volume_usd_total)
         const liveVolumeUsdR = Math.round(liveVolumeUsd * 100) / 100
         // Used-balance (margin) cumulative counter — incremented in
@@ -2756,16 +2796,21 @@ export async function GET(
         // Positions
         positionsCreated: n(progHash.live_positions_created_count),
         positionsClosed:  n(progHash.live_positions_closed_count),
-        positionsOpen:    Math.max(
-          0,
-          // Show both filled positions AND currently-placed pending fills.
-          // Filled positions are tracked by `live_positions_created_count`
-          // (incremented on confirmed fill). Pending placed positions that
-          // haven't yet filled are (live_orders_placed_count - live_orders_filled_count).
-          // The sum gives the full count of "active" positions from the user's perspective.
-          n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
-          Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count))
-        ),
+        positionsOpen: (() => {
+          // Prefer key-scan (liveOpenScanned) — authoritative; survives server
+          // restarts where InlineLocalRedis counters reset to 0.
+          const execCounterOpen = Math.max(
+            0,
+            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count),
+          )
+          const execPending = Math.max(
+            0,
+            n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count),
+          )
+          return liveOpenScanned > 0
+            ? liveOpenScanned + execPending
+            : Math.max(0, execCounterOpen + execPending)
+        })(),
         wins:             n(progHash.live_wins_count),
         // Volume — leveraged notional (cumulative qty × price across all fills)
         volumeUsdTotal:   n(progHash.live_volume_usd_total),

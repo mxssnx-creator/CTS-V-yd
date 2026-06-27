@@ -219,8 +219,8 @@ export function TradeHistoryTable({ trades, limit = 15, onRefresh }: TradeHistor
                         {trade.direction === "long" ? "L" : "S"}
                       </Badge>
                     </div>
-                    <div className="text-right font-mono text-muted-foreground">${trade.entryPrice.toFixed(3)}</div>
-                    <div className="text-right font-mono text-muted-foreground">${trade.exitPrice.toFixed(3)}</div>
+                    <div className="text-right font-mono text-muted-foreground">{trade.entryPrice > 0 ? `$${trade.entryPrice.toFixed(3)}` : "—"}</div>
+                    <div className="text-right font-mono text-muted-foreground">{trade.exitPrice > 0 ? `$${trade.exitPrice.toFixed(3)}` : "—"}</div>
                     <div className={`text-right font-medium ${isWin ? "text-green-600" : "text-red-600"}`}>
                       {isWin ? "+" : ""}{trade.pnlLabel.substring(1)}
                     </div>

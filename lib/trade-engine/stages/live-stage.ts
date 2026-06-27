@@ -134,6 +134,7 @@ interface LivePosition {
   status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "pending_fill" | "placed_unconfirmed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
   statusReason?: string
   closeReason?: string
+  closePrice?: number
   system_tracking_id?: string
   connection_tracking_id?: string
   setKey?: string
@@ -3719,6 +3720,11 @@ export async function closeLivePosition(
     position.updatedAt = Date.now()
     position.realizedPnL = Math.round(pnl * 100) / 100
     position.closeReason = closeReason
+    // Persist the actual exit price so the stats route and trade-history
+    // table can show the real close price without needing to back-derive
+    // it from realizedPnL. This is the definitive source of truth for
+    // the "Exit" column in trade history.
+    if (closePrice > 0) position.closePrice = Math.round(closePrice * 1e8) / 1e8
     
     // Step annotation distinguishes the three real outcomes:
     //   • ok            → connector returned success
