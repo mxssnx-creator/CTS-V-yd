@@ -2845,6 +2845,40 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "51")
     },
   },
+  {
+    // Reduce dev to a SINGLE symbol (BTCUSDT) for OOM survival.
+    //
+    // The dev VM has 4.39 GB physical RAM and NO swap; the kernel issues a
+    // GLOBAL OOM-kill the moment total system RAM is exhausted (~2 GB
+    // anon-rss for next-server). Migration 050 lowered dev to 3 symbols, but
+    // even one prehistoric pass over 3 symbols bursts past the ceiling because
+    // the Next.js dev worker already idles at ~1.7 GB.
+    //
+    // One symbol cuts the peak StrategySet allocation to ~1/3 and lets the
+    // engine reach live_trading and stay there, which is what we need to
+    // verify trade-history correctness and live-order placement (placed>0).
+    // Production is untouched (guarded on NODE_ENV) and keeps all 20 symbols.
+    version: 53,
+    name: "053-dev-1-symbol-oom-survival",
+    up: async (client: any) => {
+      if (process.env.NODE_ENV !== "development") {
+        console.log("[v0] Migration 053: skipped (production — keeping 20 symbols)")
+        return
+      }
+      const DEV_SYMBOLS = "BTCUSDT"
+      const connId = "bingx-x01"
+      await client.hset(`connection:${connId}`, { force_symbols: DEV_SYMBOLS, symbol_count: "1" }).catch(() => 0)
+      await client.hset(`settings:trade_engine_state:${connId}`, { force_symbols: DEV_SYMBOLS, active_symbols: DEV_SYMBOLS, symbol_count: "1" }).catch(() => 0)
+      await client.hset(`settings:connection_settings:${connId}`, { force_symbols: DEV_SYMBOLS, active_symbols: DEV_SYMBOLS, symbol_count: "1" }).catch(() => 0)
+      // Clear prehistoric cache gates so the engine re-runs with the new set.
+      await client.del(`prehistoric_loaded:${connId}`).catch(() => 0)
+      await client.del(`prehistoric:progress:${connId}`).catch(() => 0)
+      console.log(`[v0] Migration 053: dev 1-symbol OOM-survival mode applied (${DEV_SYMBOLS})`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "52")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
