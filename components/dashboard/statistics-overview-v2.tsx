@@ -865,10 +865,13 @@ export function StatisticsOverviewV2() {
     }
 
     load()
-    const interval = setInterval(load, 5000)
+    // 3s cadence per operator: the per-stage "Overall (in-process)" metrics are
+    // current-cycle snapshots, so a tighter poll keeps them live without the
+    // cost of a lifetime DB scan.
+    const interval = setInterval(load, 3000)
 
     // Event-driven refresh so toggles surface immediately rather than
-    // waiting up to 5 seconds for the next interval tick.
+    // waiting for the next interval tick.
     const handleEngineStateChanged = () => { load() }
     if (typeof window !== "undefined") {
       window.addEventListener("engine-state-changed", handleEngineStateChanged)

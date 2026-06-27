@@ -1147,13 +1147,29 @@ export async function GET(
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(
       variantKeys.map(async (variant) => {
-        const h = ((await client.hgetall(`strategy_variant:${connectionId}:${variant}`).catch(() => null)) || {}) as Record<string, string>
+        // CANONICAL SOURCE = `strategy_variant_real:` (cumulative via hincrby).
+        // The coordinator writes the lifecycle variant aggregates there (Real
+        // stage, strategy-coordinator.ts L3619) — NOT to the legacy
+        // `strategy_variant:` key this route used to read (which was never
+        // written, so every variant tile + the block/dca counts showed 0).
+        // The Real hash also stores derived averages (avg_profit_factor /
+        // avg_drawdown_time / avg_pos_per_set / pass_rate) via its recompute
+        // pass; we still fall back to computing them from the raw summed
+        // fields (entries_count / sum_pf_x1000 / sum_ddt_x10 / created_sets)
+        // in case that recompute pass was skipped on a given cycle.
+        const h = ((await client.hgetall(`strategy_variant_real:${connectionId}:${variant}`).catch(() => null)) || {}) as Record<string, string>
         const createdSets      = n(h.created_sets)
         const passedSets       = n(h.passed_sets)
         const entriesCount     = n(h.entries_count)
-        const avgPosPerSet     = parseFloat(h.avg_pos_per_set   || "0")
-        const avgProfitFactor  = parseFloat(h.avg_profit_factor || "0")
-        const avgDrawdownTime  = parseFloat(h.avg_drawdown_time || "0")
+        const sumPfX1000       = n(h.sum_pf_x1000)
+        const sumDdtX10        = n(h.sum_ddt_x10)
+        // Prefer the pre-derived field; fall back to raw-sum math when absent/0.
+        let avgPosPerSet       = parseFloat(h.avg_pos_per_set   || "0")
+        if (!(avgPosPerSet > 0) && createdSets > 0)  avgPosPerSet    = entriesCount / createdSets
+        let avgProfitFactor    = parseFloat(h.avg_profit_factor || "0")
+        if (!(avgProfitFactor > 0) && entriesCount > 0) avgProfitFactor = (sumPfX1000 / 1000) / entriesCount
+        let avgDrawdownTime    = parseFloat(h.avg_drawdown_time || "0")
+        if (!(avgDrawdownTime > 0) && entriesCount > 0) avgDrawdownTime = (sumDdtX10 / 10) / entriesCount
         const passRateRaw      = parseFloat(h.pass_rate         || "0")
         variantDetail[variant] = {
           createdSets,
@@ -1991,18 +2007,29 @@ export async function GET(
     // real = Real output / Real input  (Main→Real filter survival)
     const _pct = (num: number, den: number): number =>
       den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
-    const _baseOutput = Number(progHash.strategies_base_total     || "0")
-    const _mainOutput = Number(progHash.strategies_main_total     || "0")
-    const _mainInput  = Number(progHash.strategies_main_evaluated || "0")
-    const _realOutput = Number(progHash.strategies_real_total     || "0")
-    const _realInput  = Number(progHash.strategies_real_evaluated || "0")
-    // base  = 100% when Base sets exist (pipeline entry → always pass).
-    // main  = mainOutput / mainInput  — survival through the Main PF filter.
-    // real  = realOutput / realInput  — survival through the Real strict filter.
+    // CUMULATIVE FUNNEL (operator spec): each stage's Eval% = sets that
+    // survived/evaluated at the stage ÷ the full candidate pool considered at
+    // the stage, where the pool = (sets PASSED FORWARD from the previous stage)
+    // + (sets ADDITIONALLY CREATED via variant/axis fan-out at this stage).
+    //   strategies_{stage}_total           = stage OUTPUT (promoted / passed)
+    //   strategies_{stage}_evaluated        = stage INPUT  (passed forward in)
+    //   strategies_{stage}_related_created  = additionally created at the stage
+    const _baseOutput      = Number(progHash.strategies_base_total            || "0")
+    const _baseEvaluated   = Number(progHash.strategies_base_evaluated        || "0")
+    const _mainOutput      = Number(progHash.strategies_main_total            || "0")
+    const _mainInput       = Number(progHash.strategies_main_evaluated        || "0")
+    const _mainCreated     = Number(progHash.strategies_main_related_created  || "0")
+    const _realOutput      = Number(progHash.strategies_real_total            || "0")
+    const _realInput       = Number(progHash.strategies_real_evaluated        || "0")
+    const _realCreated     = Number(progHash.strategies_real_related_created  || "0")
+    // base = evaluated ÷ overall generated (pipeline entry — every Base Set is
+    //        evaluated, so ~100% when any exist, expressed as the true ratio).
+    // main = main output ÷ (passed-forward-from-base + additionally-created-at-main)
+    // real = real output ÷ (passed-forward-from-main + additionally-created-at-real)
     const stageEvalPercent = {
-      base: _baseOutput > 0 ? 100 : 0,      // Base is the entry point: 100% when any exist
-      main: _pct(_mainOutput, _mainInput),  // % of Main-entered sets that passed
-      real: _pct(_realOutput, _realInput),  // % of Real-entered sets that passed
+      base: _pct(_baseEvaluated, _baseOutput),
+      main: _pct(_mainOutput, _mainInput + _mainCreated),
+      real: _pct(_realOutput, _realInput + _realCreated),
     }
 
     // ── REAL AVERAGES ────────────────────────────────────────────────────────
@@ -2086,7 +2113,7 @@ export async function GET(
     let redisDbEntries = 0
     try { redisDbEntries = await client.dbSize() } catch { /* non-critical */ }
 
-    // ── Volume configuration snapshot ────────────────────────────────────────
+    // ── Volume configuration snapshot ─────────────────��──────────────────────
     // Resolve the EFFECTIVE live/preset volume factors exactly as
     // VolumeCalculator.calculateVolumeForConnection does, so the dashboard
     // can show what multiplier is actually being applied to live orders rather

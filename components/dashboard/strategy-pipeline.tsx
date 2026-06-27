@@ -37,6 +37,7 @@ interface StrategyTracking {
     setsProgressing: number
     avgProfitFactor: number
     avgDrawdownTime: number
+    avgPosPerSet: number
     minProfitFactor: number
     maxDrawdownTime: number
     variants: {
@@ -131,7 +132,7 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
   const { data, isLoading, error } = useSWR<StrategyTracking>(
     `/api/connections/progression/${connectionId}/tracking/strategies`,
     fetcher,
-    { refreshInterval: 5000, revalidateOnFocus: false },
+    { refreshInterval: 3000, revalidateOnFocus: false },
   )
 
   if (isLoading && !data) {
@@ -353,7 +354,11 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <Metric label="Sets (current)" value={data.base.setsCurrent} />
             <Metric label="Sets (total)" value={data.base.setsTotal} />
             <Metric label="Avg PF" value={data.base.avgProfitFactor.toFixed(3)} />
-            <Metric label="Avg Pos / Set" value={data.base.avgPosPerSet.toFixed(1)} />
+            <Metric
+              label="Avg Pos / Set (Overall)"
+              value={data.base.avgPosPerSet.toFixed(1)}
+              hint="Average positions per Set across ALL Base Sets in process this cycle (total entries ÷ all created Sets) — NOT limited to Sets with open positions. See 'Sets Running Now' below for the open/active count."
+            />
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Metric
@@ -415,6 +420,11 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <Metric
               label="Avg DDT (min)"
               value={Math.round(data.main.avgDrawdownTime)}
+            />
+            <Metric
+              label="Avg Pos / Set (Overall)"
+              value={data.main.avgPosPerSet.toFixed(1)}
+              hint="Average positions per Set across ALL Main Sets in process this cycle (total entries ÷ all created Sets) — NOT limited to Sets with open positions. See 'Sets Running Now' below for the open/active count."
             />
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -481,7 +491,11 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <Metric label="Sets (current)" value={data.real.setsCurrent} />
             <Metric label="Sets (cumulative)" value={data.real.setsTotal} />
             <Metric label="Avg PF" value={data.real.avgProfitFactor.toFixed(3)} />
-            <Metric label="Avg Pos / Set" value={data.real.avgPosPerSet.toFixed(1)} />
+            <Metric
+              label="Avg Pos / Set (Overall)"
+              value={data.real.avgPosPerSet.toFixed(1)}
+              hint="Average positions per Set across ALL Real Sets in process this cycle (total entries ÷ all created Sets) — NOT limited to Sets with open positions. See 'Sets Running Now' below for the open/active count."
+            />
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Metric

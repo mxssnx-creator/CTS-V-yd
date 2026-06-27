@@ -508,21 +508,27 @@ export async function getStrategyTracking(
   // main = Main output / Main input (Base→Main survival; expected ~1%)
   // real = Real output / Real input (Main→Real survival)
   // Each clamped to [0,100].
-  const baseOutput    = Number(prog.strategies_base_total     || "0")
-  const baseInput     = Number(prog.strategies_base_evaluated  || "0")
-  const mainOutput    = Number(prog.strategies_main_total      || "0")
-  const mainInput     = Number(prog.strategies_main_evaluated  || "0")
-  const realOutput    = Number(prog.strategies_real_total      || "0")
-  const realInput     = Number(prog.strategies_real_evaluated  || "0")
+  // CUMULATIVE FUNNEL (operator spec) — kept identical to the /stats route so
+  // both surfaces agree. Each stage's Eval% = output ÷ candidate pool, where the
+  // pool = (sets PASSED FORWARD from the previous stage) + (sets ADDITIONALLY
+  // CREATED via variant/axis fan-out at this stage).
+  const baseOutput    = Number(prog.strategies_base_total            || "0")
+  const baseInput     = Number(prog.strategies_base_evaluated        || "0")
+  const mainOutput    = Number(prog.strategies_main_total            || "0")
+  const mainInput     = Number(prog.strategies_main_evaluated        || "0")
+  const mainCreated   = Number(prog.strategies_main_related_created  || "0")
+  const realOutput    = Number(prog.strategies_real_total            || "0")
+  const realInput     = Number(prog.strategies_real_evaluated        || "0")
+  const realCreated   = Number(prog.strategies_real_related_created  || "0")
   const pct = (num: number, den: number): number =>
     den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
-  // base  = 100% when Base sets exist (pipeline entry → always pass).
-  // main  = mainOutput / mainInput  — survival through the Main PF filter.
-  // real  = realOutput / realInput  — survival through the Real strict filter.
+  // base = evaluated ÷ overall generated (entry point → ~100% when any exist).
+  // main = main output ÷ (passed-forward-from-base + additionally-created-at-main).
+  // real = real output ÷ (passed-forward-from-main + additionally-created-at-real).
   const stageEvalPercent = {
-    base: baseOutput > 0 ? 100 : 0,          // Base is the entry point: 100% when any exist
-    main: pct(mainOutput, mainInput),        // % of Main-entered sets that passed
-    real: pct(realOutput, realInput),        // % of Real-entered sets that passed
+    base: pct(baseInput, baseOutput),
+    main: pct(mainOutput, mainInput + mainCreated),
+    real: pct(realOutput, realInput + realCreated),
   }
 
   return {
@@ -550,6 +556,7 @@ export async function getStrategyTracking(
       setsProgressing: Number(main.sets_progressing || main.created_sets || "0"),
       avgProfitFactor: Number(main.avg_profit_factor || "0"),
       avgDrawdownTime: Number(main.avg_drawdown_time || "0"),
+      avgPosPerSet: Number(main.avg_pos_per_set || "0"),
       minProfitFactor: mainPFThreshold,
       maxDrawdownTime: mainDdtCeilingMin,
       variants: mainVariants,

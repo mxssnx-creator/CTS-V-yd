@@ -2273,7 +2273,7 @@ export class StrategyCoordinator {
       if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, set)
       if (cachedSet) reused++
 
-      // ── Register SetCoordRecord for this variant (O(1) per set) ──────
+      // ── Register SetCoordRecord for this variant (O(1) per set) ──���───
       // CoordIndex is the per-cycle performance index; registering here
       // avoids a second full scan of mainSets downstream. Stores only
       // scalars — quality fields are resolved from BaseRegistry on demand.
@@ -2302,7 +2302,7 @@ export class StrategyCoordinator {
       }
     }
 
-    // ── Log min-pos skip count (diagnostic) ──────────────────���────
+    // ── Log min-pos skip count (diagnostic) ──────────────────������───
     // Surface the number of Base Sets that didn't meet `mainEvalPosCount`
     // at this cycle so the operator can see when the threshold is
     // throttling promotion. Non-critical; debug level.
@@ -3540,6 +3540,19 @@ export class StrategyCoordinator {
       // strategies_real_evaluated = Main Sets that entered REAL (input count).
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
       if (mainPFEligible > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainPFEligible))
+
+      // strategies_real_related_created = Real Sets created via axis/variant
+      // fan-out BEYOND the Main Sets that entered (mirrors the Main stage's
+      // `strategies_main_related_created = mainSets.length - reused`). This is
+      // the "additionally created" term the dashboard's Real Eval% funnel needs
+      // for its denominator: Real% = real_total / (real_evaluated + real_related_created).
+      // Without it the Real funnel had no fan-out term and read inconsistently
+      // vs. Main. max(0, …) because Real can also net-filter below the input.
+      const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)
+      if (realRelatedCreated > 0) {
+        writes.push(client.hincrby(redisKey, "strategies_real_related_created", realRelatedCreated))
+      }
+      writes.push(client.hset(redisKey, { strategies_real_last_created: String(realRelatedCreated) }))
 
       // ── ACTIVE-NOW snapshot for Real stage ──────────────────────────
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
