@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ���─
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -3060,6 +3060,48 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "55")
+    },
+  },
+  {
+    // Migration 055 sets symbol_count=2 + symbol_order=volatility_1h + clears
+    // force_symbols for BOTH dev and prod. In dev that leaves the engine doing
+    // 2 live BingX volatility API calls on every boot AND running prehistoric
+    // across 2 symbols — more than enough to OOM the 8 GB no-swap VM (RSS hits
+    // 2.4 GB+ before the event loop can respond to HTTP). Migration 053 already
+    // set BTCUSDT force_symbols, but 055 runs after it and wipes that.
+    //
+    // This migration re-applies the dev 1-symbol BTCUSDT cap AFTER 055 so the
+    // dev engine always starts with a single cheap prehistoric run and stays
+    // under the memory guard's 1500 MB target. Production is unaffected.
+    version: 57,
+    name: "057-dev-1-symbol-btcusdt-repin",
+    up: async (client: any) => {
+      if (process.env.NODE_ENV !== "development") {
+        console.log("[v0] Migration 057: skipped (production — keeping volatility-order symbol count)")
+        return
+      }
+      const DEV_SYMBOL = "BTCUSDT"
+      const connId = "bingx-x01"
+      const hashes = [
+        `connection:${connId}`,
+        `settings:trade_engine_state:${connId}`,
+        `settings:connection_settings:${connId}`,
+      ]
+      for (const h of hashes) {
+        await client.hset(h, {
+          force_symbols: DEV_SYMBOL,
+          symbol_count:  "1",
+          // Clear volatility ordering so getSymbols() stops at force_symbols.
+          symbol_order:  "",
+        }).catch(() => 0)
+      }
+      // Clear prehistoric gates so the engine re-runs with the pinned symbol.
+      await client.del(`prehistoric_loaded:${connId}`).catch(() => 0)
+      await client.del(`prehistoric:progress:${connId}`).catch(() => 0)
+      console.log(`[v0] Migration 057: dev 1-symbol repin applied — force_symbols=${DEV_SYMBOL}`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "56")
     },
   },
 ]
