@@ -124,20 +124,62 @@ export class ErrorHandler {
 
 export const errorHandler = ErrorHandler.getInstance()
 
-// Global error handlers for uncaught errors
+// Global error handlers for uncaught errors.
+//
+// CRITICAL (Global Trade Coordinator stability): these handlers must NEVER
+// exit the process. The coordinator is a long-lived singleton that owns every
+// running engine; a `process.exit(1)` here kills ALL engines and (under
+// `next start`/Vercel) forces a worker restart — exactly the "stopping /
+// crashing / restarting" the operator reported, often triggered by a stray
+// rejection in the settings-save → recoordination → engine start/stop chain.
+//
+// Instead we SURVIVE + SELF-HEAL in place: log the error, run it through the
+// handler, and give every running engine a chance to re-arm its timers
+// (mirrors the engine-manager's unhandledRejection self-heal). The once-guard
+// prevents duplicate listeners when this module is imported by many routes.
 if (typeof window === "undefined") {
-  // Server-side error handlers
-  process.on("uncaughtException", async (error: Error) => {
-    console.error("[v0] Uncaught Exception:", error)
-    await errorHandler.handleError(error, { component: "process", action: "uncaughtException" })
-    process.exit(1)
-  })
+  const g = globalThis as any
+  if (!g.__v0_errorHandlerProcessHooks) {
+    g.__v0_errorHandlerProcessHooks = true
+    try { (process as any).setMaxListeners?.(50) } catch {}
 
-  process.on("unhandledRejection", async (reason: any) => {
-    console.error("[v0] Unhandled Rejection:", reason)
-    const error = reason instanceof Error ? reason : new Error(String(reason))
-    await errorHandler.handleError(error, { component: "process", action: "unhandledRejection" })
-  })
+    // Route a process-level error through the self-heal path WITHOUT exiting.
+    const selfHeal = async (error: Error, action: string) => {
+      try {
+        await errorHandler.handleError(error, { component: "process", action })
+      } catch {
+        /* handler itself must never throw out of the global hook */
+      }
+      try {
+        // Re-arm any running engines in place so a stray error never silently
+        // stalls the loop. Best-effort: failures here are swallowed.
+        const { getGlobalCoordinator } = await import("@/lib/trade-engine")
+        const coord = getGlobalCoordinator?.()
+        // @ts-expect-error - reach into the coordinator's manager map
+        const managers: Map<string, any> | undefined = coord?.engineManagers
+        if (managers) {
+          for (const [, mgr] of managers.entries()) {
+            if (!mgr?.isEngineRunning) continue
+            try { await mgr.rearmIfStalled?.() } catch {}
+          }
+        }
+      } catch {
+        /* import/heal failure is non-fatal — staying alive is the priority */
+      }
+    }
+
+    process.on("uncaughtException", (error: Error) => {
+      // NON-FATAL by design. Do NOT call process.exit — see header.
+      console.error("[v0] Uncaught Exception (non-fatal, self-healing):", error)
+      void selfHeal(error, "uncaughtException")
+    })
+
+    process.on("unhandledRejection", (reason: any) => {
+      console.error("[v0] Unhandled Rejection (non-fatal, self-healing):", reason)
+      const error = reason instanceof Error ? reason : new Error(String(reason))
+      void selfHeal(error, "unhandledRejection")
+    })
+  }
 }
 
 export default ErrorHandler

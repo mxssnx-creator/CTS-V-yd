@@ -1705,16 +1705,22 @@ export function getGlobalTradeEngineCoordinator(): GlobalTradeEngineCoordinator 
         _coordinatorInitLock = false
       }
     } else {
-      // Another request is initializing; wait a brief moment for it to complete.
-      // In practice this branch is extremely rare (only during concurrent first-load).
-      for (let i = 0; i < 10 && !globalCoordinator; i++) {
-        // Spin-wait 1ms × 10 = up to 10ms for initialization to complete.
-        // This is safe because the lock will be released immediately after construction.
-      }
+      // We can only reach here if the constructor RE-ENTERED this getter while
+      // still running (the lock is held but `globalCoordinator` isn't assigned
+      // yet). Node is single-threaded and the lock's critical section is fully
+      // synchronous (no await between `new` and the assignment), so a true
+      // concurrent caller is impossible — a spin-wait could never make progress
+      // and the previous code returned an UNASSIGNED orphan coordinator (its own
+      // duplicate timers, invisible to getGlobalCoordinator()), which could
+      // drive wrong start/stop decisions and instability.
+      //
+      // Construct-and-ASSIGN so the singleton is never orphaned. If the
+      // in-progress constructor later finishes, last-assignment-wins still
+      // leaves a single valid, globally-visible coordinator.
       if (!globalCoordinator) {
-        // Fallback: return a temporary instance (should not happen in practice).
-        console.warn("[v0] Coordinator initialization lock timeout; returning temporary instance")
-        return new GlobalTradeEngineCoordinator()
+        console.warn("[v0] Coordinator getter re-entered during init; assigning singleton now")
+        globalCoordinator = new GlobalTradeEngineCoordinator()
+        engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
       }
     }
   }

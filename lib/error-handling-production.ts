@@ -93,14 +93,17 @@ export class ProductionErrorHandler {
       severity: 'critical'
     }
 
-    console.error('[ERROR] Uncaught Exception:', error)
+    console.error('[ERROR] Uncaught Exception (non-fatal, surviving):', error)
 
     this.logError(productionError)
     this.trackErrorMetric(productionError)
 
-    // Graceful shutdown after logging
-    console.error('[ERROR] Initiating graceful shutdown...')
-    this.gracefulShutdown(1)
+    // DO NOT shut down on an uncaught exception. The Global Trade Coordinator
+    // must remain alive and keep every running engine active. Exiting here
+    // would kill all engines and force a worker restart — the exact crash the
+    // operator reported. We log + track and SURVIVE; the active handler in
+    // lib/error-handler.ts additionally self-heals (re-arms running engines).
+    // Graceful shutdown remains wired to SIGTERM/SIGINT only (handleShutdown).
   }
 
   /**
