@@ -2525,6 +2525,7 @@ export async function GET(
         trailing: variantDetail.trailing,
         block:    variantDetail.block,
         dca:      variantDetail.dca,
+        pause:    variantDetail.pause,
         overall:  variantOverall,
       },
 

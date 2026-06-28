@@ -3091,7 +3091,19 @@ export class StrategyCoordinator {
       // netting (handled separately via axisPassthrough).
       const outcome = aw?.outcome ?? "pos"
       const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
-      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw?.prev ?? 0}|l${aw?.last ?? 0}|c${aw?.cont ?? 0}|o${outcome}`
+      // ── Variant-INDEPENDENT bucketing (operator spec: each activated
+      // variant is handled independently) ──────────────────────────────────
+      // The bucket key MUST include the variant. Without it, every variant
+      // derived from the same Base Set + axis context (default/trailing/block/
+      // dca/pause) collapsed into ONE hedge bucket and competed against each
+      // other: only the |L−S| highest-PF survivors were kept, so the variant
+      // with the lowest pfBias (pause: 1.00–1.06) was always sorted last and
+      // dropped entirely — its Real aggregate stayed 0 even when activated and
+      // correctly built. Keying the bucket by variant nets each variant's
+      // long/short pairs WITHIN that variant only, preserving independence so
+      // every activated variant surfaces on its own merit.
+      const variantKey = (s.variant as string) ?? "default"
+      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|v${variantKey}|p${aw?.prev ?? 0}|l${aw?.last ?? 0}|c${aw?.cont ?? 0}|o${outcome}`
       let b = hedgeBuckets.get(bucketKey)
       if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
       const dir = s.direction ?? "long"
