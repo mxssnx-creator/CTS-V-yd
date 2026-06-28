@@ -1304,7 +1304,7 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
   if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
 
-  // ── Trailing stop: use the ratcheted absolute price directly ─�����─────────���
+  // ── Trailing stop: use the ratcheted absolute price directly ─�����─────────�����
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
   // with the latest ratcheted absolute stop level. Using that absolute price
   // directly avoids the percentage-anchored re-derivation below which would
@@ -5559,6 +5559,15 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // protection. This was a real bug the user reported as
         // "TP/SL control orders are not working".
         if ((position.status === "placed" || position.status === "pending_fill" || position.status === "placed_unconfirmed") && position.orderId) {
+          // Guard: connector may be null/uninitialised on the very first sync
+          // tick after a restart (factory not yet called for this connectionId).
+          // Skip fill-detection silently — the next tick will retry once the
+          // connector is ready. Previously this threw "Cannot read properties of
+          // null (reading 'getOrder')" which flooded the log on every sync tick
+          // until the connector was initialised.
+          if (!exchangeConnector || typeof exchangeConnector.getOrder !== "function") {
+            // Connector not ready yet — skip, retry next sync tick.
+          } else
           try {
             // Bounded — a hanging getOrder would block this position's
             // entire sync slot and delay every downstream close/heal step.

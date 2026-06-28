@@ -2348,16 +2348,12 @@ export async function GET(
             return eval_val
           })(),
           realEvaluated: (() => {
-            const real = stratCounts.real || 0
-            const eval_val = stratEvaluated.real || 0
-            if (eval_val > real && real > 0) {
-              console.warn(
-                `[STATS-VALIDATION] ${connectionId}: realEvaluated (${eval_val}) > real (${real}). ` +
-                `Clamping to real.`,
-              )
-              return real
-            }
-            return eval_val
+            // NOTE: realEvaluated = Main sets that ENTERED Real-stage PF evaluation
+            // (the INPUT count, written as mainPFEligible by the coordinator).
+            // stratCounts.real = Real sets that PASSED and survived to dispatch
+            // (the OUTPUT count). Input is always >= output after filtering, so
+            // realEvaluated > real is CORRECT and expected — do NOT clamp here.
+            return stratEvaluated.real || 0
           })(),
         },
       },
@@ -2543,7 +2539,7 @@ export async function GET(
         const totalCycles  = n(progHash.strategies_main_cycles)
         const reuseDenom   = totalCreated + totalReused
 
-        // ── Build per-axis-window arrays from `axis_windows:{id}` ─────────
+        // ── Build per-axis-window arrays from `axis_windows:{id}` ──────��──
         //
         // Spec mapping:
         //   prev  : N ∈ 0..12 (closed lookback window)
