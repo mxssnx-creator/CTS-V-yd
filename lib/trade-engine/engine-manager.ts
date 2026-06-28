@@ -683,7 +683,7 @@ export class TradeEngineManager {
           updated_at: new Date().toISOString(),
         }
 
-        // ── Critical Write with Retry ────────────────────────────────────
+        // ── Critical Write with Retry ─────────────────────────────────���──
         // The progression snapshot (symbol_count, settings_version, etc.) is
         // CRITICAL for "unique + solid" progress. If this write fails, the
         // entire progression becomes stale and UI will show incorrect counters.
@@ -3615,6 +3615,16 @@ export class TradeEngineManager {
           getSettings(`trade_engine_state:${this.connectionId}`),
           getSettings(`connection:${this.connectionId}`),
         ])
+
+        // ── DEV HARD CAP: always trade only BTCUSDT in development ──────────
+        // Every other path (force_symbols, self-written symbols, volatility
+        // fetch) can be clobbered by snapshot state or dynamic API results.
+        // A direct early-return here is the only reliable way to keep the dev
+        // worker's RSS under the OOM threshold (1 symbol = ~700 MB vs 20
+        // symbols = ~3.5 GB). Production is completely unaffected.
+        if (process.env.NODE_ENV === "development") {
+          return ["BTCUSDT"]
+        }
 
         if (connState && typeof connState === "object") {
           // ── Highest priority: force_symbols set by migrations/admin ────────
