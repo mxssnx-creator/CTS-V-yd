@@ -67,6 +67,10 @@ async function reconcileStrandedPositions() {
         )
         break
       }
+      // `live:position:*` over-matches the `live:position:tracking:*` pointer
+      // keys, which hold a PLAIN STRING (e.g. "live:bingx-x01:...") not a JSON
+      // position object. Skip them so JSON.parse doesn't throw on every boot.
+      if (key.startsWith("live:position:tracking:")) continue
       try {
         const raw = await client.get(key)
         if (!raw) continue

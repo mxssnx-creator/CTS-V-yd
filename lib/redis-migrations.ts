@@ -3819,14 +3819,20 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
             ),
           ),
         ])
-        console.log(`[v0] [Migrations] ✓ Completed: ${migration.name}`)
+        // Stamp `_schema_version` after EACH migration (not just once at the
+        // end). Durable per-step progress means a crash/restart mid-batch never
+        // re-runs already-applied migrations and never leaves the schema in a
+        // half-state that a later boot misreads.
+        await client.set("_schema_version", migration.version.toString())
+        console.log(`[v0] [Migrations] ✓ Completed: ${migration.name} (schema now v${migration.version})`)
       } catch (error) {
         console.error(`[v0] [Migrations] ✗ Failed during ${migration.name}:`, error)
         throw error
       }
     }
 
-    // Update schema version to final version
+    // Ensure schema version reflects the final target (defensive; the loop
+    // already stamped the last migration's version).
     await client.set("_schema_version", finalVersion.toString())
     
     // Track migration runs
