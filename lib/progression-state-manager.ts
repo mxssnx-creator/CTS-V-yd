@@ -830,6 +830,10 @@ return {
         indications_active_advanced_count: "0",
         indications_optimal_count: "0",
         indications_auto_count: "0",
+        // Indication-Set aggregate counters — used by getIndicationTracking
+        indications_count: "0",
+        indication_sets_total: "0",
+        indication_sets_at_limit: "0",
         strategies_base_total: "0",
         strategies_main_total: "0",
         strategies_real_total: "0",

@@ -199,7 +199,7 @@ async function generateIndicationsForConnection(
       marketData = await fetchLivePriceFromExchange(symbol)
     }
 
-    // ── Synthetic fallback ─────────────────────���────────────────────────
+    // ── Synthetic fallback ─────────────────────�����────────────────────────
     // In connectivity-restricted environments (e.g. the sandbox) both the
     // cached lookup and the live exchange fetch return null, so this used to
     // `return result` with generated=0 — stalling the realtime cron and
@@ -419,6 +419,27 @@ async function generateIndicationsForConnection(
     if (indications.length > 0) {
       pipeline.hincrby(progKey, "indications_count", indications.length)
       pipeline.hincrby(progKey, "indication_live_cycle_count", 1)
+
+      // ── Windowed indication counts ─────────────────────────────────────
+      // Write per-type counts into the two time-windowed hashes consumed by
+      // getIndicationTracking ("Last 5" / "Last 60 min" panels). Plain type
+      // fields (not symbol-prefixed) — HINCRBY accumulates across symbols
+      // for the same cron tick so each window shows the per-tick qualified
+      // total, not just the last symbol written. TTL is kept short (5 min /
+      // 70 min) so the windows naturally roll off older data.
+      const w5Key  = `indications_window:${connectionId}:last5`
+      const w60Key = `indications_window:${connectionId}:last60min`
+      for (const ind of indications) {
+        pipeline.hincrby(w5Key,  ind.type, 1)
+        pipeline.hincrby(w60Key, ind.type, 1)
+      }
+      pipeline.expire(w5Key,  300)  // 5-min rolling window
+      pipeline.expire(w60Key, 4200) // 70-min rolling window
+
+      // indication_sets_total: increment by number of distinct type×symbol
+      // Sets that fired this cycle (one per fired indication type counts as
+      // one active Set for this symbol).
+      pipeline.hincrby(progKey, "indication_sets_total", indications.length)
     }
     pipeline.hincrby(progKey, "indication_cycle_count", 1)
     pipeline.hincrby(progKey, "strategy_cycle_count", 1)

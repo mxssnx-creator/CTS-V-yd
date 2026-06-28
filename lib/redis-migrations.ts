@@ -1301,6 +1301,8 @@ const migrations: Migration[] = [
           prehistoric_candles_processed: have.prehistoric_candles_processed ?? "0",
           intervals_processed: have.intervals_processed ?? "0",
           indications_count: have.indications_count ?? "0",
+          indication_sets_total: have.indication_sets_total ?? "0",
+          indication_sets_at_limit: have.indication_sets_at_limit ?? "0",
           strategies_count: have.strategies_count ?? "0",
         }
 
@@ -3104,6 +3106,42 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "56")
+    },
+  },
+
+  {
+    version: 58,
+    name: "058-indication-tracking-fields",
+    up: async (client: any) => {
+      // Backfill `indication_sets_total` and `indication_sets_at_limit` onto all
+      // existing `progression:{connId}` hashes that pre-date this migration.
+      // These fields are read by getIndicationTracking (detailed-tracking.ts) and
+      // written by IndicationSetsProcessor.processAllIndicationSets and the
+      // generate-indications cron on every cycle.  We use HSETNX (SET-IF-ABSENT)
+      // so already-running engines that have already written a non-zero value are
+      // never zeroed out by the migration.
+      const connSet = await client.smembers("connections").catch(() => [] as string[])
+      const connIds: string[] = Array.isArray(connSet) ? connSet : []
+      let patched = 0
+      for (const connId of connIds) {
+        const progKey = `progression:${connId}`
+        const exists = await client.exists(progKey).catch(() => 0)
+        if (!exists) continue
+        // Only seed fields that are genuinely absent (empty string or undefined).
+        const current = await client.hgetall(progKey).catch(() => ({})) as Record<string, string>
+        const toWrite: Record<string, string> = {}
+        if (!current.indication_sets_total)   toWrite.indication_sets_total   = "0"
+        if (!current.indication_sets_at_limit) toWrite.indication_sets_at_limit = "0"
+        if (!current.indications_count)       toWrite.indications_count       = "0"
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset(progKey, toWrite).catch(() => 0)
+          patched++
+        }
+      }
+      console.log(`[v0] Migration 058: seeded indication_sets_total/at_limit on ${patched}/${connIds.length} progression hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "57")
     },
   },
 ]
