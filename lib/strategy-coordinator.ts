@@ -2295,7 +2295,7 @@ export class StrategyCoordinator {
     // ── Await all async builds to complete ────���──────────────────────────
     const results = await Promise.all(buildTasks)
     
-    // ── Process results and populate mainSets ──���─────────────────────────
+    // ── Process results and populate mainSets ──���────────���────────────────
     for (const result of results) {
       const { baseSet, profile, built, cachedSet } = result
       const set = cachedSet || built
@@ -2965,8 +2965,20 @@ export class StrategyCoordinator {
       // hasEntries is always true for them — skip the check for non-axis.
       const hasEntries = isAxisSet || (s.entries?.length ?? 0) > 0
 
+      // Non-default variant Sets (trailing/block/dca/pause) are Base-anchored
+      // PROJECTIONS built by buildVariantSet: like axis Sets they carry a
+      // derived scalar aggregate (entryCount>0, avgPF floored at the Main gate)
+      // instead of their own accumulated entries[]. Their effective position
+      // count lives on the parent Base Set, so the raw per-Set pos-count gate
+      // must NOT reject them — they are still judged on PF/DDT merit at step 3.
+      // Without this exemption a freshly-built variant Set (entryCount 1-2 from
+      // a single Base entry) failed realMinPos (relaxed to <=3) and never
+      // reached Real, so every activated variant's Real aggregate AND live
+      // dispatch were silently 0 even though the variant was correctly built.
+      const isVariantProjection = !!(s.variant && s.variant !== "default") && (s.entryCount ?? 0) > 0
+
       // ── 1. Position-count gate ──────────────────────�����─────────────────────
-      if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
+      if (posCount < realMinPos && !(isAxisSet && hasEntries) && !isVariantProjection) {
         const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
         if (!hasActiveReal) {
           s.status = "invalid"
@@ -3169,7 +3181,7 @@ export class StrategyCoordinator {
     // For future use: if we need to re-cap (e.g. for perf), read the
     // operator's `maxRealSets` setting and apply it here.
     //
-    // ── MEMORY-SAFETY CEILING (not a funnel cap) ─────────────────────────
+    // ── MEMORY-SAFETY CEILING (not a funnel cap) ─────────────���───────────
     // Real Sets remain "unlimited" by product spec, but slicing to a literal
     // Infinity let `realPostHedge` carry every qualifying Set — and each Set
     // is a full object with an `entries[]` array. On a dense symbol the Real
@@ -3200,11 +3212,52 @@ export class StrategyCoordinator {
     // during a 5-symbol live run). The operator can LOWER the cap via
     // maxRealSets but can never exceed the ceiling.
     const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING, REAL_SETS_SAFETY_CEILING)
-    const realSets = realPostHedge.slice(0, realSetsCap)
-    if (realPostHedge.length > realSetsCap) {
+    // ── Variant-fair cap (operator spec: each activated variant independent) ──
+    // `realPostHedge` is PF-desc sorted. A pure top-N slice lets the large
+    // `default` axis fan-out (up to MAIN_AXIS_SETS_CEILING Sets, ALL tagged
+    // "default") crowd out the comparatively few NON-default variant Sets
+    // (trailing/block/dca/pause), so they never reached Real — their Real
+    // aggregate AND their live dispatch were therefore always 0 even when the
+    // variant was activated and correctly built at Main. Guarantee independent
+    // representation: first reserve a bounded per-variant floor for each
+    // non-default variant (taken in PF order), then fill the remaining budget
+    // with the global PF ranking (mostly `default`). Non-default variants get
+    // NO axis fan-out, so their counts are small and reserving for them is
+    // cheap while keeping the total within `realSetsCap` (OOM ceiling intact).
+    let realSets: StrategySet[]
+    if (realPostHedge.length <= realSetsCap) {
+      realSets = realPostHedge
+    } else {
+      // Up to ~30% of the cap is split across the 4 non-default variant types;
+      // the remaining ~70% goes to the global PF ranking. Floor of 1 ensures
+      // every present variant survives even at a tiny cap.
+      const floorPerVariant = Math.max(1, Math.floor((realSetsCap * 0.3) / 4))
+      const reserved: StrategySet[] = []
+      const reservedKeys = new Set<string>()
+      const keptPerVariant: Record<string, number> = {}
+      for (const s of realPostHedge) {
+        if (reserved.length >= realSetsCap) break
+        const v = (s.variant as string) ?? "default"
+        if (v === "default") continue
+        const kept = keptPerVariant[v] ?? 0
+        if (kept >= floorPerVariant) continue
+        reserved.push(s)
+        reservedKeys.add(s.setKey)
+        keptPerVariant[v] = kept + 1
+      }
+      const remaining = Math.max(0, realSetsCap - reserved.length)
+      const fill: StrategySet[] = []
+      for (const s of realPostHedge) {
+        if (fill.length >= remaining) break
+        if (reservedKeys.has(s.setKey)) continue
+        fill.push(s)
+      }
+      // Restore global PF-desc ordering for the downstream hedge/dispatch path.
+      realSets = reserved.concat(fill).sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       console.warn(
         `[v0] [RealStage] ${this.connectionId}: ${realPostHedge.length} Real Sets exceeds ` +
-        `safety ceiling ${realSetsCap}; keeping top ${realSetsCap} by rank. ` +
+        `safety ceiling ${realSetsCap}; kept top ${realSetsCap} by rank with per-variant ` +
+        `reserve (floor ${floorPerVariant}/variant: ${JSON.stringify(keptPerVariant)}). ` +
         `Set maxRealSets in Settings to override.`,
       )
     }
