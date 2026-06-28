@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ��─
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ���─
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -3021,7 +3021,7 @@ const migrations: Migration[] = [
     // app_settings fallback and (b) the later-added bybit-x03 connection with
     // NO explicit toggles — so they silently relied on code defaults. This
     // migration seeds the canonical map (trailing=on, block=on, dca=OFF,
-    // pause=on + block tuning) wherever a key is ABSENT, so the state is
+    // + block tuning) wherever a key is ABSENT, so the state is
     // explicit and uniform. SET-IF-ABSENT: an operator's deliberate override
     // is never clobbered (we only fill in keys that don't exist yet).
     up: async (client: any) => {
@@ -3029,7 +3029,6 @@ const migrations: Migration[] = [
         variantTrailingEnabled: "true",
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false", // spec: DCA OFF by default
-        variantPauseEnabled:    "true",
         blockVolumeRatio:       "1.0",
         blockMaxStack:          "3",
       }

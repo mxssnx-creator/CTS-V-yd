@@ -1138,12 +1138,7 @@ export async function GET(
     // Pause is intentionally not a strategy variant. It is exposed below as
     // an axis/window accumulation (`axisWindows.pause`), not in
     // `strategyVariants`.
-    // ─ PAUSE VARIANT ────────────────────────────────────────────────
-    // The Real stage and StrategyCoordinator both write a 5th variant
-    // bucket — `pause` — for entries placed under the global pause-axis
-    // ratio config. `pause` is included here so the dashboard surfaces
-    // those entries in `strategyVariants.pause` of the response.
-    const variantKeys = ["default", "trailing", "block", "dca", "pause"] as const
+    const variantKeys = ["default", "trailing", "block", "dca"] as const
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(
       variantKeys.map(async (variant) => {
@@ -2525,7 +2520,6 @@ export async function GET(
         trailing: variantDetail.trailing,
         block:    variantDetail.block,
         dca:      variantDetail.dca,
-        pause:    variantDetail.pause,
         overall:  variantOverall,
       },
 

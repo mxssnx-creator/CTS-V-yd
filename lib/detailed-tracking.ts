@@ -23,7 +23,7 @@
  *                 ▼
  *   ┌─────────────────────────────────────────────────────────────────┐
  *   │ MAIN  — VARIANT Sets per Base (NO new positions; reuse Base's)  │
- *   │   • Default / Trailing / Block / DCA / Pause                    │
+ *   │   • Default / Trailing / Block / DCA                            │
  *   │   • Block + DCA: validate Base's COMPLETE positions via gates   │
  *   │   • Trailing: per-base (start, stop) trailing matrix expansion  │
  *   │   • Pos-count variants are validated here via axisWindows tag   │
@@ -612,7 +612,7 @@ export async function getStrategyTracking(
 
 // ─────────────────────────────────────────────────────────────────────────
 // HELPERS
-// ─────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────��──
 
 async function readVariantBreakdown(
   client: any,

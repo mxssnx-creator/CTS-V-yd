@@ -94,7 +94,7 @@ export interface StrategySet {
   
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
-  variant?: "default" | "trailing" | "block" | "dca" | "pause"
+  variant?: "default" | "trailing" | "block" | "dca"
 
   /**
    * ── Variant coordination scalars (Base-Anchored Coordination Model) ─────
@@ -319,7 +319,7 @@ export interface SetCoordRecord {
   /** Points at the originating Base Set in BaseRegistry. */
   parentKey: string
   /** Variant profile this record represents. */
-  variant: "default" | "trailing" | "block" | "dca" | "pause"
+  variant: "default" | "trailing" | "block" | "dca"
   /** Axis tuple — null for profile-variant (non-axis) records. */
   axisWindows: StrategySet["axisWindows"] | null
   /**
@@ -782,7 +782,6 @@ export class StrategyCoordinator {
       trailing: boolean
       block:    boolean
       dca:      boolean
-      pause:    boolean
     }
     /**
      * Block-strategy live-position × volume-ratio coordination knobs.
@@ -838,7 +837,6 @@ export class StrategyCoordinator {
       trailing: true,
       block:    true, // ← ENABLED by default (per spec)
       dca:      false, // ← OFF by default (per spec); parser also defaults false
-      pause:    true,
     },
     blockVolumeRatio: 1.0,
     blockMaxStack:    3,
@@ -1320,14 +1318,12 @@ export class StrategyCoordinator {
       this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
       this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
 
-      // Variant toggles. Defaults: trailing=true, block=true, dca=false
-      // Variant toggles. Defaults: trailing=true, block=true, dca=false, pause=true
-      // (spec: DCA off by default). The bool() helper only falls back to the
-      // default when the key is genuinely absent — an explicit "false" is honoured.
+      // Variant toggles. Defaults: trailing=true, block=true, dca=false (spec: DCA off).
+      // The bool() helper only falls back to the default when the key is genuinely
+      // absent — an explicit "false" is honoured.
       this._coordinationSettings.variants.trailing = bool(s.variantTrailingEnabled, true)
       this._coordinationSettings.variants.block    = bool(s.variantBlockEnabled,    true)
       this._coordinationSettings.variants.dca      = bool(s.variantDcaEnabled,      false)
-      this._coordinationSettings.variants.pause    = bool(s.variantPauseEnabled,    true)
 
       // ── Block-strategy tuning (previously never read from settings) ─────
       // blockVolumeRatio and blockMaxStack control the Block variant's live
@@ -2509,7 +2505,6 @@ export class StrategyCoordinator {
       trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
-      pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
     }
     // Aggregate scalars — computed in the same pass as variantAgg to avoid
     // 4 extra reduce/filter sweeps that each allocate a result value.
@@ -3740,7 +3735,6 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
-        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       }
       // Slim-path Real Sets carry entries:[] — use set-level scalar aggregates
       // (entryCount, avgProfitFactor, avgDrawdownTime) instead of iterating
@@ -3757,7 +3751,7 @@ export class StrategyCoordinator {
         agg.sumPF          += set.avgProfitFactor * ec
         agg.sumDDT         += (set.avgDrawdownTime || 0) * ec
       }
-      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
         const agg = realVariantAgg[variant]
         // Guard on setsContaining (not entries) so sets with entryCount=0 still
         // contribute their count metadata to the variant hash.
@@ -3856,7 +3850,7 @@ export class StrategyCoordinator {
       // so the stats API can read them without recomputing.
       try {
         const recompute: Promise<any>[] = []
-        for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
+        for (const variant of ["default", "trailing", "block", "dca"] as const) {
           if (realVariantAgg[variant].setsContaining === 0) continue
           const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
           recompute.push(
@@ -4109,7 +4103,6 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
-        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
       }
       for (const set of qualifying) {
         // Slim-path sets carry entries: [] — use entryCount + set-level avgPF/DDT
@@ -4151,7 +4144,7 @@ export class StrategyCoordinator {
       }
 
       const liveVariantWrites: Promise<any>[] = []
-      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
         const agg = liveVariantAgg[variant]
         // Guard on setsContaining — a variant bucket with sets but entryCount=0
         // still contributes count metadata. Avoids writing empty buckets.
@@ -4461,7 +4454,7 @@ export class StrategyCoordinator {
                     // structured fields are what downstream code reads.
                     setKey:       set.setKey,
                     parentSetKey: set.parentSetKey,
-                    setVariant:   set.variant === "pause" ? undefined : set.variant,
+                    setVariant:   set.variant,
                     axisWindows:  set.axisWindows,
                     // Forward the variant size multiplier so VolumeCalculator
                     // can apply Block (1.5–2.0×) or DCA (0.5×) notional scaling
@@ -5208,7 +5201,7 @@ export class StrategyCoordinator {
   }
 
   private variantProfiles(): Array<{
-    name: "default" | "trailing" | "block" | "dca" | "pause"
+    name: "default" | "trailing" | "block" | "dca"
     gate: (ctx: PositionContext) => boolean
     configs: Array<{ size: number; leverage: number; state: string; pfBias: number; ddtBias: number }>
   }> {
@@ -5257,32 +5250,6 @@ export class StrategyCoordinator {
           { size: 0.5, leverage: 1, state: "close",  pfBias: 0.95, ddtBias: 30 },
         ],
       },
-      {
-        // ── Pause variant — 1..8 last-position validation windows (step 1) ─���
-        // Spec: *"add Pause 1-8 Pos step 1 to Main additional Sets creation
-        // after Pos prev,Last,cont .. add the 1-8 Last for counting Pause of
-        // validating."* Each sub-config encodes one validation lookback N
-        // (the last N closed positions) — when at least one of them was a
-        // loser the Pause Set throttles back the next entry. The 8 sub-
-        // configs ramp size DOWN and DDT-bias UP as the pause window
-        // widens, so a deeper-history pause produces a more conservative
-        // entry config than a shallow-history one. Gate fires whenever
-        // there is ≥1 closed position to validate against; the closed-only
-        // lookback enforced by `getPositionContext` (P2-1) means floating
-        // mark-to-market PnL never leaks into this trigger.
-        name: "pause",
-        gate: (c) => c.lastPosCount >= 1,
-        configs: [
-          { size: 0.90, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 5  }, // last 1
-          { size: 0.85, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 10 }, // last 2
-          { size: 0.80, leverage: 1, state: "new", pfBias: 1.01, ddtBias: 15 }, // last 3
-          { size: 0.75, leverage: 1, state: "new", pfBias: 1.02, ddtBias: 20 }, // last 4
-          { size: 0.70, leverage: 1, state: "new", pfBias: 1.03, ddtBias: 25 }, // last 5
-          { size: 0.65, leverage: 1, state: "new", pfBias: 1.04, ddtBias: 30 }, // last 6
-          { size: 0.60, leverage: 1, state: "new", pfBias: 1.05, ddtBias: 35 }, // last 7
-          { size: 0.55, leverage: 1, state: "new", pfBias: 1.06, ddtBias: 40 }, // last 8
-        ],
-      },
     ]
   }
 
@@ -5317,7 +5284,7 @@ export class StrategyCoordinator {
    */
   private variantFingerprint(
     baseSet: StrategySet,
-    variant: "default" | "trailing" | "block" | "dca" | "pause",
+    variant: "default" | "trailing" | "block" | "dca",
     ctx: PositionContext,
   ): string {
     const bPF = Math.round(baseSet.avgProfitFactor * 10) / 10
