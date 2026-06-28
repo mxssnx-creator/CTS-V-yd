@@ -3428,7 +3428,14 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   // On a fresh DB the hash stays empty and the auto-start monitor's sweep
   // simply no-ops until the operator starts the engine.
 
-  // ── Dev-only boot guards (run every boot, not just on schema change) ──
+  // ── Dev-only boot guards (run once per process boot) ──────────────────
+  // ensureBaseConnections() is called once per boot from completeStartup,
+  // but the BASE_CONNECTION_CONFIG loop above iterates 6 connections and
+  // calls continue early so the code AFTER the loop runs once. Guard with
+  // a process-level flag to be safe.
+  const _g = globalThis as Record<string, unknown>
+  if (_g.__v0_devBootGuardDone) return { createdOrUpdated, credentialsInjected }
+  _g.__v0_devBootGuardDone = true
   //
   // 1. ALWAYS enforce 1-symbol BTCUSDT on bingx-x01 in dev.
   //    Migration 057 does this once, but after a snapshot wipe the schema
@@ -3447,24 +3454,30 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   if (process.env.NODE_ENV === "development") {
     const DEV_SYM   = "BTCUSDT"
     const DEV_CONN  = "bingx-x01"
+    // All key namespaces that getSymbols() reads. The engine reads from
+    // settings:trade_engine_state:{id} (set by the PATCH route + fresh-seed
+    // branch) and settings:connection:{id}. connection:{id} is the base hash.
+    // connection_settings:{id} is read by loadCoordinationSettings. Overwrite
+    // ALL of them so no stale symbol list survives regardless of which key
+    // getSymbols() falls through to.
     const devHashes = [
       `connection:${DEV_CONN}`,
       `settings:trade_engine_state:${DEV_CONN}`,
       `settings:connection_settings:${DEV_CONN}`,
+      `settings:connection:${DEV_CONN}`,
     ]
+    const devSymPayload = {
+      // force_symbols is stored as a JSON-stringified array — getSymbols()
+      // does JSON.parse() on it. Plain string "BTCUSDT" is silently ignored.
+      force_symbols:  JSON.stringify([DEV_SYM]),
+      symbol_count:   "1",
+      symbol_order:   "",              // disable volatility-order dynamic fetch
+      symbols:        JSON.stringify([DEV_SYM]),
+      active_symbols: JSON.stringify([DEV_SYM]),
+      config_set_symbols_total: "1",
+    }
     for (const h of devHashes) {
-      await client.hset(h, {
-        // force_symbols is stored as a JSON-stringified array by the admin
-        // API and migration 032 — getSymbols() does JSON.parse() on it, so
-        // a plain string "BTCUSDT" is ignored. Must be '["BTCUSDT"]'.
-        force_symbols: JSON.stringify([DEV_SYM]),
-        symbol_count:  "1",
-        // Clear self-written symbols and volatility ordering so getSymbols()
-        // stops at force_symbols rather than falling through to the old list.
-        symbol_order:  "",
-        symbols:       JSON.stringify([DEV_SYM]),
-        active_symbols: JSON.stringify([DEV_SYM]),
-      }).catch(() => 0)
+      await client.hset(h, devSymPayload).catch(() => 0)
     }
 
     // Purge stale live:position:* (open/placed/closed position hashes from
@@ -3481,9 +3494,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       }
     }
 
-    if (purged > 0) {
-      console.log(`[v0] [Dev boot] Purged ${purged} stale live:position keys and re-pinned BTCUSDT 1-symbol`)
-    }
+    console.log(`[v0] [Dev boot] Re-pinned force_symbols=BTCUSDT across all key namespaces${purged > 0 ? `, purged ${purged} stale live:position keys` : ""}`)
   }
 
   return { createdOrUpdated, credentialsInjected }
