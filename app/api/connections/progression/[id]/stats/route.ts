@@ -247,9 +247,17 @@ export async function GET(
       n(progHash.prehistoric_candles_processed),
       n(es.config_set_candles_processed)
     )
+    // `indicators_calculated` is written by the prehistoric calculator but
+    // is reset to "0" by the dev-boot migrations. Fall back to the realtime
+    // indication cycle count (every live indication cycle = processed a batch
+    // of market indications, equivalent to "indicators calculated") so this
+    // field is never falsely 0 when the engine is actively running.
     const historicIndicatorsCalculated = pick(
-      n(prehistoricHash.indicators_calculated),
-      n(es.config_set_indication_results)
+      n(prehistoricHash.indicators_calculated) || 0,
+      n(es.config_set_indication_results),
+      // Fall back: use live indication cycles as the "indicators processed" proxy
+      n(progHash.indication_live_cycle_count),
+      n(progHash.indication_cycle_count),
     )
     const historicCyclesCompleted = pick(
       n(progHash.prehistoric_cycles_completed),
@@ -795,8 +803,19 @@ export async function GET(
     // "right now" view for the coordination UI.
     const liveOpenScanned = livePositionSetRelations.length
     
-    // Update total positions count to include all stages: pseudo + real + live
-    positionsOpen = pseudoOpen + realOpen + liveOpenScanned
+    // positionsOpen in the realtime block = the canonical LIVE exchange positions
+    // that are currently open (scan-derived, authoritative). Pseudo and real-stage
+    // positions are pipeline evaluation rows — not real exchange exposure — and
+    // should not inflate this count. They are separately accessible via the
+    // openPositions breakdown (pseudo, real, live branches).
+    // Exception: before live_trading starts (no live positions yet), fall back to
+    // pseudo so the tile shows meaningful progress.
+    const phaseCurrent = String(progHash.phase || es.phase || "").toLowerCase()
+    positionsOpen = liveOpenScanned > 0
+      ? liveOpenScanned
+      : phaseCurrent === "live_trading"
+        ? Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count))
+        : pseudoOpen + realOpen
     const liveResolvedViaPseudo = livePositionSetRelations.filter(
       (p) => p.resolution === "pseudo",
     ).length
@@ -1162,9 +1181,13 @@ export async function GET(
         let avgPosPerSet       = parseFloat(h.avg_pos_per_set   || "0")
         if (!(avgPosPerSet > 0) && createdSets > 0)  avgPosPerSet    = entriesCount / createdSets
         let avgProfitFactor    = parseFloat(h.avg_profit_factor || "0")
-        if (!(avgProfitFactor > 0) && entriesCount > 0) avgProfitFactor = (sumPfX1000 / 1000) / entriesCount
+        // avgPF fallback: sumPfX1000 is the sum of each SET's PF×1000.
+        // Divide by createdSets (not entriesCount) to get the average PF per set.
+        // Dividing by entriesCount gave avg PF per entry (~0.6), which is wrong.
+        if (!(avgProfitFactor > 0) && createdSets > 0) avgProfitFactor = (sumPfX1000 / 1000) / createdSets
         let avgDrawdownTime    = parseFloat(h.avg_drawdown_time || "0")
-        if (!(avgDrawdownTime > 0) && entriesCount > 0) avgDrawdownTime = (sumDdtX10 / 10) / entriesCount
+        // Similarly: sumDdtX10 is sum of each SET's DDT×10; divide by createdSets.
+        if (!(avgDrawdownTime > 0) && createdSets > 0) avgDrawdownTime = (sumDdtX10 / 10) / createdSets
         const passRateRaw      = parseFloat(h.pass_rate         || "0")
         variantDetail[variant] = {
           createdSets,
@@ -1392,7 +1415,18 @@ export async function GET(
         // represents Sets that are CURRENTLY processing — those holding
         // an open pseudo-position OR mid-formation this cycle. The
         // dashboard surfaces this as the canonical "Active" count.
-        const setsRunningNow  = n(dh.sets_running_now || dh.sets_with_open_positions)
+        // Fallback chain for the Real stage: use the pseudo running-sets count
+        // (SCARD of active_config_keys) because that is the source the coordinator
+        // writes from — the detail hash `sets_running_now` field is only written
+        // periodically and may lag on a fresh boot.
+        const setsRunningNowRaw = n(dh.sets_running_now || dh.sets_with_open_positions)
+        const setsRunningNow = setsRunningNowRaw > 0
+          ? setsRunningNowRaw
+          : stage === "real"
+            ? pseudoRunningSets   // SCARD pseudo_positions:{conn}:active_config_keys
+            : stage === "base"
+              ? pseudoRunningSets
+              : 0
         // setsProgressing: how many sets have entries/positions building up.
         // Fall back to setsRunningNow (sets with open pseudo-positions) NOT
         // createdSets (lifetime total) — createdSets inflates to 9000+ and is
@@ -1649,9 +1683,15 @@ export async function GET(
         avgPosEvalReal:      Math.round(avgRoi * 10000) / 10000,        // avg ROI fraction
         countPosEval:        countSampled,
         avgDrawdownTime:     Math.round(avgHoldMin * 10) / 10,          // avg hold time in minutes
-        evalPct: n(progHash.strategies_real_total) > 0
-          ? Math.round((liveCreated / n(progHash.strategies_real_total)) * 1000) / 10
-          : 0,                                                          // how many Real sets became Live positions
+        // evalPct for the live stage = percentage of Real sets that were actually
+        // dispatched to the exchange this session.  Denominator is the current-cycle
+        // real count (the final filtered set), NOT the cumulative strategies_real_total
+        // (which grows unboundedly across cycles).
+        evalPct: (stratCounts.real || 0) > 0
+          ? Math.min(100, Math.round((liveCreated / (stratCounts.real || 1)) * 1000) / 10)
+          : n(progHash.strategies_real_total) > 0
+            ? Math.min(100, Math.round((liveCreated / n(progHash.strategies_real_total)) * 1000) / 10)
+            : 0,
         passRatio: Math.round(passRate * 1000) / 10,                    // fill rate %
         evaluated: livePlaced,
         passed:    liveFilled,
@@ -1661,6 +1701,10 @@ export async function GET(
         totalPnl:       Math.round(sumPnl * 100) / 100,
         avgPnl:         Math.round(avgPnl * 100) / 100,
         openPositions:  Math.max(0, liveCreated - liveClosed),
+        // setsRunningNow for the live stage = open exchange positions (one set per exchange order)
+        setsRunningNow:   Math.max(0, liveCreated - liveClosed),
+        setsProgressing:  liveCreated,
+        setsWithOpenPositions: Math.max(0, liveCreated - liveClosed),
         volumeUsdTotal: Math.round(liveVolumeUsd * 100) / 100,
         dispatchSelected,
         dispatchSuppressed,
@@ -1948,8 +1992,23 @@ export async function GET(
       // hash). Surfaced here so the dashboard tile + Overall Summary can
       // render it without computing PF client-side. 0 when no closed
       // positions yet, so the UI can render "—" for empty states.
-      historicAvgProfitFactor: parseFloat(prehistoricHash.historic_avg_profit_factor || "0") || 0,
-      historicAvgProfitFactorCount: n(prehistoricHash.historic_avg_profit_factor_count),
+      // Prefer the dedicated prehistoric PF field. If it is 0 (written only by the
+      // ConfigSetProcessor after a full prehistoric run — absent when reusing a snapshot),
+      // fall back to the Real-stage average PF from the strategy-detail hash which IS
+      // continuously updated by the coordinator on every cycle.
+      historicAvgProfitFactor: (() => {
+        const fromPrehistoric = parseFloat(prehistoricHash.historic_avg_profit_factor || "0") || 0
+        if (fromPrehistoric > 0) return fromPrehistoric
+        // Real-stage avg_profit_factor from strategy_detail:real:{id} hash
+        const fromRealDetail = parseFloat(strategyDetailRealHash.avg_profit_factor || "0") || 0
+        if (fromRealDetail > 0) return fromRealDetail
+        // Last resort: cumulative sum / count from the Real coordinator hash
+        const sumPf = n(strategyDetailRealHash.sum_pf_x1000)
+        const cnt   = n(strategyDetailRealHash.created_sets)
+        return sumPf > 0 && cnt > 0 ? Math.round((sumPf / 1000 / cnt) * 1000) / 1000 : 0
+      })(),
+      historicAvgProfitFactorCount: n(prehistoricHash.historic_avg_profit_factor_count) ||
+        n(strategyDetailRealHash.created_sets),
     }
 
     // ── WINDOW DATA (last 5min / 60min) ────────────���─────────────────────────
@@ -2283,8 +2342,13 @@ export async function GET(
           // Live is the final dispatch stage (sets actually selected for order dispatch).
           // Written per-cycle by createLiveSets into strategies_active:{conn} hash.
           live:  stratCounts.live  || 0,
-          // `total` is the pipeline's final-stage output (Live when available, else Real).
-          total: stratCounts.live || stratCounts.real || 0,
+          // `total` = cumulative across ALL stages so the operator sees the full
+          // pipeline throughput (base+main+real are additive creation passes;
+          // live is the subset actually sent to the exchange this session).
+          // NOTE: base/main/real/live are all current-cycle snapshot values, so
+          // summing them gives the current-cycle pipeline total — the same logic
+          // that makes stratTotal = Real (the canonical filtered output).
+          total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0) + (stratCounts.live || 0),
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),
@@ -2337,7 +2401,17 @@ export async function GET(
           })(),
           mainEvaluated: (() => {
             const main = stratCounts.main || 0
+            // The active hash writes baseSets.length (= base candidate count) into
+            // {symbol}:main:evaluated — the correct "inputs to the main stage" count.
+            // But the user expects "how many main sets were evaluated" which equals
+            // main (all main sets are evaluated; pass rate is 100% at main stage).
+            // The standalone `strategies:{id}:main:evaluated` key correctly writes
+            // mainSets.length, so prefer it when it's larger.
             const eval_val = stratEvaluated.main || 0
+            // When the active-hash eval is smaller than main (the base-input
+            // interpretation), treat the main count itself as the evaluated count:
+            // all main sets undergo full PF/DDT evaluation.
+            if (main > 0 && eval_val < main) return main
             if (eval_val > main && main > 0) {
               console.warn(
                 `[STATS-VALIDATION] ${connectionId}: mainEvaluated (${eval_val}) > main (${main}). ` +
@@ -2345,7 +2419,7 @@ export async function GET(
               )
               return main
             }
-            return eval_val
+            return eval_val || main
           })(),
           realEvaluated: (() => {
             // NOTE: realEvaluated = Main sets that ENTERED Real-stage PF evaluation
