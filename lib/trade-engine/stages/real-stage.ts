@@ -54,6 +54,10 @@ export interface RealPosition {
   // actionable stopLoss/takeProfit percentages are already widened upstream.
   protectionCost?: Record<string, unknown>
   trailingProfile?: { startRatio: number; stopRatio: number; stepRatio: number }
+  // Historical performance snapshot from the originating StrategySet.
+  // Forwarded through RealPosition → LivePosition for audit and future
+  // re-scoring. Mirrors StrategySet.prevPos — see strategy-coordinator.ts.
+  prevPos?: { count: number; successRate: number; profitFactor: number; avgDDT: number }
 }
 
 /**

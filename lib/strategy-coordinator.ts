@@ -1029,7 +1029,7 @@ export class StrategyCoordinator {
   private PF_REAL_MIN = 1.2    // Main sets must have avgPF >= 1.2 to enter REAL
   private PF_LIVE_MIN = 1.2    // Real sets must have avgPF >= 1.2 to enter LIVE
 
-  // ── PF threshold settings cache (per-cycle) ─────────────────────
+  // ���─ PF threshold settings cache (per-cycle) ─────────────────────
   // `loadAppPFThresholds()` hits Redis to pull the operator's slider
   // values. Pulling on every symbol's flow would mean N reads per
   // cycle for an N-symbol universe — wasteful and adds latency. The
@@ -4404,7 +4404,25 @@ export class StrategyCoordinator {
                   effectiveSizeMult,
                 )
                 const tp = protection.takeProfitPct
-                const sl = protection.stopLossPct
+
+                // ── Set-config-aware SL at dispatch ──────────────────────────
+                // Resolve the trailing profile from the Set (or its Base Set via
+                // coordIndex) so trailing-variant positions get their initial SL
+                // anchored at the trailing stop distance rather than a generic
+                // PF-derived value. For all other variants `protection.stopLossPct`
+                // is already variant-scaled (block: sizeMultiplier-up, dca: 0.5×).
+                const resolvedTrailingProfile: { startRatio: number; stopRatio: number; stepRatio: number } | undefined =
+                  set.trailingProfile ??
+                  (coordIndex ? coordIndex.base.byKey.get(parentKey)?.trailingProfile : undefined)
+
+                let sl = protection.stopLossPct
+                if (set.variant === "trailing" && resolvedTrailingProfile && resolvedTrailingProfile.stopRatio > 0) {
+                  // Trailing-variant: initial SL = trailing stop distance.
+                  // The live-stage `computeSetAwareSL` applies the same logic
+                  // but we normalise here too so the RealPosition.stopLoss and
+                  // the derived LivePosition.stopLoss are always in sync.
+                  sl = Math.max(0.2, resolvedTrailingProfile.stopRatio * 100)
+                }
 
                 const liveResult = await executeLivePosition(
                   this.connectionId,
@@ -4462,6 +4480,20 @@ export class StrategyCoordinator {
                     // already incorporated the CoordRecord sizeDelta from the
                     // Real-stage tuner — no extra entry scan needed.
                     sizeMultiplier: effectiveSizeMult,
+                    // ── Set-config propagation to Live ──────────────────────
+                    // Forward the Set's trailing profile and historical
+                    // performance snapshot into the RealPosition so that
+                    // `executeLivePosition` can (a) anchor the initial SL at
+                    // the correct trailing stop distance and (b) store the
+                    // Set's prevPos context on the LivePosition for audit.
+                    // `resolvedTrailingProfile` is already resolved from the
+                    // Base Set via coordIndex above — reuse it here rather
+                    // than doing a second lookup.
+                    trailingProfile: resolvedTrailingProfile,
+                    prevPos: (
+                      set.prevPos ??
+                      (coordIndex ? coordIndex.base.byKey.get(parentKey)?.prevPos : undefined)
+                    ),
                   },
                   connector
                 )

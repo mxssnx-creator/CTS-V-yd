@@ -43,6 +43,55 @@ import { isTruthyFlag } from "@/lib/connection-state-utils"
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 
+/**
+ * Compute the initial SL% for a newly-created live position using the Set's
+ * own configuration. Each variant has a different protection contract:
+ *
+ *   trailing — The trailing machine anchors from `trailingProfile.stopRatio`
+ *              (the trailing distance, e.g. 0.1 = 10%). Using the generic
+ *              PF-derived SL here would conflict with the ratchet: the first
+ *              tick would re-derive the SL from a different basis and either
+ *              widen or tighten the live exchange order beyond the operator's
+ *              trailing spec. We use `stopRatio * 100` as the initial SL%
+ *              so the exchange order always starts at the trailing stop distance.
+ *              This is overridden per-tick by `trailingStopPrice` once active.
+ *
+ *   block    — Block positions are additive add-ons at scaled size (1.5–2×).
+ *              The SL must NOT widen with the size multiplier (that would
+ *              multiply risk). The `derivedSl` from PF is already size-multiplier-
+ *              scaled inside `deriveProtectionFromProfitFactor` (stopLossPct =
+ *              baseRiskPct * sizeMultiplier). We apply a FLOOR of the standard
+ *              minimum to ensure the block SL never compresses below exchange min.
+ *
+ *   dca      — DCA is a recovery trade (0.5× size). Tighter SL is correct —
+ *              the PF-derived value (stopLossPct = baseRiskPct * 0.5) already
+ *              reflects this. We apply the same floor. No override needed.
+ *
+ *   default/other — Use the PF-derived value as-is.
+ *
+ * Returns the SL% (a positive percentage, e.g. 1.2 means 1.2%).
+ * Falls back to `derivedSl` for any unrecognised variant.
+ */
+function computeSetAwareSL(
+  derivedSl: number,
+  setVariant: LivePosition["setVariant"],
+  trailingProfile: LivePosition["trailingProfile"] | undefined,
+): number {
+  if (setVariant === "trailing" && trailingProfile && trailingProfile.stopRatio > 0) {
+    // For trailing-variant positions the initial exchange SL is placed at the
+    // trailing stop distance from entry. The trailing machine then ratchets this
+    // upward (long) or downward (short) as price moves in our favour. Using the
+    // trailing stopRatio ensures the initial order and the ratchet machine are
+    // in sync from the first tick.
+    const trailingSl = trailingProfile.stopRatio * 100
+    return Math.max(MIN_EXCHANGE_STOP_LOSS_PERCENT, trailingSl)
+  }
+  // For all other variants (default, block, dca, pause) the PF-derived value
+  // is already variant-adjusted (block: scaled up by sizeMultiplier, dca: 0.5×).
+  // Enforce the minimum floor in all cases.
+  return Math.max(MIN_EXCHANGE_STOP_LOSS_PERCENT, derivedSl)
+}
+
 
 
 
@@ -151,7 +200,19 @@ interface LivePosition {
   parentSetKey?: string
   setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
   accumulatedSetKeys?: string[]
-  
+  // ── Set-config propagation (Set Relations → Position Protection) ──────────
+  // The originating StrategySet's trailing profile and historical performance
+  // snapshot are carried into the live position so that:
+  //   1. Trailing-variant positions use `trailingProfile.stopRatio` as the
+  //      initial SL distance anchor rather than a generic PF-derived value
+  //      (the trailing machine ratchets from this anchor, not from a flat %).
+  //   2. `prevPos` provides the historical success rate and PF context that
+  //      the Set was scored against, available for audit and future re-scoring.
+  // Both fields ride verbatim from StrategySet → RealPosition → LivePosition
+  // via the dispatch payload in `createLiveSets`.
+  trailingProfile?: { startRatio: number; stopRatio: number; stepRatio: number }
+  prevPos?: { count: number; successRate: number; profitFactor: number; avgDDT: number }
+
   progression?: { step: string; timestamp: number; success: boolean; details: string }[]
 }
 
@@ -1304,7 +1365,7 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
   if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
 
-  // ── Trailing stop: use the ratcheted absolute price directly ─�����─────────�����
+  // ── Trailing stop: use the ratcheted absolute price directly ─�����─────────�������
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
   // with the latest ratcheted absolute stop level. Using that absolute price
   // directly avoids the percentage-anchored re-derivation below which would
@@ -1898,6 +1959,11 @@ export async function executeLivePosition(
       axisWindows:    realPosition.axisWindows,
       sizeMultiplier: realPosition.sizeMultiplier,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+      // Set-config propagation: carry trailing profile and prevPos from the
+      // originating StrategySet so the position is config-aware even when it
+      // does not actually execute (for audit-trail completeness).
+      trailingProfile: realPosition.trailingProfile,
+      prevPos:         realPosition.prevPos,
     }
     pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason!)
     logProgressionEvent(connectionId, "live_trading", "warning", cbSkipped.statusReason!, {
@@ -1958,6 +2024,8 @@ export async function executeLivePosition(
       axisWindows:    realPosition.axisWindows,
       sizeMultiplier: realPosition.sizeMultiplier,
       accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+      trailingProfile: realPosition.trailingProfile,
+      prevPos:         realPosition.prevPos,
     }
     pushStep(skipped, "preflight", false, skipped.statusReason!)
     // Don't await — fire-and-forget is fine for the cooldown skip log.
@@ -1986,7 +2054,18 @@ export async function executeLivePosition(
     volumeUsd: 0,
     leverage: realPosition.leverage,
     marginType: "cross",
-    stopLoss: normalizeStopLossPercent(realPosition.stopLoss).value,
+    // ── Set-config-aware initial SL% ──────────────────────────────────────
+    // Use `computeSetAwareSL` so the protection level is derived from the Set's
+    // own configuration rather than a generic PF-derived percentage:
+    //   • trailing variant: SL = trailingProfile.stopRatio * 100 (trail distance
+    //     anchor; ratchets upward once the trailing machine activates)
+    //   • block/dca/default: normalised PF-derived value (already variant-scaled
+    //     by sizeMultiplier in deriveProtectionFromProfitFactor at dispatch)
+    stopLoss: computeSetAwareSL(
+      normalizeStopLossPercent(realPosition.stopLoss).value,
+      realPosition.setVariant,
+      realPosition.trailingProfile,
+    ),
     takeProfit: realPosition.takeProfit,
     // Immutable assignment snapshot — preserved across overrides so the
     // progression panel and post-trade stats can always recover what the
@@ -2013,6 +2092,15 @@ export async function executeLivePosition(
     axisWindows:    realPosition.axisWindows,
     sizeMultiplier: realPosition.sizeMultiplier,
     accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+    // ── Set-config propagation (Relations → Live Protection) ──────────
+    // The trailing profile and historical performance snapshot from the
+    // originating StrategySet travel through RealPosition → LivePosition
+    // so the live protection layer can (a) anchor the initial SL at the
+    // correct trailing distance and (b) reference the Set's historical
+    // context for audit and future re-scoring. Both fields are read-only
+    // after creation — they reflect the Set's config at dispatch time.
+    trailingProfile: realPosition.trailingProfile,
+    prevPos:         realPosition.prevPos,
   }
 
   const normalizedInitialSl = normalizeStopLossPercent(realPosition.stopLoss)
@@ -2031,6 +2119,27 @@ export async function executeLivePosition(
         reason: normalizedInitialSl.reason,
       },
     ).catch(() => {})
+  }
+
+  // ── Trailing-variant SL config log ────────────────────────────────────────
+  // When the trailing profile overrides the initial SL% (anchor = stopRatio),
+  // log it explicitly so the progression panel shows both the PF-derived value
+  // and the config-anchored override side-by-side for operator visibility.
+  if (
+    realPosition.setVariant === "trailing" &&
+    livePosition.trailingProfile &&
+    livePosition.trailingProfile.stopRatio > 0
+  ) {
+    const trailSl = Math.max(MIN_EXCHANGE_STOP_LOSS_PERCENT, livePosition.trailingProfile.stopRatio * 100)
+    if (Math.abs(trailSl - normalizedInitialSl.value) > 0.001) {
+      pushStep(
+        livePosition,
+        "set_config_sl_override",
+        true,
+        `Trailing-variant SL anchored at stopRatio ${livePosition.trailingProfile.stopRatio} → ${trailSl.toFixed(3)}% ` +
+        `(PF-derived was ${normalizedInitialSl.value.toFixed(3)}%)`,
+      )
+    }
   }
 
   // Hoisted before the try/catch so the catch block can release the
@@ -4081,7 +4190,7 @@ async function checkAndForceCloseOnSltpCross(
   if (!crossReason) return null
 
   console.log(
-    `${LOG_PREFIX} ${crossReason.toUpperCase()} detected for ${pos.symbol} ${pos.direction} @ mark=${markPrice} (sl=${desiredSl} tp=${desiredTp}) — force-closing`,
+    `${LOG_PREFIX} ${crossReason.toUpperCase()} detected for ${pos.symbol} ${pos.direction} @ mark=${markPrice} (sl=${desiredSl} tp=${desiredTp}) ��� force-closing`,
   )
   await logProgressionEvent(
     connectionId,
