@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/api/cron/server-continuity",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/sync-live-positions",
+      "schedule": "* * * * *"
+    }
+  ]
+}
