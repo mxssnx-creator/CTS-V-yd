@@ -132,7 +132,7 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
   const { data, isLoading, error } = useSWR<StrategyTracking>(
     `/api/connections/progression/${connectionId}/tracking/strategies`,
     fetcher,
-    { refreshInterval: 3000, revalidateOnFocus: false },
+    { refreshInterval: 5000, revalidateOnFocus: false },
   )
 
   if (isLoading && !data) {

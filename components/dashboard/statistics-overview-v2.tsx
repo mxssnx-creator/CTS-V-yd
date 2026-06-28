@@ -865,10 +865,9 @@ export function StatisticsOverviewV2() {
     }
 
     load()
-    // 3s cadence per operator: the per-stage "Overall (in-process)" metrics are
-    // current-cycle snapshots, so a tighter poll keeps them live without the
-    // cost of a lifetime DB scan.
-    const interval = setInterval(load, 3000)
+    // UI refresh stays at 5s (original cadence). The 3s cadence is reserved for
+    // the INTERNAL avg-sets/pos calcs (server-side), not the dashboard poll.
+    const interval = setInterval(load, 5000)
 
     // Event-driven refresh so toggles surface immediately rather than
     // waiting for the next interval tick.
@@ -1281,7 +1280,7 @@ export function StatisticsOverviewV2() {
                 `Last (of previous) axis 1..4 — Sets created where the last-N\n` +
                 `wins/losses magnitude bucket was N. Peak window indicates the\n` +
                 `dominant short-term skew dimension over the run.\n` +
-                `Total: ${fmt(stats.axisLast.sets)} Sets · ${fmt(stats.axisLast.pos)} Pos.`
+                `Total: ${fmt(stats.axisLast.sets)} Sets �� ${fmt(stats.axisLast.pos)} Pos.`
               }
             >
               <span className="text-muted-foreground">Axis last 1-4</span>
