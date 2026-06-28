@@ -95,6 +95,27 @@ export interface StrategySet {
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
+
+  /**
+   * ── Variant coordination scalars (Base-Anchored Coordination Model) ─────
+   *
+   * The slim variant Set carries `entries: []` and resolves Base entries at
+   * dispatch via `coordIndex.base.byKey`. But the per-variant SIZE and
+   * LEVERAGE coordination (block's vol-ratio-scaled notional, dca's 0.5×
+   * reduce, trailing's 3/5× leverage) lives on the variant's `profile.configs`
+   * — NOT on the shared Base entries. Without surfacing them here the slim
+   * path would silently dispatch every variant at the Base entry's size/
+   * leverage (1.0× / 1×), discarding the block vol-ratio calc entirely.
+   *
+   * `buildVariantSet` therefore writes the representative surviving config's
+   * scaled `size` → `variantSizeMultiplier` and its `leverage` →
+   * `variantLeverage`. Dispatch (`createLiveSets`) prefers these over the
+   * Base entry so each activated variant carries its OWN independent sizing,
+   * coordinated off the Base Set without cloning it. Absent for Base/axis
+   * Sets (which fall back to the Base entry's own size/leverage = 1×).
+   */
+  variantSizeMultiplier?: number
+  variantLeverage?: number
   /**
    * ── Position-count axis windows that this Set satisfies ────────────
    *
@@ -2295,7 +2316,7 @@ export class StrategyCoordinator {
     // ── Await all async builds to complete ────���──────────────────────────
     const results = await Promise.all(buildTasks)
     
-    // ── Process results and populate mainSets ──���────────���────────────────
+    // ── Process results and populate mainSets ──���────────�����────────────────
     for (const result of results) {
       const { baseSet, profile, built, cachedSet } = result
       const set = cachedSet || built
@@ -4363,9 +4384,18 @@ export class StrategyCoordinator {
                 // record so we don't re-scan entries here. We apply the delta to the
                 // bestEntry SIZE only — all other entry fields come from Base unchanged.
                 const dispatchCoordRec = coordIndex?.byCoordKey.get(set.setKey)
-                const effectiveSizeMult = dispatchCoordRec?.sizeDelta !== undefined
-                  ? Math.max(0.5, Math.min(2.0, (bestEntry.sizeMultiplier ?? 1) * (1 + dispatchCoordRec.sizeDelta)))
-                  : (bestEntry.sizeMultiplier ?? 1)
+                // Variant base sizing: prefer the variant's OWN coordinated
+                // multiplier (block vol-ratio-scaled, dca 0.5×) carried on the
+                // slim Set; fall back to the Base entry (1×) for Base/axis Sets.
+                const variantBaseMult = set.variantSizeMultiplier ?? bestEntry.sizeMultiplier ?? 1
+                // Real-stage tuner delta is a BOUNDED adjustment ON TOP of the
+                // variant base (clamped [0.5,2.0]); it must not erase the
+                // variant's notional. VolumeCalculator applies the final
+                // [0.1,5] safety clamp, so block can legitimately exceed 2×.
+                const tunerFactor = dispatchCoordRec?.sizeDelta !== undefined
+                  ? Math.max(0.5, Math.min(2.0, 1 + dispatchCoordRec.sizeDelta))
+                  : 1
+                const effectiveSizeMult = variantBaseMult * tunerFactor
                 // Use tunedAvgPF for SL/TP derivation when available — reflects the
                 // Real-stage tuner's per-variant performance bias.
                 const effectivePF = dispatchCoordRec?.tunedAvgPF ?? bestEntry.profitFactor
@@ -4396,7 +4426,10 @@ export class StrategyCoordinator {
                     // 0 here remains safe as a fallback.
                     quantity: 0,
                     entryPrice: _cachedMarketPrice,
-                    leverage: bestEntry.leverage || 1,
+                    // Prefer the variant's coordinated leverage (trailing 3/5×,
+                    // etc.) over the Base entry's leverage; Base/axis Sets fall
+                    // back to the Base entry value.
+                    leverage: set.variantLeverage ?? bestEntry.leverage ?? 1,
                     riskAmount: 0,
                     rewardTarget: 0,
                     stopLoss: sl,
@@ -5339,6 +5372,15 @@ export class StrategyCoordinator {
     let sumPF = 0, sumDDT = 0, sumCnf = 0, count = 0
     const baseDDTFallback = baseSet.avgDrawdownTime || 0
 
+    // ── Representative surviving config (variant size/leverage coordination) ─
+    // Dispatch selects the Base `bestEntry` by max PF, so the variant's
+    // coordinated sizing must come from the surviving config with the highest
+    // PF bias (the one that "wins" alongside that entry). Track it here so the
+    // block vol-ratio-scaled `size` and the variant `leverage` survive the
+    // slim path and reach dispatch. `selectActiveVariants` has already folded
+    // the block vol-ratio into `cfg.size`, so reading it verbatim is correct.
+    let repConfig: { size: number; leverage: number; pfBias: number } | null = null
+
     outer: for (const baseEntry of baseSet.entries) {
       for (const cfg of profile.configs) {
         if (count >= maxEntries) break outer
@@ -5350,6 +5392,9 @@ export class StrategyCoordinator {
         sumDDT += ddt
         sumCnf += Math.min(0.99, baseEntry.confidence)
         count++
+        if (!repConfig || cfg.pfBias > repConfig.pfBias) {
+          repConfig = { size: cfg.size, leverage: cfg.leverage, pfBias: cfg.pfBias }
+        }
       }
     }
 
@@ -5383,6 +5428,18 @@ export class StrategyCoordinator {
       // coordIndex.base.byKey.get(parentSetKey).  Eliminates the primary
       // V8 heap driver (~80 000 object allocations per second).
       entries:         [],
+      // Variant size/leverage coordination — carried as scalars so dispatch
+      // applies the variant's OWN sizing (block vol-ratio-scaled, dca 0.5×,
+      // trailing 3/5×) instead of the Base entry's 1.0×/1×. See StrategySet.
+      // Scoped to NON-default variants: the `default` variant exists to
+      // validate & MIRROR the Base Set, so it must keep the Base entry's own
+      // size/leverage (writing the profile config here would silently change
+      // default dispatch leverage). Only the additive/independent variants
+      // carry their own coordinated sizing.
+      ...(repConfig && profile.name !== "default" && {
+        variantSizeMultiplier: repConfig.size,
+        variantLeverage:       repConfig.leverage,
+      }),
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }
