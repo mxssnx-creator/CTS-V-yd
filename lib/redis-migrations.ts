@@ -3089,10 +3089,12 @@ const migrations: Migration[] = [
       ]
       for (const h of hashes) {
         await client.hset(h, {
-          force_symbols: DEV_SYMBOL,
-          symbol_count:  "1",
-          // Clear volatility ordering so getSymbols() stops at force_symbols.
-          symbol_order:  "",
+          // getSymbols() does JSON.parse() on force_symbols — must be an array.
+          force_symbols:  JSON.stringify([DEV_SYMBOL]),
+          symbol_count:   "1",
+          symbol_order:   "",
+          symbols:        JSON.stringify([DEV_SYMBOL]),
+          active_symbols: JSON.stringify([DEV_SYMBOL]),
         }).catch(() => 0)
       }
       // Clear prehistoric gates so the engine re-runs with the pinned symbol.
@@ -3425,6 +3427,64 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   // the operator explicitly clicks Start (POST /api/trade-engine/start).
   // On a fresh DB the hash stays empty and the auto-start monitor's sweep
   // simply no-ops until the operator starts the engine.
+
+  // ── Dev-only boot guards (run every boot, not just on schema change) ──
+  //
+  // 1. ALWAYS enforce 1-symbol BTCUSDT on bingx-x01 in dev.
+  //    Migration 057 does this once, but after a snapshot wipe the schema
+  //    version is reset to 0 → 057 re-runs → but ensureBaseConnections runs
+  //    BEFORE migrations on very first cold boot and can write the volatile
+  //    DEFAULT_SYMBOL_COUNT=2 + volatility_1h BEFORE 057 has a chance to
+  //    override it. Running the pin here (after all per-connection work)
+  //    ensures it is always the last write regardless of migration ordering.
+  //
+  // 2. PURGE stale live:position:* keys from a previous run.
+  //    The snapshot persists open/placed positions across restarts. On a dev
+  //    boot those stale 2000+ position hashes immediately consume ~1.5 MB of
+  //    in-process Redis, raise the fill-detect connector null-error count,
+  //    and inflate the memory guard baseline. Purging them here (before the
+  //    engine starts) keeps the baseline clean.
+  if (process.env.NODE_ENV === "development") {
+    const DEV_SYM   = "BTCUSDT"
+    const DEV_CONN  = "bingx-x01"
+    const devHashes = [
+      `connection:${DEV_CONN}`,
+      `settings:trade_engine_state:${DEV_CONN}`,
+      `settings:connection_settings:${DEV_CONN}`,
+    ]
+    for (const h of devHashes) {
+      await client.hset(h, {
+        // force_symbols is stored as a JSON-stringified array by the admin
+        // API and migration 032 — getSymbols() does JSON.parse() on it, so
+        // a plain string "BTCUSDT" is ignored. Must be '["BTCUSDT"]'.
+        force_symbols: JSON.stringify([DEV_SYM]),
+        symbol_count:  "1",
+        // Clear self-written symbols and volatility ordering so getSymbols()
+        // stops at force_symbols rather than falling through to the old list.
+        symbol_order:  "",
+        symbols:       JSON.stringify([DEV_SYM]),
+        active_symbols: JSON.stringify([DEV_SYM]),
+      }).catch(() => 0)
+    }
+
+    // Purge stale live:position:* (open/placed/closed position hashes from
+    // the last run). InlineLocalRedis exposes client.keys(pattern) for
+    // glob-style matching — use that instead of SCAN (not implemented).
+    const livePositionKeys: string[] = await client.keys("live:position:*").catch(() => [])
+    let purged = 0
+    for (const k of livePositionKeys) {
+      // Keep tracking-pointer keys (plain strings, tiny) — only delete
+      // the position hash/string keys that carry the full position payload.
+      if (!k.includes(":tracking:")) {
+        await client.del(k).catch(() => 0)
+        purged++
+      }
+    }
+
+    if (purged > 0) {
+      console.log(`[v0] [Dev boot] Purged ${purged} stale live:position keys and re-pinned BTCUSDT 1-symbol`)
+    }
+  }
 
   return { createdOrUpdated, credentialsInjected }
 }
