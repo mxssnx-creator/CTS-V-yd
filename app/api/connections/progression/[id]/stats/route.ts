@@ -1683,14 +1683,16 @@ export async function GET(
         avgPosEvalReal:      Math.round(avgRoi * 10000) / 10000,        // avg ROI fraction
         countPosEval:        countSampled,
         avgDrawdownTime:     Math.round(avgHoldMin * 10) / 10,          // avg hold time in minutes
-        // evalPct for the live stage = percentage of Real sets that were actually
-        // dispatched to the exchange this session.  Denominator is the current-cycle
-        // real count (the final filtered set), NOT the cumulative strategies_real_total
-        // (which grows unboundedly across cycles).
+        // evalPct for the live stage = percentage of Real sets dispatched to the
+        // exchange this session cycle.
+        // Numerator: stratCounts.live = sets actually dispatched by createLiveSets
+        //            this cycle (written into strategies_active hash each cycle).
+        //            NOT liveCreated which is cumulative across all sessions.
+        // Denominator: stratCounts.real = current-cycle Real sets (the filter output).
         evalPct: (stratCounts.real || 0) > 0
-          ? Math.min(100, Math.round((liveCreated / (stratCounts.real || 1)) * 1000) / 10)
+          ? Math.min(100, Math.round(((stratCounts.live || 0) / (stratCounts.real || 1)) * 1000) / 10)
           : n(progHash.strategies_real_total) > 0
-            ? Math.min(100, Math.round((liveCreated / n(progHash.strategies_real_total)) * 1000) / 10)
+            ? Math.min(100, Math.round(((stratCounts.live || 0) / n(progHash.strategies_real_total)) * 1000) / 10)
             : 0,
         passRatio: Math.round(passRate * 1000) / 10,                    // fill rate %
         evaluated: livePlaced,
@@ -2080,10 +2082,15 @@ export async function GET(
     //        evaluated, so ~100% when any exist, expressed as the true ratio).
     // main = main output ÷ (passed-forward-from-base + additionally-created-at-main)
     // real = real output ÷ (passed-forward-from-main + additionally-created-at-real)
+    // live evalPct = sets dispatched this cycle / real sets available for dispatch
+    const _liveDispatched = stratCounts.live || 0
+    const _liveBase       = stratCounts.real  || 0
     const stageEvalPercent = {
       base: _pct(_baseEvaluated, _baseOutput),
       main: _pct(_mainOutput, _mainInput + _mainCreated),
       real: _pct(_realOutput, _realInput + _realCreated),
+      // Live: what fraction of Real-stage survivors were dispatched to exchange
+      live: _liveBase > 0 ? Math.min(100, Math.round((_liveDispatched / _liveBase) * 1000) / 10) : 0,
     }
 
     // ── REAL AVERAGES ────────────────────────────────────────────────────────
@@ -2385,7 +2392,10 @@ export async function GET(
           main: stratCounts.main || 0,
           real: stratCounts.real || 0,
           live: stratCounts.live || 0,
-          total: stratTotal,
+          // Total = full pipeline throughput across all stages.
+          // Use the same sum as realtime.setsCreated.total (not stratTotal
+          // which = real only and misleads as a "total" figure).
+          total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0) + (stratCounts.live || 0),
           baseEvaluated: (() => {
             // Validate constraint: eval <= sets
             const base = stratCounts.base || 0
