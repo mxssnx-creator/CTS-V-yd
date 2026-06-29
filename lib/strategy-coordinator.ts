@@ -2922,6 +2922,7 @@ export class StrategyCoordinator {
    * mirror currently running exposure as Real-stage block Sets.
    */
   private async buildActivePositionBlockOverlaysForReal(
+  private async buildActiveRealBlockOverlaysForReal(
     symbol: string,
     sourceSets: StrategySet[],
     metrics: EvaluationMetrics,
@@ -3344,6 +3345,7 @@ export class StrategyCoordinator {
 
     try {
       const activePositionBlockOverlays = await this.buildActivePositionBlockOverlaysForReal(
+      const activeLiveBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
         symbol,
         realPostHedge,
         metrics,
