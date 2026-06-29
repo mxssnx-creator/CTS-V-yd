@@ -3,6 +3,13 @@ import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 
 async function main() {
+  if (process.env.ALLOW_LIVE_ORDER_PLACEMENT !== "1") {
+    console.error(
+      "[test] Refusing to place a live market order. Set ALLOW_LIVE_ORDER_PLACEMENT=1 only when intentional real/testnet order placement is acceptable.",
+    )
+    process.exit(2)
+  }
+
   const creds = BASE_CONNECTION_CREDENTIALS["bingx-x01"]
   console.log('[test] Using stored base credentials for bingx-x01 (apiKey masked)')
   const connector = await createExchangeConnector('bingx', {
