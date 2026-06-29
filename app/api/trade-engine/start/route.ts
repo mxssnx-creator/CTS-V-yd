@@ -165,6 +165,7 @@ export async function POST(request: NextRequest) {
               await updateConnection(connId, {
                 ...conn,
                 is_live_trade: "1",
+                live_trade_blocked_reason: "",
                 paused_by_global: "0",
                 updated_at: new Date().toISOString(),
               })
@@ -202,6 +203,7 @@ export async function POST(request: NextRequest) {
             const updatedConn = {
               ...conn,
               is_live_trade: "1",
+              live_trade_blocked_reason: "",
               updated_at: new Date().toISOString(),
             }
             await updateConnection(conn.id, updatedConn)

@@ -98,6 +98,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       api_key: apiKey,
       api_secret: apiSecret,
       is_live_trade: toRedisFlag(isLiveTrade),
+      ...(isLiveTrade ? { live_trade_blocked_reason: "" } : {}),
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
