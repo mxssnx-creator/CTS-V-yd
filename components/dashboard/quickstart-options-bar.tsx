@@ -344,6 +344,15 @@ export function QuickstartOptionsBar() {
         )
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         showSaved()
+        // Notify ExchangeContext and ActiveConnectionCard that settings changed
+        // so they reload without waiting for their natural poll cadence.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("connection-settings-updated", {
+              detail: { connectionId: cid, settings: patch },
+            }),
+          )
+        }
       } catch (err) {
         console.error("[v0] [QSOptions] PATCH settings failed:", err)
         showError()
@@ -390,6 +399,15 @@ export function QuickstartOptionsBar() {
         )
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         showSaved()
+        // Broadcast so ActiveConnectionCard's Live Trade switch syncs
+        // immediately instead of waiting for its 3-8 s engine-states poll.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("live-trade-toggled", {
+              detail: { connectionId: cid, newState: next },
+            }),
+          )
+        }
       } catch (err) {
         console.error("[v0] [QSOptions] POST live-trade failed:", err)
         showError()
@@ -397,6 +415,20 @@ export function QuickstartOptionsBar() {
     },
     [cid, showSaved, showError],
   )
+
+  // Reverse sync — when ActiveConnectionCard (or any other surface) toggles
+  // live-trade, update this bar's switch so both surfaces always agree.
+  useEffect(() => {
+    if (!cid) return
+    const handler = (e: Event) => {
+      const ev = e as CustomEvent
+      if (ev.detail?.connectionId === cid && typeof ev.detail?.newState === "boolean") {
+        setControlOrders(ev.detail.newState)
+      }
+    }
+    window.addEventListener("live-trade-toggled", handler)
+    return () => window.removeEventListener("live-trade-toggled", handler)
+  }, [cid])
 
   // Debounced savers — one per knob group. Sliders rapid-fire on drag,
   // switches fire once on toggle (debounce is harmless for them and

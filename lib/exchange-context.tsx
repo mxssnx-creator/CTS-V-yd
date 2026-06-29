@@ -118,12 +118,23 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
     if (typeof window !== "undefined") {
       window.addEventListener("connection-toggled", handleConnectionChange)
       window.addEventListener("connection-removed", handleConnectionChange)
+      // When connection settings are saved (via any settings dialog or the
+      // options bar), `is_live_trade` and other flags may have changed.
+      // Force a refresh so every consumer that reads `activeConnections`
+      // (QuickstartOptionsBar, ActiveConnectionCard, etc.) sees fresh data
+      // without waiting for the 10 s natural cooldown to expire.
+      window.addEventListener("connection-settings-updated", handleConnectionChange)
+      // QuickstartConnectionControls fires this after adding/resetting a
+      // connection so the picker reflects the change immediately.
+      window.addEventListener("quickstart:refresh", handleConnectionChange)
     }
 
     return () => {
       if (typeof window !== "undefined") {
         window.removeEventListener("connection-toggled", handleConnectionChange)
         window.removeEventListener("connection-removed", handleConnectionChange)
+        window.removeEventListener("connection-settings-updated", handleConnectionChange)
+        window.removeEventListener("quickstart:refresh", handleConnectionChange)
       }
     }
   }, [])

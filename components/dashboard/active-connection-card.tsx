@@ -138,6 +138,11 @@ export function ActiveConnectionCard({
   const [presetMode, setPresetMode] = useState(false)
   const [liveTradeLoading, setLiveTradeLoading] = useState(false)
   const [presetModeLoading, setPresetModeLoading] = useState(false)
+  // Refs that mirror the loading states — mutated synchronously so the
+  // engine-states poller (a closure captured at effect-mount time) can
+  // read the current value without stale-closure issues.
+  const liveTradeLoadingRef  = useRef(false)
+  const presetModeLoadingRef = useRef(false)
   const [liveVolumeFactor, setLiveVolumeFactor] = useState(1.0)
   const [presetVolumeFactor, setPresetVolumeFactor] = useState(1.0)
   const [volumeStepRatio, setVolumeStepRatio] = useState(DEFAULT_VOLUME_STEP_RATIO)
@@ -311,11 +316,18 @@ export function ActiveConnectionCard({
           live:    data.live,
           preset:  data.preset,
         })
-        // If the DB flag says "live" but the engine is not running, re-sync the
-        // local toggle to the flag (authoritative). We do NOT flip the DB here —
-        // the toggle API is the only writer; we only correct local state drift.
-        if (typeof data?.live?.flag === "boolean") setLiveTrade(data.live.flag)
-        if (typeof data?.preset?.flag === "boolean") setPresetMode(data.preset.flag)
+        // Re-sync local toggle state to the DB flag (authoritative) so drift
+        // is corrected on every poll cycle. Guard: skip the write while a
+        // toggle is in-flight — setLiveTradeLoading(true) sets the ref
+        // synchronously, so if an in-progress POST hasn't landed yet the
+        // poller won't flip the switch back to the old server value and
+        // cause a visible flicker on the switch.
+        if (typeof data?.live?.flag === "boolean" && !liveTradeLoadingRef.current) {
+          setLiveTrade(data.live.flag)
+        }
+        if (typeof data?.preset?.flag === "boolean" && !presetModeLoadingRef.current) {
+          setPresetMode(data.preset.flag)
+        }
       } catch {
         /* non-critical polling */
       }
@@ -801,6 +813,7 @@ export function ActiveConnectionCard({
   // so the user can flip Live and the engine comes up with the flag set.
   const handleLiveTradeToggle = async (newState: boolean) => {
     const connName = connection.exchangeName
+    liveTradeLoadingRef.current = true
     setLiveTradeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/live-trade`, {
@@ -826,6 +839,7 @@ export function ActiveConnectionCard({
     } catch {
       toast.error("Failed to toggle Live Trade")
     } finally {
+      liveTradeLoadingRef.current = false
       setLiveTradeLoading(false)
     }
   }
@@ -833,6 +847,7 @@ export function ActiveConnectionCard({
   // Handle Preset Mode toggle — no longer gated on connection.isActive,
   // same rationale as handleLiveTradeToggle above.
   const handlePresetModeToggle = async (newState: boolean) => {
+    presetModeLoadingRef.current = true
     setPresetModeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/preset-toggle`, {
@@ -850,6 +865,7 @@ export function ActiveConnectionCard({
     } catch {
       toast.error("Failed to toggle Preset Mode")
     } finally {
+      presetModeLoadingRef.current = false
       setPresetModeLoading(false)
     }
   }
