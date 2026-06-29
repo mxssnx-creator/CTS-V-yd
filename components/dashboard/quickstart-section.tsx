@@ -675,8 +675,19 @@ export function QuickstartSection() {
       // button back to "Start Engine" mid-initialisation.
       // Use startingRef (mutated synchronously) rather than the `starting` state
       // variable, which may be stale inside this useCallback closure in production.
-      if (s.metadata?.engineRunning === true) setIsRunning(true)
-      if (s.metadata?.engineRunning === false && !startingRef.current) setIsRunning(false)
+      if (s.metadata?.engineRunning === true) {
+        setIsRunning(true)
+        // Engine confirmed running — cancel the grace period immediately so a
+        // later stop (engineRunning=false) is applied without the 45s delay.
+        if (startingGraceRef.current) {
+          startingGraceRef.current = false
+          if (startingGraceTimerRef.current !== null) {
+            clearTimeout(startingGraceTimerRef.current)
+            startingGraceTimerRef.current = null
+          }
+        }
+      }
+      if (s.metadata?.engineRunning === false && !startingRef.current && !startingGraceRef.current) setIsRunning(false)
     } catch { /* non-critical */ }
     finally { if (!silent) setLoadingStats(false) }
   }, [connectionId])
@@ -860,6 +871,15 @@ export function QuickstartSection() {
         addLog(body?.message || "Engine already running — monitoring active", "warning")
         setIsRunning(true)
       }
+      // Activate a 45 s grace period so the polling fetchStats does NOT flip
+      // isRunning back to false while the engine boots through prehistoric.
+      // The grace is cleared early when the server confirms engineRunning=true.
+      if (startingGraceTimerRef.current !== null) clearTimeout(startingGraceTimerRef.current)
+      startingGraceRef.current = true
+      startingGraceTimerRef.current = setTimeout(() => {
+        startingGraceRef.current = false
+        startingGraceTimerRef.current = null
+      }, 45_000)
     } catch (err) {
       addLog(`Error: ${err instanceof Error ? err.message : String(err)}`, "error")
     } finally {
