@@ -422,8 +422,53 @@ const SYMBOL_AFFECTING_SETTING_FIELDS = new Set([
   "exchangeOrderBy",
   "symbol_limit",
   "symbolLimit",
+  "symbol_count",
+  "symbolCount",
+  "symbol_order",
+  "force_symbols",
   "useMainSymbols",
   "mainSymbols",
+])
+
+const STRATEGY_AFFECTING_SETTING_FIELDS = new Set([
+  "profitFactorMin",
+  "baseProfitFactor",
+  "mainProfitFactor",
+  "realProfitFactor",
+  "liveProfitFactor",
+  "maxDrawdownTimeMainHours",
+  "maxDrawdownTimeRealHours",
+  "maxDrawdownTimeLiveHours",
+  "stageMinPosCountBase",
+  "stageMinPosCountMain",
+  "stageMinPosCountReal",
+  "variantTrailingEnabled",
+  "variantBlockEnabled",
+  "variantDcaEnabled",
+  "axisPrevEnabled",
+  "axisLastEnabled",
+  "axisContEnabled",
+  "axisPauseEnabled",
+  "axisPrevMaxWindow",
+  "axisLastMaxWindow",
+  "axisContMaxWindow",
+  "axisPauseMaxWindow",
+  "blockVolumeRatio",
+  "blockMaxStack",
+  "minimal_step_count",
+  "minimalStepCount",
+  "minStep",
+  "trailingMinStep",
+  "prevPosWindow",
+  "prevPosMinCount",
+  "mainEvalPosCount",
+  "realEvalPosCount",
+  "volume_factor",
+  "volume_factor_live",
+  "volume_factor_preset",
+  "volume_step_ratio",
+  "leveragePercentage",
+  "useMaximalLeverage",
 ])
 
 function isGenericConnectionSettingsReload(fields: readonly string[]): boolean {
@@ -436,6 +481,18 @@ function hasSymbolAffectingChange(fields: readonly string[]): boolean {
     if (field.startsWith("connection_settings.")) {
       const nested = field.slice("connection_settings.".length)
       return SYMBOL_AFFECTING_SETTING_FIELDS.has(nested)
+    }
+    return false
+  })
+}
+
+function hasStrategyAffectingChange(fields: readonly string[]): boolean {
+  return fields.some((field) => {
+    if (field === "strategies" || field === "coordination_settings") return true
+    if (STRATEGY_AFFECTING_SETTING_FIELDS.has(field)) return true
+    if (field.startsWith("connection_settings.")) {
+      const nested = field.slice("connection_settings.".length)
+      return nested === "strategies" || nested === "coordination_settings" || STRATEGY_AFFECTING_SETTING_FIELDS.has(nested)
     }
     return false
   })
@@ -529,6 +586,8 @@ export class TradeEngineManager {
   private settingsVersion = 0
   /** Set true while a settings apply is in flight to prevent overlap. */
   private settingsApplying = false
+  /** Prevents dirty-flag and hot-reload fast paths from recursively fanning out. */
+  private immediateStrategyReevaluationInFlight = false
 
   private componentHealth: {
     indications: ComponentHealth
@@ -3769,6 +3828,49 @@ export class TradeEngineManager {
   }
 
   /**
+   * Best-effort settings-save fast path: run one immediate realtime
+   * ind+strat pass for the currently configured symbols instead of waiting
+   * for the next scheduled processor tick. This is intentionally guarded and
+   * non-fatal because the normal timer loop remains the correctness fallback.
+   */
+  public triggerImmediateStrategyReevaluation(reason = "settings-dirty"): void {
+    if (!this.isRunning) return
+    if (this.immediateStrategyReevaluationInFlight) return
+    this.immediateStrategyReevaluationInFlight = true
+    void (async () => {
+      try {
+        const symbols = await this.getSymbols()
+        if (!symbols || symbols.length === 0) return
+        await prefetchMarketDataBatch(symbols).catch(() => { /* non-critical */ })
+        const pipelineDeps = {
+          indication: this.indicationProcessor,
+          strategy: this.strategyProcessor,
+          realtime: this.realtimeProcessor,
+        }
+        await mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
+          runIndStratCycle(this.connectionId, symbol, "realtime", pipelineDeps).catch((err) => {
+            console.warn(
+              `[v0] [Engine ${this.connectionId}] immediate strategy re-evaluation failed for ${symbol}:`,
+              err instanceof Error ? err.message : String(err),
+            )
+            return null
+          }),
+        )
+        console.log(
+          `[v0] [Engine ${this.connectionId}] immediate strategy re-evaluation completed for ${symbols.length} symbol(s) (${reason})`,
+        )
+      } catch (err) {
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] immediate strategy re-evaluation failed:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      } finally {
+        this.immediateStrategyReevaluationInFlight = false
+      }
+    })()
+  }
+
+  /**
    * Update engine state (Redis-based)
    * Uses consistent key naming for status endpoint compatibility
    */
@@ -4167,7 +4269,8 @@ export class TradeEngineManager {
       const changedFields = Array.isArray(_changedFields) ? _changedFields : []
       const invalidatedCaches: string[] = []
       const genericConnectionSettingsReload = isGenericConnectionSettingsReload(changedFields)
-      const symbolAffectingChange = genericConnectionSettingsReload || hasSymbolAffectingChange(changedFields)
+      const symbolAffectingChange = hasSymbolAffectingChange(changedFields)
+      const strategyAffectingChange = genericConnectionSettingsReload || hasStrategyAffectingChange(changedFields)
 
       if (symbolAffectingChange) {
         this.invalidateSymbolsCache()
@@ -4177,14 +4280,17 @@ export class TradeEngineManager {
       clearFlowThrottleForConnection(this.connectionId)
       invalidatedCaches.push("strategy.flowThrottle")
 
-      const coordinatorReloadGeneration = StrategyCoordinator.forceNextSettingsReload(this.connectionId)
-      invalidatedCaches.push(
-        "strategyCoordinator.PFThresholds",
-        "strategyCoordinator.DDTThresholds",
-        "strategyCoordinator.trailingSettings",
-        "strategyCoordinator.minStepSettings",
-        "strategyCoordinator.coordinationSettings",
-      )
+      let coordinatorReloadGeneration = 0
+      if (strategyAffectingChange) {
+        coordinatorReloadGeneration = StrategyCoordinator.forceNextSettingsReload(this.connectionId)
+        invalidatedCaches.push(
+          "strategyCoordinator.PFThresholds",
+          "strategyCoordinator.DDTThresholds",
+          "strategyCoordinator.trailingSettings",
+          "strategyCoordinator.minStepSettings",
+          "strategyCoordinator.coordinationSettings",
+        )
+      }
 
       try {
         this.realtimeProcessor.invalidatePrevSet(undefined)
@@ -4316,11 +4422,14 @@ export class TradeEngineManager {
             changedFields,
             invalidatedCaches,
             symbolAffectingChange,
+            strategyAffectingChange,
             genericConnectionSettingsReload,
             coordinatorReloadGeneration,
           },
         )
       } catch { /* best-effort */ }
+
+      this.triggerImmediateStrategyReevaluation("settings-hot-reload")
     } catch (err) {
       console.warn(
         `[v0] [Engine ${this.connectionId}] applyHotReload failed:`,

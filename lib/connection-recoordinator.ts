@@ -84,12 +84,15 @@ export async function recoordinateAfterSettingsChange(
   try {
     await notifySettingsChanged(id, changedFields, before, after)
   } catch (notifyErr) {
-    console.warn(
+    console.error(
       `[v0] [${opts.logTag}] notifySettingsChanged failed for ${id}:`,
       notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
     )
-    // Continue — the recoordinate step below can still start/stop the
-    // engine even if the notify envelope didn't land.
+    // The API must not report a successful save until the durable reload
+    // envelope and dirty flag have been persisted. Coordinator fast-path
+    // work below is optional; the Redis signal above is the correctness
+    // layer consumed by engine-owning processes.
+    throw notifyErr
   }
 
   // ── SETTINGS CHANGES THAT AFFECT PROGRESS VISIBILITY ──────────────────
@@ -101,7 +104,7 @@ export async function recoordinateAfterSettingsChange(
     // Symbols — prehistoric must restart with new symbol list
     "symbol_count", "force_symbols", "symbols",
     // Strategy coordination — variants, block/dca, axis settings
-    "coordination_settings", "variantTrailingEnabled", "variantBlockEnabled",
+    "strategies", "coordination_settings", "variantTrailingEnabled", "variantBlockEnabled",
     "variantDcaEnabled",
     "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
     "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
@@ -213,8 +216,8 @@ export async function recoordinateAfterSettingsChange(
     if (symbolsChanged && (coordinator as any).getEngineManager) {
       try {
         const manager = (coordinator as any).getEngineManager(id)
-        if (manager && typeof (manager as any).invalidateSymbolCache === "function") {
-          (manager as any).invalidateSymbolCache()
+        if (manager && typeof (manager as any).invalidateSymbolsCache === "function") {
+          (manager as any).invalidateSymbolsCache()
           console.log(`[v0] [${opts.logTag}] Symbol cache invalidated for ${id}`)
         }
       } catch (cacheErr) {

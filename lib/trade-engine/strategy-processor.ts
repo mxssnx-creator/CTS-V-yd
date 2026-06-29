@@ -101,9 +101,24 @@ export class StrategyProcessor {
           
           // Clear flow throttle cache so next cycle re-evaluates immediately
           clearFlowThrottleForConnection(this.connectionId)
+
+          // If this processor is owned by an in-process engine manager, ask it
+          // to run one immediate pass over all current symbols. Clearing the
+          // throttle keeps this symbol's current call productive; the manager
+          // fast-path prevents the rest of the watchlist from waiting for the
+          // next scheduled interval after a settings save.
+          try {
+            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+            const manager = getGlobalTradeEngineCoordinator()?.getEngineManager?.(this.connectionId)
+            if (manager && typeof (manager as any).triggerImmediateStrategyReevaluation === "function") {
+              ;(manager as any).triggerImmediateStrategyReevaluation("settings-dirty")
+            }
+          } catch {
+            /* Cross-process or test environments may not have a manager. */
+          }
           
           console.log(
-            `[v0] [StrategyProcessor] Settings reloaded for ${this.connectionId} - flow throttle cleared, will re-evaluate next cycle`
+            `[v0] [StrategyProcessor] Settings reloaded for ${this.connectionId} - flow throttle cleared, immediate re-evaluation requested`
           )
         }
       } catch (settingsErr) {
