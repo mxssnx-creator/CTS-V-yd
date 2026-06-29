@@ -15,7 +15,14 @@ export async function GET(req: Request) {
 
     // ── 1. Read live cycle counts from progression:{connId} hash ──────────────
     // This hash is updated EVERY indication cycle, so it is always current.
-    const progHash = await redis.hgetall(`progression:${connectionId}`) || {}
+    const [progHashRaw, baseDetailRaw, realDetailRaw] = await Promise.all([
+      redis.hgetall(`progression:${connectionId}`).catch(() => null),
+      redis.hgetall(`strategy_detail:${connectionId}:base`).catch(() => null),
+      redis.hgetall(`strategy_detail:${connectionId}:real`).catch(() => null),
+    ])
+    const progHash = progHashRaw || {}
+    const baseDetail = baseDetailRaw || {}
+    const realDetail = realDetailRaw || {}
 
     const indicationCycleCount = parseInt(progHash.indication_cycle_count || "0", 10)
     const indicationsCount     = parseInt(progHash.indications_count     || "0", 10)
@@ -86,6 +93,16 @@ export async function GET(req: Request) {
 
     // Also read cycles_completed from ProgressionStateManager field for the overall count
     const cyclesCompleted = parseInt(progHash.cycles_completed || "0", 10)
+
+    const n = (value: unknown): number => {
+      const parsed = Number(value || 0)
+      return Number.isFinite(parsed) ? parsed : 0
+    }
+
+    const stageDetail = (detail: Record<string, any>) => ({
+      avgProfitFactor: n(detail.avg_profit_factor),
+      avgPosPerSet: n(detail.avg_pos_per_set),
+    })
 
     // ── 4. Read active pseudo positions count ────────────────────────────────────
     // PseudoPositionManager stores positions at:
@@ -164,6 +181,23 @@ export async function GET(req: Request) {
       liveStrategyCandidateCount: liveCandidateCount,
       totalStrategyCount: totalStrategySets,
       positionsCount,
+      strategyDetail: {
+        base: stageDetail(baseDetail),
+        real: stageDetail(realDetail),
+      },
+      stageBase: stageDetail(baseDetail),
+      stageReal: stageDetail(realDetail),
+      baseAvgProfitFactor: n(baseDetail.avg_profit_factor),
+      realActivePosAvg: n(progHash.real_active_pos_avg),
+      openPositions: {
+        real: {
+          activeAvg: n(progHash.real_active_pos_avg),
+          activeSamples: parseInt(progHash.real_active_pos_samples || "0", 10) || 0,
+        },
+      },
+      progression: {
+        strategy_base_avg_profit_factor: progHash.strategy_base_avg_profit_factor || baseDetail.avg_profit_factor || "0",
+      },
       totalProfit: 0, // calculated from closed positions if needed
       // Legacy nested shapes for backward compat
       indications: {
