@@ -367,8 +367,20 @@ export class RealtimeProcessor {
           if (isDirty) {
             await client.del(dirtyKey)
             this.prevSetCache.clear()
+            try {
+              const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+              const manager = getGlobalTradeEngineCoordinator()?.getEngineManager?.(this.connectionId)
+              if (manager && typeof (manager as any).invalidateStrategyAndCoordinationCaches === "function") {
+                ;(manager as any).invalidateStrategyAndCoordinationCaches([], "dirty-flag:realtime")
+              }
+              if (manager && typeof (manager as any).triggerImmediateStrategyReevaluation === "function") {
+                ;(manager as any).triggerImmediateStrategyReevaluation("dirty-flag:realtime")
+              }
+            } catch {
+              /* Cross-process or test environments may not have a manager. */
+            }
             console.log(
-              `[v0] [RealtimeProcessor] Settings reloaded for ${this.connectionId} - caches cleared`
+              `[v0] [RealtimeProcessor] Dirty flag consumed for ${this.connectionId}; caches cleared and immediate strategy re-evaluation requested`
             )
           }
         }

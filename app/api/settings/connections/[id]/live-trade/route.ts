@@ -107,6 +107,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             last_test_status: "success",
           }
         : {}),
+      ...(isLiveTrade ? { live_trade_blocked_reason: "" } : {}),
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)

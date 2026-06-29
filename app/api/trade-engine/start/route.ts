@@ -2,12 +2,49 @@ import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { SystemLogger } from "@/lib/system-logger"
+import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
 export const dynamic = "force-dynamic"
 
 // RUNTIME FIX: Patch IndicationProcessor cache on every API call
 // This fixes the "Cannot read properties of undefined (reading 'get')" error
+
+function hasApiCredentials(connection: any): boolean {
+  return Boolean(String(connection?.api_key || "").trim() && String(connection?.api_secret || "").trim())
+}
+
+async function validateLiveTradeCredentials(connection: any): Promise<{ valid: boolean; reason: string }> {
+  if (!hasApiCredentials(connection)) {
+    return { valid: false, reason: "No API credentials configured" }
+  }
+
+  try {
+    const connector = await createExchangeConnector(connection.exchange || "bingx", {
+      apiKey: connection.api_key,
+      apiSecret: connection.api_secret,
+      apiPassphrase: connection.api_passphrase || "",
+      isTestnet: connection.is_testnet === true || connection.is_testnet === "1" || connection.is_testnet === "true",
+      apiType: connection.api_type || "perpetual_futures",
+    })
+    const testResult = await Promise.race([
+      connector.testConnection(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Test timeout (30s)")), 30000)),
+    ]) as any
+
+    if (testResult?.success === false) {
+      return { valid: false, reason: `Connection test failed: ${testResult.error || "exchange transport unavailable"}` }
+    }
+
+    return { valid: true, reason: "" }
+  } catch (error) {
+    return {
+      valid: false,
+      reason: `Connection test failed: ${error instanceof Error ? error.message : "exchange transport unavailable"}`,
+    }
+  }
+}
+
 function patchIndicationProcessorCaches(coordinator: any) {
   if (!coordinator) return
   
@@ -148,6 +185,8 @@ export async function POST(request: NextRequest) {
     // Auto-resume connections AND enable ALL assigned main connections
     let resumedConnections: string[] = []
     let startedConnections: string[] = []
+    let liveTradeEnabledConnections: string[] = []
+    let liveTradeRequestedConnections: string[] = []
     try {
       const { getConnection, updateConnection, getAllConnections } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
@@ -164,8 +203,25 @@ export async function POST(request: NextRequest) {
             if (conn && conn.paused_by_global === "1") {
               // Re-enable live trade
               const staleLiveTradeBlockReason = String((conn as any).live_trade_blocked_reason || "").trim()
+              // Re-request live trade, but only re-enable real exchange order placement
+              // when credentials still pass validation. Operators can see the
+              // difference between requested and enabled in progression logs.
+              const credentialCheck = await validateLiveTradeCredentials(conn)
+              const liveTradeUpdate = credentialCheck.valid
+                ? {
+                    is_live_trade: "1",
+                    live_trade_blocked_reason: "",
+                    live_trade_requested: "1",
+                  }
+                : {
+                    is_live_trade: "0",
+                    live_trade_blocked_reason: credentialCheck.reason,
+                    live_trade_requested: "1",
+                  }
+
               await updateConnection(connId, {
                 ...conn,
+                ...liveTradeUpdate,
                 is_live_trade: "1",
                 live_trade_blocked_reason: "",
                 live_trade_requested: "1",
@@ -181,6 +237,25 @@ export async function POST(request: NextRequest) {
                   { previous_block_reason: staleLiveTradeBlockReason },
                 )
               }
+                paused_by_global: "0",
+                updated_at: new Date().toISOString(),
+              })
+
+              await logProgressionEvent(
+                connId,
+                credentialCheck.valid ? "global_start_live_trade_enabled" : "global_start_live_trade_requested",
+                credentialCheck.valid ? "info" : "warning",
+                credentialCheck.valid
+                  ? "Live trading enabled by global start"
+                  : "Live trading requested by global start, but exchange order placement remains blocked",
+                {
+                  connectionId: connId,
+                  connectionName: conn.name,
+                  liveTradeRequested: true,
+                  liveTradeEnabled: credentialCheck.valid,
+                  liveTradeBlockedReason: credentialCheck.reason || undefined,
+                },
+              )
               
               // Restart the engine
               await coordinator.startEngine(connId, {
@@ -192,8 +267,16 @@ export async function POST(request: NextRequest) {
                 realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
               })
               
+              if (credentialCheck.valid) {
+                liveTradeEnabledConnections.push(connId)
+              } else {
+                liveTradeRequestedConnections.push(connId)
+              }
               resumedConnections.push(connId)
-              console.log("[v0] [Trade Engine] Resumed paused connection:", connId, conn.name)
+              console.log(
+                `[v0] [Trade Engine] Resumed paused connection: ${connId} ${conn.name} ` +
+                `(live_trade_${credentialCheck.valid ? "enabled" : "requested_only"}${credentialCheck.reason ? `: ${credentialCheck.reason}` : ""})`,
+              )
             }
           } catch (resumeErr) {
             console.warn("[v0] [Trade Engine] Failed to resume connection:", connId, resumeErr)
@@ -213,8 +296,14 @@ export async function POST(request: NextRequest) {
           try {
             // Ensure live trade is enabled
             const staleLiveTradeBlockReason = String((conn as any).live_trade_blocked_reason || "").trim()
+            // Request live trade for assigned connections, but only enable real
+            // exchange order placement when credentials validate right now.
+            const credentialCheck = await validateLiveTradeCredentials(conn)
             const updatedConn = {
               ...conn,
+              is_live_trade: credentialCheck.valid ? "1" : "0",
+              live_trade_blocked_reason: credentialCheck.valid ? "" : credentialCheck.reason,
+              live_trade_requested: "1",
               is_live_trade: "1",
               live_trade_blocked_reason: "",
               live_trade_requested: "1",
@@ -230,6 +319,25 @@ export async function POST(request: NextRequest) {
                 { previous_block_reason: staleLiveTradeBlockReason },
               )
             }
+              updated_at: new Date().toISOString(),
+            }
+            await updateConnection(conn.id, updatedConn)
+
+            await logProgressionEvent(
+              conn.id,
+              credentialCheck.valid ? "global_start_live_trade_enabled" : "global_start_live_trade_requested",
+              credentialCheck.valid ? "info" : "warning",
+              credentialCheck.valid
+                ? "Live trading enabled by global start"
+                : "Live trading requested by global start, but exchange order placement remains blocked",
+              {
+                connectionId: conn.id,
+                connectionName: conn.name,
+                liveTradeRequested: true,
+                liveTradeEnabled: credentialCheck.valid,
+                liveTradeBlockedReason: credentialCheck.reason || undefined,
+              },
+            )
             
             // Start the engine for this connection
             await coordinator.startEngine(conn.id, {
@@ -241,8 +349,16 @@ export async function POST(request: NextRequest) {
               realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             })
             
+            if (credentialCheck.valid) {
+              liveTradeEnabledConnections.push(conn.id)
+            } else {
+              liveTradeRequestedConnections.push(conn.id)
+            }
             startedConnections.push(conn.id)
-            console.log("[v0] [Trade Engine] Started assigned connection:", conn.id, conn.name)
+            console.log(
+              `[v0] [Trade Engine] Started assigned connection: ${conn.id} ${conn.name} ` +
+              `(live_trade_${credentialCheck.valid ? "enabled" : "requested_only"}${credentialCheck.reason ? `: ${credentialCheck.reason}` : ""})`,
+            )
           } catch (startErr) {
             console.warn("[v0] [Trade Engine] Failed to start assigned connection:", conn.id, startErr)
           }
@@ -294,20 +410,25 @@ export async function POST(request: NextRequest) {
     const startedMsg = startedConnections.length > 0
       ? ` Started ${startedConnections.length} assigned connection(s).`
       : ""
+    const liveTradeMsg = liveTradeEnabledConnections.length > 0 || liveTradeRequestedConnections.length > 0
+      ? ` Live trading enabled for ${liveTradeEnabledConnections.length} connection(s); requested-only for ${liveTradeRequestedConnections.length} connection(s).`
+      : ""
     
-    console.log("[v0] [Trade Engine] Global Coordinator is running and ready." + resumeMsg + startedMsg)
+    console.log("[v0] [Trade Engine] Global Coordinator is running and ready." + resumeMsg + startedMsg + liveTradeMsg)
     await SystemLogger.logTradeEngine(
-      `Global Coordinator started.${resumeMsg}${startedMsg}`,
+      `Global Coordinator started.${resumeMsg}${startedMsg}${liveTradeMsg}`,
       "info",
-      { resumedConnections, startedConnections }
+      { resumedConnections, startedConnections, liveTradeEnabledConnections, liveTradeRequestedConnections }
     )
 
     return NextResponse.json({
       success: true,
-      message: `Global Trade Engine Coordinator started and ready.${resumeMsg}${startedMsg}`,
+      message: `Global Trade Engine Coordinator started and ready.${resumeMsg}${startedMsg}${liveTradeMsg}`,
       coordinator_status: "running",
       resumedConnections,
       startedConnections,
+      liveTradeEnabledConnections,
+      liveTradeRequestedConnections,
     })
 
   } catch (error) {
