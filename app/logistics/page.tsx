@@ -241,10 +241,12 @@ function MainSystemTab({ stats }: { stats: EngineStats | null }) {
     s?.baseAvgProfitFactor,
     s?.progression?.strategy_base_avg_profit_factor,
   )
-  const realActivePosAvg = positiveNumber(s?.realActivePosAvg, s?.openPositions?.real?.activeAvg)
-  const realAvgPosPerSet = positiveNumber(s?.strategyDetail?.real?.avgPosPerSet, s?.stageReal?.avgPosPerSet)
-  const realAverageLabel = realActivePosAvg !== null ? "Avg active Real positions" : "Avg positions / Set"
-  const realAverageValue = realActivePosAvg ?? realAvgPosPerSet
+  const realAvgPositions = positiveNumber(
+    s?.strategyDetail?.real?.avgPosPerSet,
+    s?.stageReal?.avgPosPerSet,
+    s?.realActivePosAvg,
+    s?.openPositions?.real?.activeAvg,
+  )
 
   return (
     <div className="space-y-3">
@@ -357,7 +359,7 @@ function MainSystemTab({ stats }: { stats: EngineStats | null }) {
             <Row label="Sets this cycle" value={`${s?.realStrategyCount || 0}`} />
             <Row label="PF threshold" value="≥ 1.4" />
             <Row label="Confidence" value="≥ 0.65" />
-            <Row label={realAverageLabel} value={realAverageValue !== null ? realAverageValue.toFixed(2) : "—"} />
+            <Row label="Avg positions" value={realAvgPositions !== null ? realAvgPositions.toFixed(2) : "—"} />
             <Row label="Max drawdown time" value="≤ 960 min (16 h)" />
             <Row label="Live gate" value="is_live_trade=1 + valid credentials" />
           </Block>
