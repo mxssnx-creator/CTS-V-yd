@@ -404,10 +404,10 @@ export class GlobalTradeEngineCoordinator {
   /**
    * Best-effort runtime cleanup shared by both normal stops and "no local
    * manager" stops. This intentionally does NOT mutate Main Connections
-   * assignment flags (`is_active_inserted`, `is_dashboard_inserted`,
-   * `is_assigned`). Assignment is user intent and is only cleared by explicit
-   * remove/unassign flows; a normal engine stop should only mark runtime state
-   * as stopped.
+   * assignment/enabled flags (`is_active_inserted`, `is_dashboard_inserted`,
+   * `is_assigned`, `is_active`). Assignment is user intent and is only cleared
+   * by explicit remove/unassign flows; a normal engine stop should only clear
+   * runtime-only Redis state and mark the engine runtime as stopped.
    */
   private async cleanupStoppedRuntimeState(connectionId: string): Promise<void> {
     try {
@@ -416,25 +416,44 @@ export class GlobalTradeEngineCoordinator {
       const redisClient = getRedisClient()
       const nowIso = new Date().toISOString()
       const nowMs = String(Date.now())
+      const stateRuntimeFieldsToClear = [
+        "stop_requested",
+        "stop_reason",
+        "stop_requested_at",
+        "running",
+        "is_running",
+        "engine_started",
+        "started_at",
+        "last_processor_heartbeat",
+      ]
+      const progressionRuntimeFieldsToClear = [
+        "stop_requested",
+        "stop_reason",
+        "stop_requested_at",
+        "is_running",
+        "running",
+        "engine_started",
+        "prehistoric_phase_active",
+      ]
 
       await Promise.all([
         redisClient.del(`engine_is_running:${connectionId}`).catch(() => 0),
+        redisClient.hdel(`trade_engine_state:${connectionId}`, ...stateRuntimeFieldsToClear).catch(() => 0),
+        redisClient.hdel(`settings:trade_engine_state:${connectionId}`, ...stateRuntimeFieldsToClear).catch(() => 0),
         redisClient.hset(`trade_engine_state:${connectionId}`, {
           status: "stopped",
-          is_running: "false",
-          engine_started: "false",
           stopped_at: nowIso,
           updated_at: nowIso,
-          stop_requested: "1",
-          stop_requested_at: nowIso,
         }).catch(() => 0),
+        redisClient.hset(`settings:trade_engine_state:${connectionId}`, {
+          status: "stopped",
+          stopped_at: nowIso,
+          updated_at: nowIso,
+        }).catch(() => 0),
+        redisClient.hdel(`progression:${connectionId}`, ...progressionRuntimeFieldsToClear).catch(() => 0),
         redisClient.hset(`progression:${connectionId}`, {
-          engine_started: "false",
-          prehistoric_phase_active: "false",
           ended_at: nowMs,
           last_update: nowIso,
-          stop_requested: "1",
-          stop_requested_at: nowIso,
         }).catch(() => 0),
         setSettings(`engine_progression:${connectionId}`, {
           phase: "stopped",
