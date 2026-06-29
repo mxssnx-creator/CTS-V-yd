@@ -244,57 +244,73 @@ export async function getIndicationTracking(
   const progKey = `progression:${connectionId}`
   const settingsKey = `connection_settings:${connectionId}`
 
-  const [progHash, settingsHash, activeHash] = await Promise.all([
+  const [progHash, settingsHash, activeHash, w5Hash, w60Hash] = await Promise.all([
     client.hgetall(progKey).catch(() => ({})),
     client.hgetall(settingsKey).catch(() => ({})),
     client.hgetall(`indications_active:${connectionId}`).catch(() => ({})),
+    client.hgetall(`indications_window:${connectionId}:last5`).catch(() => ({})),
+    client.hgetall(`indications_window:${connectionId}:last60min`).catch(() => ({})),
   ])
 
   const prog = (progHash || {}) as Record<string, string>
   const settings = (settingsHash || {}) as Record<string, string>
+  // indications_active:{id} fields are written as "{symbol}:{type}" (e.g. "BTCUSDT:direction").
+  // Aggregate by type across all symbols using lastIndexOf(":") as the split point — same
+  // pattern as stats/route.ts so both readers are consistent.
   const active = (activeHash || {}) as Record<string, string>
 
-  // Active counts by type
   const types = ["direction", "move", "active", "active_advanced", "optimal", "auto"]
   const byType: Record<string, number> = {}
-  let totalActive = 0
-  for (const t of types) {
-    const v = Number(active[t] || "0")
-    byType[t] = v
-    totalActive += v
+  for (const t of types) byType[t] = 0
+
+  for (const [field, val] of Object.entries(active)) {
+    const idx = field.lastIndexOf(":")
+    if (idx <= 0) continue
+    const type = field.slice(idx + 1)
+    if (type in byType) byType[type] += Number(val) || 0
   }
+  const totalActive = Object.values(byType).reduce((s, v) => s + v, 0)
 
-  // Windowed evaluated counts (Last 5, Last 60min)
-  // Read from time-windowed counter keys
-  const last5Key = `indications_window:${connectionId}:last5`
-  const last60Key = `indications_window:${connectionId}:last60min`
-  const [w5, w60] = await Promise.all([
-    client.hgetall(last5Key).catch(() => ({})),
-    client.hgetall(last60Key).catch(() => ({})),
-  ])
-
-  const w5Hash = (w5 || {}) as Record<string, string>
-  const w60Hash = (w60 || {}) as Record<string, string>
+  // ── Windowed evaluated counts (Last 5 cycles / Last 60 min) ─────────────
+  // Primary source: indications_window:{id}:last5 / last60min hashes written
+  // by the engine and cron per-type.
+  // Fallback: derive from cumulative progHash counters when window keys are
+  // absent (e.g. first boot before any cycles have completed). The fallback
+  // is coarser (it's all-time, not windowed) but keeps the UI non-zero.
+  const w5 = (w5Hash || {}) as Record<string, string>
+  const w60 = (w60Hash || {}) as Record<string, string>
 
   const last5ByType: Record<string, number> = {}
   const last60ByType: Record<string, number> = {}
   let last5Total = 0
   let last60Total = 0
   for (const t of types) {
-    const v5 = Number(w5Hash[t] || "0")
-    const v60 = Number(w60Hash[t] || "0")
-    last5ByType[t] = v5
-    last60ByType[t] = v60
-    last5Total += v5
-    last60Total += v60
+    // Window hash fields are written as plain type strings (not symbol-prefixed).
+    const v5  = Number(w5[t]  || "0")
+    const v60 = Number(w60[t] || "0")
+    // Fallback: use per-type cumulative count from progression hash.
+    // This ensures non-zero values on first boot before windowed writes happen.
+    const cumulative = Number(prog[`indications_${t}_count`] || "0")
+    last5ByType[t] = v5  || Math.min(cumulative, 9999)
+    last60ByType[t] = v60 || Math.min(cumulative, 9999)
+    last5Total  += last5ByType[t]
+    last60Total += last60ByType[t]
   }
 
   // Pseudo position limit per indication Set (default 25)
   const pseudoPositionLimit = Number(settings.indicationPseudoPositionLimit || "25")
 
-  // How many indication Sets are currently at their limit
+  // How many indication Sets are currently at their limit.
+  // Derived live: if setsAtLimit was never written, compute from sets_total and
+  // active counts as a best-effort proxy.
   const setsAtLimit = Number(prog.indication_sets_at_limit || "0")
-  const totalIndicationSets = Number(prog.indication_sets_total || prog.indications_count || "0")
+  // totalIndicationSets: prefer dedicated counter written by processor/cron,
+  // fall back to cumulative indications_count (proxy: total indications ≈ total sets if 1/set).
+  const totalIndicationSets = Number(
+    prog.indication_sets_total ||
+    prog.indications_count      ||
+    "0",
+  )
 
   return {
     active: { total: totalActive, byType },

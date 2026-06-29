@@ -1343,39 +1343,27 @@ export class StrategyCoordinator {
   }
 
   // ── Per-Base Stage Threshold Loader ───────────────────────────────────
-  // Reads stageMinPosCount{Base/Main/Real} from operator settings and
-  // snaps to the 5-step grid. Already written into _pfThresholdsLoadedAt
-  // TTL by loadAppPFThresholds() — separate this from the validate methods
-  // so the cluster only does one combined read per cycle.
+  // NOTE: stageMinPosCount{Base/Main/Real} are now loaded entirely inside
+  // loadAppPFThresholds(), which already overlays the per-connection
+  // connection_settings:{id} hash on top of global app_settings and snaps
+  // to the 5-step grid. This method is kept as a true no-op delegate so
+  // the Promise.all call-site compiles without changes.
+  //
+  // The previous implementation ran its OWN getAppSettings() read (global
+  // only) concurrently with loadAppPFThresholds() via Promise.all. Because
+  // both shared the same _pfThresholdsLoadedAt TTL timestamp, both would
+  // START on the same tick (before either stamped the clock), and whichever
+  // finished LAST would overwrite stageMinPosCount with global-only values
+  // — silently discarding any per-connection overrides the operator saved
+  // via the Settings dialog. Making this a true delegate eliminates that
+  // race entirely.
 
   /**
-   * Read and apply operator-tunable Base/Main/Real position-count thresholds.
-   *
-   * Read from app_settings (getAppSettings).
-   * Cached at the same TTL as PF thresholds (_pfTtlMs = 5 s).
-   * Called from loadAppPFThresholds() on the same cycle schedule.
+   * Delegates entirely to loadAppPFThresholds().
+   * stageMinPosCount* are read inside that method with per-connection override.
    */
   private async loadStageThresholds(): Promise<void> {
-    // Already loaded in the same tick as PF — noop.
-    // The actual read happens in loadAppPFThresholds(); we just gate here.
-    const now = Date.now()
-    if (now - this._pfThresholdsLoadedAt < this._pfTtlMs) return
-    this._pfThresholdsLoadedAt = now
-
-    try {
-      const { getAppSettings } = await import("@/lib/redis-db")
-      const s = (await getAppSettings()) || {}
-      const snap = (raw: unknown, fallback: number): number => {
-        const n = Number(raw)
-        if (!Number.isFinite(n) || n <= 0) return 0          // 0 = coordinator default
-        return Math.min(50, Math.max(5, Math.round(n / 5) * 5)) // snap to 5-step grid
-      }
-      this.stageMinPosCountBase = snap((s as any).stageMinPosCountBase, 0)
-      this.stageMinPosCountMain = snap((s as any).stageMinPosCountMain, 0)
-      this.stageMinPosCountReal = snap((s as any).stageMinPosCountReal, 0)
-    } catch {
-      // retry next cycle
-    }
+    return this.loadAppPFThresholds()
   }
 
   /**
@@ -1405,8 +1393,12 @@ export class StrategyCoordinator {
   private async memoryCircuitBreaker(symbol: string): Promise<void> {
     if (process.env.NODE_ENV !== "development") return
     try {
-      const SOFT_RSS_MB = 1500 // force GC above this
-      const HARD_RSS_MB = 1750 // throttle above this (kernel kills ~2000)
+      // Match the memory thresholds from the multi-symbol dev fix (redis-db.ts):
+      // dev heap = 4 GB, RSS_PRESSURE = 5000 MB, kernel OOM at ~8.4 GB VM.
+      // Soft/hard thresholds are a fraction of that envelope — GC at 2.0 GB,
+      // throttle at 3.0 GB (leaving ~2+ GB buffer before RSS_PRESSURE fires).
+      const SOFT_RSS_MB = 2_000 // force GC above this
+      const HARD_RSS_MB = 3_000 // throttle above this
       let rssMB = process.memoryUsage().rss / 1024 / 1024
       if (rssMB < SOFT_RSS_MB) return
 
@@ -2407,11 +2399,17 @@ export class StrategyCoordinator {
       // Raised from 400 so 15-symbol test sessions exercise the same code paths
       // as prod (400 was hitting the ceiling every cycle and masking correct behaviour).
       // Still well below the prod 2500 × 20 symbol × 6 concurrency = 300k worst-case.
-      // Dev lowered 1500→500 per symbol: on the 4.39 GB v0 sandbox VM the
-      // engine OOM-crashes during live_trading when peak in-memory StrategySet
-      // count is high. 500 × SYMBOL_CONCURRENCY(3) = 1500 in-flight keeps the
-      // full pipeline (BASE→MAIN→REAL→LIVE) working with ample headroom.
-      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development" ? 500 : 2500
+      // Scale with symbol count so multi-symbol dev runs don't OOM.
+      // Base: 300 sets per symbol in dev, 2500 in prod.
+      // V0_DEV_SYMBOL_COUNT controls the dev symbol count (default 1).
+      // At 10 symbols: 10 × 300 = 3000 ceiling (well within 4GB heap with
+      // the new per-symbol eviction caps in redis-db).
+      const _devSyms = process.env.NODE_ENV === "development"
+        ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+        : 1
+      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development"
+        ? Math.max(300, _devSyms * 300)
+        : 2500
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3232,7 +3230,13 @@ export class StrategyCoordinator {
     // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
     // candidates for the live dispatch to find qualifying PF-positive sets.
-    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development" ? 200 : 3000
+    // Scale with dev symbol count: 60 real sets per symbol in dev, 3000 in prod.
+    const _devSymsReal = process.env.NODE_ENV === "development"
+      ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+      : 1
+    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development"
+      ? Math.max(200, _devSymsReal * 60)
+      : 3000
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at

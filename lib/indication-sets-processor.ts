@@ -399,12 +399,61 @@ export class IndicationSetsProcessor {
         const client = _getRedis()
         const activeKey = `indications_active:${this.connectionId}`
         await client.hset(activeKey, {
-          [`${symbol}:direction`]: String(directionResults?.qualified ?? 0),
-          [`${symbol}:move`]:      String(moveResults?.qualified      ?? 0),
-          [`${symbol}:active`]:    String(activeResults?.qualified    ?? 0),
-          [`${symbol}:optimal`]:   String(optimalResults?.qualified   ?? 0),
+          [`${symbol}:direction`]:       String(directionResults?.qualified ?? 0),
+          [`${symbol}:move`]:            String(moveResults?.qualified      ?? 0),
+          [`${symbol}:active`]:          String(activeResults?.qualified    ?? 0),
+          [`${symbol}:optimal`]:         String(optimalResults?.qualified   ?? 0),
+          // active_advanced is tracked in DEFAULT_LIMITS and the active hash schema
+          // but the processor has no separate processActiveAdvancedSet — write 0 so
+          // the reader always sees all expected type fields, preventing stale values
+          // from a previous hotter cycle from persisting for this symbol.
+          [`${symbol}:active_advanced`]: "0",
         })
         await client.expire(activeKey, 600) // 10 min — engine refreshes each cycle
+
+        // ── Windowed indication counts ────────────────────────────────────
+        // Write/refresh per-type counts into the two windowed hashes that
+        // getIndicationTracking reads for "Last 5" and "Last 60 min" panels.
+        // Fields are plain type strings (not symbol-prefixed) so the reader
+        // can do a direct hash field lookup without iterating all keys.
+        // Both windows share the same current-cycle qualified count; the
+        // semantic distinction (5 cycles vs 60 min) is maintained by the
+        // short TTL (5 min for last5, 70 min for last60min) — each new
+        // cycle overwrites with a fresh value so older data naturally
+        // expires from the 5-minute view before the next write arrives.
+        // We HINCRBY so the counts accumulate across symbols in the same
+        // progression cycle without overwriting a sibling symbol's count.
+        const progKey    = `progression:${this.connectionId}`
+        const w5Key      = `indications_window:${this.connectionId}:last5`
+        const w60Key     = `indications_window:${this.connectionId}:last60min`
+        const dirQ  = directionResults?.qualified  ?? 0
+        const moveQ = moveResults?.qualified       ?? 0
+        const actQ  = activeResults?.qualified     ?? 0
+        const optQ  = optimalResults?.qualified    ?? 0
+        if (dirQ > 0 || moveQ > 0 || actQ > 0 || optQ > 0) {
+          const pipe = client.multi()
+          pipe.hincrby(w5Key,  "direction",  dirQ)
+          pipe.hincrby(w5Key,  "move",       moveQ)
+          pipe.hincrby(w5Key,  "active",     actQ)
+          pipe.hincrby(w5Key,  "optimal",    optQ)
+          pipe.expire(w5Key,   300) // 5 min rolling window
+          pipe.hincrby(w60Key, "direction",  dirQ)
+          pipe.hincrby(w60Key, "move",       moveQ)
+          pipe.hincrby(w60Key, "active",     actQ)
+          pipe.hincrby(w60Key, "optimal",    optQ)
+          pipe.expire(w60Key,  4200) // 70 min rolling window
+          // Total indication Sets active this cycle: configs that qualified across
+          // all types. Stored as a progression field so getIndicationTracking has
+          // a non-zero totalIndicationSets without a separate keys() scan.
+          const totalSetsThisCycle = (directionResults?.configs ?? dirQ) +
+                                     (moveResults?.configs      ?? moveQ) +
+                                     (activeResults?.configs    ?? actQ) +
+                                     (optimalResults?.configs   ?? optQ)
+          if (totalSetsThisCycle > 0) {
+            pipe.hincrby(progKey, "indication_sets_total", totalSetsThisCycle)
+          }
+          await pipe.exec().catch(() => {})
+        }
       } catch { /* non-critical: dashboard falls back to cumulative */ }
 
       if (totalQualified > 0) {
@@ -900,7 +949,11 @@ export class IndicationSetsProcessor {
       // into the InlineLocalRedis Map every boot). 1000 pending signals/symbol is
       // far more than the low-RAM dev VM needs; 100 is plenty to evaluate forward
       // outcomes. Production keeps the full 1000-entry window.
-      const pendingCap = this._isDev ? 100 : 1000
+      // Scale with symbol count: 30 per symbol in dev (e.g. 300 for 10 symbols).
+      const _nDevSyms = this._isDev
+        ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+        : 1
+      const pendingCap = this._isDev ? Math.max(100, _nDevSyms * 30) : 1000
       await client.ltrim(key, -pendingCap, -1)
       await client.expire(key, 86400)
     } catch { /* non-critical */ }
@@ -1278,16 +1331,30 @@ export class IndicationSetsProcessor {
     try {
       const client = await getCachedClient()
       const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
+      // NOTE: client.keys() is a full-keyspace scan. Acceptable here because
+      // this method is called only for the dashboard "Indications" detail
+      // panel (low frequency) and because the InlineLocalRedis Map scan is
+      // O(N) in the number of stored keys but bounded by per-symbol type
+      // ceiling (at most ~144 keys in dev / ~522 in prod per type×symbol).
+      // A SCAN-based alternative would be equivalent — InlineLocalRedis has
+      // no SCAN, so keys() is the only option for the in-process client.
       const keys = await client.keys(`${prefix}*`)
       if (!keys || keys.length === 0) return []
 
+      // Fan out all GETs in parallel — same pattern as getCurrentIndications
+      // in indication-stage.ts to avoid sequential await latency.
+      const rawValues = await Promise.all(
+        keys.map((k: string) => client.get(k).catch(() => null)),
+      )
       const allEntries: any[] = []
-      for (const key of keys) {
-        const raw = await client.get(key)
+      for (let i = 0; i < rawValues.length; i++) {
+        const raw = rawValues[i]
         if (!raw) continue
-        const entries = JSON.parse(raw)
-        if (!Array.isArray(entries)) continue
-        allEntries.push(...entries.map((entry) => ({ ...entry, setKey: key })))
+        try {
+          const entries = JSON.parse(raw as string)
+          if (!Array.isArray(entries)) continue
+          allEntries.push(...entries.map((entry) => ({ ...entry, setKey: keys[i] })))
+        } catch { /* skip malformed entries */ }
       }
 
       return allEntries

@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ������
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ��������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -1301,6 +1301,8 @@ const migrations: Migration[] = [
           prehistoric_candles_processed: have.prehistoric_candles_processed ?? "0",
           intervals_processed: have.intervals_processed ?? "0",
           indications_count: have.indications_count ?? "0",
+          indication_sets_total: have.indication_sets_total ?? "0",
+          indication_sets_at_limit: have.indication_sets_at_limit ?? "0",
           strategies_count: have.strategies_count ?? "0",
         }
 
@@ -3064,46 +3066,144 @@ const migrations: Migration[] = [
   },
   {
     // Migration 055 sets symbol_count=2 + symbol_order=volatility_1h + clears
-    // force_symbols for BOTH dev and prod. In dev that leaves the engine doing
-    // 2 live BingX volatility API calls on every boot AND running prehistoric
-    // across 2 symbols — more than enough to OOM the 8 GB no-swap VM (RSS hits
-    // 2.4 GB+ before the event loop can respond to HTTP). Migration 053 already
-    // set BTCUSDT force_symbols, but 055 runs after it and wipes that.
+    // force_symbols for BOTH dev and prod. In dev that can leave the engine
+    // doing volatile API calls across many symbols before any boot guard runs.
     //
-    // This migration re-applies the dev 1-symbol BTCUSDT cap AFTER 055 so the
-    // dev engine always starts with a single cheap prehistoric run and stays
-    // under the memory guard's 1500 MB target. Production is unaffected.
+    // This migration re-applies the V0_DEV_SYMBOL_COUNT cap (default 1 =
+    // BTCUSDT pin) AFTER 055 so the dev engine always starts with the correct
+    // symbol set regardless of snapshot state. Production is unaffected.
     version: 57,
-    name: "057-dev-1-symbol-btcusdt-repin",
+    name: "057-dev-symbol-count-repin",
     up: async (client: any) => {
       if (process.env.NODE_ENV !== "development") {
         console.log("[v0] Migration 057: skipped (production — keeping volatility-order symbol count)")
         return
       }
-      const DEV_SYMBOL = "BTCUSDT"
+      const devSymCount = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
       const connId = "bingx-x01"
       const hashes = [
         `connection:${connId}`,
         `settings:trade_engine_state:${connId}`,
         `settings:connection_settings:${connId}`,
       ]
-      for (const h of hashes) {
-        await client.hset(h, {
-          // getSymbols() does JSON.parse() on force_symbols — must be an array.
-          force_symbols:  JSON.stringify([DEV_SYMBOL]),
-          symbol_count:   "1",
-          symbol_order:   "",
-          symbols:        JSON.stringify([DEV_SYMBOL]),
-          active_symbols: JSON.stringify([DEV_SYMBOL]),
-        }).catch(() => 0)
+      if (devSymCount === 1) {
+        const DEV_SYMBOL = "BTCUSDT"
+        for (const h of hashes) {
+          await client.hset(h, {
+            force_symbols:  JSON.stringify([DEV_SYMBOL]),
+            symbol_count:   "1",
+            symbol_order:   "",
+            symbols:        JSON.stringify([DEV_SYMBOL]),
+            active_symbols: JSON.stringify([DEV_SYMBOL]),
+          }).catch(() => 0)
+        }
+        console.log(`[v0] Migration 057: dev 1-symbol repin — force_symbols=${DEV_SYMBOL}`)
+      } else {
+        // Multi-symbol: clear force_symbols, set count and volatility order.
+        for (const h of hashes) {
+          await client.hset(h, {
+            force_symbols:  "",
+            symbol_count:   String(devSymCount),
+            symbol_order:   "volatility_1h",
+            symbols:        "",
+            active_symbols: "",
+          }).catch(() => 0)
+        }
+        console.log(`[v0] Migration 057: dev multi-symbol repin — symbol_count=${devSymCount} volatility_1h`)
       }
-      // Clear prehistoric gates so the engine re-runs with the pinned symbol.
+      // Clear prehistoric gates so the engine re-runs with the correct symbols.
       await client.del(`prehistoric_loaded:${connId}`).catch(() => 0)
       await client.del(`prehistoric:progress:${connId}`).catch(() => 0)
-      console.log(`[v0] Migration 057: dev 1-symbol repin applied — force_symbols=${DEV_SYMBOL}`)
     },
     down: async (client: any) => {
       await client.set("_schema_version", "56")
+    },
+  },
+
+  {
+    version: 58,
+    name: "058-indication-tracking-fields",
+    up: async (client: any) => {
+      // Backfill `indication_sets_total` and `indication_sets_at_limit` onto all
+      // existing `progression:{connId}` hashes that pre-date this migration.
+      // These fields are read by getIndicationTracking (detailed-tracking.ts) and
+      // written by IndicationSetsProcessor.processAllIndicationSets and the
+      // generate-indications cron on every cycle.  We use HSETNX (SET-IF-ABSENT)
+      // so already-running engines that have already written a non-zero value are
+      // never zeroed out by the migration.
+      const connSet = await client.smembers("connections").catch(() => [] as string[])
+      const connIds: string[] = Array.isArray(connSet) ? connSet : []
+      let patched = 0
+      for (const connId of connIds) {
+        const progKey = `progression:${connId}`
+        const exists = await client.exists(progKey).catch(() => 0)
+        if (!exists) continue
+        // Only seed fields that are genuinely absent (empty string or undefined).
+        const current = await client.hgetall(progKey).catch(() => ({})) as Record<string, string>
+        const toWrite: Record<string, string> = {}
+        if (!current.indication_sets_total)   toWrite.indication_sets_total   = "0"
+        if (!current.indication_sets_at_limit) toWrite.indication_sets_at_limit = "0"
+        if (!current.indications_count)       toWrite.indications_count       = "0"
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset(progKey, toWrite).catch(() => 0)
+          patched++
+        }
+      }
+      console.log(`[v0] Migration 058: seeded indication_sets_total/at_limit on ${patched}/${connIds.length} progression hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "57")
+    },
+  },
+  {
+    // Apply V0_DEV_SYMBOL_COUNT to bingx-x01 symbol settings.
+    // This migration runs at the correct version point so raising or lowering
+    // V0_DEV_SYMBOL_COUNT (and deleting the snapshot to force a re-migration)
+    // correctly resets the symbol config.  In production this is a no-op.
+    version: 59,
+    name: "059-dev-multi-symbol-support",
+    up: async (client: any) => {
+      if (process.env.NODE_ENV !== "development") {
+        console.log("[v0] Migration 059: skipped (production)")
+        return
+      }
+      const devSymCount = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+      const connId = "bingx-x01"
+      const hashes = [
+        `connection:${connId}`,
+        `settings:trade_engine_state:${connId}`,
+        `settings:connection_settings:${connId}`,
+      ]
+      if (devSymCount === 1) {
+        const DEV_SYM = "BTCUSDT"
+        for (const h of hashes) {
+          await client.hset(h, {
+            force_symbols:  JSON.stringify([DEV_SYM]),
+            symbol_count:   "1",
+            symbol_order:   "",
+            symbols:        JSON.stringify([DEV_SYM]),
+            active_symbols: JSON.stringify([DEV_SYM]),
+          }).catch(() => 0)
+        }
+        console.log("[v0] Migration 059: dev 1-symbol (BTCUSDT)")
+      } else {
+        for (const h of hashes) {
+          await client.hset(h, {
+            force_symbols:  "",
+            symbol_count:   String(devSymCount),
+            symbol_order:   "volatility_1h",
+            symbols:        "",
+            active_symbols: "",
+          }).catch(() => 0)
+        }
+        // Clear prehistoric gates so the engine re-runs with the new symbol set.
+        await client.del(`prehistoric_loaded:${connId}`).catch(() => 0)
+        await client.del(`prehistoric:progress:${connId}`).catch(() => 0)
+        console.log(`[v0] Migration 059: dev ${devSymCount}-symbol volatility_1h`)
+      }
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "58")
     },
   },
 ]
@@ -3153,7 +3253,11 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   // capped to 2 in dev for OOM survival on the 4.39 GB no-swap VM. The actual
   // symbols are chosen dynamically by getSymbols() via fetchTopSymbols(...,
   // "volatility_1h"); this only controls how many are selected.
-  const DEFAULT_SYMBOL_COUNT = process.env.NODE_ENV !== "production" ? "2" : "6"
+  // V0_DEV_SYMBOL_COUNT controls how many symbols dev uses (default 1 to match
+  // the getSymbols() fast-path). In production always 6.
+  const DEFAULT_SYMBOL_COUNT = process.env.NODE_ENV !== "production"
+    ? String(Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1))
+    : "6"
 
   // bybit-x03 is NO LONGER in this list: it is once again a canonical base
   // connection (see BASE_CONNECTION_CONFIG) and is always inited + visible
@@ -3437,13 +3541,15 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   if (_g.__v0_devBootGuardDone) return { createdOrUpdated, credentialsInjected }
   _g.__v0_devBootGuardDone = true
   //
-  // 1. ALWAYS enforce 1-symbol BTCUSDT on bingx-x01 in dev.
-  //    Migration 057 does this once, but after a snapshot wipe the schema
-  //    version is reset to 0 → 057 re-runs → but ensureBaseConnections runs
-  //    BEFORE migrations on very first cold boot and can write the volatile
-  //    DEFAULT_SYMBOL_COUNT=2 + volatility_1h BEFORE 057 has a chance to
-  //    override it. Running the pin here (after all per-connection work)
-  //    ensures it is always the last write regardless of migration ordering.
+  // 1. ENFORCE DEV SYMBOL COUNT on bingx-x01.
+  //    V0_DEV_SYMBOL_COUNT controls how many symbols dev uses (default 1).
+  //    When set to 1 (the default) we pin force_symbols=["BTCUSDT"] as the
+  //    cheapest safe fixture (no volatile API call needed). When set to N>1
+  //    we write symbol_count=N and symbol_order=volatility_1h so getSymbols()
+  //    resolves the top-N symbols dynamically, then slices to N.
+  //
+  //    Migration 057 / 055 may run before this guard and write their own
+  //    symbol_count — this runs AFTER all migrations so it always wins.
   //
   // 2. PURGE stale live:position:* keys from a previous run.
   //    The snapshot persists open/placed positions across restarts. On a dev
@@ -3452,29 +3558,39 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   //    and inflate the memory guard baseline. Purging them here (before the
   //    engine starts) keeps the baseline clean.
   if (process.env.NODE_ENV === "development") {
-    const DEV_SYM   = "BTCUSDT"
     const DEV_CONN  = "bingx-x01"
-    // All key namespaces that getSymbols() reads. The engine reads from
-    // settings:trade_engine_state:{id} (set by the PATCH route + fresh-seed
-    // branch) and settings:connection:{id}. connection:{id} is the base hash.
-    // connection_settings:{id} is read by loadCoordinationSettings. Overwrite
-    // ALL of them so no stale symbol list survives regardless of which key
-    // getSymbols() falls through to.
+    const devSymCount = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+    // All key namespaces that getSymbols() reads.
     const devHashes = [
       `connection:${DEV_CONN}`,
       `settings:trade_engine_state:${DEV_CONN}`,
       `settings:connection_settings:${DEV_CONN}`,
       `settings:connection:${DEV_CONN}`,
     ]
-    const devSymPayload = {
-      // force_symbols is stored as a JSON-stringified array — getSymbols()
-      // does JSON.parse() on it. Plain string "BTCUSDT" is silently ignored.
-      force_symbols:  JSON.stringify([DEV_SYM]),
-      symbol_count:   "1",
-      symbol_order:   "",              // disable volatility-order dynamic fetch
-      symbols:        JSON.stringify([DEV_SYM]),
-      active_symbols: JSON.stringify([DEV_SYM]),
-      config_set_symbols_total: "1",
+
+    let devSymPayload: Record<string, string>
+    if (devSymCount === 1) {
+      // Fast path: pin BTCUSDT — no API call needed, cheapest possible boot.
+      const DEV_SYM = "BTCUSDT"
+      devSymPayload = {
+        force_symbols:            JSON.stringify([DEV_SYM]),
+        symbol_count:             "1",
+        symbol_order:             "",   // disable dynamic fetch
+        symbols:                  JSON.stringify([DEV_SYM]),
+        active_symbols:           JSON.stringify([DEV_SYM]),
+        config_set_symbols_total: "1",
+      }
+    } else {
+      // Multi-symbol path: clear force_symbols so getSymbols() resolves
+      // dynamically via volatility_1h, then slices to devSymCount.
+      devSymPayload = {
+        force_symbols:            "",                       // cleared — getSymbols() falls through
+        symbol_count:             String(devSymCount),
+        symbol_order:             "volatility_1h",
+        symbols:                  "",                       // cleared — engine will repopulate
+        active_symbols:           "",
+        config_set_symbols_total: String(devSymCount),
+      }
     }
     for (const h of devHashes) {
       await client.hset(h, devSymPayload).catch(() => 0)
@@ -3494,7 +3610,8 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       }
     }
 
-    console.log(`[v0] [Dev boot] Re-pinned force_symbols=BTCUSDT across all key namespaces${purged > 0 ? `, purged ${purged} stale live:position keys` : ""}`)
+    const symDesc = devSymCount === 1 ? "force_symbols=BTCUSDT" : `symbol_count=${devSymCount} (volatility_1h)`
+    console.log(`[v0] [Dev boot] Pinned ${symDesc} across all key namespaces${purged > 0 ? `, purged ${purged} stale live:position keys` : ""}`)
   }
 
   return { createdOrUpdated, credentialsInjected }

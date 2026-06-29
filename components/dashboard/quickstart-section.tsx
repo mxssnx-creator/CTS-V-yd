@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import {
   Play, FileText, RefreshCw, Loader2, TrendingUp, StopCircle, Activity,
   BarChart3, ChevronDown, ChevronUp, Database, Zap, Clock, CheckCircle2,
-  Circle, AlertCircle,
+  Circle,
 } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Badge } from "@/components/ui/badge"
@@ -1061,6 +1061,70 @@ export function QuickstartSection() {
     { label: "Auto", value: stats.indAuto      },
   ]
 
+  // ── Combined pipeline progress ───────────────────────────────────────────
+  // One unified 0–100 % that walks through all stages in sequence:
+  //   Segment 0–33 %  = Prehistoric (historical data load)
+  //   Segment 33–66 % = Indications (realtime indication cycles active)
+  //   Segment 66–100% = Strategies  (strategy cycles → real sets → live)
+  // Derived entirely from the stats already in the component; no extra fetch.
+  const combinedProgress = (() => {
+    // Segment 1 — prehistoric (0–33)
+    const prehistoricShare = 33
+    const prehistoricPct   = Math.min(100, Math.max(0, stats.historicProgress))
+    if (!stats.historicComplete) return (prehistoricPct / 100) * prehistoricShare
+
+    // Segment 2 — indications (33–66)
+    const indShare = 33
+    const indActive = stats.indicationCycles > 0
+    if (!indActive) return prehistoricShare
+    // Use a soft cap: treat 5 cycles as "fully into the indication segment"
+    const indPct = Math.min(100, (stats.indicationCycles / Math.max(5, stats.indicationCycles)) * 100)
+    if (stats.strategyCycles === 0) return prehistoricShare + (indPct / 100) * indShare
+
+    // Segment 3 — strategies / real / live (66–100)
+    const stratShare = 34
+    // stageReal.createdSets > 0 → approaching full; live positions → final
+    const stratPct = stats.stratReal > 0
+      ? (stats.livePositionsOpen > 0 ? 100 : Math.min(95, 50 + (stats.strategyCycles / Math.max(10, stats.strategyCycles)) * 45))
+      : Math.min(50, (stats.strategyCycles / Math.max(5, stats.strategyCycles)) * 50)
+    return prehistoricShare + indShare + (stratPct / 100) * stratShare
+  })()
+
+  // Stage-level progress labels for the combined strip
+  const pipelineStages: Array<{
+    key: string
+    label: string
+    done: boolean
+    active: boolean
+    pct?: number
+  }> = [
+    {
+      key:    "prehistoric",
+      label:  "Historical",
+      done:   stats.historicComplete,
+      active: !stats.historicComplete && stats.historicSymbolsTotal > 0,
+      pct:    stats.historicProgress,
+    },
+    {
+      key:    "indications",
+      label:  "Indications",
+      done:   stats.historicComplete && stats.indicationCycles > 0,
+      active: stats.indicationCycles > 0 && stats.strategyCycles === 0,
+    },
+    {
+      key:    "strategies",
+      label:  "Strategies",
+      done:   stats.historicComplete && stats.strategyCycles > 0 && stats.stratReal > 0,
+      active: stats.strategyCycles > 0,
+    },
+    {
+      key:    "live",
+      label:  "Live",
+      done:   stats.livePositionsOpen > 0 || stats.liveOrdersFilled > 0,
+      active: stats.livePositionsOpen > 0 || (stats.engineRunning && stats.stratReal > 0),
+    },
+  ]
+
   return (
     <Card className="border-primary/20 overflow-hidden">
       {/* ── connection picker + Reset DB strip ──────────────────────────────
@@ -1256,134 +1320,79 @@ export function QuickstartSection() {
           </Button>
         </div>
 
-        {/* ── historical processing row (always visible, BEFORE live stats) ──
-            Shows prehistoric load status up-front so users can see how much
-            historical context the engine has behind it before we show any
-            realtime cycle counters. This mirrors the ordering the engine
-            itself follows: historic data is loaded first, then live loops
-            start — so the dashboard should read the same way top-to-bottom.
+        {/* ── Combined pipeline progress (always visible) ──────────────────
+            One unified strip for the full Historical → Indications →
+            Strategies → Live pipeline. A single progress bar advances
+            through all stages in sequence; individual stage pills show
+            done/active/idle state at a glance with no separate loops.
          */}
-        <div
-          className={`flex flex-wrap items-center gap-1.5 rounded-md border px-2 py-1.5 ${
-            stats.historicComplete
-              ? "bg-green-50/50 dark:bg-green-950/20 border-green-500/20"
-              : "bg-blue-50/40 dark:bg-blue-950/20 border-blue-500/20"
-          }`}
-        >
-          <div className="flex items-center gap-1.5 shrink-0">
-            <Database className={`w-3.5 h-3.5 ${stats.historicComplete ? "text-green-600 dark:text-green-500" : "text-blue-600 dark:text-blue-500"}`} />
-            <span className="text-[11px] font-semibold text-foreground">Historical</span>
-            {stats.historicComplete ? (
-              <Badge className="bg-green-600 hover:bg-green-600 text-white h-4 text-[9px] px-1.5 py-0">Loaded</Badge>
-            ) : (
-              <Badge variant="secondary" className="h-4 text-[9px] px-1.5 py-0 tabular-nums">
-                {stats.historicProgress}%
-              </Badge>
+        <div className="rounded-md border bg-muted/20 px-2.5 py-2 space-y-1.5">
+          {/* header row: label + overall % */}
+          <div className="flex items-center gap-2">
+            <Activity className="w-3.5 h-3.5 text-primary/70 shrink-0" />
+            <span className="text-[11px] font-semibold text-foreground">Processing Pipeline</span>
+            <span className="ml-auto text-[10px] tabular-nums text-muted-foreground font-medium">
+              {combinedProgress.toFixed(0)}%
+            </span>
+            {stats.engineRunning && (
+              <span className="relative flex h-2 w-2 shrink-0">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
+              </span>
             )}
           </div>
 
-          {/* inline progress bar when still loading — keeps the row slim */}
-          {!stats.historicComplete && (
-            <div className="flex-1 min-w-[80px] max-w-[160px] h-1 bg-muted rounded-full overflow-hidden">
-              <div
-                className="h-full bg-blue-500/70 rounded-full transition-all"
-                style={{ width: `${Math.min(100, Math.max(0, stats.historicProgress))}%` }}
-              />
-            </div>
-          )}
+          {/* single combined progress bar */}
+          <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all duration-500"
+              style={{
+                width: `${Math.min(100, combinedProgress)}%`,
+                background: combinedProgress >= 100
+                  ? "hsl(var(--primary))"
+                  : "linear-gradient(to right, hsl(var(--primary)/0.6), hsl(var(--primary)))",
+              }}
+            />
+          </div>
 
-          <div className="flex flex-wrap gap-1.5 ml-auto">
-            <MiniStat
-              label="Symbols"
-              value={`${stats.historicSymbols}/${stats.historicSymbolsTotal || "—"}`}
-            />
-            {/* Frames — the BIG count when timeframe=1s. Each frame = one
-                timeframe-interval tick processed by the config-set processor.
-                At 1s over 8h this is ~28,800 per symbol, which is the
-                "big number" the dashboard used to miss entirely. */}
-            {stats.historicFrames > 0 && (
-              <MiniStat
-                label={stats.historicTimeframeSec === 1 ? "Frames 1s" : `Frames ${stats.historicTimeframeSec}s`}
-                value={fmt(stats.historicFrames)}
-                sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} new` : undefined}
-              />
-            )}
-            {/* "Candles" tile intentionally omitted — it duplicated the
-                250-set per-Set DB capacity counter shown elsewhere and
-                wasn't a true candle count, just confusing the operator. */}
-            {stats.historicIndicators > 0 && (
-              <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
-            )}
-            {/* P-Cycles tile reflects the cycle-frame work magnitude, not
-                symbol count. Value = cycles × frames (the high-magnitude
-                number the operator sees grow during prehistoric processing).
-                Falls back to plain `historicCycles` only when no frames
-                have been counted yet (very early in a run) so we never
-                display a misleading "0" for non-zero work. */}
-            <MiniStat
-              label="P-Cycles"
-              value={
-                stats.historicFrames > 0 && stats.historicCycles > 0
-                  ? fmt(stats.historicCycles * stats.historicFrames)
-                  : fmt(stats.historicCycles)
-              }
-              sub={
-                stats.historicFrames > 0 && stats.historicCycles > 0
-                  ? `${fmt(stats.historicCycles)}×${fmt(stats.historicFrames)}`
-                  : undefined
-              }
-            />
-            {/* Base PF — average Profit Factor across ALL closed Base
-                pseudo positions in the prehistoric run, computed from
-                `historicAvgProfitFactor` (sum(+pct) / |sum(-pct)| over
-                every closed prehistoric position). Switched away from
-                the per-stage `stageBase.avgProfitFactor` because the
-                spec asks for the overall pseudo-position aggregate, not
-                the strategy-stage-specific number. */}
-            <MiniStat
-              label="Base PF"
-              value={
-                stats.historicAvgProfitFactor > 0
-                  ? stats.historicAvgProfitFactor.toFixed(2)
-                  : "—"
-              }
-              sub={
-                stats.historicAvgProfitFactorCount > 0
-                  ? `n=${fmt(stats.historicAvgProfitFactorCount)}`
-                  : undefined
-              }
-            />
-            {/* Avg Real Pos — true running mean of currently-active
-                validated Real-stage positions (unbounded). Sourced
-                from `realActivePosAvg`, NOT `stageReal.avgPosPerSet`:
-                the latter is mathematically capped at the per-set
-                250-entry DB capacity (entries/sets ≤ 250) and would
-                always be ≤ 250 even when the operator has many
-                hundreds of validated positions in flight. The new
-                source accumulates `realOpen` samples server-side
-                and is reset by ResetDB. 0 samples ⇒ render "—". */}
-            <MiniStat
-              label="Avg Real Pos"
-              value={
-                stats.realActivePosSamples > 0 && stats.realActivePosAvg > 0
-                  ? stats.realActivePosAvg.toFixed(2)
-                  : "—"
-              }
-              sub={
-                stats.realActivePosSamples > 0
-                  ? `n=${fmt(stats.realActivePosSamples)}`
-                  : undefined
-              }
-            />
-            {/* Real Positions — currently active, valid, opened
-                Real-stage strategies (snapshot from openPositions.real.open). */}
-            {stats.realOpen > 0 && (
-              <MiniStat
-                label="Real Pos"
-                value={fmt(stats.realOpen)}
-                sub="active"
-              />
-            )}
+          {/* stage pills row */}
+          <div className="flex items-center gap-1 flex-wrap">
+            {pipelineStages.map(({ key, label, done, active, pct }) => (
+              <div
+                key={key}
+                className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded-full border text-[10px] transition-colors ${
+                  done
+                    ? "border-green-500/40 bg-green-500/10 text-green-700 dark:text-green-400"
+                    : active
+                      ? "border-primary/40 bg-primary/10 text-primary"
+                      : "border-border/50 bg-muted/30 text-muted-foreground/60"
+                }`}
+              >
+                {done
+                  ? <CheckCircle2 className="w-2.5 h-2.5 shrink-0" />
+                  : active
+                    ? <span className="relative flex h-1.5 w-1.5 shrink-0"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-60" /><span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-primary" /></span>
+                    : <Circle className="w-2.5 h-2.5 opacity-30 shrink-0" />
+                }
+                <span>{label}</span>
+                {active && pct !== undefined && pct > 0 && (
+                  <span className="tabular-nums opacity-70">{pct.toFixed(0)}%</span>
+                )}
+              </div>
+            ))}
+
+            {/* key metrics inline — space-efficient summary */}
+            <div className="ml-auto flex items-center gap-1.5 text-[10px] text-muted-foreground tabular-nums">
+              {stats.historicSymbolsTotal > 0 && (
+                <span title="Symbols loaded">{stats.historicSymbols}/{stats.historicSymbolsTotal} sym</span>
+              )}
+              {stats.indicationCycles > 0 && (
+                <span title="Indication cycles">{fmt(stats.indicationCycles)} ind</span>
+              )}
+              {stats.stratReal > 0 && (
+                <span title="Real strategy sets" className="text-green-700 dark:text-green-500 font-medium">{fmt(stats.stratReal)} real</span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -2197,25 +2206,51 @@ export function QuickstartSection() {
               </div>
             </div>
 
-            {/* processing status pills */}
-            <div className="flex flex-wrap gap-1.5 text-[10px]">
-              {[
-                { label: "Prehistoric",  done: stats.historicComplete },
-                { label: "Indications",  done: stats.indicationCycles > 0 },
-                { label: "Strategies",   done: stats.strategyCycles > 0 },
-                { label: "Realtime",     done: stats.isActive },
-              ].map(({ label, done }) => (
-                <div key={label} className={`flex items-center gap-1 px-2 py-0.5 rounded-full border ${done ? "border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-400" : "border-border bg-muted/30 text-muted-foreground"}`}>
-                  {done ? <CheckCircle2 className="w-2.5 h-2.5" /> : <AlertCircle className="w-2.5 h-2.5 opacity-40" />}
-                  {label}
+            {/* ── Combined pipeline progress summary (expanded footer) ──
+                Same single combined progress shown in compact form; acts
+                as a quick status recap at the bottom of the detail panel.
+                No separate loops — all stages are part of one pipeline. */}
+            <div className="rounded-md border bg-muted/20 px-2.5 py-2 space-y-1.5">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-semibold text-foreground">Pipeline</span>
+                <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all duration-500"
+                    style={{
+                      width: `${Math.min(100, combinedProgress)}%`,
+                      background: combinedProgress >= 100
+                        ? "hsl(var(--primary))"
+                        : "linear-gradient(to right, hsl(var(--primary)/0.6), hsl(var(--primary)))",
+                    }}
+                  />
                 </div>
-              ))}
-              {stats.avgCycleMs > 0 && (
-                <div className="flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-muted/30 text-muted-foreground">
-                  <Clock className="w-2.5 h-2.5" />
-                  {stats.avgCycleMs}ms avg
-                </div>
-              )}
+                <span className="text-[10px] tabular-nums text-muted-foreground font-medium shrink-0">
+                  {combinedProgress.toFixed(0)}%
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-1">
+                {pipelineStages.map(({ key, label, done, active }) => (
+                  <div
+                    key={key}
+                    className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded-full border text-[10px] ${
+                      done
+                        ? "border-green-500/40 bg-green-500/10 text-green-700 dark:text-green-400"
+                        : active
+                          ? "border-primary/40 bg-primary/10 text-primary"
+                          : "border-border/50 bg-muted/30 text-muted-foreground/60"
+                    }`}
+                  >
+                    {done ? <CheckCircle2 className="w-2.5 h-2.5 shrink-0" /> : active ? <span className="relative flex h-1.5 w-1.5 shrink-0"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-60" /><span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-primary" /></span> : <Circle className="w-2.5 h-2.5 opacity-30 shrink-0" />}
+                    {label}
+                  </div>
+                ))}
+                {stats.avgCycleMs > 0 && (
+                  <div className="flex items-center gap-1 px-1.5 py-0.5 rounded-full border border-border/50 bg-muted/30 text-[10px] text-muted-foreground ml-auto">
+                    <Clock className="w-2.5 h-2.5" />
+                    {stats.avgCycleMs}ms avg
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* ── Live Exchange Positions & Account Balance (footer) ───
