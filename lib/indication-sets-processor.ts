@@ -414,15 +414,11 @@ export class IndicationSetsProcessor {
         // ── Windowed indication counts ────────────────────────────────────
         // Write/refresh per-type counts into the two windowed hashes that
         // getIndicationTracking reads for "Last 5" and "Last 60 min" panels.
-        // Fields are plain type strings (not symbol-prefixed) so the reader
-        // can do a direct hash field lookup without iterating all keys.
-        // Both windows share the same current-cycle qualified count; the
-        // semantic distinction (5 cycles vs 60 min) is maintained by the
-        // short TTL (5 min for last5, 70 min for last60min) — each new
-        // cycle overwrites with a fresh value so older data naturally
-        // expires from the 5-minute view before the next write arrives.
-        // We HINCRBY so the counts accumulate across symbols in the same
-        // progression cycle without overwriting a sibling symbol's count.
+        // Fields are symbol-prefixed and overwritten with the latest value for
+        // each symbol/type. Production runs can process overlapping cycles;
+        // HINCRBY on plain type fields made non-direction counts drift upward
+        // with every retry/overlap instead of reflecting the current window.
+        // Per-symbol HSET keeps sibling symbols independent and idempotent.
         const progKey    = `progression:${this.connectionId}`
         const w5Key      = `indications_window:${this.connectionId}:last5`
         const w60Key     = `indications_window:${this.connectionId}:last60min`
@@ -430,18 +426,24 @@ export class IndicationSetsProcessor {
         const moveQ = moveResults?.qualified       ?? 0
         const actQ  = activeResults?.qualified     ?? 0
         const optQ  = optimalResults?.qualified    ?? 0
+        const pipe = client.multi()
+        pipe.hset(w5Key, {
+          [`${symbol}:direction`]: String(dirQ),
+          [`${symbol}:move`]: String(moveQ),
+          [`${symbol}:active`]: String(actQ),
+          [`${symbol}:optimal`]: String(optQ),
+          [`${symbol}:active_advanced`]: "0",
+        })
+        pipe.expire(w5Key,   300) // 5 min rolling window
+        pipe.hset(w60Key, {
+          [`${symbol}:direction`]: String(dirQ),
+          [`${symbol}:move`]: String(moveQ),
+          [`${symbol}:active`]: String(actQ),
+          [`${symbol}:optimal`]: String(optQ),
+          [`${symbol}:active_advanced`]: "0",
+        })
+        pipe.expire(w60Key,  4200) // 70 min rolling window
         if (dirQ > 0 || moveQ > 0 || actQ > 0 || optQ > 0) {
-          const pipe = client.multi()
-          pipe.hincrby(w5Key,  "direction",  dirQ)
-          pipe.hincrby(w5Key,  "move",       moveQ)
-          pipe.hincrby(w5Key,  "active",     actQ)
-          pipe.hincrby(w5Key,  "optimal",    optQ)
-          pipe.expire(w5Key,   300) // 5 min rolling window
-          pipe.hincrby(w60Key, "direction",  dirQ)
-          pipe.hincrby(w60Key, "move",       moveQ)
-          pipe.hincrby(w60Key, "active",     actQ)
-          pipe.hincrby(w60Key, "optimal",    optQ)
-          pipe.expire(w60Key,  4200) // 70 min rolling window
           // Total indication Sets active this cycle: configs that qualified across
           // all types. Stored as a progression field so getIndicationTracking has
           // a non-zero totalIndicationSets without a separate keys() scan.
@@ -452,8 +454,8 @@ export class IndicationSetsProcessor {
           if (totalSetsThisCycle > 0) {
             pipe.hincrby(progKey, "indication_sets_total", totalSetsThisCycle)
           }
-          await pipe.exec().catch(() => {})
         }
+        await pipe.exec().catch(() => {})
       } catch { /* non-critical: dashboard falls back to cumulative */ }
 
       if (totalQualified > 0) {

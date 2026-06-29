@@ -941,7 +941,7 @@ export function ConnectionSettingsDialog({
                   <Separator className="my-1" />
 
                   {/* ── Minimal Position Step — promoted to page 1 per operator spec ─ */}
-                  <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (3–30, default 5). Higher values create fewer, smoother position ranges." />
+                  <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (2–30, default 5). Higher values create fewer, smoother position ranges." />
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
                       <Label className="text-xs">Base Min Step (2–30)</Label>

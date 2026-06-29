@@ -314,8 +314,8 @@ function MainSystemTab({ stats }: { stats: EngineStats | null }) {
             {/* per-type mini bars */}
             <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 py-1">
               {[
-                { k: "direction", label: "Direction", desc: "Reversal — close vs open, 3–30 steps" },
-                { k: "move",      label: "Move",      desc: "Momentum — trend follow, 3–30 steps" },
+                { k: "direction", label: "Direction", desc: "Reversal — close vs open, 2–30 steps" },
+                { k: "move",      label: "Move",      desc: "Momentum — trend follow, 2–30 steps" },
                 { k: "active",    label: "Active",    desc: "Breakout — 0.5–2.5% vol threshold" },
                 { k: "optimal",   label: "Optimal",   desc: "High-precision multi-filter signal" },
               ].map(t => {

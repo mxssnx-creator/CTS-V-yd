@@ -1546,7 +1546,7 @@ const migrations: Migration[] = [
 
       // ── 2. Seed minStep default (5) for all connections ──────────────────
       //
-      // minStep (range 3-30, default 5) was added to the per-connection
+      // minStep (range 2-30, default 5) was added to the per-connection
       // strategy settings in the same session as this migration. Backfill
       // the default into connection_settings:{id} for every existing
       // connection so the engine reads the correct floor immediately without

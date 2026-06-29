@@ -89,6 +89,8 @@ export async function GET() {
     
     // Get active connections
     const connections = await getActiveConnectionsForEngine()
+    const coordinatorEngineCount = coordinator?.getActiveEngineCount() || 0
+    const hasLocalEngineRuntime = coordinatorEngineCount > 0
     
     if (connections.length === 0) {
       // Get all connections to explain why none are active
@@ -144,15 +146,28 @@ export async function GET() {
           
           const positionsCount = await client.scard(positionsKey)
           const tradesCount = await client.scard(tradesKey)
+          const engineState = await client.hgetall(`trade_engine_state:${conn.id}`).catch(() => ({} as Record<string, string>))
+          const processorHeartbeat = Number((engineState as any)?.last_processor_heartbeat || 0)
+          const hasFreshDistributedHeartbeat =
+            Number.isFinite(processorHeartbeat) && processorHeartbeat > 0 && Date.now() - processorHeartbeat < 90_000
 
-          // Determine if this connection's engine is actively running
-          const connectionRunning = effectivelyRunning && !isGloballyPaused
+          // Determine if this connection's engine is actively running either in
+          // THIS worker or in another production worker with a fresh Redis
+          // heartbeat. Redis `trade_engine:global.status=running` is only
+          // operator intent; the heartbeat is the distributed proof of real
+          // engine progress and avoids both false "running" and false "stopped"
+          // in multi-worker/OpenNext deployments.
+          const connectionRunning =
+            effectivelyRunning && !isGloballyPaused && (hasLocalEngineRuntime || hasFreshDistributedHeartbeat)
 
           return {
             id: conn.id,
             name: conn.name,
             exchange: conn.exchange,
             status: connectionRunning ? "running" : "stopped",
+            workerAttached: hasLocalEngineRuntime,
+            distributedHeartbeatFresh: hasFreshDistributedHeartbeat,
+            lastProcessorHeartbeat: processorHeartbeat || null,
             enabled: conn.is_enabled_dashboard === true || conn.is_enabled_dashboard === "1",
             activelyUsing: conn.is_enabled_dashboard === true || conn.is_enabled_dashboard === "1",
             positions: positionsCount,
@@ -193,16 +208,8 @@ export async function GET() {
       errors: connectionStatuses.filter((c: any) => c.error).length,
     }
 
-    // In Next dev, route handlers may execute in a freshly compiled module
-    // instance whose in-memory coordinator has no local managers, while Redis
-    // correctly records operator intent and progression state. Report the
-    // effective running connection count as a floor so the UI does not flicker
-    // `activeEngineCount: 0` during hot-route recompiles even though the
-    // connection status remains running.
-    const coordinatorEngineCount = coordinator?.getActiveEngineCount() || 0
-    const activeEngineCount = effectivelyRunning
-      ? Math.max(coordinatorEngineCount, summary.running)
-      : coordinatorEngineCount
+    const distributedEngineCount = connectionStatuses.filter((c: any) => c.distributedHeartbeatFresh).length
+    const activeEngineCount = Math.max(coordinatorEngineCount, distributedEngineCount)
 
     const responseBody = {
       success: true,
@@ -210,6 +217,16 @@ export async function GET() {
       paused: isGloballyPaused,
       status: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "stopped"),
       activeEngineCount,
+      workerAttached: hasLocalEngineRuntime,
+      distributedEngineCount,
+      operatorStatus: engineHash.status || "stopped",
+      diagnostics: {
+        rootCause:
+          effectivelyRunning && activeEngineCount === 0
+            ? "Global Redis status is running, but no local manager or fresh distributed processor heartbeat is attached. In production this means the UI worker only has operator intent; a dedicated opted-in engine worker/cron heartbeat is not actually running."
+            : null,
+        requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 (and ENABLE_IN_PROCESS_CONTINUITY=1 for in-process timers) on exactly one dedicated worker/process",
+      },
       connections: connectionStatuses,
       summary,
     }
