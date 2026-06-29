@@ -2921,7 +2921,6 @@ export class StrategyCoordinator {
    * block-count overlays remain a Live-dispatch expansion, while these options
    * mirror currently running exposure as Real-stage block Sets.
    */
-  private async buildActivePositionBlockOverlaysForReal(
   private async buildActiveRealBlockOverlaysForReal(
     symbol: string,
     sourceSets: StrategySet[],
@@ -3179,7 +3178,7 @@ export class StrategyCoordinator {
         continue
       }
 
-      // ── 3. PF/DDT gate ────────────────────────────────────────────────────
+      // ── 3. PF/DDT gate ─────────────────────────��──────────────────────────
       const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                      s.avgDrawdownTime  <= metrics.maxDrawdownTime
       if (passes) {
@@ -3344,8 +3343,7 @@ export class StrategyCoordinator {
     )
 
     try {
-      const activePositionBlockOverlays = await this.buildActivePositionBlockOverlaysForReal(
-      const activeLiveBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
+      const activePositionBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
         symbol,
         realPostHedge,
         metrics,
