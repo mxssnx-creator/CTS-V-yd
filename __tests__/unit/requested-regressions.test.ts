@@ -316,6 +316,14 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("private static readonly _AXIS_LRU_MAX = 8_000")
   })
 
+  test("coordinator startEngine is guarded in production UI workers", () => {
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(source).toContain('process.env.npm_lifecycle_event === "start"')
+    expect(source).toContain('startEngine(${connectionId}) queued/skipped in production UI worker')
+  })
+
   test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
