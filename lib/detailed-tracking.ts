@@ -283,6 +283,26 @@ export async function getIndicationTracking(
     const totals: Record<string, number> = {}
     for (const t of types) totals[t] = 0
 
+    // Current writers use per-symbol fields ("BTCUSDT:direction"). Older
+    // production data may still contain plain legacy fields ("direction").
+    // When both shapes exist, prefer the per-symbol snapshot and ignore the
+    // legacy plain field for that type; otherwise a mixed deployment doubles
+    // the count and makes sibling type totals look unstable/identical.
+    const hasSymbolField: Record<string, boolean> = {}
+    for (const t of types) hasSymbolField[t] = false
+    for (const field of Object.keys(hash)) {
+      const idx = field.lastIndexOf(":")
+      if (idx <= 0) continue
+      const type = field.slice(idx + 1)
+      if (type in hasSymbolField) hasSymbolField[type] = true
+    }
+
+    for (const [field, raw] of Object.entries(hash)) {
+      const idx = field.lastIndexOf(":")
+      const type = idx > 0 ? field.slice(idx + 1) : field
+      if (!(type in totals)) continue
+      if (idx <= 0 && hasSymbolField[type]) continue
+      totals[type] += Number(raw) || 0
     for (const [field, raw] of Object.entries(hash)) {
       const idx = field.lastIndexOf(":")
       const type = idx > 0 ? field.slice(idx + 1) : field

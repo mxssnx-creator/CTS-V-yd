@@ -617,23 +617,33 @@ return {
         ? (Number((await client.hget(key, "successful_trades")) || "0") || 0)
         : (Number(successfulTradesRaw) || 0)
 
+      // Defensive bound: after quickstart resets or cross-worker recovery, stale
+      // successful_trades can momentarily exceed the freshly reset total_trades,
+      // producing impossible UI/log values such as 200% success. Clamp and write
+      // the corrected counter back so subsequent readers stay sane.
+      const maxPossibleSuccessfulTrades = successful ? newTotalTrades : Math.max(0, newTotalTrades - 1)
+      const boundedSuccessfulTrades = Math.max(0, Math.min(newSuccessfulTrades, maxPossibleSuccessfulTrades))
       const tradeSuccessRate =
-        newTotalTrades > 0 ? (newSuccessfulTrades / newTotalTrades) * 100 : 0
+        newTotalTrades > 0 ? (boundedSuccessfulTrades / newTotalTrades) * 100 : 0
 
       // Metadata + rate write in parallel with the expire refresh.
       const nowIso = new Date().toISOString()
+      const tradeUpdate: Record<string, string> = {
+        trade_success_rate: String(tradeSuccessRate.toFixed(2)),
+        last_update: nowIso,
+        last_trade_time: nowIso,
+      }
+      if (boundedSuccessfulTrades !== newSuccessfulTrades) {
+        tradeUpdate.successful_trades = String(boundedSuccessfulTrades)
+      }
       await Promise.all([
-        client.hset(key, {
-          trade_success_rate: String(tradeSuccessRate.toFixed(2)),
-          last_update: nowIso,
-          last_trade_time: nowIso,
-        }),
+        client.hset(key, tradeUpdate),
         client.expire(key, 7 * 24 * 60 * 60),
       ]).catch(() => { /* non-critical */ })
 
       console.log(
         `[v0] [Progression] Trade recorded: ${successful ? "✓ Win" : "✗ Loss"} | ` +
-          `Profit: ${profit.toFixed(2)} | Trades: ${newSuccessfulTrades}/${newTotalTrades} | ` +
+          `Profit: ${profit.toFixed(2)} | Trades: ${boundedSuccessfulTrades}/${newTotalTrades} | ` +
           `Success Rate: ${tradeSuccessRate.toFixed(1)}%`,
       )
     } catch (error) {

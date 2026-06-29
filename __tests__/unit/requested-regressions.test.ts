@@ -77,6 +77,19 @@ describe("requested regression guardrails", () => {
     expect(disableBranch).not.toContain('if (activeCount === 0) return "stopped"')
   })
 
+  test("explicit dashboard enable starts coordinator in production-safe foreground", () => {
+    const source = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
+    const startBranch = source.slice(
+      source.indexOf('if (engineAction === "start")'),
+      source.indexOf('} else if (engineAction === "stop")'),
+    )
+
+    expect(startBranch).toContain('status: "running"')
+    expect(startBranch).toContain('coordinator_ready: "true"')
+    expect(startBranch).toContain("const started = await coordinator.startEngine")
+    expect(startBranch).not.toContain("setImmediate")
+  })
+
   test("indication windows use idempotent per-symbol fields", () => {
     const processor = read("lib/indication-sets-processor.ts")
     const cron = read("app/api/cron/generate-indications/route.ts")
@@ -87,6 +100,20 @@ describe("requested regression guardrails", () => {
     expect(cron).toContain("pipeline.hset(w5Key,  `${symbol}:${type}`, String(count))")
     expect(cron).toContain("Zeroes are written too")
     expect(tracking).toContain("aggregateWindowByType")
+    expect(tracking).toContain("prefer the per-symbol snapshot")
+    expect(tracking).toContain("if (idx <= 0 && hasSymbolField[type]) continue")
+  })
+
+
+  test("QuickStart resolves four-symbol volatility order without HTTP self-fetch", () => {
+    const source = read("app/api/trade-engine/quick-start/route.ts")
+
+    expect(source).toContain('import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"')
+    expect(source).toContain('normaliseSort(body.symbolOrder || body.symbol_order || "volatility_1h")')
+    expect(source).toContain("fetchTopSymbols(exchangeName, requestedCount, requestedSymbolOrder)")
+    expect(source).toContain("symbol_order: requestedSymbolOrder")
+    expect(source).toContain("dev_symbol_count_override: String(symbols.length)")
+    expect(source).not.toContain("/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&sort=volatility")
   })
 
   test("live-trade enable awaits production-safe engine start", () => {
@@ -108,6 +135,76 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("? 1")
     expect(source).toContain("realMinPos = 1")
     expect(source).toContain("const relaxed = Math.min(realMinPF, 0.75)")
+  })
+
+
+
+
+
+  test("live position APIs separate real exchange data from simulated history", () => {
+    const liveRoute = read("app/api/trading/live-positions/route.ts")
+    const exchangeRoute = read("app/api/exchange-positions/route.ts")
+    const tradingStatsRoute = read("app/api/trading/stats/route.ts")
+    const symbolStatsRoute = read("app/api/exchange-positions/symbols-stats/route.ts")
+
+    expect(liveRoute).toContain('searchParams.get("connection_id") || searchParams.get("connectionId")')
+    expect(liveRoute).toContain("realPositions")
+    expect(liveRoute).toContain("simulatedPositions")
+    expect(liveRoute).toContain("dataIntegrity")
+    expect(liveRoute).toContain("effectivePnL")
+    expect(exchangeRoute).toContain('searchParams.get("connection_id") || searchParams.get("connectionId")')
+    expect(exchangeRoute).toContain('source: "exchange_position_manager"')
+    expect(tradingStatsRoute).toContain('source: "exchange_live_positions"')
+    expect(tradingStatsRoute).toContain("simulatedExcluded: true")
+    expect(tradingStatsRoute).not.toContain("FROM pseudo_positions")
+    expect(symbolStatsRoute).toContain('source: "exchange_live_positions"')
+    expect(symbolStatsRoute).not.toContain("For now, return mock symbols")
+  })
+
+  test("pseudo position close PnL and PF inputs are net of 0.1% position cost", () => {
+    const helper = read("lib/pseudo-position-costs.ts")
+    const pseudoManager = read("lib/trade-engine/pseudo-position-manager.ts")
+    const posHistory = read("lib/pos-history.ts")
+    const configProcessor = read("lib/trade-engine/config-set-processor.ts")
+    const strategyConfig = read("lib/strategy-config-manager.ts")
+
+    expect(helper).toContain("PSEUDO_POSITION_CLOSE_COST_RATIO = 0.001")
+    expect(helper).toContain("const netPnl = grossPnl - positionCost")
+    expect(helper).toContain("netPnlPct")
+    expect(pseudoManager).toContain("calculatePseudoClosePnl({ entryPrice, currentPrice, quantity, side })")
+    expect(pseudoManager).toContain("realized_pnl: String(pnl)")
+    expect(pseudoManager).toContain("gross_realized_pnl: String(grossPnl)")
+    expect(pseudoManager).toContain("position_cost_ratio: String(PSEUDO_POSITION_CLOSE_COST_RATIO)")
+    expect(posHistory).toContain("PnL is already cost-adjusted")
+    expect(configProcessor).toContain("netPnlPct")
+    expect(strategyConfig).toContain("calculatePseudoClosePnl")
+  })
+
+  test("simulated live stage does not create duplicate open slots", () => {
+    const source = read("lib/trade-engine/stages/live-stage.ts")
+
+    expect(source).toContain("existingSimulatedSlot")
+    expect(source).toContain("simulated slot already open")
+    expect(source).toContain("existingSimulatedSlot,")
+    expect(source).toContain('"simulate_skip"')
+  })
+
+  test("dev symbol cap honors QuickStart multi-symbol override", () => {
+    const source = read("lib/trade-engine/engine-manager.ts")
+
+    expect(source).toContain("dev_symbol_count_override")
+    expect(source).toContain('process.env.V0_DEV_SYMBOL_COUNT ?? "1"')
+    expect(source).toContain('if (devCap === 1) return ["BTCUSDT"]')
+  })
+
+  test("progression trade counters clamp impossible success rates after resets", () => {
+    const source = read("lib/progression-state-manager.ts")
+
+    expect(source).toContain("boundedSuccessfulTrades")
+    expect(source).toContain("maxPossibleSuccessfulTrades")
+    expect(source).toContain("Math.max(0, newTotalTrades - 1)")
+    expect(source).toContain("tradeUpdate.successful_trades = String(boundedSuccessfulTrades)")
+    expect(source).toContain("Success Rate: ${tradeSuccessRate.toFixed(1)}%")
   })
 
   test("startEngine retries stale cross-worker startup locks", () => {
