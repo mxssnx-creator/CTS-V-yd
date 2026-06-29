@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { SystemLogger } from "@/lib/system-logger"
+import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
 export const dynamic = "force-dynamic"
 
@@ -162,12 +163,24 @@ export async function POST(request: NextRequest) {
             const conn = await getConnection(connId)
             if (conn && conn.paused_by_global === "1") {
               // Re-enable live trade
+              const staleLiveTradeBlockReason = String((conn as any).live_trade_blocked_reason || "").trim()
               await updateConnection(connId, {
                 ...conn,
                 is_live_trade: "1",
+                live_trade_blocked_reason: "",
+                live_trade_requested: "1",
                 paused_by_global: "0",
                 updated_at: new Date().toISOString(),
               })
+              if (staleLiveTradeBlockReason) {
+                await logProgressionEvent(
+                  connId,
+                  "live_trading",
+                  "info",
+                  "Global start resumed live trading; cleared stale block so exchange orders can proceed.",
+                  { previous_block_reason: staleLiveTradeBlockReason },
+                )
+              }
               
               // Restart the engine
               await coordinator.startEngine(connId, {
@@ -199,12 +212,24 @@ export async function POST(request: NextRequest) {
             !resumedConnections.includes(conn.id)) {
           try {
             // Ensure live trade is enabled
+            const staleLiveTradeBlockReason = String((conn as any).live_trade_blocked_reason || "").trim()
             const updatedConn = {
               ...conn,
               is_live_trade: "1",
+              live_trade_blocked_reason: "",
+              live_trade_requested: "1",
               updated_at: new Date().toISOString(),
             }
             await updateConnection(conn.id, updatedConn)
+            if (staleLiveTradeBlockReason) {
+              await logProgressionEvent(
+                conn.id,
+                "live_trading",
+                "info",
+                "Global start enabled live trading; cleared stale block so exchange orders can proceed.",
+                { previous_block_reason: staleLiveTradeBlockReason },
+              )
+            }
             
             // Start the engine for this connection
             await coordinator.startEngine(conn.id, {
