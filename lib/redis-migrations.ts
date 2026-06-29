@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ��������
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ����������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -3216,6 +3216,40 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "58")
+    },
+  },
+  {
+    version: 60,
+    name: "060-purge-ghost-connection-hashes",
+    up: async (client: any) => {
+      // Purge `connection:*` keys whose hash has no `id` field — these are
+      // leftover ghost entries from aborted saves or partial migrations that
+      // trigger a recurring `getAllConnections: skipping malformed connection
+      // hash` log on every poll interval. Safe to delete: any legitimate
+      // connection always has at least `id`, `name`, and `exchange` written
+      // atomically by `saveConnection`.
+      let purged = 0
+      try {
+        const allKeys: string[] = await client.keys("connection:*")
+        for (const key of allKeys) {
+          try {
+            const id = await client.hget(key, "id")
+            const name = await client.hget(key, "name")
+            const exchange = await client.hget(key, "exchange")
+            if (!id || !name || !exchange) {
+              await client.del(key)
+              purged++
+              console.log(`[v0] Migration 060: deleted ghost key ${key}`)
+            }
+          } catch { /* skip individual key errors */ }
+        }
+      } catch (err) {
+        console.warn("[v0] Migration 060: keys scan failed (non-fatal):", err)
+      }
+      console.log(`[v0] Migration 060: purged ${purged} ghost connection hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "59")
     },
   },
 ]

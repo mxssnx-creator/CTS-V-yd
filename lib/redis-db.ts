@@ -2055,7 +2055,10 @@ export async function getAllConnections(): Promise<any[]> {
 
           if (id && name && exchange) return true
 
-          console.warn("[v0] [redis-db] getAllConnections: ignoring malformed connection hash", {
+          // Not a crash — ghost keys left from an aborted save or a partial
+          // migration are silently skipped. Downgraded from warn to debug to
+          // avoid polluting server logs on every poll interval.
+          console.debug("[v0] [redis-db] getAllConnections: skipping malformed connection hash", {
             id: id || undefined,
             name: name || undefined,
             exchange: exchange || undefined,

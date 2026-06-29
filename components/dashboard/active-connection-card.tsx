@@ -134,8 +134,17 @@ export function ActiveConnectionCard({
   const [infoDialogOpen, setInfoDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [logsDialogOpen, setLogsDialogOpen] = useState(false)
-  const [liveTrade, setLiveTrade] = useState(false)
-  const [presetMode, setPresetMode] = useState(false)
+  // Seed live-trade / preset switches from the connection prop so they
+  // render correctly on first mount before the engine-states poll fires.
+  // The poll (every 3–8 s) then corrects any drift against the DB flag.
+  const toInitBool = (v: unknown) =>
+    v === true || v === 1 || v === "1" || v === "true"
+  const [liveTrade, setLiveTrade] = useState(() =>
+    toInitBool((connection.details as any)?.is_live_trade)
+  )
+  const [presetMode, setPresetMode] = useState(() =>
+    toInitBool((connection.details as any)?.is_preset_trade)
+  )
   const [liveTradeLoading, setLiveTradeLoading] = useState(false)
   const [presetModeLoading, setPresetModeLoading] = useState(false)
   // Refs that mirror the loading states — mutated synchronously so the
@@ -559,6 +568,16 @@ export function ActiveConnectionCard({
     const handleLiveTradeToggled = (event: Event) => {
       const customEvent = event as CustomEvent
       if (customEvent.detail?.connectionId === connection.connectionId) {
+        // `live-trade-toggled` carries { connectionId, newState } from QuickstartOptionsBar.
+        // Apply it directly so this card's switch syncs without waiting for the
+        // 3–8 s engine-states poll — but only when the toggle isn't already
+        // in-flight from this card itself (guard matches handleLiveTradeToggle).
+        if (typeof customEvent.detail?.newState === "boolean" && !liveTradeLoadingRef.current) {
+          setLiveTrade(customEvent.detail.newState)
+        }
+
+        // `connection-settings-updated` carries { connectionId, settings } from volume sliders.
+        // Apply any volume changes embedded in the settings bag.
         const updatedSettings = customEvent.detail?.settings || {}
         const liveFactor = Number(updatedSettings.live_volume_factor ?? updatedSettings.volume_factor_live)
         const presetFactor = Number(updatedSettings.preset_volume_factor ?? updatedSettings.volume_factor_preset)
