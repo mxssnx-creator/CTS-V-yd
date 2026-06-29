@@ -3710,27 +3710,27 @@ export class TradeEngineManager {
           getSettings(`connection:${this.connectionId}`),
         ])
 
-        // ── DEV SYMBOL CAP ────────────────────────────────────────────────
+        // ── DEV / LOCAL-PROD SYMBOL CAP ───────────────────────────────────
         // In development the InlineLocalRedis emulator holds ALL state on the
         // Node.js heap, so symbol count directly controls peak RSS. The cap
         // is controlled by V0_DEV_SYMBOL_COUNT (env var, default "1") so it
         // can be raised to 10+ on a larger-RAM VM without touching code.
         //
-        // Behaviour:
-        //   V0_DEV_SYMBOL_COUNT=1  → always ["BTCUSDT"] (minimum safe, old default)
-        //   V0_DEV_SYMBOL_COUNT=10 → normal resolution below, then slice to 10
-        //   unset                  → default 1, same as before
+        // ALSO applied when running `next start` locally (NODE_ENV=production
+        // but VERCEL !== "1"). On a local VM the same RSS constraint applies.
+        // True Vercel deployments always have VERCEL="1" so they are unaffected.
         //
-        // Production (NODE_ENV !== "development") is COMPLETELY UNAFFECTED —
-        // this block only runs in the dev Next.js worker.
-        if (process.env.NODE_ENV === "development") {
+        // Behaviour:
+        //   V0_DEV_SYMBOL_COUNT=1  → always ["BTCUSDT"] (minimum safe, default)
+        //   V0_DEV_SYMBOL_COUNT=10 → normal resolution below, then slice to 10
+        //   unset                  → default 1
+        const _isLocalRun = process.env.NODE_ENV === "development" ||
+          (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")
+        if (_isLocalRun) {
           const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "1"
           const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 1)
           // Fast path for the default single-symbol case — skip the Redis
           // resolution chain entirely; BTCUSDT is the canonical dev fixture.
-          // QuickStart can set dev_symbol_count_override so explicit 4-symbol
-          // smoke tests exercise the same multi-symbol path without requiring
-          // an environment restart.
           if (devCap === 1) return ["BTCUSDT"]
           // For devCap > 1 fall through to the full resolution chain below
           // (force_symbols → self-written symbols → volatility fetch).
