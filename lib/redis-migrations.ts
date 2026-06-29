@@ -3459,22 +3459,24 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       continue
     }
 
-    // Existing connection: if is_live_trade is still "0"/false and active_symbols
-    // is empty, apply the same defaults (handles the case where the connection
-    // existed but was created before migration 031 added these fields).
+    // Existing connection: repair missing selection defaults only.
+    // Never re-enable `is_live_trade` here: it is an operator-controlled flag
+    // and migrations/bootstraps run during every production cold start. The
+    // first-time seed above may choose a fresh default, but an existing row with
+    // `is_live_trade = "0"` means the operator disabled live trading and must
+    // stay disabled until the live-trade route or explicit Start changes it.
     {
-      const liveFlag = String(existing["is_live_trade"] ?? "0")
-      const hasLiveTrade = liveFlag === "1" || liveFlag === "true"
       // We no longer require a static active_symbols list — the default is
       // dynamic top-N selection by 1h volatility (getSymbols). We only ensure
-      // is_live_trade + the selection config (symbol_count / symbol_order /
-      // volume) are present so the engine can place live orders and pick
-      // symbols on the first tick. We never seed a static symbol list here.
+      // missing selection config (symbol_count / symbol_order / volume) is
+      // present so the engine can pick symbols on the first tick. We never seed
+      // a static symbol list here.
       const hasOrder = String(existing["symbol_order"] ?? "").length > 0
-      if (cfg.autoActive && cfg.exchange === "bingx" && (!hasLiveTrade || !hasOrder)) {
+      const needsSelectionRepair =
+        !hasOrder || !existing["symbol_count"] || !existing["live_volume_factor"] || !existing["position_mode"]
+      if (cfg.autoActive && cfg.exchange === "bingx" && needsSelectionRepair) {
         const patchData: Record<string,string> = {}
-        if (!hasLiveTrade) patchData["is_live_trade"] = "1"
-        if (!hasOrder)     patchData["symbol_order"]  = "volatility_1h"
+        if (!hasOrder) patchData["symbol_order"] = "volatility_1h"
         if (!existing["symbol_count"]) patchData["symbol_count"] = DEFAULT_SYMBOL_COUNT
         if (!existing["live_volume_factor"]) patchData["live_volume_factor"] = "0.1"
         if (!existing["position_mode"]) patchData["position_mode"] = "hedge"

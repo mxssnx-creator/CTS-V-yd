@@ -334,6 +334,23 @@ describe("requested regression guardrails", () => {
     expect(source).toContain('startEngine(${connectionId}) queued/skipped in production UI worker')
   })
 
+  test("base connection migrations preserve existing live-trade operator state", () => {
+    const source = read("lib/redis-migrations.ts")
+    const existingBlock = source.slice(
+      source.indexOf("Existing connection: repair missing selection defaults only."),
+      source.indexOf("// Existing connection: PRESERVE every operator-controlled field."),
+    )
+
+    expect(existingBlock).toContain("Never re-enable `is_live_trade` here")
+    expect(existingBlock).toContain('existing row with')
+    expect(existingBlock).toContain("const needsSelectionRepair =")
+    expect(existingBlock).toContain("!hasOrder || !existing")
+    expect(existingBlock).toContain('if (cfg.autoActive && cfg.exchange === "bingx" && needsSelectionRepair)')
+    expect(existingBlock).toContain('patchData["symbol_order"] = "volatility_1h"')
+    expect(existingBlock).not.toContain('patchData["is_live_trade"] = "1"')
+    expect(existingBlock).not.toContain("!hasLiveTrade")
+  })
+
   test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
