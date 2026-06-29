@@ -6,6 +6,7 @@ import { API_VERSIONS } from "@/lib/system-version"
 
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
+export const maxDuration = 30
 
 const API_VERSION = API_VERSIONS.connections
 

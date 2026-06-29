@@ -5,6 +5,7 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
+export const maxDuration = 30
 export const revalidate = 0
 
 function toNumber(value: unknown): number {

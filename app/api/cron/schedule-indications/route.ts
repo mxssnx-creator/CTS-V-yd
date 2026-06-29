@@ -11,6 +11,7 @@
 import { NextResponse } from "next/server"
 
 export const dynamic = "force-dynamic"
+export const maxDuration = 60
 export const revalidate = 0
 export const fetchCache = "force-no-store"
 

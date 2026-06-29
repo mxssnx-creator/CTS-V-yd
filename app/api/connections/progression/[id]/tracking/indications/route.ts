@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { getIndicationTracking } from "@/lib/detailed-tracking"
 
 export const dynamic = "force-dynamic"
+export const maxDuration = 30
 
 export async function GET(
   _req: Request,

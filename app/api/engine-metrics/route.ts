@@ -6,6 +6,7 @@ import { MetricsAggregator } from "@/lib/metrics-aggregator"
 import { getEngineLogger } from "@/lib/engine-logger"
 
 export const dynamic = "force-dynamic"
+export const maxDuration = 60
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)

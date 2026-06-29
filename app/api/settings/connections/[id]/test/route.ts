@@ -55,6 +55,7 @@ async function withRetry<T>(
 }
 
 export const dynamic = "force-dynamic"
+export const maxDuration = 15
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const testLog: string[] = []
   const startTime = Date.now()

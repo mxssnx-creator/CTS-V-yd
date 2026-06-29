@@ -22,6 +22,7 @@ import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { SystemLogger } from "@/lib/system-logger"
 
 export const runtime = "nodejs"
+export const maxDuration = 15
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
 
