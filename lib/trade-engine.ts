@@ -383,41 +383,69 @@ export class GlobalTradeEngineCoordinator {
       const manager = this.engineManagers.get(connectionId)
 
       if (!manager) {
-        console.log(`[v0] No engine found for connection: ${connectionId}`)
+        console.log(`[v0] No in-memory engine found for connection: ${connectionId}; running Redis cleanup anyway`)
+        await this.cleanupStoppedRuntimeState(connectionId)
         return
       }
 
       await manager.stop()
       this.engineManagers.delete(connectionId)
 
-      // Clear the `engine_is_running` Redis flag immediately after the manager
-      // stops. This prevents the subsequent `startEngine` call from hitting its
-      // startup-lock guard ("Engine already running — skipping") when the flag
-      // survived from a previous run or was never cleaned up by the caller.
-      // Fire-and-forget — stop must not fail just because Redis is unavailable.
-      try {
-        const { getRedisClient } = await import("@/lib/redis-db")
-        const redisClient = getRedisClient()
-        await Promise.all([
-          redisClient.del(`engine_is_running:${connectionId}`),
-          // Flip is_active_inserted back to "0" so the dashboard card
-          // returns to the Connections panel on stop (mirrors the start path above).
-          redisClient.hset(`connection:${connectionId}`, {
-            is_active_inserted: "0",
-            is_active:          "0",
-            updated_at:         new Date().toISOString(),
-          }),
-        ])
-        console.log(`[v0] ✓ Cleared engine_is_running flag for ${connectionId}`)
-      } catch (redisErr) {
-        console.warn(`[v0] [STOP LOCK] Could not clear engine_is_running flag for ${connectionId}:`, redisErr)
-      }
+      await this.cleanupStoppedRuntimeState(connectionId)
 
       console.log(`[v0] ✓ TradeEngine stopped for connection: ${connectionId}`)
     } finally {
       // Step 3: Remove from stop lock set (always, even on error)
       this.stoppingEngines.delete(connectionId)
       console.log(`[v0] [STOP LOCK] Removed ${connectionId} from stop lock`)
+    }
+  }
+
+  /**
+   * Best-effort runtime cleanup shared by both normal stops and "no local
+   * manager" stops. This intentionally does NOT mutate Main Connections
+   * assignment flags (`is_active_inserted`, `is_dashboard_inserted`,
+   * `is_assigned`). Assignment is user intent and is only cleared by explicit
+   * remove/unassign flows; a normal engine stop should only mark runtime state
+   * as stopped.
+   */
+  private async cleanupStoppedRuntimeState(connectionId: string): Promise<void> {
+    try {
+      const { getRedisClient, initRedis, setSettings } = await import("@/lib/redis-db")
+      await initRedis().catch(() => undefined)
+      const redisClient = getRedisClient()
+      const nowIso = new Date().toISOString()
+      const nowMs = String(Date.now())
+
+      await Promise.all([
+        redisClient.del(`engine_is_running:${connectionId}`).catch(() => 0),
+        redisClient.hset(`trade_engine_state:${connectionId}`, {
+          status: "stopped",
+          is_running: "false",
+          engine_started: "false",
+          stopped_at: nowIso,
+          updated_at: nowIso,
+          stop_requested: "1",
+          stop_requested_at: nowIso,
+        }).catch(() => 0),
+        redisClient.hset(`progression:${connectionId}`, {
+          engine_started: "false",
+          prehistoric_phase_active: "false",
+          ended_at: nowMs,
+          last_update: nowIso,
+          stop_requested: "1",
+          stop_requested_at: nowIso,
+        }).catch(() => 0),
+        setSettings(`engine_progression:${connectionId}`, {
+          phase: "stopped",
+          progress: 0,
+          detail: "Engine stopped",
+          updated_at: nowIso,
+        }).catch(() => undefined),
+      ])
+      console.log(`[v0] ✓ Cleaned stopped runtime state for ${connectionId}`)
+    } catch (redisErr) {
+      console.warn(`[v0] [STOP LOCK] Could not clean stopped runtime state for ${connectionId}:`, redisErr)
     }
   }
 
