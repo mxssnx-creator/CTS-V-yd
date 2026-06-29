@@ -20,6 +20,7 @@ const checks = [
 
 const syntaxFiles = [
   "app/api/trade-engine/start/route.ts",
+  "lib/detailed-tracking.ts",
 ]
 
 let failed = false
@@ -60,10 +61,12 @@ function assertTopLevelExport(file, exportName) {
   const abs = resolve(root, file)
   const source = readFileSync(abs, "utf8")
   const marker = `export function ${exportName}`
-  const index = source.indexOf(marker)
+  const asyncMarker = `export async function ${exportName}`
+  const markerToUse = source.includes(marker) ? marker : asyncMarker
+  const index = source.indexOf(markerToUse)
   if (index === -1) {
     failed = true
-    console.error(`[source-syntax] ${file}: Missing ${marker}.`)
+    console.error(`[source-syntax] ${file}: Missing ${marker} or ${asyncMarker}.`)
     return
   }
 
@@ -76,7 +79,7 @@ function assertTopLevelExport(file, exportName) {
 
   if (depth !== 0) {
     failed = true
-    console.error(`[source-syntax] ${file}: ${marker} is nested inside an unclosed block.`)
+    console.error(`[source-syntax] ${file}: ${markerToUse} is nested inside an unclosed block.`)
   }
 }
 
@@ -105,6 +108,7 @@ function assertTopLevelAsyncGet(file) {
 }
 
 assertTopLevelExport("lib/trade-engine/stages/live-stage.ts", "clearMarginCooldown")
+assertTopLevelExport("lib/detailed-tracking.ts", "getStrategyTracking")
 assertTopLevelAsyncGet("app/api/cron/server-continuity/route.ts")
 
 if (failed) {
