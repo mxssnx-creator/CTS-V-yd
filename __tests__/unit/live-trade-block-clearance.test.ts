@@ -1,4 +1,4 @@
-import { hasLiveTradeBlock } from "@/lib/live-trade-gates"
+import { hasRealTradeBlock } from "@/lib/real-trade-gates"
 
 const mockConnection = {
   id: "conn-live-blocked",
@@ -73,7 +73,7 @@ describe("live-trade block clearance", () => {
     expect(updated.live_trade_blocked_reason).toBe("")
     expect(updated.live_trade_requested).toBe("1")
     expect(updated.last_test_status).toBe("success")
-    expect(hasLiveTradeBlock(updated)).toBe(false)
+    expect(hasRealTradeBlock(updated)).toBe(false)
     expect(logProgressionEvent).toHaveBeenCalledWith(
       mockConnection.id,
       "live_trading",
