@@ -400,6 +400,7 @@ export interface EngineConfig {
   connection_name?: string
   exchange?: string
   engine_type?: string
+  allowInProcessStart?: boolean
   indicationInterval?: number // seconds, default 1
   strategyInterval?: number // seconds, default 1
   realtimeInterval?: number // seconds, default 1
