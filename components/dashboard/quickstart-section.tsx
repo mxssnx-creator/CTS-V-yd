@@ -381,6 +381,13 @@ export function QuickstartSection() {
   // Ref that mirrors `starting` but is mutated synchronously so fetchStats'
   // race guard always reads the current value regardless of closure age.
   const startingRef = useRef(false)
+  // Grace period ref: stays true for 45 s after a successful start POST while
+  // the engine boots through prehistoric (no indication cycles yet).
+  // Prevents fetchStats from flipping isRunning back to false before the server
+  // writes its first engineRunning=true, which only happens after the first
+  // realtime cycle completes (~30-120 s depending on prehistoric length).
+  const startingGraceRef = useRef(false)
+  const startingGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Persisted across reloads (via localStorage) so QuickStart restores the
   // exact running/expanded/situation state of the current session.
   // IMPORTANT (hydration): initialise to the SAME values the server renders

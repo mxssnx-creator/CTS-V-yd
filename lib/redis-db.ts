@@ -1967,6 +1967,42 @@ function parseHashValue(value: unknown): unknown {
   return strValue
 }
 
+// Fields that are genuinely numeric but whose raw Redis values are "1", "2",
+// etc. — strings that `parseHashValue` would coerce to boolean `true` because
+// of the "1"→true shorthand.  For these fields we force a Number() parse so
+// the UI slider/input always receives an integer, not `true`/`false`.
+const NUMERIC_HASH_FIELDS = new Set([
+  "symbol_count", "symbolCount",
+  "block_max_stack", "blockMaxStack",
+  "block_volume_ratio", "blockVolumeRatio",
+  "block_pause_count_ratio", "blockPauseCountRatio",
+  "max_concurrent_trades", "maxConcurrentTrades",
+  "prev_pos_min_count", "prevPosMinCount",
+  "prev_pos_window", "prevPosWindow",
+  "main_eval_pos_count", "mainEvalPosCount",
+  "real_eval_pos_count", "realEvalPosCount",
+  "min_step", "minStep",
+  "trailing_min_step", "trailingMinStep",
+  "leverage_percentage", "leveragePercentage",
+  "live_volume_factor", "preset_volume_factor",
+  "volume_factor", "volume_factor_live", "volume_factor_preset",
+  "volume_step_ratio",
+  "axis_prev_max_window", "axisPrevMaxWindow",
+  "axis_last_max_window", "axisLastMaxWindow",
+  "axis_cont_max_window", "axisContMaxWindow",
+  "axis_pause_max_window", "axisPauseMaxWindow",
+  "base_profit_factor", "baseProfitFactor",
+  "main_profit_factor", "mainProfitFactor",
+  "real_profit_factor", "realProfitFactor",
+  "live_profit_factor", "liveProfitFactor",
+  "max_drawdown_time_main_hours", "maxDrawdownTimeMainHours",
+  "max_drawdown_time_real_hours", "maxDrawdownTimeRealHours",
+  "max_drawdown_time_live_hours", "maxDrawdownTimeLiveHours",
+  "stage_min_pos_count_base", "stageMinPosCountBase",
+  "stage_min_pos_count_main", "stageMinPosCountMain",
+  "stage_min_pos_count_real", "stageMinPosCountReal",
+])
+
 function parseHash(hash: Record<string, string> | null): Record<string, any> | null {
   // Empty hash → null. Real Redis hGetAll returns {} for missing keys (the
   // emulator now matches that), but getSettings' contract is `any | null`
@@ -1976,7 +2012,13 @@ function parseHash(hash: Record<string, string> | null): Record<string, any> | n
   if (!hash || Object.keys(hash).length === 0) return null
   const result: Record<string, any> = {}
   for (const [key, value] of Object.entries(hash)) {
-    result[key] = parseHashValue(value)
+    if (NUMERIC_HASH_FIELDS.has(key) && typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) {
+      // Force numeric parse — these fields legitimately hold numbers like "1",
+      // "2", "0.1" that parseHashValue would wrongly coerce to true/false/0.
+      result[key] = value.includes(".") ? parseFloat(value) : parseInt(value, 10)
+    } else {
+      result[key] = parseHashValue(value)
+    }
   }
   return result
 }
