@@ -1705,6 +1705,8 @@ const migrations: Migration[] = [
         // Block strategy tuning
         blockVolumeRatio: "1.0",
         blockMaxStack:    "3",
+        blockPauseCountRatio: "1.0",
+        blockActiveLiveEnabled: "true",
       }
 
       // ── 1. app_settings global fallback ─────────────────────────────────
@@ -2028,6 +2030,8 @@ const migrations: Migration[] = [
         // Block knobs
         blockVolumeRatio:     "1.0",
         blockMaxStack:        "3",
+        blockPauseCountRatio: "1.0",
+        blockActiveLiveEnabled: "true",
         // Eval thresholds
         mainEvalPosCount:     "3",
         realEvalPosCount:     "3",
@@ -2408,6 +2412,8 @@ const migrations: Migration[] = [
         variantPauseEnabled:    "true",
         blockVolumeRatio:       "1.0",
         blockMaxStack:          "3",
+        blockPauseCountRatio: "1.0",
+        blockActiveLiveEnabled: "true",
         mainEvalPosCount:       "3",
         realEvalPosCount:       "3",
         minStep:                "5",
@@ -3033,6 +3039,8 @@ const migrations: Migration[] = [
         variantDcaEnabled:      "false", // spec: DCA OFF by default
         blockVolumeRatio:       "1.0",
         blockMaxStack:          "3",
+        blockPauseCountRatio: "1.0",
+        blockActiveLiveEnabled: "true",
       }
       const seedIfAbsent = async (hashKey: string) => {
         const existing = ((await client.hgetall(hashKey).catch(() => ({}))) || {}) as Record<string, string>

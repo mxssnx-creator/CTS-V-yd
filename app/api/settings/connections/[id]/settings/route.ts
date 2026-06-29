@@ -58,7 +58,7 @@ export async function GET(
           // Axis max-window values
           "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
           // Block strategy tuning
-          "blockVolumeRatio", "blockMaxStack",
+          "blockVolumeRatio", "blockMaxStack", "blockPauseCountRatio", "blockActiveLiveEnabled",
           // PF / DDT / stage thresholds
           "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
           "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
@@ -345,7 +345,9 @@ export async function PATCH(
             }
           }
 
-          // Block-strategy tuning knobs (blockVolumeRatio 0.25-3.0, blockMaxStack 2-8).
+          // Block-strategy tuning knobs (blockVolumeRatio 0.25-3.0,
+          // blockMaxStack 2-8, blockPauseCountRatio 1-4 step 0.5,
+          // blockActiveLiveEnabled boolean).
           // Previously never written to the hash — engine always used 1.0/3.
           const bvr = Number(coord.blockVolumeRatio)
           if (Number.isFinite(bvr) && bvr > 0) {
@@ -354,6 +356,13 @@ export async function PATCH(
           const bms = Number(coord.blockMaxStack)
           if (Number.isFinite(bms) && bms >= 2) {
             flatKnobs.blockMaxStack = String(Math.min(8, Math.max(2, Math.floor(bms))))
+          }
+          const bpcr = Number(coord.blockPauseCountRatio)
+          if (Number.isFinite(bpcr) && bpcr > 0) {
+            flatKnobs.blockPauseCountRatio = String(Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2)))
+          }
+          if (typeof coord.blockActiveLiveEnabled === "boolean") {
+            flatKnobs.blockActiveLiveEnabled = String(coord.blockActiveLiveEnabled)
           }
         }
       }

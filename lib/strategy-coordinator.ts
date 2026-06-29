@@ -6,7 +6,7 @@
  * 1. BASE: Create one strategy Set per (indication_type × direction) combination
  *          Each Set holds up to 250 config entries. Count = number of Sets.
  * 2. MAIN: Select Sets where avgProfitFactor >= 1.2 (from base).
- *          Expand each Set with position-size / leverage config variants.
+ *          Expand each Set with Standard/default plus Adjust variants.
  *          Max 250 entries per Set; rearrange by performance when over limit.
  * 3. REAL: Select Sets where avgProfitFactor >= 1.4 (from main).
  *          Exchange-mirrored high-confidence strategies.
@@ -47,10 +47,12 @@ export interface StrategyEvaluation {
 }
 
 // One Set = one unique (indication_type × direction) combination at BASE.
-// At MAIN we additionally produce related variant Sets derived from a parent
-// Base Set — these carry `parentSetKey` (=> the Base Set they derive from)
-// and `variant` (=> default / trailing / block / dca). REAL and LIVE stages
-// treat them uniformly alongside base-promoted Sets.
+// At MAIN we additionally produce related Sets derived from a parent Base Set.
+// These carry `parentSetKey` and `variant`. IMPORTANT: trailing is NOT a
+// Main-stage Adjust strategy. Trailing is coordinated at BASE: createBaseSets
+// emits independent Base Sets with trailingProfile; those Sets then continue
+// through the same Standard/default and block/dca Adjust flow as every other
+// Base Set.
 export interface StrategySet {
   setKey: string            // e.g. "direction:long" (Base) or "direction:long#block" (Main variant)
   indicationType: string
@@ -102,7 +104,7 @@ export interface StrategySet {
    * The slim variant Set carries `entries: []` and resolves Base entries at
    * dispatch via `coordIndex.base.byKey`. But the per-variant SIZE and
    * LEVERAGE coordination (block's vol-ratio-scaled notional, dca's 0.5×
-   * reduce, trailing's 3/5× leverage) lives on the variant's `profile.configs`
+   * reduce) lives on the Adjust variant's `profile.configs`
    * — NOT on the shared Base entries. Without surfacing them here the slim
    * path would silently dispatch every variant at the Base entry's size/
    * leverage (1.0× / 1×), discarding the block vol-ratio calc entirely.
@@ -784,29 +786,34 @@ export class StrategyCoordinator {
       dca:      boolean
     }
     /**
-     * Block-strategy live-position × volume-ratio coordination knobs.
+     * Block-strategy previous-position × volume-ratio coordination knobs.
      *
-     * The Block variant fires when the per-symbol open-position count is in
-     * `[1 .. blockMaxStack-1]` and emits ADD-ON entries that scale on TWO
-     * axes simultaneously:
+     * Block uses completed-position history, not currently-open position count.
+     * Every block size `[1 .. blockMaxStack]` is evaluated as its own execution
+     * overlay on top of the already-selected Standard/Trailing Set so each
+     * block count can recover independently until that count's results are
+     * positive again.
      *
-     *   1. **Live position count** — each additional open position on the
-     *      symbol multiplies the add-on size by `(1 + (n-1) × ratio)` where
-     *      `n = continuousCount` and `ratio = blockVolumeRatio`. At `n=1`
-     *      the multiplier is 1.0 (no scaling — first add-on uses raw base
-     *      sub-config size). At `n=2` it becomes `(1 + ratio)`.
+     *   1. **Block count** — each block size multiplies add-on size by
+     *      `(1 + (blockCount-1) × ratio)`, where ratio is blockVolumeRatio.
      *
-     *   2. **Operator vol-ratio** — `blockVolumeRatio` is the per-position
-     *      additive step (0.25 = +25 % per extra open position). The spec
+     *   2. **Operator vol-ratio** — `blockVolumeRatio` is the per-block-count
+     *      additive step (0.25 = +25 % per extra block count). The spec
      *      default 1.0 mirrors the legacy `applyBlockAdjustment` math in
      *      `lib/strategies.ts` so existing presets keep their behaviour.
      *
-     * `blockMaxStack` replaces the magic `< 3` literal that used to live
-     * inside the variant gate; the operator can now widen or narrow the
-     * cap from the Connection Settings dialog without a code change.
+     * `blockPauseCountRatio` turns a block count into a pause window for
+     * post-success cooldown/evaluation (`pause = blockCount × ratio`).
+     *
+     * `blockActiveLiveEnabled` adds an optional active-live-position overlay
+     * path. It is independent from completed-position block-count overlays and
+     * lets currently running live exposure receive Block add-ons even when the
+     * completed-position block count is not the driver for that cycle.
      */
     blockVolumeRatio: number
     blockMaxStack:    number
+    blockPauseCountRatio: number
+    blockActiveLiveEnabled: boolean
     /**
      * ── Stage-validation min-position thresholds (operator spec) ──────
      *
@@ -834,12 +841,17 @@ export class StrategyCoordinator {
       pause: { enabled: true,  maxWindow: 8  },
     },
     variants: {
+      // Compatibility storage only. Trailing is coordinated at BASE via
+      // strategyBaseTrailingEnabled/strategyBaseTrailingVariants, not emitted
+      // as a Main-stage Adjust variant.
       trailing: true,
       block:    true, // ← ENABLED by default (per spec)
       dca:      false, // ← OFF by default (per spec); parser also defaults false
     },
     blockVolumeRatio: 1.0,
     blockMaxStack:    3,
+    blockPauseCountRatio: 1.0,
+    blockActiveLiveEnabled: true,
     mainEvalPosCount: 15,
     realEvalPosCount: 10,
   }
@@ -1317,7 +1329,9 @@ export class StrategyCoordinator {
       this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
       this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
 
-      // Variant toggles. Defaults: trailing=true, block=true, dca=false (spec: DCA off).
+      // Adjust-variant toggles. Defaults: block=true, dca=false (spec: DCA off).
+      // variantTrailingEnabled is kept only as a backwards-compatible stored
+      // flag; trailing Sets are created at BASE, not emitted as Main Adjusts.
       // The bool() helper only falls back to the default when the key is genuinely
       // absent — an explicit "false" is honoured.
       this._coordinationSettings.variants.trailing = bool(s.variantTrailingEnabled, true)
@@ -1325,9 +1339,9 @@ export class StrategyCoordinator {
       this._coordinationSettings.variants.dca      = bool(s.variantDcaEnabled,      false)
 
       // ── Block-strategy tuning (previously never read from settings) ─────
-      // blockVolumeRatio and blockMaxStack control the Block variant's live
-      // size-stacking formula. Without reading them here the engine always
-      // used the coded defaults (1.0 / 3) regardless of operator changes.
+      // blockVolumeRatio, blockMaxStack, blockPauseCountRatio, and
+      // blockActiveLiveEnabled control Block overlays. Without reading them here
+      // the engine always used coded defaults regardless of operator changes.
       const bvr = Number(s.blockVolumeRatio)
       if (Number.isFinite(bvr) && bvr > 0) {
         this._coordinationSettings.blockVolumeRatio = Math.max(0.25, Math.min(3.0, bvr))
@@ -1336,6 +1350,11 @@ export class StrategyCoordinator {
       if (Number.isFinite(bms) && bms >= 2) {
         this._coordinationSettings.blockMaxStack = Math.min(8, Math.max(2, Math.floor(bms)))
       }
+      const bpcr = Number(s.blockPauseCountRatio)
+      if (Number.isFinite(bpcr) && bpcr > 0) {
+        this._coordinationSettings.blockPauseCountRatio = Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))
+      }
+      this._coordinationSettings.blockActiveLiveEnabled = bool(s.blockActiveLiveEnabled, true)
     } catch {
       // use last-known values on any Redis error
     }
@@ -1573,7 +1592,7 @@ export class StrategyCoordinator {
    * Returns one TrailingProfile per ENABLED `(start, stop)` combo.
    *
    * When the master toggle (`strategyBaseTrailingEnabled`) is off OR no
-   * variants are enabled, returns `[]` and the caller falls back to the
+   * trailing range profiles are enabled, returns `[]` and the caller falls back to the
    * legacy single-Set path with confidence-based trailing on/off.
    *
    * Cached per-cycle on `this._trailingVariantsCache` so the per-symbol
@@ -1636,10 +1655,11 @@ export class StrategyCoordinator {
   }
 
   /**
-   * Create one StrategySet per (indication_type × direction × trailing_variant)
-   * combination. Each Set holds multiple config entries (max 250).
+   * Create one StrategySet per (indication_type × direction × trailing range)
+   * combination. Each trailing range is a BASE coordination profile, not a
+   * Main-stage Adjust strategy. Each Set holds multiple config entries (max 250).
    *
-   * When multi-step trailing is disabled (or no variants are enabled), the
+   * When multi-step trailing is disabled (or no range profiles are enabled), the
    * fan-out collapses to one Set per (type × direction) — original behaviour.
    */
   private async createBaseSets(
@@ -1733,7 +1753,7 @@ export class StrategyCoordinator {
       console.warn(`[v0] [StrategyFlow] ${symbol} prev-pos prefetch failed:`, posErr)
     }
 
-    // Multi-step trailing matrix — `[]` (= no fan-out) collapses to legacy
+    // Multi-step trailing range matrix — `[]` (= no fan-out) collapses to legacy
     // single-Set-per-(type,direction) behaviour. We use `[null]` as a
     // sentinel "untrailed" pass so the body of the loop is shared between
     // both paths.
@@ -1743,8 +1763,8 @@ export class StrategyCoordinator {
 
     for (const variant of variantPasses) {
       for (const [baseSetKey, group] of setMap.entries()) {
-        // Per-variant Set key — keeps each trailing combo as an INDEPENDENT
-        // Set throughout the BASE → MAIN → REAL → LIVE flow.
+        // Per-range Set key — keeps each trailing combo as an INDEPENDENT
+        // BASE Set throughout the BASE → MAIN → REAL → LIVE flow.
         const setKey = variant ? `${baseSetKey}:${variant.tag}` : baseSetKey
 
         // Build up to maxEntries config entries for this Set
@@ -2138,11 +2158,10 @@ export class StrategyCoordinator {
     let reused = 0
 
     // ── 2. Variant profiles ─────────────────────────────────────────────
-    // The `block` gate must fire when THIS symbol already has an open
-    // position — not when any symbol globally does. Patch continuousCount
-    // to the per-symbol open count so both gate evaluation and the `cont`
-    // axis in axisWindows reflect the per-symbol reality. All other
-    // ctx fields (prev, last, pause) remain global / shared as designed.
+    // Patch continuousCount to the per-symbol open count so position-count
+    // axisWindows reflect the per-symbol reality. Block no longer gates on
+    // active open positions; it uses completed-position block-count overlays
+    // at Live dispatch. All other ctx fields remain global/shared as designed.
     const symbolCtx: PositionContext = {
       ...ctx,
       continuousCount: ctx.perSymbolOpen[symbol] ?? 0,
@@ -2210,19 +2229,23 @@ export class StrategyCoordinator {
       // Mark as valid for BASE→MAIN evaluation
       baseSet.status = "valid_base"
 
-      const variantsForThisBase = baseSet.trailingProfile
-        ? activeVariants.filter((p) => p.name === "default")
-        : activeVariants
+      // Trailing is a BASE range-coordination profile, not a Main variant.
+      // Once a trailing Base Set exists it must behave like any other Base Set:
+      // Standard/default validates it, then active Adjust strategies (block/dca)
+      // may layer on top. Block is an execution overlay on the already-selected
+      // Set (not an independent Main Set), while DCA remains materialized so its
+      // reduce/close stats and Real-stage evaluation stay independently visible.
+      // selectActiveVariants() already excludes the deprecated Main-stage
+      // `trailing` profile, so do not special-case trailingProfile here.
+      const variantsForThisBase = activeVariants.filter((p) => p.name !== "block")
 
       for (const profile of variantsForThisBase) {
         // Spawn async build task for this variant
         buildTasks.push((async () => {
           // ── IMPORTANT: fingerprint must use symbolCtx (per-symbol continuousCount)
-          // not the global ctx — the block variant's configs were built from symbolCtx
-          // (which patches continuousCount to perSymbolOpen[symbol]).  Using global ctx
-          // here caused cross-symbol cache collisions: a symbol with 0 open positions
-          // would receive a cached block Set that was originally sized for a different
-          // symbol that had 2 open positions (wrong sizeMultiplier baked in).
+          // not the global ctx so position-count axis Sets do not collide across
+          // symbols with different active counts. Block is excluded from Main
+          // materialization and handled later as completed-position overlays.
           const fingerprint = this.variantFingerprint(baseSet, profile.name, symbolCtx)
           let cachedSet: StrategySet | null = null
 
@@ -2498,6 +2521,14 @@ export class StrategyCoordinator {
     // stats. This preserves the intended sequence:
     //   1. default Base mirror
     //   2. default position-count axis Sets
+    //   3. Adjust Sets (block, then DCA)
+    // Trailing Sets are already Base-derived Standard Sets with
+    // trailingProfile, not a separate Main-stage Adjust bucket.
+    const mainSetOrder = (set: StrategySet): number => {
+      if ((set.variant ?? "default") === "default" && !set.axisWindows?.axisKey) return 0
+      if ((set.variant ?? "default") === "default" && set.axisWindows?.axisKey) return 1
+      if (set.variant === "block") return 2
+      if (set.variant === "dca") return 3
     //   3. additional trailing Sets (independent Base-derived Sets)
     //   4. Adjust Sets (block, then DCA)
     const mainSetOrder = (set: StrategySet): number => {
@@ -2779,12 +2810,11 @@ export class StrategyCoordinator {
       // DEV-MODE CAP (was a blanket early-return): pseudo_position hashes are
       // the single largest heap allocator in the 20-symbol dev run (up to 3000
       // sets/symbol × 3 writes = 9000 ops/symbol/cycle → OOM at ~30s). But
-      // returning entirely starved getPositionContext() of open-position data,
-      // so the `block` variant gate (needs ≥1 open position) could NEVER fire
-      // in dev — leaving block/dca/trailing permanently at 0.
+      // returning entirely starved getPositionContext() of position data and
+      // left dca/trailing/progression dashboards permanently at 0 in dev.
       //
       // Compromise: in dev, write only the TOP-N Real Sets by profit factor.
-      // That gives the gates real open positions + populates the dashboard tile
+      // That gives the gates real sampled positions + populates the dashboard tile
       // while keeping the write volume bounded (N×3 ops, not 3000×3). Prod is
       // uncapped. Sorting is cheap relative to the avoided write amplification.
       const isDev = process.env.NODE_ENV === "development"
@@ -2878,6 +2908,99 @@ export class StrategyCoordinator {
     } catch (error) {
       console.warn(`[v0] Error creating pseudo positions from REAL sets for ${symbol}:`, error)
     }
+  }
+
+  /**
+   * Real-stage Active Live Position Block overlay.
+   *
+   * Active live-position Block handling belongs to REAL, not only final Live
+   * dispatch: the running exposure must be visible to Real-stage stats, caps,
+   * tuning and lineage before Live chooses exchange candidates. Completed-position
+   * block-count overlays remain a Live-dispatch expansion, while this option
+   * mirrors currently running live exposure as Real-stage block Sets.
+   */
+  private async buildActiveLiveBlockOverlaysForReal(
+    symbol: string,
+    sourceSets: StrategySet[],
+    metrics: EvaluationMetrics,
+    coordIndex?: CoordIndex,
+  ): Promise<StrategySet[]> {
+    if (!this._coordinationSettings.variants.block || !this._coordinationSettings.blockActiveLiveEnabled) {
+      return []
+    }
+
+    const blockProfile = this.variantProfiles().find((p) => p.name === "block")
+    const blockConfig = blockProfile?.configs.slice().sort((a, b) => b.pfBias - a.pfBias)[0]
+    if (!blockConfig) return []
+
+    const activePositions = await new PseudoPositionManager(this.connectionId).getActivePositions()
+    const activeByDir = { long: 0, short: 0 }
+    for (const pos of activePositions) {
+      if (String(pos.symbol || "").toUpperCase() !== symbol.toUpperCase()) continue
+      const dir = String(pos.direction || pos.side || "").toLowerCase() === "short" ? "short" : "long"
+      activeByDir[dir]++
+    }
+
+    const maxStack = Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))
+    const ratio = this._coordinationSettings.blockVolumeRatio
+    const pauseRatio = this._coordinationSettings.blockPauseCountRatio
+    const overlays: StrategySet[] = []
+
+    for (const dir of ["long", "short"] as const) {
+      const activeCount = activeByDir[dir]
+      if (activeCount <= 0) continue
+      const source = sourceSets.find((s) => s.direction === dir && s.variant !== "dca" && !String(s.setKey).includes("#block:active:"))
+      if (!source) continue
+
+      const boundedCount = Math.min(Math.max(1, activeCount), maxStack)
+      const blockMul = 1 + (boundedCount - 1) * ratio
+      const pauseWindow = Math.max(1, Math.min(32, Math.round(boundedCount * pauseRatio)))
+      const parentSetKey = source.parentSetKey || source.setKey
+      const axisWindows = {
+        ...(source.axisWindows || { prev: 0, last: 0, cont: 0, pause: 0 }),
+        cont: boundedCount,
+        pause: pauseWindow,
+        axisKey: `block:active:${boundedCount}:pause${pauseWindow}`,
+      }
+      const overlay: StrategySet = {
+        ...source,
+        setKey: `${source.setKey}#block:active:${boundedCount}`,
+        parentSetKey,
+        variant: "block",
+        axisWindows,
+        avgProfitFactor: Math.max(
+          metrics.minProfitFactor,
+          (source.avgProfitFactor || metrics.minProfitFactor) * blockConfig.pfBias,
+        ),
+        avgDrawdownTime: (source.avgDrawdownTime || 0) + (blockConfig.ddtBias * boundedCount),
+        variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6)),
+        variantLeverage: blockConfig.leverage,
+        status: "valid_real",
+      }
+      overlays.push(overlay)
+
+      if (coordIndex && !coordIndex.byCoordKey.has(overlay.setKey)) {
+        registerCoordRecord(coordIndex, {
+          coordKey: overlay.setKey,
+          parentKey: parentSetKey,
+          variant: "block",
+          axisWindows,
+          status: "valid_real",
+          avgProfitFactor: overlay.avgProfitFactor,
+          avgDrawdownTime: overlay.avgDrawdownTime,
+          avgConfidence: overlay.avgConfidence,
+          entryCount: overlay.entryCount,
+          indicationType: overlay.indicationType,
+          direction: overlay.direction,
+          prevPos: overlay.prevPos,
+          trailingProfile: overlay.trailingProfile,
+          _setView: overlay,
+          _hasLivePositions: true,
+        })
+      }
+    }
+
+    return overlays
   }
 
   /**
@@ -3210,9 +3333,28 @@ export class StrategyCoordinator {
         )
       }
     }
-    const realPostHedge = [...effectiveNetted, ...axisPassthrough].sort(
+    let realPostHedge = [...effectiveNetted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
+
+    try {
+      const activeLiveBlockOverlays = await this.buildActiveLiveBlockOverlaysForReal(
+        symbol,
+        realPostHedge,
+        metrics,
+        coordIndex,
+      )
+      if (activeLiveBlockOverlays.length > 0) {
+        realPostHedge = realPostHedge
+          .concat(activeLiveBlockOverlays)
+          .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+      }
+    } catch (err) {
+      console.warn(
+        `[v0] [StrategyFlow] ${symbol} Real-stage active-live Block overlay failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
 
     if (hedgeBuckets.size > 0) {
       logProgressionEvent(
@@ -4352,39 +4494,106 @@ export class StrategyCoordinator {
             //   • "new" variants (default, trailing): at most 1 per
             //   • "new" variants (default, trailing, pause): at most 1 per
             //     direction — first (highest-PF) wins.
-            //   • "block" variant: allowed through even when the direction
-            //     already has a "new" set selected. Block places an ADD-ON
-            //     order into an existing open position; the dedup-lock path
-            //     handles whether to accumulate or open a fresh add-on lot.
-            //     At most 1 block set per direction (the highest-PF one).
+            //   • "block" overlays: allowed through even when the direction
+            //     already has a "new" set selected. Block processes every
+            //     configured block size in parallel from completed-position
+            //     context; it is not gated by active open position count.
             //   • "dca" variant: same as block — at most 1 per direction,
             //     allowed alongside a "new" set.
             //
             // Without this rule, block/dca sets targeting e.g. long were
             // always dropped because `sawLong=true` was already set by the
             // default set, meaning block strategy NEVER dispatched.
+            //
+            // Block overlay model:
+            // Block is not materialized as its own Main/Real Set. When active,
+            // it overlays the best already-qualified Set for each direction for
+            // EVERY block size [1..blockMaxStack]. The block count is coordinated
+            // from previous completed-position recovery logic (not active open
+            // positions) and each count receives its own setKey/pause window so
+            // performance and cooldown can be tracked independently. If the
+            // operator enables Active Live Position Block, Real stage already
+            // materializes the running-exposure overlay before caps/stats/tuning;
+            // Live consumes that Real Set instead of creating it here. DCA remains a materialized
+            // Adjust Set because its reduce/close state has separate evaluation
+            // and stats semantics.
+            let dispatchCandidates = qualifying
+            if (this._coordinationSettings.variants.block) {
+              try {
+                const maxStack = Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))
+                const ratio = this._coordinationSettings.blockVolumeRatio
+                const pauseRatio = this._coordinationSettings.blockPauseCountRatio
+                const blockProfile = this.variantProfiles().find((p) => p.name === "block")
+                const blockConfig = blockProfile?.configs
+                  .slice()
+                  .sort((a, b) => b.pfBias - a.pfBias)[0]
+
+                if (blockConfig) {
+                  const blockOverlays: StrategySet[] = []
+                  for (const dir of ["long", "short"] as const) {
+                    const source = qualifying.find((s) => s.direction === dir && s.variant !== "dca")
+                    if (!source) continue
+                    for (let blockCount = 1; blockCount <= maxStack; blockCount++) {
+                      const blockMul = 1 + (blockCount - 1) * ratio
+                      const pauseWindow = Math.max(1, Math.min(32, Math.round(blockCount * pauseRatio)))
+                      blockOverlays.push({
+                        ...source,
+                        setKey: `${source.setKey}#block:${blockCount}`,
+                        parentSetKey: source.parentSetKey || source.setKey,
+                        variant: "block",
+                        axisWindows: {
+                          ...(source.axisWindows || { prev: 0, last: 0, cont: 0, pause: 0 }),
+                          cont: blockCount,
+                          pause: pauseWindow,
+                          axisKey: `block:${blockCount}:pause${pauseWindow}`,
+                        },
+                        avgProfitFactor: Math.max(
+                          metrics.minProfitFactor,
+                          (source.avgProfitFactor || metrics.minProfitFactor) * blockConfig.pfBias,
+                        ),
+                        avgDrawdownTime: (source.avgDrawdownTime || 0) + (blockConfig.ddtBias * blockCount),
+                        variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6)),
+                        variantLeverage: blockConfig.leverage,
+                      })
+                    }
+                  }
+                  if (blockOverlays.length > 0) {
+                    dispatchCandidates = [...qualifying, ...blockOverlays]
+                      .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+                  }
+                }
+              } catch (err) {
+                console.warn(
+                  `[v0] [StrategyFlow] ${symbol} block overlay coordination failed:`,
+                  err instanceof Error ? err.message : String(err),
+                )
+              }
+            }
+
             const dispatchSets: StrategySet[] = []
             {
               let sawNewLong  = false
               let sawNewShort = false
-              let sawBlockLong  = false
-              let sawBlockShort = false
               let sawDcaLong    = false
               let sawDcaShort   = false
-              for (const s of qualifying) {
+              for (const s of dispatchCandidates) {
                 const isBlock = s.variant === "block"
                 const isDca   = s.variant === "dca"
                 const isNew   = !isBlock && !isDca // default / trailing / pause
                 if (s.direction === "long") {
                   if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
-                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
+                  if (isBlock)                   { dispatchSets.push(s) }
                   if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
                 } else {
                   if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
-                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
+                  if (isBlock)                   { dispatchSets.push(s) }
                   if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
                 }
-                if (sawNewLong && sawNewShort && sawBlockLong && sawBlockShort && sawDcaLong && sawDcaShort) break
+                if (sawNewLong && sawNewShort && sawDcaLong && sawDcaShort) {
+                  // Do not early-break for Block overlays: every block size is
+                  // intentionally processed independently and in parallel.
+                  continue
+                }
               }
             }
 
@@ -4981,12 +5190,12 @@ export class StrategyCoordinator {
    *   - prevPosCount, prevLosses, lastPosCount, lastWins, lastLosses
    *     → closed pseudo positions within a 24h lookback window.
    * Intentional exceptions (fields based on OPEN state by design, per
-   * spec) ��� gates on these fields are NOT closed-only:
+   * spec) — gates on these fields are NOT closed-only:
    *   - continuousCount  → # currently-open pseudo positions
    *                        (spec: "Continuous Positions" are active)
-   *   - perSymbolOpen    → per-symbol open count (feeds `block` gate
-   *                        which explicitly needs an open position to
-   *                        continue into)
+   *   - perSymbolOpen    → per-symbol open count for position-count axes.
+   *                        Block itself is completed-position based and is
+   *                        overlaid at Live dispatch.
    * Every other axis used below is closed-only. This invariant keeps
    * Main-stage factor coordination free of floating mark-to-market
    * pollution while allowing the few gates that MUST reference live
@@ -4995,67 +5204,26 @@ export class StrategyCoordinator {
   private selectActiveVariants(ctx: PositionContext): Array<ReturnType<StrategyCoordinator["variantProfiles"]>[number]> {
     const all = this.variantProfiles()
     // ── P-VARIANT-ACT: activation toggle is the SOLE inclusion gate ───────
-    // Operator spec ("handle only if activated"): an enabled variant runs
-    // INDEPENDENTLY on every cycle. `trailing` emits its own dedicated sets
-    // (own configs / SL behaviour); `block` and `dca` layer ADDITIVELY on top
-    // of all sets. `default` is always on (operator fallback / Base mirror).
+    // Operator spec ("handle only if activated"): enabled ADJUST variants run
+    // after Standard/default. Trailing is intentionally excluded here: it is a
+    // BASE range-coordination type that emits independent Base Sets carrying
+    // trailingProfile; those Sets continue through Standard/default and the
+    // active block/dca Adjust flow like normal Base Sets.
     //
     // We deliberately no longer require the transient position-context gate
     // (`p.gate(ctx)`) to pass for inclusion. Those conditions (recent wins for
-    // trailing, live open-position count for block, recent losses for dca)
+    // trailing, completed-position recovery for block, recent losses for dca)
     // rarely align with the pseudo-position lifecycle and were silently
-    // suppressing activated variants — leaving trailing/block/dca permanently
-    // at 0 even when the operator had turned them on. Activation is now the
+    // suppressing activated variants — leaving block/dca permanently at 0 even
+    // when the operator had turned them on. Activation is now the
     // single source of truth: toggle ON ⇒ the variant is emitted; toggle OFF
-    // ⇒ it contributes nothing. The position context still PARAMETERISES
-    // `block`'s volume-ratio scaling below; it just no longer blocks emission.
+    // ⇒ it contributes nothing. Block volume-ratio scaling is applied later by
+    // the Live dispatch overlay for every configured block count.
     const filtered = all.filter((p) => {
       if (p.name === "default") return true
+      if (p.name === "trailing") return false
       return this._coordinationSettings.variants[p.name] === true
     })
-
-    // ── Block: live position × vol-ratio scaling ──────────────��──����───
-    //
-    // The Block variant's `configs[].size` is the *base* multiplier. The
-    // emitted Sets must scale on TWO live axes:
-    //
-    //   1. `continuousCount` (live open-position count on this symbol)
-    //   2. `blockVolumeRatio` (operator slider, 0.25..3.0)
-    //
-    // Multiplier formula:  m(n) = 1 + (n − 1) × ratio
-    //
-    //   - n = 1 (first add-on)  → m = 1.0   (raw base size; no scaling)
-    //   - n = 2                 → m = 1 + ratio
-    //   - n = 3                 → m = 1 + 2 × ratio
-    //   - n ≥ blockMaxStack     → gate already filtered this variant out
-    //
-    // We patch the variant in-place inside a *fresh* clone so the shared
-    // `variantProfiles()` array (built per-call but referenced by other
-    // emit paths in the same flow) is never mutated.
-    // `n` = live block depth, CLAMPED to [1, blockMaxStack]. Because activation
-    // no longer gates on depth, continuousCount can be 0 (→ n=1, raw base size)
-    // or arbitrarily large (e.g. the pseudo-model piling up 90 stubs → clamped
-    // down to the operator's max stack). Clamping keeps the vol-ratio multiplier
-    // bounded and correct: it never explodes past blockMaxStack steps.
-    const maxStack = Math.max(1, this._coordinationSettings.blockMaxStack | 0)
-    const n = Math.min(Math.max(1, ctx.continuousCount | 0), maxStack)
-    const ratio = this._coordinationSettings.blockVolumeRatio
-    const blockMul = 1 + (n - 1) * ratio
-    if (blockMul !== 1) {
-      const idx = filtered.findIndex((p) => p.name === "block")
-      if (idx !== -1) {
-        const orig = filtered[idx]
-        filtered[idx] = {
-          ...orig,
-          configs: orig.configs.map((c) => ({
-            ...c,
-            // `size` flows downstream as the Set's `sizeMultiplier`, so
-            // multiplying here is the single point of scaling.
-            size: Number((c.size * blockMul).toFixed(6)),
-          })),
-        }
-      }
-    }
 
     return filtered
   }
@@ -5072,8 +5240,8 @@ export class StrategyCoordinator {
    *
    * Gate predicates encode the user's coordination spec:
    *   default  — always on (validates & mirrors the Base Set)
-   *   trailing — recent winners, no open position (scale-in opportunity)
-   *   block    — there's an open position we can add to (continuation)
+   *   trailing — legacy placeholder only; real trailing Sets are created at BASE
+   *   block    — completed-position block-count overlays at Live dispatch
    *   dca      — recent losses to recover with averaged entries
    */
   /**
@@ -5296,27 +5464,23 @@ export class StrategyCoordinator {
       },
       {
         name: "trailing",
-        gate: (c) => c.lastWins >= 2 && c.continuousCount === 0,
-        configs: [
-          { size: 1.0, leverage: 3, state: "new", pfBias: 1.10, ddtBias: 30 },
-          { size: 1.0, leverage: 5, state: "new", pfBias: 1.15, ddtBias: 60 },
-        ],
+        // Deprecated Main-stage profile. Kept only so old persisted
+        // fingerprints remain parseable; selectActiveVariants() never emits it.
+        gate: () => false,
+        configs: [],
       },
       {
         name: "block",
-        // ── Block gate: ≥1 open pos on this symbol, capped by stack ─────
+        // ── Block gate: setting-driven; actual block counts are completed-pos
+        // overlays generated at Live dispatch, not open-position gates. ─────
         //
-        // The cap (`blockMaxStack`) is operator-controlled (defaults to 3
-        // for spec parity). At `n = blockMaxStack` the gate closes —
-        // preventing unbounded add-on stacking on a single symbol.
-        gate: (c) => c.continuousCount >= 1 && c.continuousCount < this._coordinationSettings.blockMaxStack,
-        // ── Block sub-configs ─ size is the *base* multiplier that
-        // `selectActiveVariants` THEN scales by `(1 + (n−1)×ratio)` at
-        // evaluation time so the live position count and the operator's
-        // vol-ratio knob both flow into the emitted Set's
-        // `sizeMultiplier`. Keeping the raw bases here (1.5 / 2.0)
-        // preserves the relative aggression spread between the two
-        // entries; the runtime scaling is additive on top.
+        // The cap (`blockMaxStack`) is operator-controlled (defaults to 3).
+        // Each blockCount 1..blockMaxStack is emitted independently as a
+        // transient execution overlay over the selected Set.
+        gate: () => true,
+        // ── Block sub-configs ─ size is the *base* multiplier that the
+        // block overlay then scales by `(1 + (blockCount−1)×ratio)` so the
+        // block count and operator vol-ratio knob both flow into live notional.
         configs: [
           { size: 1.5, leverage: 2, state: "add", pfBias: 1.08, ddtBias: 45 },
           { size: 2.0, leverage: 2, state: "add", pfBias: 1.12, ddtBias: 75 },
@@ -5476,8 +5640,10 @@ export class StrategyCoordinator {
       // V8 heap driver (~80 000 object allocations per second).
       entries:         [],
       // Variant size/leverage coordination — carried as scalars so dispatch
-      // applies the variant's OWN sizing (block vol-ratio-scaled, dca 0.5×,
-      // trailing 3/5×) instead of the Base entry's 1.0×/1×. See StrategySet.
+      // applies the Adjust variant's OWN sizing (block vol-ratio-scaled,
+      // dca 0.5×) instead of the Base entry's 1.0×/1×. Trailing is a
+      // Base-stage range-coordination type and flows via trailingProfile.
+      // See StrategySet.
       // Scoped to NON-default variants: the `default` variant exists to
       // validate & MIRROR the Base Set, so it must keep the Base entry's own
       // size/leverage (writing the profile config here would silently change

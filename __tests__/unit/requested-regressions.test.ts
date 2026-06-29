@@ -244,6 +244,54 @@ describe("requested regression guardrails", () => {
 
     expect(source).toContain("Operator rule: process the Standard strategy outputs first")
     expect(source).toContain("const mainSetOrder = (set: StrategySet): number")
+    expect(source).toContain('if (set.variant === "block") return 2')
+    expect(source).toContain('if (set.variant === "dca") return 3')
+    expect(source).toContain("mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))")
+  })
+
+  test("trailing is coordinated at Base and is not emitted as a Main adjust variant", () => {
+    const source = read("lib/strategy-coordinator.ts")
+
+    expect(source).toContain("trailing is NOT a")
+    expect(source).toContain("Main-stage Adjust strategy")
+    expect(source).toContain("Trailing is coordinated at BASE")
+    expect(source).toContain('if (p.name === "trailing") return false')
+    expect(source).toContain('const variantsForThisBase = activeVariants.filter((p) => p.name !== "block")')
+    expect(source).toContain("do not special-case trailingProfile here")
+    expect(source).toContain("legacy placeholder only; real trailing Sets are created at BASE")
+  })
+
+  test("block overlays completed-position counts and active-live exposure at Real stage", () => {
+    const source = read("lib/strategy-coordinator.ts")
+
+    expect(source).toContain("Block is not materialized as its own Main/Real Set")
+    expect(source).toContain('activeVariants.filter((p) => p.name !== "block")')
+    expect(source).toContain("EVERY block size [1..blockMaxStack]")
+    expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
+    expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
+    expect(source).toContain("Real-stage Active Live Position Block overlay")
+    expect(source).toContain("buildActiveLiveBlockOverlaysForReal")
+    expect(source).toContain("setKey: `${source.setKey}#block:active:${boundedCount}`")
+    expect(source).toContain("variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6))")
+    expect(source).toContain("variant: \"block\"")
+  })
+
+  test("block pause count ratio is persisted and clamped for strategy settings", () => {
+    const section = read("components/settings/strategy-coordination-section.tsx")
+    const route = read("app/api/settings/connections/[id]/settings/route.ts")
+    const coordinator = read("lib/strategy-coordinator.ts")
+
+    expect(section).toContain("blockPauseCountRatio: number")
+    expect(section).toContain("blockActiveLiveEnabled: boolean")
+    expect(section).toContain("Pause Count Ratio")
+    expect(section).toContain("Active Live Position Block")
+    expect(route).toContain("flatKnobs.blockPauseCountRatio")
+    expect(route).toContain("flatKnobs.blockActiveLiveEnabled")
+    expect(coordinator).toContain("this._coordinationSettings.blockPauseCountRatio")
+    expect(coordinator).toContain("this._coordinationSettings.blockActiveLiveEnabled")
+    expect(coordinator).toContain("Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))")
+  })
+
     expect(source).toContain('if (set.variant === "block") return 3')
     expect(source).toContain('if (set.variant === "dca") return 4')
     expect(source).toContain("mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))")
