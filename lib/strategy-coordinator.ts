@@ -1343,39 +1343,27 @@ export class StrategyCoordinator {
   }
 
   // ── Per-Base Stage Threshold Loader ───────────────────────────────────
-  // Reads stageMinPosCount{Base/Main/Real} from operator settings and
-  // snaps to the 5-step grid. Already written into _pfThresholdsLoadedAt
-  // TTL by loadAppPFThresholds() — separate this from the validate methods
-  // so the cluster only does one combined read per cycle.
+  // NOTE: stageMinPosCount{Base/Main/Real} are now loaded entirely inside
+  // loadAppPFThresholds(), which already overlays the per-connection
+  // connection_settings:{id} hash on top of global app_settings and snaps
+  // to the 5-step grid. This method is kept as a true no-op delegate so
+  // the Promise.all call-site compiles without changes.
+  //
+  // The previous implementation ran its OWN getAppSettings() read (global
+  // only) concurrently with loadAppPFThresholds() via Promise.all. Because
+  // both shared the same _pfThresholdsLoadedAt TTL timestamp, both would
+  // START on the same tick (before either stamped the clock), and whichever
+  // finished LAST would overwrite stageMinPosCount with global-only values
+  // — silently discarding any per-connection overrides the operator saved
+  // via the Settings dialog. Making this a true delegate eliminates that
+  // race entirely.
 
   /**
-   * Read and apply operator-tunable Base/Main/Real position-count thresholds.
-   *
-   * Read from app_settings (getAppSettings).
-   * Cached at the same TTL as PF thresholds (_pfTtlMs = 5 s).
-   * Called from loadAppPFThresholds() on the same cycle schedule.
+   * Delegates entirely to loadAppPFThresholds().
+   * stageMinPosCount* are read inside that method with per-connection override.
    */
   private async loadStageThresholds(): Promise<void> {
-    // Already loaded in the same tick as PF — noop.
-    // The actual read happens in loadAppPFThresholds(); we just gate here.
-    const now = Date.now()
-    if (now - this._pfThresholdsLoadedAt < this._pfTtlMs) return
-    this._pfThresholdsLoadedAt = now
-
-    try {
-      const { getAppSettings } = await import("@/lib/redis-db")
-      const s = (await getAppSettings()) || {}
-      const snap = (raw: unknown, fallback: number): number => {
-        const n = Number(raw)
-        if (!Number.isFinite(n) || n <= 0) return 0          // 0 = coordinator default
-        return Math.min(50, Math.max(5, Math.round(n / 5) * 5)) // snap to 5-step grid
-      }
-      this.stageMinPosCountBase = snap((s as any).stageMinPosCountBase, 0)
-      this.stageMinPosCountMain = snap((s as any).stageMinPosCountMain, 0)
-      this.stageMinPosCountReal = snap((s as any).stageMinPosCountReal, 0)
-    } catch {
-      // retry next cycle
-    }
+    return this.loadAppPFThresholds()
   }
 
   /**
@@ -1405,8 +1393,12 @@ export class StrategyCoordinator {
   private async memoryCircuitBreaker(symbol: string): Promise<void> {
     if (process.env.NODE_ENV !== "development") return
     try {
-      const SOFT_RSS_MB = 1500 // force GC above this
-      const HARD_RSS_MB = 1750 // throttle above this (kernel kills ~2000)
+      // Match the memory thresholds from the multi-symbol dev fix (redis-db.ts):
+      // dev heap = 4 GB, RSS_PRESSURE = 5000 MB, kernel OOM at ~8.4 GB VM.
+      // Soft/hard thresholds are a fraction of that envelope — GC at 2.0 GB,
+      // throttle at 3.0 GB (leaving ~2+ GB buffer before RSS_PRESSURE fires).
+      const SOFT_RSS_MB = 2_000 // force GC above this
+      const HARD_RSS_MB = 3_000 // throttle above this
       let rssMB = process.memoryUsage().rss / 1024 / 1024
       if (rssMB < SOFT_RSS_MB) return
 
