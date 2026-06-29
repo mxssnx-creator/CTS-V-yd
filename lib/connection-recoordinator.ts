@@ -300,14 +300,16 @@ export async function recoordinateAfterSettingsChange(
       } catch {
         globalRunning = false
       }
-      if (globalRunning) {
+      const localStartAllowed =
+        process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"
+      if (globalRunning && localStartAllowed) {
         console.log(
-          `[v0] [${opts.logTag}] Recoordinate: starting engine for ${id} (was stopped, now should run, global=running)`,
+          `[v0] [${opts.logTag}] Recoordinate: starting engine for ${id} (was stopped, now should run, global=running, local worker opted in)`,
         )
         await coordinator.startMissingEngines([after])
       } else {
         console.log(
-          `[v0] [${opts.logTag}] Recoordinate: NOT starting ${id} — global engine not running (operator stop honored); settings apply on next Start`,
+          `[v0] [${opts.logTag}] Recoordinate: NOT starting ${id} — ${globalRunning ? "web worker has no local engine runtime/opt-in" : "global engine not running (operator stop honored)"}; settings apply on next explicit Start or dedicated worker tick`,
         )
       }
     } else if (!shouldRun && isRunning) {

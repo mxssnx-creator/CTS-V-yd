@@ -56,14 +56,16 @@ export interface CoordinationSettings {
     block:    boolean
     dca:      boolean
   }
-  // ── Block-strategy: live position × vol-ratio coordination ──────────
+  // ── Block-strategy: completed-position block count × vol-ratio coordination ─
   // Knobs that flow into the Block variant's runtime size scaling.
   // The coordinator multiplies each Block sub-config's base size by
-  //   m(n) = 1 + (n − 1) × blockVolumeRatio
-  // where n = live continuousCount on the symbol. blockMaxStack caps n
-  // (gate closes at n ≥ blockMaxStack) so the stacking is bounded.
+  //   m(blockCount) = 1 + (blockCount − 1) × blockVolumeRatio
+  // for every blockCount in [1..blockMaxStack]. pause count is derived as
+  // round(blockCount × blockPauseCountRatio).
   blockVolumeRatio: number // 0.25..3.0 per spec band (UI clamps; engine re-clamps)
-  blockMaxStack:    number // 2..8 (gate uses `n < blockMaxStack`)
+  blockMaxStack:    number // 1..10 block sizes processed independently
+  blockPauseCountRatio: number // 1..4, step 0.5
+  blockActiveRealEnabled: boolean // active real-position Block overlay, default true
 
   /**
    * ── Prev-PI threshold (operator spec) ──────────────────────────────
@@ -152,7 +154,9 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
     dca:      false, // off by default per operator spec
   },
   blockVolumeRatio: 1.0,
-  blockMaxStack:    3,
+  blockMaxStack:    10,
+  blockPauseCountRatio: 1.0,
+  blockActiveRealEnabled: true,
   prevPosMinCount:   5,
   prevPosWindow:    25,
   mainEvalPosCount: 15,
@@ -230,7 +234,7 @@ const VARIANTS: Array<{
     badge: "Independent · Add-on",
     axisIndependent: true,
     description:
-      "Continuation profile that adds to an existing open position (continuousCount 1..2). Evaluated INDEPENDENTLY of position-count axes.",
+      "Completed-position recovery profile that processes every configured block count independently over the selected Set.",
   },
   {
     key: "dca",
@@ -500,27 +504,26 @@ export function StrategyCoordinationSection({
       </Card>
 
       {/* ── Block tuning card ────────────────────────────────────────
-          Two-axis live-coordination knobs for the Block variant:
-            • Volume-ratio slider → additive multiplier per live position
-            • Max-stack stepper   → upper bound on the gate (n < stack) */}
+          Completed-position Block coordination knobs:
+            • Volume-ratio slider → additive multiplier per block count
+            • Max-stack stepper   → number of independent block counts
+            • Pause ratio         → post-success pause window per block count */}
       <Card>
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-2">
             <div>
               <CardTitle className="text-sm">
-                Block — Live Position × Vol-Ratio
+                Block — Completed Position Count × Vol-Ratio
               </CardTitle>
               <CardDescription className="text-xs">
-                Adjusts how the Block variant scales add-on size by the live
-                open-position count on the symbol. The emitted Set&apos;s
+                Adjusts how the Block variant scales add-on size by completed
+                block count. The emitted overlay&apos;s
                 size multiplier follows{" "}
                 <span className="font-mono text-[11px]">
-                  m(n) = 1 + (n − 1) × ratio
+                  m(block) = 1 + (block − 1) × ratio
                 </span>{" "}
-                where <strong>n</strong> is the per-symbol open count and{" "}
-                <strong>ratio</strong> is set below. The gate closes when{" "}
-                <span className="font-mono text-[11px]">n ≥ max-stack</span>{" "}
-                so stacking is always bounded.
+                and every block count up to <strong>max stack</strong> is
+                processed independently, so coverage is bounded and parallel.
               </CardDescription>
             </div>
             <Badge
@@ -538,8 +541,8 @@ export function StrategyCoordinationSection({
               <div>
                 <Label className="text-sm font-semibold">Volume Ratio</Label>
                 <p className="text-xs text-muted-foreground leading-relaxed">
-                  Additive scaling step per extra open position on the
-                  symbol. 1.0 ≈ doubles per add-on (spec default); 0.25 is
+                  Additive scaling step per completed-position block count.
+                  1.0 ≈ doubles per block step (spec default); 0.25 is
                   conservative; 3.0 is aggressive. Engine clamps to
                   0.25–3.0 even if the value is bypassed.
                 </p>
@@ -573,7 +576,7 @@ export function StrategyCoordinationSection({
                     className="rounded-md border border-border/60 p-2 flex items-center justify-between gap-2"
                   >
                     <span className="text-muted-foreground">
-                      n={n}
+                      block={n}
                     </span>
                     <span className="font-mono tabular-nums font-semibold">
                       ×{mul.toFixed(2)}
@@ -584,29 +587,45 @@ export function StrategyCoordinationSection({
             </div>
           </div>
 
+          {/* Active Real position overlay */}
+          <div className="rounded-lg border border-border/60 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="space-y-1">
+                <Label className="text-sm font-semibold">Active Real Position Block</Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Adds an independent Block overlay for currently running Real-stage
+                  positions, separate from completed-position block-count calcs.
+                </p>
+              </div>
+              <Switch
+                checked={value.blockActiveRealEnabled}
+                onCheckedChange={(checked) =>
+                  onChange({ ...value, blockActiveRealEnabled: checked })
+                }
+                disabled={!value.variants.block}
+              />
+            </div>
+          </div>
+
           {/* Max stack */}
           <div className="rounded-lg border border-border/60 p-3 space-y-2">
             <div className="flex items-center justify-between gap-3">
               <div>
                 <Label className="text-sm font-semibold">Max Stack</Label>
                 <p className="text-xs text-muted-foreground leading-relaxed">
-                  Upper bound on the Block gate: variant fires only while{" "}
-                  <span className="font-mono text-[11px]">
-                    1 ≤ n &lt; max-stack
-                  </span>
-                  . Default 3 means the variant emits at n=1 and n=2 then
-                  closes. Engine clamps to 2–8.
+                  Number of independent Block sizes processed in parallel.
+                  Default 10 emits all block counts 1 through 10. Engine clamps to 1–10.
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] tabular-nums">
-                2–8
+                1–10
               </Badge>
             </div>
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.blockMaxStack]}
-                min={2}
-                max={8}
+                min={1}
+                max={10}
                 step={1}
                 onValueChange={(v) =>
                   onChange({ ...value, blockMaxStack: v[0] })
@@ -616,6 +635,38 @@ export function StrategyCoordinationSection({
               />
               <span className="text-xs font-semibold tabular-nums w-8 text-right">
                 {value.blockMaxStack}
+              </span>
+            </div>
+          </div>
+
+          {/* Pause count ratio */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">Pause Count Ratio</Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Converts each Block count into a post-success pause/cooldown
+                  window: pause = round(block count × ratio). Default 1.0.
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] tabular-nums">
+                1–4 · step 0.5
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.blockPauseCountRatio]}
+                min={1}
+                max={4}
+                step={0.5}
+                onValueChange={(v) =>
+                  onChange({ ...value, blockPauseCountRatio: Number(v[0].toFixed(1)) })
+                }
+                disabled={!value.variants.block}
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-10 text-right">
+                {value.blockPauseCountRatio.toFixed(1)}×
               </span>
             </div>
           </div>
@@ -854,7 +905,7 @@ export function StrategyCoordinationSection({
               </CardTitle>
               <CardDescription className="text-xs">
                 Minimum step size used when generating pseudo-position windows
-                for Base-stage indication configs (range 3–30, monotonic step
+                for Base-stage indication configs (range 2–30, monotonic step
                 5 by default). Only step values <strong>≥ this floor</strong>{" "}
                 are created and evaluated. Raising the value removes fast
                 short-window configs that react quickly but fire on noise.
@@ -862,7 +913,7 @@ export function StrategyCoordinationSection({
               </CardDescription>
             </div>
             <Badge variant="outline" className="text-[10px] tabular-nums">
-              3–30, step 1
+              2–30, step 1
             </Badge>
           </div>
         </CardHeader>
@@ -879,7 +930,7 @@ export function StrategyCoordinationSection({
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.minStep ?? 5]}
-                min={3}
+                min={1}
                 max={30}
                 step={1}
                 onValueChange={(v) =>
@@ -892,14 +943,14 @@ export function StrategyCoordinationSection({
               </span>
             </div>
             <div className="flex justify-between text-[10px] text-muted-foreground pt-0.5">
-              <span>3 (all)</span>
+              <span>2 (all)</span>
               <span className="text-muted-foreground/60">default 5</span>
               <span>30 (slowest)</span>
             </div>
             <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
               At default 5 the engine creates windows [5, 10, 15, 20, 25, 30].
-              Setting to 3 adds the two fastest windows. Setting to 10 removes
-              the two shortest (noisiest). Changes take effect from the next
+              Setting to 2 adds the fastest 2 and 3 step windows. Setting to 10 removes
+              the shortest noisy windows. Changes take effect from the next
               indication-config regeneration cycle.
             </p>
           </div>

@@ -36,9 +36,10 @@ function parseInterval(name: string, fallback: number, min: number, max: number)
 }
 
 function shouldSkipInProcessTimers(): boolean {
-  // Vercel crons are the durable mechanism there; long in-process intervals in
-  // serverless are not guaranteed and can keep invocations open unexpectedly.
-  if (process.env.ENABLE_IN_PROCESS_CONTINUITY === "1") return false
+  // Heavy in-process timers are safe only in a dedicated worker. In the Next.js
+  // web/UI process they can monopolize the event loop and make health/UI routes
+  // time out while an active BingX engine is warming up.
+  if (process.env.ENABLE_IN_PROCESS_CONTINUITY !== "1") return true
   return process.env.VERCEL === "1" || process.env.NEXT_RUNTIME === "edge"
 }
 

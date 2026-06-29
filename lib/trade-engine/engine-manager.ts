@@ -3723,9 +3723,13 @@ export class TradeEngineManager {
         // Production (NODE_ENV !== "development") is COMPLETELY UNAFFECTED —
         // this block only runs in the dev Next.js worker.
         if (process.env.NODE_ENV === "development") {
-          const devCap = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+          const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "1"
+          const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 1)
           // Fast path for the default single-symbol case — skip the Redis
           // resolution chain entirely; BTCUSDT is the canonical dev fixture.
+          // QuickStart can set dev_symbol_count_override so explicit 4-symbol
+          // smoke tests exercise the same multi-symbol path without requiring
+          // an environment restart.
           if (devCap === 1) return ["BTCUSDT"]
           // For devCap > 1 fall through to the full resolution chain below
           // (force_symbols → self-written symbols → volatility fetch).

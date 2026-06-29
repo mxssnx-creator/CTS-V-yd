@@ -76,7 +76,7 @@ Where:
 - n=2 (second position): m = 1 + 0.5 = 1.5
 - n=3 (third position): m = 1 + 2×0.5 = 2.0
 - n=4 (fourth position): m = 1 + 3×0.5 = 2.5
-- At max stack (blockMaxStack=8): stacks continue per formula
+- At max stack (blockMaxStack=10): stacks continue per formula
 
 ## Field Propagation
 

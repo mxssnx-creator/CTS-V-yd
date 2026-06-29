@@ -450,6 +450,8 @@ export function ConnectionSettingsDialog({
             variants: { ...DEFAULT_COORDINATION_SETTINGS.variants, ...(coord.variants || {}) },
             blockVolumeRatio: typeof coord.blockVolumeRatio === "number" ? coord.blockVolumeRatio : DEFAULT_COORDINATION_SETTINGS.blockVolumeRatio,
             blockMaxStack:    typeof coord.blockMaxStack    === "number" ? coord.blockMaxStack    : DEFAULT_COORDINATION_SETTINGS.blockMaxStack,
+            blockPauseCountRatio: typeof coord.blockPauseCountRatio === "number" ? coord.blockPauseCountRatio : DEFAULT_COORDINATION_SETTINGS.blockPauseCountRatio,
+            blockActiveRealEnabled: typeof coord.blockActiveRealEnabled === "boolean" ? coord.blockActiveRealEnabled : typeof coord.blockActiveLiveEnabled === "boolean" ? coord.blockActiveLiveEnabled : DEFAULT_COORDINATION_SETTINGS.blockActiveRealEnabled,
             prevPosMinCount: (() => {
               const flat = Number((settings as Record<string, unknown>).prevPosMinCount ?? (settings as Record<string, unknown>).prevPiMinCount)
               if (Number.isFinite(flat) && flat >= 1) return Math.min(50, Math.floor(flat))
@@ -941,7 +943,7 @@ export function ConnectionSettingsDialog({
                   <Separator className="my-1" />
 
                   {/* ── Minimal Position Step — promoted to page 1 per operator spec ─ */}
-                  <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (3–30, default 5). Higher values create fewer, smoother position ranges." />
+                  <SectionHeading icon={Sparkles} title="Minimal Base Pseudo Positions Range Step" subtitle="Minimum step size for Base pseudo-position windows (2–30, default 5). Higher values create fewer, smoother position ranges." />
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
                       <Label className="text-xs">Base Min Step (2–30)</Label>

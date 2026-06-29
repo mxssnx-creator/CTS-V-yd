@@ -29,6 +29,7 @@ import { logProgressionEvent } from "@/lib/engine-progression-logs"
  *   started so the new flag actually has an effect.
  */
 export const dynamic = "force-dynamic"
+export const runtime = "nodejs"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id: connectionId } = await params
   try {
@@ -64,10 +65,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     let apiSecret = (connection.api_secret || connection.apiSecret || "") as string
     let hasCredentials = apiKey.length > 10 && apiSecret.length > 10
 
+    let liveTradeBlockedReason = ""
     if (isLiveTrade) {
       if (
         !hasCredentials &&
-        BASE_CONNECTION_CREDENTIALS[connectionId as keyof typeof BASE_CONNECTION_CREDENTIALS]
+        BASE_CONNECTION_CREDENTIALS[connectionId as keyof typeof BASE_CONNECTION_CREDENTIALS]?.apiKey &&
+        BASE_CONNECTION_CREDENTIALS[connectionId as keyof typeof BASE_CONNECTION_CREDENTIALS]?.apiSecret
       ) {
         const creds = BASE_CONNECTION_CREDENTIALS[connectionId as keyof typeof BASE_CONNECTION_CREDENTIALS]
         apiKey = creds.apiKey
@@ -82,14 +85,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         console.log(`[v0] [LiveTrade] Injected predefined credentials for ${connName}`)
       }
       if (!hasCredentials) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "API credentials required for live trading",
-            hint: "Add API key and secret in Settings to enable live trading",
-          },
-          { status: 400 },
-        )
+        liveTradeBlockedReason = "API credentials required for live trading"
       }
     }
 
@@ -99,15 +95,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       ...connection,
       api_key: apiKey,
       api_secret: apiSecret,
-      is_live_trade: toRedisFlag(isLiveTrade),
-      live_trade_blocked_reason: "",
+      is_live_trade: toRedisFlag(isLiveTrade && hasCredentials),
+      live_trade_blocked_reason: liveTradeBlockedReason,
       ...(isLiveTrade
         ? {
             live_trade_requested: "1",
-            last_test_status: "success",
+            ...(hasCredentials ? { last_test_status: "success" } : {}),
           }
-        : {}),
-      ...(isLiveTrade ? { live_trade_blocked_reason: "" } : {}),
+        : { live_trade_requested: "0" }),
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
@@ -123,7 +118,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     if (isLiveTrade) {
       await getRedisClient().hset("trade_engine:global", {
         status: "running",
-        mode: "live",
+        mode: hasCredentials ? "live" : "live_requested",
         updated_at: new Date().toISOString(),
       }).catch((stateErr: unknown) => {
         console.warn(
@@ -151,43 +146,64 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         engineStatus = "running"
         console.log(`[v0] [LiveTrade] Engine already running for ${connName} — flag updated, no restart`)
       } else {
-        // Engine is not running — start it so the flag has an effect.
-        // Do this in the background. startEngine performs heavy market-data
-        // bootstrap work; awaiting it made the UI Live toggle and scripted
-        // 15-symbol debug flows time out even though the engine did start.
+        // Engine is not running — start it so the flag has an effect. In
+        // production/serverless workers, fire-and-forget work scheduled after
+        // the response is not reliable; the worker can be frozen before the
+        // background start runs. Await the coordinator start and return a clear
+        // status to the UI instead of reporting "starting" for work that may
+        // never begin.
         try {
-          const settings = await loadSettingsAsync()
-          const engineConfig = {
-            connectionId,
-            connection_name: connName,
-            exchange: connection.exchange,
-            engine_type: "live",
-            indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
-            strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
-            realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-          }
-          setImmediate(() => {
-            coordinator.startEngine(connectionId, engineConfig).catch(async (err: unknown) => {
-              console.error(`[v0] [LiveTrade] Background engine start failed for ${connName}:`, err)
-              await getRedisClient().hset("trade_engine:global", {
-                status: "error",
-                error_message: err instanceof Error ? err.message : String(err),
-                updated_at: new Date().toISOString(),
-              }).catch(() => {})
-              await getRedisClient().set(`engine_is_running:${connectionId}`, "0").catch(() => {})
-              await SystemLogger.logError(err, "api", `Background start engine for ${connName}`).catch(() => {})
+          const localStartAllowed =
+            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"
+
+          if (localStartAllowed) {
+            const settings = await loadSettingsAsync()
+            const engineConfig = {
+              connectionId,
+              connection_name: connName,
+              exchange: connection.exchange,
+              engine_type: "live",
+              indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
+              strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
+              realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+            }
+            const started = await coordinator.startEngine(connectionId, engineConfig)
+            if (!started && !coordinator.isEngineRunning(connectionId)) {
+              throw new Error("Coordinator did not start the engine; startup lock may still be owned by another worker")
+            }
+            engineStatus = "running"
+            engineStartedNow = started
+            console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
+          } else {
+            await getRedisClient().hset("engine_coordinator:refresh_requested", {
+              timestamp: new Date().toISOString(),
+              connectionId,
+              action: "start",
+              reason: "live_trade_enable",
             })
-          })
-          engineStatus = "starting"
-          engineStartedNow = true
-          console.log(`[v0] [LiveTrade] Engine start queued for ${connName} to service live-trade flag`)
+            await logProgressionEvent(connectionId, "engine_start_queued", "info", "Live Trade enabled; start queued for coordinator worker", {
+              connectionId,
+              connectionName: connName,
+              exchange: connection.exchange,
+              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+            })
+            engineStatus = "starting"
+            engineStartedNow = false
+            console.log(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
+          }
         } catch (err) {
-          console.error(`[v0] [LiveTrade] Failed to queue engine start for ${connName}:`, err)
+          console.error(`[v0] [LiveTrade] Failed to start engine for ${connName}:`, err)
+          await getRedisClient().hset("trade_engine:global", {
+            status: "error",
+            error_message: err instanceof Error ? err.message : String(err),
+            updated_at: new Date().toISOString(),
+          }).catch(() => {})
+          await getRedisClient().set(`engine_is_running:${connectionId}`, "0").catch(() => {})
           await SystemLogger.logError(err, "api", `Start engine for ${connName}`)
           return NextResponse.json(
             {
               success: false,
-              error: "Failed to queue engine start",
+              error: "Failed to start engine",
               details: err instanceof Error ? err.message : String(err),
             },
             { status: 500 },
@@ -207,7 +223,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       `Live Trading ${isLiveTrade ? "enabled" : "disabled"} via UI toggle`,
       connectionId,
       "info",
-      { is_live_trade: isLiveTrade, engineStartedNow, engineStatus },
+      {
+        is_live_trade: isLiveTrade && hasCredentials,
+        live_trade_requested: isLiveTrade,
+        engineStartedNow,
+        engineStatus,
+        liveTradeBlockedReason,
+      },
     )
 
     // SECURITY: never echo raw credentials back to the client. The previous
@@ -222,11 +244,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     return NextResponse.json({
       success: true,
-      is_live_trade: isLiveTrade,
+      is_live_trade: isLiveTrade && hasCredentials,
+      live_trade_requested: isLiveTrade,
+      live_trade_blocked_reason: liveTradeBlockedReason,
       engineStatus,
       engineStartedNow,
       connection: safeConnection,
-      message: `Live Trading ${isLiveTrade ? "enabled" : "disabled"}`,
+      message:
+        isLiveTrade && !hasCredentials
+          ? "Live Trading requested; exchange order placement is blocked until API credentials are configured"
+          : `Live Trading ${isLiveTrade ? "enabled" : "disabled"}`,
       connectionName: connName,
       exchange: connection.exchange,
     })

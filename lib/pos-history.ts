@@ -46,7 +46,6 @@
  */
 
 import { getRedisClient } from "@/lib/redis-db"
-import { resolvePositionCostNotional } from "@/lib/tp-sl-ratio"
 
 // ── Constants ──────────────────────────────────────────────────────────
 const TTL_SECONDS = 90 * 24 * 60 * 60 // 90 days — the run window we care about
@@ -163,13 +162,13 @@ export interface RecordPosClosedInput {
   /** Indication type that originated the position (e.g. "direction" / "active" / "auto"). */
   indicationType: string
   direction: "long" | "short"
-  /** Realised PnL in quote currency. Positive = win. */
+  /** Cost-adjusted realised PnL in quote currency. Positive = win after costs. */
   pnl: number
   /** Drawdown duration in minutes (best-effort, 0 ok). */
   drawdownMinutes?: number
-  /** Entry price for position cost calculation (optional, used for cost-adjusted PF). */
+  /** Entry price retained for compatibility/diagnostics. PnL is already cost-adjusted by the close path. */
   entryPrice?: number
-  /** Quantity for position cost calculation (optional, used for cost-adjusted PF). */
+  /** Quantity retained for compatibility/diagnostics. PnL is already cost-adjusted by the close path. */
   quantity?: number
   /**
    * Optional Redis pipeline. When provided we COMPOSE the writes into the
@@ -219,9 +218,13 @@ export function recordPosClosed(input: RecordPosClosedInput): void {
   const grossLoss   = Math.max(0, -pnl)
   const ddt         = Math.max(0,  drawdownMinutes)
   
-  // Position cost calculation: entry price × quantity × 0.001 (0.1% maker fee)
-  // Used as adjustment factor in PF denominator so PF reflects cost-adjusted returns
-  const positionCost = resolvePositionCostNotional({ entry_price: entryPrice, quantity }) * 0.001
+  // Pseudo positions are closed with a fixed 0.1% notional cost already
+  // deducted from `pnl` by PseudoPositionManager. Do NOT add that cost to
+  // the PF denominator again here, or losses would be double-charged. Legacy
+  // ring rows may still carry a non-zero cost field and deriveWindow keeps
+  // backward-compatible handling for those historical gross-PnL records.
+  void entryPrice
+  void quantity
 
   // Scaled integer fields so every increment is a single atomic hincrby.
   // We round-down on the way in and divide on the way out — small per-
@@ -255,13 +258,15 @@ export function recordPosClosed(input: RecordPosClosedInput): void {
   if (ddtX10 > 0)           client.hincrby(o, "ddt_num_x10",  ddtX10)
   client.expire(o, TTL_SECONDS)
 
-  // Windowed ring list (last-N). One compact "pnl|cost|ddt" record per close,
-  // including position cost (0.1% maker fee) so PF can be computed cost-adjusted.
+  // Windowed ring list (last-N). One compact "netPnl|cost|ddt" record per close.
+  // Current writers store net PnL (after the fixed 0.1% pseudo close cost) and
+  // cost=0. Legacy rows used "grossPnl|cost|ddt"; deriveWindow still handles
+  // them by adding that legacy cost to the denominator.
   // Capped at RING_CAP so memory is bounded regardless of run length. We
   // lpush (newest at head) then ltrim to [0, RING_CAP-1]; readers lrange
   // the head N. Both per-bucket and overall rings are maintained so the
   // eval gates and the dashboard "any-symbol" tile can both read windows.
-  const ringRecord = `${pnl.toFixed(6)}|${positionCost.toFixed(6)}|${ddt.toFixed(3)}`
+  const ringRecord = `${pnl.toFixed(6)}|0|${ddt.toFixed(3)}`
   const ringK = listKey(connectionId, cleanSymbol, cleanType, cleanDir)
   client.lpush(ringK, ringRecord)
   client.ltrim(ringK, 0, RING_CAP - 1)

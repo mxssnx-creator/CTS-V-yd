@@ -7,6 +7,7 @@ import { logProgressionEvent, getProgressionLogs } from "@/lib/engine-progressio
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
+import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
 
 function toNumber(value: unknown): number {
   const n = Number(value)
@@ -340,41 +341,33 @@ export async function POST(request: Request) {
     // is what caused the dashboard to display "1/1" even when the
     // user-facing slot picker advertised two symbols.
 
-    // PRIMARY: fetch most volatile symbol(s) from public exchange API (no auth required)
+    // PRIMARY: resolve most volatile symbol(s) from the public exchange API
+    // DIRECTLY (no HTTP self-fetch). In production/serverless a route handler
+    // cannot reliably call its own origin/localhost, so use the shared resolver
+    // that powers /api/exchange/[exchange]/top-symbols. QuickStart defaults to
+    // true 1h ATR volatility with a liquidity floor, matching the operator spec.
+    const requestedSymbolOrder = normaliseSort(body.symbolOrder || body.symbol_order || "volatility_1h")
     if (symbols.length === 0) {
       try {
-        const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || `http://localhost:${process.env.PORT || "3002"}`
-        // AbortSignal.timeout() is unreliable on Node.js < V20. Use a plain
-        // Promise.race so the timeout actually fires even when the built-in
-        // abort-controller integration is absent (Node 18 §fetch).
-        const FETCH_MS = 30000
-        const timeoutCtrl = new AbortController()
-        const FETCH_TIMEOUT = setTimeout(() => timeoutCtrl.abort(), FETCH_MS)
-        const topRes = await Promise.race([
-          fetch(
-            `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&sort=volatility&t=${Date.now()}`,
-            { signal: timeoutCtrl.signal, cache: "no-store" },
-          ),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`top-symbols fetch timed out after ${FETCH_MS} ms`)), FETCH_MS),
-          ),
-        ])
-        clearTimeout(FETCH_TIMEOUT)
-        if (topRes.ok) {
-          const topData = await topRes.json()
-          // Prefer the new `symbolList` (string[]) when N>1; fall back to
-          // the single `symbol` for the limit=1 fast-path. The endpoint
-          // already returns `symbolList` for every response.
-          const list: string[] = Array.isArray(topData.symbolList) && topData.symbolList.length > 0
-            ? topData.symbolList.filter((s: unknown): s is string => typeof s === "string" && s.length > 0).slice(0, requestedCount)
-            : (topData.symbol ? [topData.symbol] : [])
-          if (list.length > 0) {
-            symbols = list
-            console.log(`${LOG_PREFIX}: [2/4] Top ${list.length}/${requestedCount} symbol(s) from public API: ${list.join(", ")} (top: ${(topData.priceChangePercent || 0).toFixed(2)}%)`)
-          }
+        const topData = await fetchTopSymbols(exchangeName, requestedCount, requestedSymbolOrder)
+        const list = Array.isArray(topData.symbols)
+          ? topData.symbols
+              .map((item) => item.symbol)
+              .filter((symbol): symbol is string => typeof symbol === "string" && symbol.length > 0)
+              .slice(0, requestedCount)
+          : []
+        if (list.length > 0) {
+          symbols = list
+          console.log(
+            `${LOG_PREFIX}: [2/4] Top ${list.length}/${requestedCount} symbol(s) by ${requestedSymbolOrder}: ` +
+              `${list.join(", ")} (top: ${(topData.priceChangePercent || 0).toFixed(2)}%)`,
+          )
         }
       } catch (e) {
-        console.warn(`${LOG_PREFIX}: [2/4] Public top-symbols fetch failed, trying exchange connector:`, e instanceof Error ? e.message : String(e))
+        console.warn(
+          `${LOG_PREFIX}: [2/4] Public top-symbols resolver failed, trying exchange connector:`,
+          e instanceof Error ? e.message : String(e),
+        )
       }
     }
 
@@ -475,7 +468,7 @@ export async function POST(request: Request) {
        // QuickStart uses the minimum live volume factor so live-trade smoke tests
        // place only exchange-minimum orders when credentials are available.
        // Symbol ordering: operator spec is volatility_1h for quickstart.
-       symbol_order: "volatility_1h",
+       symbol_order: requestedSymbolOrder,
        symbol_count: String(symbols.length),
        last_test_status: testPassed ? "success" : "failed",
        last_test_balance: testBalance,
@@ -519,7 +512,7 @@ export async function POST(request: Request) {
       volume_step_ratio:    String(DEFAULT_VOLUME_STEP_RATIO),
       volume_factor_preset: "1.0",
       // Symbol order
-      symbol_order: "volatility_1h",
+      symbol_order: requestedSymbolOrder,
       symbol_count: String(symbols.length),
       // Strategy PF thresholds
       base_min_profit_factor:  "1.0",
@@ -545,6 +538,7 @@ export async function POST(request: Request) {
       quickstart_symbol_generation: symbolSelectionEpoch,
       symbol_selection_epoch: symbolSelectionEpoch,
       quickstart_symbol_count: symbols.length,
+      dev_symbol_count_override: String(symbols.length),
       quickstart_symbols: JSON.stringify(symbols),
       selected_symbols: JSON.stringify(symbols),
       config_set_symbols_total: symbols.length,
@@ -806,6 +800,7 @@ export async function POST(request: Request) {
               active_symbols: JSON.stringify(symbols),
               force_symbols: JSON.stringify(symbols),
               symbol_count: String(symbols.length),
+              dev_symbol_count_override: String(symbols.length),
               live_volume_factor: "0.1",
               volume_step_ratio: String(DEFAULT_VOLUME_STEP_RATIO),
               updated_at: new Date().toISOString(),

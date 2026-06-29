@@ -5,12 +5,12 @@ export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
-    const connectionId = searchParams.get("connection_id")
+    const connectionId = searchParams.get("connection_id") || searchParams.get("connectionId")
     const symbol = searchParams.get("symbol")
     const status = searchParams.get("status") || "open"
 
     if (!connectionId) {
-      return NextResponse.json({ success: false, error: "connection_id is required" }, { status: 400 })
+      return NextResponse.json({ success: false, error: "connection_id or connectionId is required" }, { status: 400 })
     }
 
     const manager = new ExchangePositionManager(connectionId)
@@ -20,11 +20,17 @@ export async function GET(request: NextRequest) {
     if (symbol) filters.symbol = symbol
 
     const positions = await manager.getActivePositions(filters)
+    const filtered = status && status !== "all"
+      ? positions.filter((pos: any) => String(pos.status || "") === status)
+      : positions
 
     return NextResponse.json({
       success: true,
-      data: positions,
-      count: positions.length,
+      connectionId,
+      source: "exchange_position_manager",
+      data: filtered,
+      count: filtered.length,
+      filters: { symbol, status },
     })
   } catch (error) {
     console.error("[v0] Get exchange positions error:", error)

@@ -1546,7 +1546,7 @@ const migrations: Migration[] = [
 
       // ── 2. Seed minStep default (5) for all connections ──────────────────
       //
-      // minStep (range 3-30, default 5) was added to the per-connection
+      // minStep (range 2-30, default 5) was added to the per-connection
       // strategy settings in the same session as this migration. Backfill
       // the default into connection_settings:{id} for every existing
       // connection so the engine reads the correct floor immediately without
@@ -1679,7 +1679,7 @@ const migrations: Migration[] = [
     //   axes:      all disabled by default, including pause-axis; maxWindow seeded to spec defaults
     //   variants:  trailing=true, block=true, dca=false, pause=true
     //   axes:      all disabled by default, maxWindow seeded to spec defaults
-    //   block knobs: blockVolumeRatio=1.0, blockMaxStack=3
+    //   block knobs: blockVolumeRatio=1.0, blockMaxStack=10
     //
     // Also seeds app_settings so global fallback works the same way.
     name: "030-coordination-variant-axis-block-defaults",
@@ -1704,7 +1704,9 @@ const migrations: Migration[] = [
         axisPauseMaxWindow: "8",
         // Block strategy tuning
         blockVolumeRatio: "1.0",
-        blockMaxStack:    "3",
+        blockMaxStack:    "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
       }
 
       // ── 1. app_settings global fallback ─────────────────────────────────
@@ -2027,7 +2029,9 @@ const migrations: Migration[] = [
         variantPauseEnabled:    "true",
         // Block knobs
         blockVolumeRatio:     "1.0",
-        blockMaxStack:        "3",
+        blockMaxStack:        "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
         // Eval thresholds
         mainEvalPosCount:     "3",
         realEvalPosCount:     "3",
@@ -2407,7 +2411,9 @@ const migrations: Migration[] = [
         variantDcaEnabled:      "false",
         variantPauseEnabled:    "true",
         blockVolumeRatio:       "1.0",
-        blockMaxStack:          "3",
+        blockMaxStack:          "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
         mainEvalPosCount:       "3",
         realEvalPosCount:       "3",
         minStep:                "5",
@@ -3032,7 +3038,9 @@ const migrations: Migration[] = [
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false", // spec: DCA OFF by default
         blockVolumeRatio:       "1.0",
-        blockMaxStack:          "3",
+        blockMaxStack:          "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
       }
       const seedIfAbsent = async (hashKey: string) => {
         const existing = ((await client.hgetall(hashKey).catch(() => ({}))) || {}) as Record<string, string>
