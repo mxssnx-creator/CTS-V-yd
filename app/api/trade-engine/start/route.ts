@@ -102,17 +102,16 @@ export async function POST(request: NextRequest) {
     await initRedis()
     const client = getRedisClient()
     
-    // DOUBLE-START GUARD: Check if already running to prevent concurrent startup issues
+    // DOUBLE-START GUARD: Check if already running to prevent concurrent startup issues.
+    // Do not return early here: production can have trade_engine:global.status
+    // "running" while the selected connection engine was stopped/crashed or
+    // lives in another worker. A Start click must reconcile missing engines.
+    let wasAlreadyRunning = false
     try {
       const currentStatus = await client.hget("trade_engine:global", "status")
       if (currentStatus === "running") {
-        console.log("[v0] [Trade Engine] Already running — skipping redundant start request")
-        return NextResponse.json({ 
-          success: true, 
-          message: "Engine already running", 
-          alreadyRunning: true,
-          startedConnections: [],
-        })
+        wasAlreadyRunning = true
+        console.log("[v0] [Trade Engine] Global state already running — reconciling missing engines instead of returning early")
       }
     } catch (e) {
       console.warn("[v0] [Trade Engine] Double-start check failed (continuing anyway):", e)
@@ -411,6 +410,7 @@ export async function POST(request: NextRequest) {
       success: true,
       message: `Global Trade Engine Coordinator started and ready.${resumeMsg}${startedMsg}${liveTradeMsg}`,
       coordinator_status: "running",
+      alreadyRunning: wasAlreadyRunning,
       resumedConnections,
       startedConnections,
       liveTradeEnabledConnections,
