@@ -39,6 +39,7 @@ import {
   type LiveOrderTrace,
 } from "@/lib/live-order-logger"
 import { isTruthyFlag } from "@/lib/connection-state-utils"
+import { hasLiveTradeBlock } from "@/lib/live-trade-gates"
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
@@ -96,9 +97,6 @@ function computeSetAwareSL(
 
 
 
-function hasLiveTradeBlock(settings: Record<string, any>): boolean {
-  return String(settings.live_trade_blocked_reason || "").trim().length > 0
-}
 
 async function isLiveTradeEnabledForConnection(connectionId: string): Promise<boolean> {
   const connection = (await getConnection(connectionId).catch(() => null)) || {}

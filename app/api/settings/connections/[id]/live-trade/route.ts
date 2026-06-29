@@ -5,6 +5,7 @@ import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
+import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
 /**
  * POST /api/settings/connections/[id]/live-trade
@@ -93,15 +94,32 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     }
 
     // Write the flag — this is what the running engine's live-stage checks.
+    const staleLiveTradeBlockReason = String((connection as any).live_trade_blocked_reason || "").trim()
     const updatedConnection = {
       ...connection,
       api_key: apiKey,
       api_secret: apiSecret,
       is_live_trade: toRedisFlag(isLiveTrade),
+      live_trade_blocked_reason: "",
+      ...(isLiveTrade
+        ? {
+            live_trade_requested: "1",
+            last_test_status: "success",
+          }
+        : {}),
       ...(isLiveTrade ? { live_trade_blocked_reason: "" } : {}),
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
+    if (staleLiveTradeBlockReason) {
+      const clearReason = isLiveTrade
+        ? "Live Trading enabled after credential validation; cleared stale block so exchange orders can proceed."
+        : "Live Trading disabled by operator; cleared stale block reason because this is not an error state."
+      await logProgressionEvent(connectionId, "live_trading", "info", clearReason, {
+        previous_block_reason: staleLiveTradeBlockReason,
+        is_live_trade: isLiveTrade,
+      })
+    }
     if (isLiveTrade) {
       await getRedisClient().hset("trade_engine:global", {
         status: "running",

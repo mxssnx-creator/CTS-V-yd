@@ -201,6 +201,8 @@ export async function POST(request: NextRequest) {
           try {
             const conn = await getConnection(connId)
             if (conn && conn.paused_by_global === "1") {
+              // Re-enable live trade
+              const staleLiveTradeBlockReason = String((conn as any).live_trade_blocked_reason || "").trim()
               // Re-request live trade, but only re-enable real exchange order placement
               // when credentials still pass validation. Operators can see the
               // difference between requested and enabled in progression logs.
@@ -222,6 +224,19 @@ export async function POST(request: NextRequest) {
                 ...liveTradeUpdate,
                 is_live_trade: "1",
                 live_trade_blocked_reason: "",
+                live_trade_requested: "1",
+                paused_by_global: "0",
+                updated_at: new Date().toISOString(),
+              })
+              if (staleLiveTradeBlockReason) {
+                await logProgressionEvent(
+                  connId,
+                  "live_trading",
+                  "info",
+                  "Global start resumed live trading; cleared stale block so exchange orders can proceed.",
+                  { previous_block_reason: staleLiveTradeBlockReason },
+                )
+              }
                 paused_by_global: "0",
                 updated_at: new Date().toISOString(),
               })
@@ -279,6 +294,8 @@ export async function POST(request: NextRequest) {
         if (conn.is_assigned === "1" && conn.is_enabled_dashboard === "1" && conn.is_active === "1" && 
             !resumedConnections.includes(conn.id)) {
           try {
+            // Ensure live trade is enabled
+            const staleLiveTradeBlockReason = String((conn as any).live_trade_blocked_reason || "").trim()
             // Request live trade for assigned connections, but only enable real
             // exchange order placement when credentials validate right now.
             const credentialCheck = await validateLiveTradeCredentials(conn)
@@ -289,6 +306,19 @@ export async function POST(request: NextRequest) {
               live_trade_requested: "1",
               is_live_trade: "1",
               live_trade_blocked_reason: "",
+              live_trade_requested: "1",
+              updated_at: new Date().toISOString(),
+            }
+            await updateConnection(conn.id, updatedConn)
+            if (staleLiveTradeBlockReason) {
+              await logProgressionEvent(
+                conn.id,
+                "live_trading",
+                "info",
+                "Global start enabled live trading; cleared stale block so exchange orders can proceed.",
+                { previous_block_reason: staleLiveTradeBlockReason },
+              )
+            }
               updated_at: new Date().toISOString(),
             }
             await updateConnection(conn.id, updatedConn)
