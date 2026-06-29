@@ -452,6 +452,7 @@ export function ConnectionSettingsDialog({
             blockMaxStack:    typeof coord.blockMaxStack    === "number" ? coord.blockMaxStack    : DEFAULT_COORDINATION_SETTINGS.blockMaxStack,
             blockPauseCountRatio: typeof coord.blockPauseCountRatio === "number" ? coord.blockPauseCountRatio : DEFAULT_COORDINATION_SETTINGS.blockPauseCountRatio,
             blockActiveRealEnabled: typeof coord.blockActiveRealEnabled === "boolean" ? coord.blockActiveRealEnabled : typeof coord.blockActiveLiveEnabled === "boolean" ? coord.blockActiveLiveEnabled : DEFAULT_COORDINATION_SETTINGS.blockActiveRealEnabled,
+            blockActiveLiveEnabled: typeof coord.blockActiveLiveEnabled === "boolean" ? coord.blockActiveLiveEnabled : DEFAULT_COORDINATION_SETTINGS.blockActiveLiveEnabled,
             prevPosMinCount: (() => {
               const flat = Number((settings as Record<string, unknown>).prevPosMinCount ?? (settings as Record<string, unknown>).prevPiMinCount)
               if (Number.isFinite(flat) && flat >= 1) return Math.min(50, Math.floor(flat))

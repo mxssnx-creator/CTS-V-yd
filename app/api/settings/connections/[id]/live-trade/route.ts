@@ -191,6 +191,23 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engineStartedNow = false
             console.log(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
           }
+          const settings = await loadSettingsAsync()
+          const engineConfig = {
+            connectionId,
+            connection_name: connName,
+            exchange: connection.exchange,
+            engine_type: "live",
+            indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
+            strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
+            realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+          }
+          const started = await coordinator.startEngine(connectionId, engineConfig)
+          if (!started && !coordinator.isEngineRunning(connectionId)) {
+            throw new Error("Coordinator did not start the engine; startup lock may still be owned by another worker")
+          }
+          engineStatus = "running"
+          engineStartedNow = started
+          console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
         } catch (err) {
           console.error(`[v0] [LiveTrade] Failed to start engine for ${connName}:`, err)
           await getRedisClient().hset("trade_engine:global", {

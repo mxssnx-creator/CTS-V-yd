@@ -215,6 +215,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           const coordinator = getGlobalTradeEngineCoordinator()
           const localStartAllowed =
             process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"
+            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
