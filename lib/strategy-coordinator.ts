@@ -2481,6 +2481,28 @@ export class StrategyCoordinator {
       }
     }
 
+    // ── Stable Main processing order ───────────────────────────────────
+    //
+    // Operator rule: process the Standard strategy outputs first, including
+    // the position-count axis fan-out, then let Adjust variants layer over
+    // them afterwards.  The async variant builder can complete in any order
+    // and the in-memory cache may return different variants at different
+    // speeds, so normalize the final Main array before Real evaluation and
+    // stats. This preserves the intended sequence:
+    //   1. default Base mirror
+    //   2. default position-count axis Sets
+    //   3. additional trailing Sets (independent Base-derived Sets)
+    //   4. Adjust Sets (block, then DCA)
+    const mainSetOrder = (set: StrategySet): number => {
+      if ((set.variant ?? "default") === "default" && !set.axisWindows?.axisKey) return 0
+      if ((set.variant ?? "default") === "default" && set.axisWindows?.axisKey) return 1
+      if (set.variant === "trailing") return 2
+      if (set.variant === "block") return 3
+      if (set.variant === "dca") return 4
+      return 5
+    }
+    mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))
+
     // ─── VARIANT accounting ───────────────────────�������────���──────────────────
     // Each related Main Set now carries an authoritative `variant` tag set
     // at build time, so we no longer have to heuristically classify

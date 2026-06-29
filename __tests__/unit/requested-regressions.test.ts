@@ -225,4 +225,39 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("exchange order placement remains credential-gated")
     expect(source).not.toContain("Engine start skipped - missing credentials")
   })
+
+  test("base pseudo-position step range includes the requested 2-step floor", () => {
+    const manager = read("lib/indication-config-manager.ts")
+    const settingsTab = read("components/settings/tabs/strategy-tab.tsx")
+    const coordinationSection = read("components/settings/strategy-coordination-section.tsx")
+
+    expect(manager).toContain("parsed >= 2 && parsed <= 30")
+    expect(manager).toContain("const ALL_STEPS = [2, 3, 5, 10, 15, 20, 25, 30]")
+    expect(settingsTab).toContain("Minimum pseudo-position step-window size (Steps 2–30).")
+    expect(settingsTab).toContain("min={2}")
+    expect(coordinationSection).toContain("2–30, step 1")
+    expect(coordinationSection).toContain("Setting to 2 adds the fastest 2 and 3 step windows")
+  })
+
+  test("standard and position-count sets are ordered before adjust variants", () => {
+    const source = read("lib/strategy-coordinator.ts")
+
+    expect(source).toContain("Operator rule: process the Standard strategy outputs first")
+    expect(source).toContain("const mainSetOrder = (set: StrategySet): number")
+    expect(source).toContain('if (set.variant === "block") return 3')
+    expect(source).toContain('if (set.variant === "dca") return 4')
+    expect(source).toContain("mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))")
+  })
+
+  test("dashboard detailed logs header action scrolls within the log dialog", () => {
+    const button = read("components/dashboard/detailed-logs-button.tsx")
+    const scrollArea = read("components/ui/scroll-area.tsx")
+    const dashboard = read("components/dashboard/dashboard.tsx")
+
+    expect(dashboard).toContain("<DetailedLogsButton />")
+    expect(button).toContain("scrollContainerRef.current?.scrollTo({ top: 0, behavior: \"smooth\" })")
+    expect(button).toContain("viewportRef={scrollContainerRef}")
+    expect(scrollArea).toContain("viewportRef?: React.Ref<HTMLDivElement>")
+    expect(scrollArea).toContain("ref={viewportRef}")
+  })
 })

@@ -854,7 +854,7 @@ export function StrategyCoordinationSection({
               </CardTitle>
               <CardDescription className="text-xs">
                 Minimum step size used when generating pseudo-position windows
-                for Base-stage indication configs (range 3–30, monotonic step
+                for Base-stage indication configs (range 2–30, monotonic step
                 5 by default). Only step values <strong>≥ this floor</strong>{" "}
                 are created and evaluated. Raising the value removes fast
                 short-window configs that react quickly but fire on noise.
@@ -862,7 +862,7 @@ export function StrategyCoordinationSection({
               </CardDescription>
             </div>
             <Badge variant="outline" className="text-[10px] tabular-nums">
-              3–30, step 1
+              2–30, step 1
             </Badge>
           </div>
         </CardHeader>
@@ -879,7 +879,7 @@ export function StrategyCoordinationSection({
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.minStep ?? 5]}
-                min={3}
+                min={2}
                 max={30}
                 step={1}
                 onValueChange={(v) =>
@@ -892,14 +892,14 @@ export function StrategyCoordinationSection({
               </span>
             </div>
             <div className="flex justify-between text-[10px] text-muted-foreground pt-0.5">
-              <span>3 (all)</span>
+              <span>2 (all)</span>
               <span className="text-muted-foreground/60">default 5</span>
               <span>30 (slowest)</span>
             </div>
             <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
               At default 5 the engine creates windows [5, 10, 15, 20, 25, 30].
-              Setting to 3 adds the two fastest windows. Setting to 10 removes
-              the two shortest (noisiest). Changes take effect from the next
+              Setting to 2 adds the fastest 2 and 3 step windows. Setting to 10 removes
+              the shortest noisy windows. Changes take effect from the next
               indication-config regeneration cycle.
             </p>
           </div>
