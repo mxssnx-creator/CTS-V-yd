@@ -3,6 +3,7 @@ import { initRedis, getRedisClient, getSettings, getConnection } from "@/lib/red
 import { getProgressionLogs, forceFlushLogs } from "@/lib/engine-progression-logs"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
+import { normalizeSymbolList } from "@/lib/trade-engine/symbol-selection-ownership"
 
 export const dynamic = "force-dynamic"
 export const dynamicParams = true
@@ -37,6 +38,9 @@ function parseSymbolList(value: unknown): string[] {
 }
 
 function getConfiguredSymbolCount(connection: any, engineState: any): number {
+  const canonicalSelectedSymbols = normalizeSymbolList(engineState?.selected_symbols)
+  const canonicalTotal = Math.max(toNumber(engineState?.config_set_symbols_total), canonicalSelectedSymbols.length)
+  if (canonicalTotal > 0) return canonicalTotal
   const candidates = [
     connection?.force_symbols,
     connection?.active_symbols,
@@ -326,10 +330,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           // prehistoric progress, so the saved connection/engine symbol list is
           // the floor for the denominator.
           const hashSymbolsTotal = Number(prehistoricData.symbols_total || 0)
+          const canonicalProgressTotal = configuredSymbolCount > 0 ? configuredSymbolCount : hashSymbolsTotal
           prehistoricProgress.symbolsTotal = Math.max(
             prehistoricProgress.symbolsTotal,
-            hashSymbolsTotal,
-            configuredSymbolCount,
+            canonicalProgressTotal,
             processedSet.length,
           )
 
@@ -476,7 +480,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         cycleTimeMs: toNumber(engineState?.last_cycle_duration),
         totalStrategiesEvaluated: toNumber(engineState?.total_strategies_evaluated),
         totalIndicationsEvaluated: toNumber(engineState?.total_indications_evaluated),
-        prehistoricSymbolsTotal: toNumber(engineState?.config_set_symbols_total),
+        prehistoricSymbolsTotal: configuredSymbolCount,
         prehistoricSymbolsProcessed: toNumber(engineState?.config_set_symbols_processed),
         prehistoricCandlesProcessed: toNumber(engineState?.config_set_candles_processed),
         prehistoricIndicationResults: toNumber(engineState?.config_set_indication_results),

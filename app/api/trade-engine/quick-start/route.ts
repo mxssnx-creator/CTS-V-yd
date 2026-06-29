@@ -406,6 +406,8 @@ export async function POST(request: Request) {
 
     console.log(`${LOG_PREFIX}: [2/4] Final symbol: ${symbols.join(", ")}`)
 
+    const symbolSelectionEpoch = `${Date.now()}:${Math.random().toString(36).slice(2)}`
+
     const liveTradeRequested = body.liveTrade !== false && body.is_live_trade !== false
     const liveTradeEnabled = liveTradeRequested && hasCredentials && testPassed
     const liveTradeBlockedReason = liveTradeRequested && !liveTradeEnabled
@@ -540,6 +542,9 @@ export async function POST(request: Request) {
       active_symbols: symbols,
       force_symbols: symbols,
       status: "ready",
+      quickstart_symbol_generation: symbolSelectionEpoch,
+      symbol_selection_epoch: symbolSelectionEpoch,
+      selected_symbols: JSON.stringify(symbols),
       config_set_symbols_total: symbols.length,
       config_set_symbols_processed: 0,
       prehistoric_data_loaded: false,

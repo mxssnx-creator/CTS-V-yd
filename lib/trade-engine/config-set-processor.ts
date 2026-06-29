@@ -11,6 +11,7 @@ import { StrategyConfigManager, PseudoPosition, StrategyConfig } from "@/lib/str
 import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { canonicalTotalForSymbols, clampProcessedToTotal, ownsCanonicalSymbolSelection } from "@/lib/trade-engine/symbol-selection-ownership"
 
 export interface ProcessingResult {
   indicationConfigs: number
@@ -144,8 +145,11 @@ export class ConfigSetProcessor {
       Math.min(32, Number(process.env.PREHISTORIC_SYMBOL_CONCURRENCY) || 8)
     )
 
+    const canonicalSymbolsTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
+    const ownsCurrentSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+
     console.log(
-      `[v0] [ConfigSetProcessor] ▶ prehistoric start | symbols=${symbols.length} | ` +
+      `[v0] [ConfigSetProcessor] ▶ prehistoric start | symbols=${symbols.length} canonicalTotal=${canonicalSymbolsTotal} | ` +
       `range=${effectiveStart.toISOString()} → ${effectiveEnd.toISOString()} | ` +
       `timeframe=${timeframeSec}s | concurrency=${SYMBOL_CONCURRENCY}`
     )
@@ -194,7 +198,7 @@ export class ConfigSetProcessor {
         range_start: effectiveStart.toISOString(),
         range_end: effectiveEnd.toISOString(),
         timeframe_seconds: String(timeframeSec),
-        symbols_total: String(symbols.length),
+        symbols_total: String(canonicalSymbolsTotal),
         symbol_concurrency: String(SYMBOL_CONCURRENCY),
         indication_configs: String(indicationConfigs.length),
         strategy_configs: String(strategyConfigs.length),
@@ -237,6 +241,15 @@ export class ConfigSetProcessor {
         if (candles.length === 0) {
           console.log(`[v0] [ConfigSetProcessor] ⚠ no candles for ${symbol} — skipping`)
           symbolsWithoutData++
+          if (!ownsCurrentSelection) {
+            await logProgressionEvent(this.connectionId, "config_set_symbol_skipped_stale_selection", "info", `Ignoring stale prehistoric skip progress for ${symbol}`, {
+              symbol,
+              stage: "prehistoric",
+              canonicalSymbolsTotal,
+              staleSymbolsTotal: symbols.length,
+            }).catch(() => {})
+            return
+          }
           // CRITICAL ("0/N stuck" + stalled progress-bar fix): a symbol with
           // no prehistoric candles must STILL count toward the processed
           // total, otherwise `symbols_processed` can never reach
@@ -253,13 +266,13 @@ export class ConfigSetProcessor {
             if (added > 0) {
               await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
             }
-            const distinctSkipProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
+            const distinctSkipProcessed = clampProcessedToTotal(await client.scard(`prehistoric:${this.connectionId}:symbols`), canonicalSymbolsTotal)
             await client.hset(`prehistoric:${this.connectionId}`, {
               symbols_processed: String(distinctSkipProcessed),
             })
             // Advance the dashboard percent bar even for data-less symbols,
             // using the SAME `engine_progression` schema the main path writes.
-            const totalSyms = Math.max(1, symbols.length)
+            const totalSyms = Math.max(1, canonicalSymbolsTotal)
             const skipPct = Math.min(95, 15 + Math.round((symbolsProcessed / totalSyms) * 80))
             void setSettings(`engine_progression:${this.connectionId}`, {
               phase: "prehistoric_data",
@@ -352,13 +365,13 @@ export class ConfigSetProcessor {
         // state report 30/15 symbols in 15-symbol live tests even though the
         // distinct processed set was correct. SADD gives us an idempotent
         // "new symbol" signal, then SCARD becomes the displayed count.
-        const progressWrite = (async () => {
+        const progressWrite = ownsCurrentSelection ? (async () => {
           const added = Number(await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol).catch(() => 0)) || 0
           await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400).catch(() => 0)
           if (added > 0) {
             await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1).catch(() => 0)
           }
-          const distinctProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`).catch(() => 0)
+          const distinctProcessed = clampProcessedToTotal(await client.scard(`prehistoric:${this.connectionId}:symbols`).catch(() => 0), canonicalSymbolsTotal)
           await Promise.all([
             client.hincrby(progressKey, "prehistoric_candles_processed", combinedCandles.length),
             client.hset(progressKey, {
@@ -373,7 +386,7 @@ export class ConfigSetProcessor {
             }),
             client.expire(progressKey, 7 * 24 * 60 * 60),
           ])
-        })().catch(() => { /* non-critical */ })
+        })().catch(() => { /* non-critical */ }) : Promise.resolve()
 
         // --- Run indications + strategies in parallel for this symbol ---
         const tCalcStart = Date.now()
@@ -401,10 +414,14 @@ export class ConfigSetProcessor {
         // async write could stamp a STALE (lower) value over a newer one,
         // freezing the dashboard at "X/N". SADD + SCARD is order-independent
         // and idempotent, so the distinct count is always monotonic and exact.
+        if (!ownsCurrentSelection) {
+          console.log(`[v0] [ConfigSetProcessor] stale symbol-selection progress ignored for ${symbol} (${symbols.length} symbols; canonical=${canonicalSymbolsTotal})`)
+          return
+        }
         await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
-        const distinctProcessed = await client
+        const distinctProcessed = clampProcessedToTotal(await client
           .scard(`prehistoric:${this.connectionId}:symbols`)
-          .catch(() => symbolsProcessed)
+          .catch(() => symbolsProcessed), canonicalSymbolsTotal)
         await Promise.all([
           progressWrite,
           client.hincrby(progressKey, "prehistoric_indications_total", indicationResults),
@@ -442,7 +459,7 @@ export class ConfigSetProcessor {
           // so the progress bar and the "symbols processed of N" label can
           // never regress under parallel workers — they advance in lockstep
           // with the authoritative distinct-symbol set.
-          const total = Math.max(1, symbols.length)
+          const total = Math.max(1, canonicalSymbolsTotal)
           const pct = Math.min(95, 15 + Math.round((distinctProcessed / total) * 80))
           void setSettings(`engine_progression:${this.connectionId}`, {
             phase: "prehistoric_data",
@@ -466,6 +483,15 @@ export class ConfigSetProcessor {
       } catch (error) {
         console.error(`[v0] [ConfigSetProcessor] ✗ ${symbol}:`, error instanceof Error ? error.message : String(error))
         errors++
+        if (!ownsCurrentSelection) {
+          await logProgressionEvent(this.connectionId, "config_set_symbol_error_stale_selection", "info", `Ignoring stale prehistoric error progress for ${symbol}`, {
+            symbol,
+            error: error instanceof Error ? error.message : String(error),
+            canonicalSymbolsTotal,
+            staleSymbolsTotal: symbols.length,
+          }).catch(() => {})
+          return
+        }
         // CRITICAL ("stuck below 100%" fix): a symbol that throws mid-process
         // must STILL count toward progress, otherwise the SCARD-derived
         // distinct count never reaches N and the bar freezes forever. Mirror
@@ -479,11 +505,11 @@ export class ConfigSetProcessor {
           if (added > 0) {
             await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
           }
-          const distinctErrProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
+          const distinctErrProcessed = clampProcessedToTotal(await client.scard(`prehistoric:${this.connectionId}:symbols`), canonicalSymbolsTotal)
           await client.hset(`prehistoric:${this.connectionId}`, {
             symbols_processed: String(distinctErrProcessed),
           })
-          const totalSyms = Math.max(1, symbols.length)
+          const totalSyms = Math.max(1, canonicalSymbolsTotal)
           const errPct = Math.min(95, 15 + Math.round((distinctErrProcessed / totalSyms) * 80))
           void setSettings(`engine_progression:${this.connectionId}`, {
             phase: "prehistoric_data",
@@ -524,8 +550,8 @@ export class ConfigSetProcessor {
       indicationResults: totalIndicationResults,
       strategyConfigs: strategyConfigs.length,
       strategyPositions: totalStrategyPositions,
-      symbolsTotal: symbols.length,
-      symbolsProcessed,
+      symbolsTotal: canonicalSymbolsTotal,
+      symbolsProcessed: clampProcessedToTotal(symbolsProcessed, canonicalSymbolsTotal),
       symbolsWithoutData,
       candlesProcessed,
       errors,

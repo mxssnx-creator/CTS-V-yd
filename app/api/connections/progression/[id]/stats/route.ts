@@ -3,6 +3,7 @@ import { initRedis, getRedisClient, getSettings, getConnection, getAppSettings }
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { aggregateLastXClosedPositions } from "@/lib/trade-engine/closed-position-aggregation"
 import { getGlobalCoordinator } from "@/lib/trade-engine"
+import { normalizeSymbolList } from "@/lib/trade-engine/symbol-selection-ownership"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -235,13 +236,20 @@ export async function GET(
         if (Array.isArray(parsed)) symbolsFromArray = parsed.length
       } catch { /* ignore */ }
     }
-    const historicSymbolsTotal = Math.max(
-      historicSymbolsProcessed,
-      n(prehistoricHash.symbols_total),
+    const canonicalSelectedSymbols = normalizeSymbolList(es.selected_symbols)
+    const canonicalCurrentTotal = Math.max(
       n(es.config_set_symbols_total),
+      canonicalSelectedSymbols.length,
       symbolsFromArray,
-      1
     )
+    const historicSymbolsTotal = canonicalCurrentTotal > 0
+      ? Math.max(Math.min(historicSymbolsProcessed, canonicalCurrentTotal), canonicalCurrentTotal)
+      : Math.max(
+          historicSymbolsProcessed,
+          n(prehistoricHash.symbols_total),
+          symbolsFromArray,
+          1,
+        )
     const historicCandlesLoaded = pick(
       n(prehistoricHash.candles_loaded),
       n(progHash.prehistoric_candles_processed),
