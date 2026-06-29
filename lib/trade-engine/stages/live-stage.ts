@@ -2355,6 +2355,25 @@ export async function executeLivePosition(
     // `processSimulatedPositions` sweep walking Redis market_data
     // and force-closing on SL/TP cross or max-hold-time expiry.
     if (!isLiveTradeEnabled) {
+      const existingSimulatedSlot = await findOpenLivePositionByDir(
+        connectionId,
+        realPosition.symbol,
+        realPosition.direction,
+      )
+      if (existingSimulatedSlot) {
+        pushStep(
+          existingSimulatedSlot,
+          "simulate_skip",
+          false,
+          `simulated slot already open for ${realPosition.symbol} ${realPosition.direction}`,
+        )
+        existingSimulatedSlot.statusReason =
+          existingSimulatedSlot.statusReason || "live_trade disabled — no exchange execution"
+        existingSimulatedSlot.updatedAt = Date.now()
+        await savePosition(existingSimulatedSlot)
+        return existingSimulatedSlot
+      }
+
       // Fetch the current market price so simulated positions open at a
       // real price (not 0). This mirrors the live path's Step 2 but runs
       // here before the simulation early-return so SL/TP cross-checks and

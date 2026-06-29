@@ -412,6 +412,21 @@ async function generateIndicationsForConnection(
     pipeline.hset(`indications_active:${connectionId}`, activeFields)
     pipeline.expire(`indications_active:${connectionId}`, 600)
 
+    // ── Windowed indication counts ─────────────────────────────────────
+    // Write latest per-symbol/per-type counts into the two time-windowed
+    // hashes consumed by getIndicationTracking. HSET is intentionally
+    // idempotent: production cron retries/overlaps must not inflate counts
+    // via HINCRBY. Zeroes are written too so a type that stops firing clears
+    // its previous "hot" value immediately instead of remaining stale.
+    const w5Key  = `indications_window:${connectionId}:last5`
+    const w60Key = `indications_window:${connectionId}:last60min`
+    for (const [type, count] of Object.entries(activeTypeCounts)) {
+      pipeline.hset(w5Key,  `${symbol}:${type}`, String(count))
+      pipeline.hset(w60Key, `${symbol}:${type}`, String(count))
+    }
+    pipeline.expire(w5Key,  300)  // 5-min rolling window
+    pipeline.expire(w60Key, 4200) // 70-min rolling window
+
     // cumulative indication counters — only when indications fired
     // This cron route is the ACTUAL realtime driver in this deployment (the
     // engine-manager realtime loop does not run in serverless). These writes
@@ -419,23 +434,6 @@ async function generateIndicationsForConnection(
     if (indications.length > 0) {
       pipeline.hincrby(progKey, "indications_count", indications.length)
       pipeline.hincrby(progKey, "indication_live_cycle_count", 1)
-
-      // ── Windowed indication counts ─────────────────────────────────────
-      // Write per-type counts into the two time-windowed hashes consumed by
-      // getIndicationTracking ("Last 5" / "Last 60 min" panels). Plain type
-      // fields (not symbol-prefixed) — HINCRBY accumulates across symbols
-      // for the same cron tick so each window shows the per-tick qualified
-      // total, not just the last symbol written. TTL is kept short (5 min /
-      // 70 min) so the windows naturally roll off older data.
-      const w5Key  = `indications_window:${connectionId}:last5`
-      const w60Key = `indications_window:${connectionId}:last60min`
-      for (const ind of indications) {
-        pipeline.hincrby(w5Key,  ind.type, 1)
-        pipeline.hincrby(w60Key, ind.type, 1)
-      }
-      pipeline.expire(w5Key,  300)  // 5-min rolling window
-      pipeline.expire(w60Key, 4200) // 70-min rolling window
-
       // indication_sets_total: increment by number of distinct type×symbol
       // Sets that fired this cycle (one per fired indication type counts as
       // one active Set for this symbol).

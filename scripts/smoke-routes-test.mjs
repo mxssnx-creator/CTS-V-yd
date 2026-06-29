@@ -16,7 +16,10 @@ async function waitForRoute(path, attempts = 30) {
   let lastCode = '000'
   for (let i = 0; i < attempts; i++) {
     try {
-      const response = await fetch(`${base}${path}`, { cache: 'no-store' })
+      const response = await fetch(`${base}${path}`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(5000),
+      })
       lastCode = String(response.status)
       if (response.status === 200 || response.status === 307) return
     } catch {
@@ -43,7 +46,10 @@ try {
   for (let i = 0; i < 90; i++) {
     if (existsSync('.next/routes-manifest.json')) {
       try {
-        const response = await fetch(base, { cache: 'no-store' })
+        const response = await fetch(base, {
+          cache: 'no-store',
+          signal: AbortSignal.timeout(5000),
+        })
         if (response.ok || response.status === 307) break
       } catch {
         // dev server not ready yet

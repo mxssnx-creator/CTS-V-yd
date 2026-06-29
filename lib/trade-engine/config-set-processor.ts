@@ -12,6 +12,7 @@ import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { canonicalTotalForSymbols, clampProcessedToTotal, getCanonicalSymbolSelection, ownsCanonicalSymbolSelectionEpoch } from "@/lib/trade-engine/symbol-selection-ownership"
+import { calculatePseudoClosePnl } from "@/lib/pseudo-position-costs"
 
 export interface ProcessingResult {
   indicationConfigs: number
@@ -1113,6 +1114,12 @@ export class ConfigSetProcessor {
         const pnl = positionSide === "long"
           ? (currentPrice - entryPrice) / entryPrice
           : (entryPrice - currentPrice) / entryPrice
+        const netPnlPct = calculatePseudoClosePnl({
+          entryPrice,
+          currentPrice,
+          quantity: 1,
+          side: positionSide,
+        }).netPnlPct
 
         const takeProfitHit = pnl >= takeprofit
         const stopLossHit = pnl <= -stoploss
@@ -1125,7 +1132,7 @@ export class ConfigSetProcessor {
             take_profit: entryPrice * (1 + (positionSide === "long" ? takeprofit : -takeprofit)),
             stop_loss: entryPrice * (1 + (positionSide === "long" ? -stoploss : stoploss)),
             status: "closed",
-            result: pnl * 100,
+            result: netPnlPct,
             exit_time: currentTime,
             exit_price: currentPrice,
             // Carry direction + indication_type into the in-memory
@@ -1151,6 +1158,12 @@ export class ConfigSetProcessor {
       const pnl = positionSide === "long"
         ? (lastPrice - entryPrice) / entryPrice
         : (entryPrice - lastPrice) / entryPrice
+      const netPnlPct = calculatePseudoClosePnl({
+        entryPrice,
+        currentPrice: lastPrice,
+        quantity: 1,
+        side: positionSide,
+      }).netPnlPct
 
       positions.push({
         entry_time: entryTime,
@@ -1159,7 +1172,7 @@ export class ConfigSetProcessor {
         take_profit: entryPrice * (1 + (positionSide === "long" ? takeprofit : -takeprofit)),
         stop_loss: entryPrice * (1 + (positionSide === "long" ? -stoploss : stoploss)),
         status: "open",
-        result: pnl * 100,
+        result: netPnlPct,
       })
     }
 
