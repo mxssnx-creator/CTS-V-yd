@@ -11,7 +11,7 @@ import { StrategyConfigManager, PseudoPosition, StrategyConfig } from "@/lib/str
 import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
-import { canonicalTotalForSymbols, clampProcessedToTotal, ownsCanonicalSymbolSelection } from "@/lib/trade-engine/symbol-selection-ownership"
+import { canonicalTotalForSymbols, clampProcessedToTotal, getCanonicalSymbolSelection, ownsCanonicalSymbolSelectionEpoch } from "@/lib/trade-engine/symbol-selection-ownership"
 
 export interface ProcessingResult {
   indicationConfigs: number
@@ -145,8 +145,11 @@ export class ConfigSetProcessor {
       Math.min(32, Number(process.env.PREHISTORIC_SYMBOL_CONCURRENCY) || 8)
     )
 
+    const initialSelection = await getCanonicalSymbolSelection(this.connectionId)
+    const writerSelectionEpoch = initialSelection?.epoch || ""
     const canonicalSymbolsTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
-    const ownsCurrentSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+    const ownsCurrentSelection = await ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
+    const stillOwnsCurrentSelection = () => ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
 
     console.log(
       `[v0] [ConfigSetProcessor] ▶ prehistoric start | symbols=${symbols.length} canonicalTotal=${canonicalSymbolsTotal} | ` +
@@ -198,7 +201,10 @@ export class ConfigSetProcessor {
         range_start: effectiveStart.toISOString(),
         range_end: effectiveEnd.toISOString(),
         timeframe_seconds: String(timeframeSec),
-        symbols_total: String(canonicalSymbolsTotal),
+        ...(ownsCurrentSelection ? {
+          symbol_selection_epoch: writerSelectionEpoch,
+          symbols_total: String(canonicalSymbolsTotal),
+        } : {}),
         symbol_concurrency: String(SYMBOL_CONCURRENCY),
         indication_configs: String(indicationConfigs.length),
         strategy_configs: String(strategyConfigs.length),
@@ -241,7 +247,7 @@ export class ConfigSetProcessor {
         if (candles.length === 0) {
           console.log(`[v0] [ConfigSetProcessor] ⚠ no candles for ${symbol} — skipping`)
           symbolsWithoutData++
-          if (!ownsCurrentSelection) {
+          if (!(await stillOwnsCurrentSelection())) {
             await logProgressionEvent(this.connectionId, "config_set_symbol_skipped_stale_selection", "info", `Ignoring stale prehistoric skip progress for ${symbol}`, {
               symbol,
               stage: "prehistoric",
@@ -365,7 +371,8 @@ export class ConfigSetProcessor {
         // state report 30/15 symbols in 15-symbol live tests even though the
         // distinct processed set was correct. SADD gives us an idempotent
         // "new symbol" signal, then SCARD becomes the displayed count.
-        const progressWrite = ownsCurrentSelection ? (async () => {
+        const progressWrite = (async () => {
+          if (!(await stillOwnsCurrentSelection())) return
           const added = Number(await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol).catch(() => 0)) || 0
           await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400).catch(() => 0)
           if (added > 0) {
@@ -386,7 +393,7 @@ export class ConfigSetProcessor {
             }),
             client.expire(progressKey, 7 * 24 * 60 * 60),
           ])
-        })().catch(() => { /* non-critical */ }) : Promise.resolve()
+        })().catch(() => { /* non-critical */ })
 
         // --- Run indications + strategies in parallel for this symbol ---
         const tCalcStart = Date.now()
@@ -414,7 +421,7 @@ export class ConfigSetProcessor {
         // async write could stamp a STALE (lower) value over a newer one,
         // freezing the dashboard at "X/N". SADD + SCARD is order-independent
         // and idempotent, so the distinct count is always monotonic and exact.
-        if (!ownsCurrentSelection) {
+        if (!(await stillOwnsCurrentSelection())) {
           console.log(`[v0] [ConfigSetProcessor] stale symbol-selection progress ignored for ${symbol} (${symbols.length} symbols; canonical=${canonicalSymbolsTotal})`)
           return
         }
@@ -483,7 +490,7 @@ export class ConfigSetProcessor {
       } catch (error) {
         console.error(`[v0] [ConfigSetProcessor] ✗ ${symbol}:`, error instanceof Error ? error.message : String(error))
         errors++
-        if (!ownsCurrentSelection) {
+        if (!(await stillOwnsCurrentSelection())) {
           await logProgressionEvent(this.connectionId, "config_set_symbol_error_stale_selection", "info", `Ignoring stale prehistoric error progress for ${symbol}`, {
             symbol,
             error: error instanceof Error ? error.message : String(error),

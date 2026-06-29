@@ -544,6 +544,8 @@ export async function POST(request: Request) {
       status: "ready",
       quickstart_symbol_generation: symbolSelectionEpoch,
       symbol_selection_epoch: symbolSelectionEpoch,
+      quickstart_symbol_count: symbols.length,
+      quickstart_symbols: JSON.stringify(symbols),
       selected_symbols: JSON.stringify(symbols),
       config_set_symbols_total: symbols.length,
       config_set_symbols_processed: 0,
@@ -557,6 +559,9 @@ export async function POST(request: Request) {
     // initial value must already match what the user picked.
     try {
       await client.hset(`prehistoric:${connectionId}`, {
+        symbol_selection_epoch: String(symbolSelectionEpoch),
+        quickstart_symbol_count: String(symbols.length),
+        quickstart_symbols: JSON.stringify(symbols),
         symbols_total: String(symbols.length),
         symbols_processed: "0",
         is_complete: "0",
@@ -715,6 +720,9 @@ export async function POST(request: Request) {
             client.hset(`progression:${connectionId}`, {
               ...QUICKSTART_ZERO_COUNTERS,
               session_reset_at: new Date().toISOString(),
+              symbol_selection_epoch: String(symbolSelectionEpoch),
+              quickstart_symbol_count: String(symbols.length),
+              quickstart_symbols: JSON.stringify(symbols),
               symbols_total: String(symbols.length),
               symbols_processed: "0",
             }).catch(() => 0),

@@ -45,6 +45,19 @@ export async function ownsCanonicalSymbolSelection(connectionId: string, activeS
   return sameSymbolSelection(selection.symbols, activeSymbols)
 }
 
+export function epochOwnsActiveSelection(writerEpoch: unknown, activeEpoch: unknown): boolean {
+  const active = String(activeEpoch || "").trim()
+  if (!active) return true
+  return String(writerEpoch || "").trim() === active
+}
+
+export async function ownsCanonicalSymbolSelectionEpoch(connectionId: string, activeSymbols: string[], writerEpoch?: unknown): Promise<boolean> {
+  const selection = await getCanonicalSymbolSelection(connectionId)
+  if (!selection) return true
+  return epochOwnsActiveSelection(writerEpoch ?? selection.epoch, selection.epoch)
+    && (selection.symbols.length === 0 || sameSymbolSelection(selection.symbols, activeSymbols))
+}
+
 export async function canonicalTotalForSymbols(connectionId: string, activeSymbols: string[]): Promise<number> {
   const selection = await getCanonicalSymbolSelection(connectionId)
   if (selection?.total && selection.total > 0) return selection.total
