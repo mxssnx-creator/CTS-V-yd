@@ -220,6 +220,8 @@ export async function POST(request: NextRequest) {
               await updateConnection(connId, {
                 ...conn,
                 ...liveTradeUpdate,
+                is_live_trade: "1",
+                live_trade_blocked_reason: "",
                 paused_by_global: "0",
                 updated_at: new Date().toISOString(),
               })
@@ -285,6 +287,8 @@ export async function POST(request: NextRequest) {
               is_live_trade: credentialCheck.valid ? "1" : "0",
               live_trade_blocked_reason: credentialCheck.valid ? "" : credentialCheck.reason,
               live_trade_requested: "1",
+              is_live_trade: "1",
+              live_trade_blocked_reason: "",
               updated_at: new Date().toISOString(),
             }
             await updateConnection(conn.id, updatedConn)

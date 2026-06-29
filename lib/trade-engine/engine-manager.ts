@@ -179,7 +179,7 @@ function getCyclePauseMsSync(): number {
 refreshCyclePauseMsAsync()
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync, getAppSettings, getAppSetting, getSettingsVersion } from "@/lib/redis-db"
-import { canonicalTotalForSymbols, clampProcessedToTotal, ownsCanonicalSymbolSelection } from "@/lib/trade-engine/symbol-selection-ownership"
+import { canonicalTotalForSymbols, clampProcessedToTotal, getCanonicalSymbolSelection, ownsCanonicalSymbolSelection, ownsCanonicalSymbolSelectionEpoch } from "@/lib/trade-engine/symbol-selection-ownership"
 import { DataSyncManager } from "@/lib/data-sync-manager"
 import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor, clearFlowThrottleForConnection } from "./strategy-processor"
@@ -837,10 +837,13 @@ export class TradeEngineManager {
         // cached state.
         try {
           const symbols = await this.getSymbols()
-          const ownsCacheSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+          const cacheSelection = await getCanonicalSymbolSelection(this.connectionId)
+          const writerSelectionEpoch = cacheSelection?.epoch || ""
+          const ownsCacheSelection = await ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
           const canonicalCacheTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
-          await redisClient.hset(`prehistoric:${this.connectionId}`, {
+          if (ownsCacheSelection) await redisClient.hset(`prehistoric:${this.connectionId}`, {
             is_complete: "1",
+            symbol_selection_epoch: writerSelectionEpoch,
             symbols_processed: String(clampProcessedToTotal(symbols.length, canonicalCacheTotal)),
             symbols_total: String(canonicalCacheTotal),
             updated_at: new Date().toISOString(),
@@ -1561,7 +1564,9 @@ export class TradeEngineManager {
       // From this point ConfigSetProcessor is the SOLE incremental writer of
       // symbols_processed (always derived from scard of the SET it owns), so
       // the displayed count can never disagree with symbols_total.
-      const ownsCurrentSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+      const initialSelection = await getCanonicalSymbolSelection(this.connectionId)
+      const writerSelectionEpoch = initialSelection?.epoch || ""
+      const ownsCurrentSelection = await ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
       const canonicalSymbolsTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
       if (ownsCurrentSelection) {
         await redisClient.del(`prehistoric:${this.connectionId}:symbols`).catch(() => {})
@@ -1573,9 +1578,12 @@ export class TradeEngineManager {
         range_days: String(storedRangeDays),
         timeframe_seconds: String(storedTimeframeSec),
         is_complete: "0",
-        symbols_processed: "0",
-        symbols_total: String(canonicalSymbolsTotal),
-        ...(ownsCurrentSelection ? { prehistoric_symbols_processed_count: "0" } : {}),
+        ...(ownsCurrentSelection ? {
+          symbol_selection_epoch: writerSelectionEpoch,
+          symbols_processed: "0",
+          symbols_total: String(canonicalSymbolsTotal),
+          prehistoric_symbols_processed_count: "0",
+        } : {}),
         started_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
@@ -1620,9 +1628,14 @@ export class TradeEngineManager {
         .scard(`prehistoric:${this.connectionId}:symbols`)
         .catch(() => processingResult.symbolsProcessed)
       const finalScard = clampProcessedToTotal(finalScardRaw, processingResult.symbolsTotal)
+      const ownsCurrentSelectionAtCompletion = await ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
       await redisClient.hset(`prehistoric:${this.connectionId}`, {
         is_complete: "1",
-        symbols_processed: String(finalScard),
+        ...(ownsCurrentSelectionAtCompletion ? {
+          symbol_selection_epoch: writerSelectionEpoch,
+          symbols_processed: String(finalScard),
+          symbols_total: String(processingResult.symbolsTotal),
+        } : {}),
         candles_loaded: String(processingResult.candlesProcessed),
         indicators_calculated: String(processingResult.indicationResults),
         total_duration_ms: String(totalPrehistoricDurationMs),
@@ -1931,8 +1944,10 @@ export class TradeEngineManager {
             if (isDirty) {
               // Clear the dirty flag
               await client.del(dirtyKey)
+              this.invalidateStrategyAndCoordinationCaches([], "dirty-flag:indication")
+              this.triggerImmediateStrategyReevaluation("dirty-flag:indication")
               console.log(
-                `[v0] [IndicationProcessor] Settings reloaded for ${this.connectionId}`
+                `[v0] [IndicationProcessor] Dirty flag consumed for ${this.connectionId}; settings reloaded and immediate strategy re-evaluation requested`
               )
             }
           }
@@ -3838,6 +3853,42 @@ export class TradeEngineManager {
   public invalidateSymbolsCache(): void {
     this._symbolsCache = null
     this._symbolsCachedAt = 0
+  }
+
+  /**
+   * Force-expire strategy/coordination settings that are cached across ticks.
+   * Used by settings-save fast paths and dirty-flag consumers for PF, DDT,
+   * coordination, and variant changes; symbol-only invalidation is not enough
+   * for those settings because StrategyCoordinator memoizes thresholds.
+   */
+  public invalidateStrategyAndCoordinationCaches(changedFields: string[] = [], reason = "settings-change"): void {
+    const invalidatedCaches: string[] = []
+    try {
+      clearFlowThrottleForConnection(this.connectionId)
+      invalidatedCaches.push("strategy.flowThrottle")
+    } catch { /* best-effort */ }
+
+    let coordinatorReloadGeneration = 0
+    try {
+      coordinatorReloadGeneration = StrategyCoordinator.forceNextSettingsReload(this.connectionId)
+      invalidatedCaches.push(
+        "strategyCoordinator.PFThresholds",
+        "strategyCoordinator.DDTThresholds",
+        "strategyCoordinator.trailingSettings",
+        "strategyCoordinator.minStepSettings",
+        "strategyCoordinator.coordinationSettings",
+      )
+    } catch { /* best-effort */ }
+
+    try {
+      this.realtimeProcessor.invalidatePrevSet(undefined)
+      ;(this.realtimeProcessor as any).prevSetCache?.clear?.()
+      invalidatedCaches.push("realtime.prevSetCache")
+    } catch { /* best-effort */ }
+
+    console.log(
+      `[v0] [Engine ${this.connectionId}] strategy/coordination caches invalidated (${reason}); generation=${coordinatorReloadGeneration}; fields=[${changedFields.join(",")}]; caches=[${invalidatedCaches.join(",")}]`,
+    )
   }
 
   /**
