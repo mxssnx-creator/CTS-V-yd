@@ -251,7 +251,7 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
                   <div className="space-y-2">
                     <h3 className="text-lg font-semibold">Minimal Step</h3>
                     <p className="text-xs text-muted-foreground">
-                      Minimum pseudo-position step-window size (Steps 3–30).
+                      Minimum pseudo-position step-window size (Steps 2–30).
                       Only windows ≥ this value are generated. Higher values
                       filter out fast noisy configs and can reduce losing orders.
                       Default: 5.
@@ -261,7 +261,7 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
                     <Label>Min Step Window</Label>
                     <div className="flex items-center gap-4">
                       <Slider
-                        min={3}
+                        min={2}
                         max={30}
                         step={1}
                         value={[settings.minStep ?? 5]}
@@ -273,7 +273,7 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
                       </span>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      Steps generated: {[3, 5, 10, 15, 20, 25, 30].filter(s => s >= (settings.minStep ?? 5)).join(", ")}
+                      Steps generated: {[2, 3, 5, 10, 15, 20, 25, 30].filter(s => s >= (settings.minStep ?? 5)).join(", ")}
                     </p>
                   </div>
 

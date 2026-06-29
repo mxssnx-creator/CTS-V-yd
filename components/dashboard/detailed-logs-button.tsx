@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import { AlertTriangle, ArrowUp, FileText, RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -33,6 +33,7 @@ export function DetailedLogsButton() {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>("error")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null)
 
   const visibleLogs = useMemo(() => {
     return filter === "all" ? logs : logs.filter((log) => log.type === filter || log.phase?.includes(filter))
@@ -93,7 +94,11 @@ export function DetailedLogsButton() {
             ))}
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => scrollContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" })}
+            >
               <ArrowUp className="h-4 w-4" />
               Top
             </Button>
@@ -110,7 +115,7 @@ export function DetailedLogsButton() {
           </div>
         )}
 
-        <ScrollArea className="h-[65vh] rounded-md border bg-muted/20">
+        <ScrollArea className="h-[65vh] rounded-md border bg-muted/20" viewportRef={scrollContainerRef}>
           <div className="space-y-2 p-3">
             {visibleLogs.length === 0 ? (
               <p className="py-10 text-center text-sm text-muted-foreground">

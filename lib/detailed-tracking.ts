@@ -279,15 +279,47 @@ export async function getIndicationTracking(
   // is coarser (it's all-time, not windowed) but keeps the UI non-zero.
   const w5 = (w5Hash || {}) as Record<string, string>
   const w60 = (w60Hash || {}) as Record<string, string>
+  const aggregateWindowByType = (hash: Record<string, string>): Record<string, number> => {
+    const totals: Record<string, number> = {}
+    for (const t of types) totals[t] = 0
+
+    // Current writers use per-symbol fields ("BTCUSDT:direction"). Older
+    // production data may still contain plain legacy fields ("direction").
+    // When both shapes exist, prefer the per-symbol snapshot and ignore the
+    // legacy plain field for that type; otherwise a mixed deployment doubles
+    // the count and makes sibling type totals look unstable/identical.
+    const hasSymbolField: Record<string, boolean> = {}
+    for (const t of types) hasSymbolField[t] = false
+    for (const field of Object.keys(hash)) {
+      const idx = field.lastIndexOf(":")
+      if (idx <= 0) continue
+      const type = field.slice(idx + 1)
+      if (type in hasSymbolField) hasSymbolField[type] = true
+    }
+
+    for (const [field, raw] of Object.entries(hash)) {
+      const idx = field.lastIndexOf(":")
+      const type = idx > 0 ? field.slice(idx + 1) : field
+      if (!(type in totals)) continue
+      if (idx <= 0 && hasSymbolField[type]) continue
+      totals[type] += Number(raw) || 0
+    }
+
+    return totals
+  }
+  const w5ByType = aggregateWindowByType(w5)
+  const w60ByType = aggregateWindowByType(w60)
 
   const last5ByType: Record<string, number> = {}
   const last60ByType: Record<string, number> = {}
   let last5Total = 0
   let last60Total = 0
   for (const t of types) {
-    // Window hash fields are written as plain type strings (not symbol-prefixed).
-    const v5  = Number(w5[t]  || "0")
-    const v60 = Number(w60[t] || "0")
+    // Window hash fields may be legacy plain type strings or current
+    // "{symbol}:{type}" fields. Aggregate both shapes to keep production
+    // counts stable across overlapping/retried cycles.
+    const v5  = w5ByType[t] || 0
+    const v60 = w60ByType[t] || 0
     // Fallback: use per-type cumulative count from progression hash.
     // This ensures non-zero values on first boot before windowed writes happen.
     const cumulative = Number(prog[`indications_${t}_count`] || "0")

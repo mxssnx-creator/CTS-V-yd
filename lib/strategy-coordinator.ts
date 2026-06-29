@@ -2086,21 +2086,23 @@ export class StrategyCoordinator {
     // (and across cycles within the 5s PF-cache window), so an in-place write
     // would bleed the relaxed threshold into every subsequent symbol's call.
     let mainMinPF = metricsMain.minProfitFactor
+    let liveQuickstartOn = false
     try {
-      const { isProductionEnvironment, getConnection: getConn } = await import("@/lib/redis-db")
+      const { getConnection: getConn } = await import("@/lib/redis-db")
       const { isTruthyFlag } = await import("@/lib/connection-state-utils")
-      if (isProductionEnvironment()) {
-        const conn = await getConn(this.connectionId).catch(() => null as any)
-        const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
-        if (liveOn) {
-          const relaxed = Math.min(mainMinPF, 0.85)
-          if (relaxed !== mainMinPF) {
-            console.log(
-              `[v0] [StrategyCoordinator] ${this.connectionId} MAIN bootstrap (prod + live quickstart): ` +
-              `relaxed minProfitFactor ${mainMinPF} → ${relaxed} to allow first Base→Main→Real flow.`
-            )
-            mainMinPF = relaxed
-          }
+      const conn = await getConn(this.connectionId).catch(() => null as any)
+      liveQuickstartOn =
+        isTruthyFlag(conn?.is_live_trade) ||
+        isTruthyFlag(conn?.live_trade_enabled) ||
+        isTruthyFlag(conn?.live_trade_requested)
+      if (liveQuickstartOn) {
+        const relaxed = Math.min(mainMinPF, 0.75)
+        if (relaxed !== mainMinPF) {
+          console.log(
+            `[v0] [StrategyCoordinator] ${this.connectionId} MAIN bootstrap (live quickstart): ` +
+            `relaxed minProfitFactor ${mainMinPF} → ${relaxed} to allow first Base→Main→Real flow.`
+          )
+          mainMinPF = relaxed
         }
       }
     } catch { /* non-fatal */ }
@@ -2117,7 +2119,9 @@ export class StrategyCoordinator {
     // entryCount climbs. Tracked via a single counter so the dashboard
     // can surface "skipped due to insufficient positions" without
     // polluting the passed/failed buckets.
-    const mainMinPos = this._coordinationSettings.mainEvalPosCount
+    const mainMinPos = liveQuickstartOn
+      ? 1
+      : this._coordinationSettings.mainEvalPosCount
     let skippedLowPos = 0
 
     // ── 1. Fingerprint-cache lookup ────────────────────────────────────────
@@ -2476,6 +2480,28 @@ export class StrategyCoordinator {
         }).catch(() => {}) // non-critical
       }
     }
+
+    // ── Stable Main processing order ───────────────────────────────────
+    //
+    // Operator rule: process the Standard strategy outputs first, including
+    // the position-count axis fan-out, then let Adjust variants layer over
+    // them afterwards.  The async variant builder can complete in any order
+    // and the in-memory cache may return different variants at different
+    // speeds, so normalize the final Main array before Real evaluation and
+    // stats. This preserves the intended sequence:
+    //   1. default Base mirror
+    //   2. default position-count axis Sets
+    //   3. additional trailing Sets (independent Base-derived Sets)
+    //   4. Adjust Sets (block, then DCA)
+    const mainSetOrder = (set: StrategySet): number => {
+      if ((set.variant ?? "default") === "default" && !set.axisWindows?.axisKey) return 0
+      if ((set.variant ?? "default") === "default" && set.axisWindows?.axisKey) return 1
+      if (set.variant === "trailing") return 2
+      if (set.variant === "block") return 3
+      if (set.variant === "dca") return 4
+      return 5
+    }
+    mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))
 
     // ─── VARIANT accounting ───────────────────────�������────���──────────────────
     // Each related Main Set now carries an authoritative `variant` tag set
@@ -2912,10 +2938,13 @@ export class StrategyCoordinator {
         const { getConnection: getConn } = await import("@/lib/redis-db")
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
         const conn = await getConn(this.connectionId).catch(() => null as any)
-        const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
+        const liveOn =
+          isTruthyFlag(conn?.is_live_trade) ||
+          isTruthyFlag(conn?.live_trade_enabled) ||
+          isTruthyFlag(conn?.live_trade_requested)
         if (liveOn) {
           // Position count relaxation (already present)
-          realMinPos = Math.max(1, Math.min(realMinPos, 3))
+          realMinPos = 1
 
           // PF bootstrap relaxation — lower the Real gate slightly to allow first
           // cycles to promote sets when live trading is explicitly enabled.
@@ -2923,7 +2952,7 @@ export class StrategyCoordinator {
           if (relaxed !== realMinPF) {
             console.log(
               `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
-              `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount���${realMinPos} ` +
+              `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount=${realMinPos} ` +
               `to allow first Real→Live escalation while history builds.`
             )
             realMinPF = relaxed
@@ -2991,7 +3020,7 @@ export class StrategyCoordinator {
       // dispatch were silently 0 even though the variant was correctly built.
       const isVariantProjection = !!(s.variant && s.variant !== "default") && (s.entryCount ?? 0) > 0
 
-      // ── 1. Position-count gate ──────────────────────�����─────────────────────
+      // ── 1. Position-count gate ───────────────────────────────────────────
       if (posCount < realMinPos && !(isAxisSet && hasEntries) && !isVariantProjection) {
         const hasActiveReal = realActiveKeysForVP.has(s.setKey) || (s as any)._hasLivePositions === true
         if (!hasActiveReal) {

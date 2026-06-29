@@ -5,6 +5,7 @@
  */
 
 import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { calculatePseudoClosePnl } from "@/lib/pseudo-position-costs"
 
 export interface StrategyConfig {
   id: string
@@ -431,7 +432,12 @@ export class StrategyConfigManager {
     const openPositions = positions.filter((p) => p.symbol === symbol && p.status === "open")
 
     for (const pos of openPositions) {
-      const pnl = ((exitPrice - pos.entry_price) / pos.entry_price) * 100
+      const pnl = calculatePseudoClosePnl({
+        entryPrice: pos.entry_price,
+        currentPrice: exitPrice,
+        quantity: 1,
+        side: pos.direction || "long",
+      }).netPnlPct
       const closedPos: PseudoPosition = {
         ...pos,
         status: "closed",
