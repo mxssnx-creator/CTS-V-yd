@@ -942,7 +942,13 @@ export class StrategyCoordinator {
    * safe. If a future caller needs to mutate, they should clone the
    * returned record explicitly.
    */
-  private static readonly _FP_LRU_MAX = 4_096
+  // Scale LRU with symbol count so a single-symbol dev run keeps ~300 slots
+  // while a 10-symbol prod run keeps up to 1024. Each slot holds a StrategySet
+  // reference (~2-5 KB) so capping tightly saves 8-40 MB of heap in practice.
+  private static readonly _FP_LRU_MAX = (() => {
+    const n = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+    return process.env.NODE_ENV === "development" ? Math.min(512, n * 128) : 1_024
+  })()
   private static _fpLru: Map<string, StrategySet> = new Map()
   private static _fpLruGet(fp: string): StrategySet | undefined {
     const hit = StrategyCoordinator._fpLru.get(fp)
@@ -968,7 +974,12 @@ export class StrategyCoordinator {
   // Bounded tightly because production workers can be restarted with already-
   // active engines. Keeping tens of thousands of axis objects resident across
   // warmup cycles caused OOM kills before health probes could complete.
-  private static readonly _AXIS_LRU_MAX = 8_000
+  // Scale with symbol count: 1 symbol → 600 slots; 10 symbols → 2000 slots.
+  // Each slot ~2-5 KB → 600 slots ≈ 1.2-3 MB (was 16-40 MB at 8000).
+  private static readonly _AXIS_LRU_MAX = (() => {
+    const n = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+    return process.env.NODE_ENV === "development" ? Math.min(1_000, n * 600) : 2_000
+  })()
   private static readonly _axisLruMap: Map<string, StrategySet> = new Map()
   private static _axisLruGet(key: string): StrategySet | undefined {
     const hit = StrategyCoordinator._axisLruMap.get(key)
@@ -1549,6 +1560,17 @@ export class StrategyCoordinator {
       }
 
       await this.logStrategyProgression(symbol, results)
+
+      // Explicitly release the CoordIndex Maps so V8 can reclaim them before
+      // the next cycle's allocation pressure. Without this, the Map entries
+      // (each holding a StrategySet reference) stay reachable until the next
+      // major GC, which may not run between tight cycles at high symbol counts.
+      if (coordIndex) {
+        coordIndex.base.byKey.clear()
+        coordIndex.records.length = 0
+        coordIndex.validRealKeys.clear()
+      }
+
       return results
     } catch (error) {
       console.error(`[v0] [StrategyCoordinator] Flow failed for ${symbol}:`, error)
@@ -2446,9 +2468,13 @@ export class StrategyCoordinator {
         Number.isFinite(rawAxisCeiling) && rawAxisCeiling > 0
           ? Math.floor(rawAxisCeiling)
           : null
+      // Dev: 150 per symbol keeps the pipeline fed without the memory spike
+      // that 300/sym caused (300 × ~2 KB entries × 2 variants = ~1.2 MB/sym
+      // in-flight; at 1 sym the cycle footprint drops from ~600 KB to ~300 KB).
+      // Prod: 50 unchanged (serverless — each invocation is short-lived).
       const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (
         process.env.NODE_ENV === "development"
-          ? Math.max(300, _devSyms * 300)
+          ? Math.max(150, _devSyms * 150)
           : 50
       )
       let axisCapHit = false

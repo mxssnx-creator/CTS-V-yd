@@ -406,10 +406,11 @@ export class InlineLocalRedis {
     // 4 GB VM: RSS at boot is ~2.3 GB (Next.js + InlineLocalRedis migrations).
     // Evict aggressively at 250 MB heap / 1400 MB RSS so the prehistoric
     // burst (which adds ~300-400 MB) never pushes RSS past the kernel OOM limit.
-    // Heap eviction trigger: fire at 1200 MB in dev (dev heap cap is now 4096 MB)
-    // and 1500 MB in prod. These are ~30% of the respective heap caps, leaving
-    // ample room for the prehistoric burst (~300 MB) before hitting the V8 limit.
-    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 1_200 : 1_500
+    // Heap eviction trigger: fire at 800 MB in dev (dev heap cap 4096 MB, engine
+    // runs ~900-1100 MB heap at peak so this fires proactively before bursts).
+    // Prod: 1200 MB (serverless invocations rarely exceed 512 MB so this is
+    // a safety net for long-lived containers).
+    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 800 : 1_200
 
     // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
     // to clear volatile key families that accumulate across hot-reload cycles
@@ -604,12 +605,11 @@ export class InlineLocalRedis {
         const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
-        // RSS trigger: in dev, Next.js idle RSS is ~1.9–2.5 GB so the trigger
-        // must be set high enough to avoid false-positives at idle, yet low
-        // enough to fire before kernel OOM (which kills at ~8 GB on this VM).
-        // 5 GB gives a comfortable eviction runway on the 8.4 GB VM.
-        // In prod (real Redis, off-heap) RSS trigger fires at 3.5 GB.
-        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 5_000 : 3_500
+        // RSS trigger: in dev, Next.js + engine idle RSS is ~1.8–2.4 GB.
+        // Trigger at 2200 MB so eviction runs before the engine prehistoric burst
+        // (which adds 300-400 MB) pushes RSS past 2.5 GB and routes start timing out.
+        // Prod: 3000 MB (serverless containers rarely hit this; safety net only).
+        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 2_200 : 3_000
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         // Scale the key-count eviction trigger with symbol count so the threshold
@@ -772,34 +772,36 @@ export class InlineLocalRedis {
       ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
       : 1  // prod caps don't scale (real Redis is off-heap)
 
-    // Caps indexed by bucket name (shared between hash and string passes)
+    // Caps indexed by bucket name (shared between hash and string passes).
+    // Dev caps are deliberately tight to keep RSS below 2.2 GB so the eviction
+    // interval fires before routes start timing out. Prod caps are generous
+    // because real Redis is off-heap and these are only safety-net guards.
     const CAPS: Record<string, number> = {
-      // N × per-symbol baseline keeps the active evaluation window alive across
-      // all symbols without letting any one family blow up the heap.
-      pseudo_position:              isDev ? _N * 200  : 2000,
-      s_pseudo_position:            isDev ? _N * 150  : 1500,
-      strategies:                   isDev ? _N * 50   : 100,
-      s_strategies:                 isDev ? _N * 20   : 20,
-      config_set:                   isDev ? _N * 60   : 1500,
-      strategy_positions:           isDev ? _N * 30   : 1000,
-      strategy_detail:              isDev ? _N * 30   : 1000,
-      real_stage:                   isDev ? _N * 30   : 1000,
-      indication:                   isDev ? _N * 100  : 500,
-      indications:                  isDev ? _N * 20   : 100,
-      // indication_set:* — per-cycle per-symbol indication set hashes.
-      // 150 sets per symbol keeps the most-recent evaluation window alive.
-      // At 10 symbols: 1500 keys × ~6.6 KB each ≈ 10 MB (manageable).
-      indication_set:               isDev ? _N * 150  : 5000,
-      // indication_outcomes_pending:* — rolling outcome list, one per symbol.
-      // 15 per symbol is enough to track recent outcomes across all types.
-      indication_outcomes_pending:  isDev ? _N * 15   : 200,
-      // axis_pos_acc:* — axis position accumulator (one per connection, ~200 KB).
+      // Pseudo-positions: reduced from N*200 → N*80. A single-symbol engine
+      // realistically holds ≤ 50 open pseudo positions at any time; the extra
+      // capacity was just hot waste in the Map.
+      pseudo_position:              isDev ? _N * 80   : 2000,
+      s_pseudo_position:            isDev ? _N * 60   : 1500,
+      strategies:                   isDev ? _N * 30   : 100,
+      s_strategies:                 isDev ? _N * 15   : 20,
+      config_set:                   isDev ? _N * 40   : 1500,
+      strategy_positions:           isDev ? _N * 20   : 1000,
+      strategy_detail:              isDev ? _N * 20   : 1000,
+      real_stage:                   isDev ? _N * 20   : 1000,
+      indication:                   isDev ? _N * 60   : 500,
+      indications:                  isDev ? _N * 15   : 100,
+      // indication_set: reduced from N*150 → N*80. The pipeline reads the most
+      // recent 50-80 sets per symbol; keeping 150 was unnecessary headroom.
+      indication_set:               isDev ? _N * 80   : 5000,
+      // indication_outcomes_pending: reduced from N*15 → N*10 (tight list).
+      indication_outcomes_pending:  isDev ? _N * 10   : 200,
+      // axis_pos_acc: one per connection.
       axis_pos_acc:                 5,
       prehistoric:                  20,
-      live_history:                 isDev ? _N * 30   : 500,
+      live_history:                 isDev ? _N * 20   : 500,
       // string-only
-      indications_str:              isDev ? _N * 20   : 50,
-      dedup:                        isDev ? _N * 100  : 3000,
+      indications_str:              isDev ? _N * 15   : 50,
+      dedup:                        isDev ? _N * 60   : 3000,
       candle_cache:                 isDev ? _N * 4    : 20,
       candles:                      isDev ? _N * 4    : 20,
     }
@@ -911,8 +913,26 @@ export class InlineLocalRedis {
       }
     }
 
+    // ── TTL expiry sweep ─────────────────────────────────────────────────────
+    // Eagerly delete any keys whose TTL has already passed. Without this, expired
+    // keys stay in the Map until a reader calls isExpired(), so the eviction
+    // loop above sees them as live entries and keeps them under caps.
+    if (this.data.ttl) {
+      const now = Date.now()
+      for (const [key, expireAt] of this.data.ttl.entries()) {
+        if (expireAt <= now) {
+          this.deleteKey(key)
+          evicted++
+        }
+      }
+    }
+
     if (evicted > 10) {
       console.log(`[v0] [Redis Memory] Evicted ${evicted} old records to reduce memory pressure`)
+      // Nudge V8 GC if --expose-gc was passed (dev start script uses it).
+      // After trimming Map entries the GC needs a hint to return the freed
+      // memory to the OS heap rather than keeping it as V8 slack capacity.
+      ;(globalThis as any).gc?.()
     }
     return evicted
   }
@@ -2230,7 +2250,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
 // `getAppSettings()` returns a merged record with `app_settings` winning
 // on conflict (it's the canonical UI-facing key). Missing keys silently
 // fall back to an empty object so callers can use `?? default` patterns.
-// ─��───────────────────────────────────────────────────────────────────
+// ─��─��─────────────────────────────────────────────────────────────────
 
 const APP_SETTINGS_KEY_CANONICAL = "app_settings" as const
 const APP_SETTINGS_KEY_LEGACY    = "all_settings" as const
