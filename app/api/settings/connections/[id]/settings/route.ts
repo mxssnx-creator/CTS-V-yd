@@ -18,7 +18,7 @@ export async function GET(
     await initRedis()
     const client = getRedisClient()
 
-    const [connection, trades, positions, connSettingsHash] = await Promise.all([
+    const [connection, trades, positions, connSettingsHashRaw, connSettingsPrefixedRaw, tradeEngineStateRaw] = await Promise.all([
       getConnection(id),
       RedisTrades.getTradesByConnection(id).catch(() => []),
       RedisPositions.getPositionsByConnection(id).catch(() => []),
@@ -30,7 +30,24 @@ export async function GET(
       // mirror existed. We must merge both sources so the dialog can hydrate
       // all saved values on open.
       client.hgetall(`connection_settings:${id}`).catch(() => null),
+      // ensureBaseConnections and migrations seed into `settings:connection_settings:{id}`
+      // (settings:-prefixed). Fall back to this key when the bare key is empty
+      // so the dialog always shows the seeded defaults on first boot.
+      client.hgetall(`settings:connection_settings:${id}`).catch(() => null),
+      // Migrations 055/057/059 and ensureBaseConnections seed symbol_count,
+      // live_volume_factor, symbol_order etc. into settings:trade_engine_state:{id}.
+      // Read this as an additional source for fields the other hashes may not have yet.
+      client.hgetall(`settings:trade_engine_state:${id}`).catch(() => null),
     ])
+
+    // Merge all three hashes: bare key wins over settings:-prefixed wins over trade_engine_state.
+    // This ensures symbol_count and live_volume_factor are always available from the
+    // migration-seeded trade_engine_state hash even before the user opens the settings dialog.
+    const connSettingsHash: Record<string, string> = {
+      ...(tradeEngineStateRaw ?? {}),
+      ...(connSettingsPrefixedRaw ?? {}),
+      ...(connSettingsHashRaw ?? {}),
+    }
 
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
@@ -55,6 +72,9 @@ export async function GET(
           "symbol_count", "symbolCount", "leveragePercentage",
           "prevPosMinCount", "prevPosWindow", "mainEvalPosCount",
           "realEvalPosCount", "minStep", "trailingMinStep",
+          // Volume / live trading factors
+          "live_volume_factor", "volume_factor_live", "preset_volume_factor",
+          "volume_step_ratio", "block_volume_step_ratio",
           // Axis max-window values
           "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
           // Block strategy tuning
