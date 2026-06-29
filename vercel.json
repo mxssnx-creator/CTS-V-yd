@@ -9,5 +9,19 @@
       "path": "/api/cron/sync-live-positions",
       "schedule": "* * * * *"
     }
-  ]
+  ],
+  "functions": {
+    "app/api/**": {
+      "maxDuration": 30
+    },
+    "app/api/cron/**": {
+      "maxDuration": 60
+    },
+    "app/api/engine/**": {
+      "maxDuration": 60
+    },
+    "app/api/connections/*/progression/**": {
+      "maxDuration": 45
+    }
+  }
 }

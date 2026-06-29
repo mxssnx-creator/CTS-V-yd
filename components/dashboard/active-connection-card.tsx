@@ -134,10 +134,24 @@ export function ActiveConnectionCard({
   const [infoDialogOpen, setInfoDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [logsDialogOpen, setLogsDialogOpen] = useState(false)
-  const [liveTrade, setLiveTrade] = useState(false)
-  const [presetMode, setPresetMode] = useState(false)
+  // Seed live-trade / preset switches from the connection prop so they
+  // render correctly on first mount before the engine-states poll fires.
+  // The poll (every 3–8 s) then corrects any drift against the DB flag.
+  const toInitBool = (v: unknown) =>
+    v === true || v === 1 || v === "1" || v === "true"
+  const [liveTrade, setLiveTrade] = useState(() =>
+    toInitBool((connection.details as any)?.is_live_trade)
+  )
+  const [presetMode, setPresetMode] = useState(() =>
+    toInitBool((connection.details as any)?.is_preset_trade)
+  )
   const [liveTradeLoading, setLiveTradeLoading] = useState(false)
   const [presetModeLoading, setPresetModeLoading] = useState(false)
+  // Refs that mirror the loading states — mutated synchronously so the
+  // engine-states poller (a closure captured at effect-mount time) can
+  // read the current value without stale-closure issues.
+  const liveTradeLoadingRef  = useRef(false)
+  const presetModeLoadingRef = useRef(false)
   const [liveVolumeFactor, setLiveVolumeFactor] = useState(1.0)
   const [presetVolumeFactor, setPresetVolumeFactor] = useState(1.0)
   const [volumeStepRatio, setVolumeStepRatio] = useState(DEFAULT_VOLUME_STEP_RATIO)
@@ -311,11 +325,18 @@ export function ActiveConnectionCard({
           live:    data.live,
           preset:  data.preset,
         })
-        // If the DB flag says "live" but the engine is not running, re-sync the
-        // local toggle to the flag (authoritative). We do NOT flip the DB here —
-        // the toggle API is the only writer; we only correct local state drift.
-        if (typeof data?.live?.flag === "boolean") setLiveTrade(data.live.flag)
-        if (typeof data?.preset?.flag === "boolean") setPresetMode(data.preset.flag)
+        // Re-sync local toggle state to the DB flag (authoritative) so drift
+        // is corrected on every poll cycle. Guard: skip the write while a
+        // toggle is in-flight — setLiveTradeLoading(true) sets the ref
+        // synchronously, so if an in-progress POST hasn't landed yet the
+        // poller won't flip the switch back to the old server value and
+        // cause a visible flicker on the switch.
+        if (typeof data?.live?.flag === "boolean" && !liveTradeLoadingRef.current) {
+          setLiveTrade(data.live.flag)
+        }
+        if (typeof data?.preset?.flag === "boolean" && !presetModeLoadingRef.current) {
+          setPresetMode(data.preset.flag)
+        }
       } catch {
         /* non-critical polling */
       }
@@ -547,6 +568,23 @@ export function ActiveConnectionCard({
     const handleLiveTradeToggled = (event: Event) => {
       const customEvent = event as CustomEvent
       if (customEvent.detail?.connectionId === connection.connectionId) {
+        // `live-trade-toggled` is fired by QuickstartOptionsBar when the user
+        // toggles "Control Orders".  We do NOT apply newState here because:
+        //   1. The card already has its own optimistic state when the card
+        //      itself fires this event (handleLiveTradeToggle).
+        //   2. Applying newState = true optimistically and then having the
+        //      engine-states poll return flag: false causes the switch to
+        //      visibly revert 3-8 s later — confusing and incorrect.
+        // Instead, we just schedule an immediate re-fetch so the card picks
+        // up the server's canonical live.flag as soon as possible.
+        fetchProgression()
+      }
+    }
+    const handleSettingsUpdated = (event: Event) => {
+      const customEvent = event as CustomEvent
+      if (customEvent.detail?.connectionId === connection.connectionId) {
+        // `connection-settings-updated` carries { connectionId, settings } from volume sliders.
+        // Apply any volume changes embedded in the settings bag.
         const updatedSettings = customEvent.detail?.settings || {}
         const liveFactor = Number(updatedSettings.live_volume_factor ?? updatedSettings.volume_factor_live)
         const presetFactor = Number(updatedSettings.preset_volume_factor ?? updatedSettings.volume_factor_preset)
@@ -568,7 +606,7 @@ export function ActiveConnectionCard({
       window.addEventListener("connection-toggled", handleConnectionToggled)
       window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
       window.addEventListener("engine-state-changed", handleConnectionToggled)
-      window.addEventListener("connection-settings-updated", handleLiveTradeToggled)
+      window.addEventListener("connection-settings-updated", handleSettingsUpdated)
     }
 
     return () => {
@@ -577,7 +615,7 @@ export function ActiveConnectionCard({
         window.removeEventListener("connection-toggled", handleConnectionToggled)
         window.removeEventListener("live-trade-toggled", handleLiveTradeToggled)
         window.removeEventListener("engine-state-changed", handleConnectionToggled)
-        window.removeEventListener("connection-settings-updated", handleLiveTradeToggled)
+        window.removeEventListener("connection-settings-updated", handleSettingsUpdated)
       }
     }
   }, [fetchProgression, connection.connectionId])
@@ -801,6 +839,7 @@ export function ActiveConnectionCard({
   // so the user can flip Live and the engine comes up with the flag set.
   const handleLiveTradeToggle = async (newState: boolean) => {
     const connName = connection.exchangeName
+    liveTradeLoadingRef.current = true
     setLiveTradeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/live-trade`, {
@@ -826,6 +865,7 @@ export function ActiveConnectionCard({
     } catch {
       toast.error("Failed to toggle Live Trade")
     } finally {
+      liveTradeLoadingRef.current = false
       setLiveTradeLoading(false)
     }
   }
@@ -833,6 +873,7 @@ export function ActiveConnectionCard({
   // Handle Preset Mode toggle — no longer gated on connection.isActive,
   // same rationale as handleLiveTradeToggle above.
   const handlePresetModeToggle = async (newState: boolean) => {
+    presetModeLoadingRef.current = true
     setPresetModeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/preset-toggle`, {
@@ -850,6 +891,7 @@ export function ActiveConnectionCard({
     } catch {
       toast.error("Failed to toggle Preset Mode")
     } finally {
+      presetModeLoadingRef.current = false
       setPresetModeLoading(false)
     }
   }
@@ -1044,7 +1086,7 @@ export function ActiveConnectionCard({
                             ? "Flag is ON but engine is not running — will reconcile shortly"
                             : "Engine is running but flag is OFF — will stop shortly"}
                           className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
-                          aria-label="engine state drift"
+                          aria-hidden="true"
                         />
                       )}
                     </span>
@@ -1082,7 +1124,7 @@ export function ActiveConnectionCard({
                         <span
                           title="Live flag ON but engine state differs — reconciling"
                           className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
-                          aria-label="live engine state drift"
+                          aria-hidden="true"
                         />
                       )}
                     </span>
@@ -1118,7 +1160,7 @@ export function ActiveConnectionCard({
                         <span
                           title="Preset flag ON but engine state differs — reconciling"
                           className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
-                          aria-label="preset engine state drift"
+                          aria-hidden="true"
                         />
                       )}
                     </span>

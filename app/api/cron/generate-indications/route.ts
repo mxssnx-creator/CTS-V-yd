@@ -24,6 +24,7 @@ import { fetchTopSymbols } from "@/lib/top-symbols"
 import { RealtimeProcessor } from "@/lib/trade-engine/realtime-processor"
 
 export const dynamic = "force-dynamic"
+export const maxDuration = 60
 export const revalidate = 0
 export const fetchCache = "force-no-store"
 

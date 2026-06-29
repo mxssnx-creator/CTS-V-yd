@@ -201,7 +201,10 @@ export function QuickstartOptionsBar() {
   // sliders don't flash defaults over saved values.
   const [hydrated, setHydrated] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [controlOrders, setControlOrders] = useState(true)
+  // Default false — hydrate() will set the correct value once the
+  // settings fetch returns. Defaulting to true caused a false "Orders ON"
+  // flash before the first fetch resolved.
+  const [controlOrders, setControlOrders] = useState(false)
   const [pfMin, setPfMin] = useState<ProfitFactorMin>(DEFAULT_PF_MIN)
   const [volumeFactor, setVolumeFactor] = useState<number>(1.0)
   const [minimalStepCount, setMinimalStepCount] = useState<number>(3)
@@ -265,8 +268,15 @@ export function QuickstartOptionsBar() {
           ? data.settings
           : {}
 
+        // Prefer `live_trade_requested` — set by the server to the operator's
+        // intended state even when the actual `is_live_trade` flag stays false
+        // (e.g. because API credentials aren't configured yet).  This way the
+        // switch correctly shows "ON" after a page reload when the user had
+        // previously enabled Control Orders.
+        const liveRequested = conn.live_trade_requested
+        const liveEffective = conn.is_live_trade === "1" || conn.is_live_trade === true || conn.is_live_trade === 1
         setControlOrders(
-          conn.is_live_trade === "1" || conn.is_live_trade === true,
+          typeof liveRequested === "boolean" ? liveRequested : liveEffective,
         )
 
         // Profit-factor min — fall through both the new namespaced
@@ -344,6 +354,15 @@ export function QuickstartOptionsBar() {
         )
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         showSaved()
+        // Notify ExchangeContext and ActiveConnectionCard that settings changed
+        // so they reload without waiting for their natural poll cadence.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("connection-settings-updated", {
+              detail: { connectionId: cid, settings: patch },
+            }),
+          )
+        }
       } catch (err) {
         console.error("[v0] [QSOptions] PATCH settings failed:", err)
         showError()
@@ -389,14 +408,60 @@ export function QuickstartOptionsBar() {
           },
         )
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+        // Read the server's actual resulting flag (may differ from `next` when
+        // credentials are missing — server sets `live_trade_requested=true` but
+        // keeps `is_live_trade=false`). Apply the truth so the switch doesn't
+        // stay ON when the server couldn't honour the toggle.
+        let actualState = next
+        try {
+          const data = await res.json()
+          if (typeof data?.live_trade_requested === "boolean") {
+            // The server echoes back `live_trade_requested` as the intended state
+            // and `is_live_trade` as the effective state (may be false if blocked).
+            // For the UI switch we use `live_trade_requested` — the operator
+            // intended it, and the system will honour it once creds are added.
+            actualState = data.live_trade_requested
+          } else if (typeof data?.is_live_trade === "boolean") {
+            actualState = data.is_live_trade
+          }
+        } catch { /* keep optimistic value on parse failure */ }
+
+        setControlOrders(actualState)
         showSaved()
+
+        // Broadcast so ActiveConnectionCard's Live Trade switch syncs
+        // immediately instead of waiting for its 3–8 s engine-states poll.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("live-trade-toggled", {
+              detail: { connectionId: cid, newState: actualState },
+            }),
+          )
+        }
       } catch (err) {
+        // On network failure revert the optimistic toggle.
+        setControlOrders(!next)
         console.error("[v0] [QSOptions] POST live-trade failed:", err)
         showError()
       }
     },
     [cid, showSaved, showError],
   )
+
+  // Reverse sync — when ActiveConnectionCard (or any other surface) toggles
+  // live-trade, update this bar's switch so both surfaces always agree.
+  useEffect(() => {
+    if (!cid) return
+    const handler = (e: Event) => {
+      const ev = e as CustomEvent
+      if (ev.detail?.connectionId === cid && typeof ev.detail?.newState === "boolean") {
+        setControlOrders(ev.detail.newState)
+      }
+    }
+    window.addEventListener("live-trade-toggled", handler)
+    return () => window.removeEventListener("live-trade-toggled", handler)
+  }, [cid])
 
   // Debounced savers — one per knob group. Sliders rapid-fire on drag,
   // switches fire once on toggle (debounce is harmless for them and

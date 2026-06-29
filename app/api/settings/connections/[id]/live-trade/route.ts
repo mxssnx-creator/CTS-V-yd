@@ -30,6 +30,7 @@ import { logProgressionEvent } from "@/lib/engine-progression-logs"
  */
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
+export const maxDuration = 15
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id: connectionId } = await params
   try {

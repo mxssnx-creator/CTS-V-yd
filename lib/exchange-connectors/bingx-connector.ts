@@ -837,25 +837,6 @@ export class BingXConnector extends BaseExchangeConnector {
           // Resync didn't fix it; fall through with the retry response
           // so the operator sees the real underlying error.
           Object.assign(data, tsRetryData)
-          if (this.isBingXSuccess(data.code)) {
-            const info = data.data?.order || data.data || {}
-            const id = info.orderId || info.id || data.data?.orderId
-            return { success: true, orderId: id ? String(id) : undefined, filledPrice: Number(info.avgPrice ?? info.price ?? info.filledPrice ?? 0) || undefined, avgPrice: Number(info.avgPrice ?? 0) || undefined, price: Number(info.price ?? 0) || undefined, filledQty: Number(info.executedQty ?? info.filledQty ?? info.cumQty ?? 0) || undefined, executedQty: Number(info.executedQty ?? 0) || undefined, status: info.status }
-          }
-	          if (this.isBingXSuccess(tsRetryData.code)) {
-	            const info = tsRetryData.data?.order || tsRetryData.data || {}
-	            const id = info.orderId || info.id || tsRetryData.data?.orderId
-	            this.log(`✓ Order placed on retry (timestamp resync): ${id}`)
-	            return { success: true, orderId: id ? String(id) : undefined, clientOrderId: params.clientOrderId } as any
-	          }
-          // Resync didn't fix it; fall through with the retry response
-          // so the operator sees the real underlying error.
-          Object.assign(data, tsRetryData)
-	          if (this.isBingXSuccess(data.code)) {
-	            const info = data.data?.order || data.data || {}
-	            const id = info.orderId || info.id || data.data?.orderId
-	            return { success: true, orderId: id ? String(id) : undefined, clientOrderId: params.clientOrderId } as any
-	          }
         }
 
         // Special-case: 109400 "In the Hedge mode, the 'ReduceOnly' field
@@ -876,12 +857,12 @@ export class BingXConnector extends BaseExchangeConnector {
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
           const roRetryData = await this.safeJson(roRetryResp)
-	          if (this.isBingXSuccess(roRetryData.code)) {
-	            const info = roRetryData.data?.order || roRetryData.data || {}
-	            const id = info.orderId || info.id || roRetryData.data?.orderId
-	            this.log(`✓ Order placed on retry (hedge, no reduceOnly): ${id}`)
-	            return { success: true, orderId: id ? String(id) : undefined, clientOrderId: params.clientOrderId } as any
-	          }
+          if (this.isBingXSuccess(roRetryData.code)) {
+            const info = roRetryData.data?.order || roRetryData.data || {}
+            const id = info.orderId || info.id || roRetryData.data?.orderId
+            this.log(`✓ Order placed on retry (hedge, no reduceOnly): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined, filledPrice: Number(info.avgPrice ?? info.price ?? info.filledPrice ?? 0) || undefined, avgPrice: Number(info.avgPrice ?? 0) || undefined, price: Number(info.price ?? 0) || undefined, filledQty: Number(info.executedQty ?? info.filledQty ?? info.cumQty ?? 0) || undefined, executedQty: Number(info.executedQty ?? 0) || undefined, status: info.status }
+          }
           // Fall through with the retry's response so the operator sees
           // the real underlying error rather than the 109400 we already
           // worked around.
@@ -909,12 +890,12 @@ export class BingXConnector extends BaseExchangeConnector {
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
           const retryData = await this.safeJson(retryResp)
-	          if (this.isBingXSuccess(retryData.code)) {
-	            const info = retryData.data?.order || retryData.data || {}
-	            const id = info.orderId || info.id || retryData.data?.orderId
-	            this.log(`✓ Order placed on retry (one-way): ${id}`)
-	            return { success: true, orderId: id ? String(id) : undefined, clientOrderId: params.clientOrderId } as any
-	          }
+          if (this.isBingXSuccess(retryData.code)) {
+            const info = retryData.data?.order || retryData.data || {}
+            const id = info.orderId || info.id || retryData.data?.orderId
+            this.log(`✓ Order placed on retry (one-way): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined, filledPrice: Number(info.avgPrice ?? info.price ?? info.filledPrice ?? 0) || undefined, avgPrice: Number(info.avgPrice ?? 0) || undefined, price: Number(info.price ?? 0) || undefined, filledQty: Number(info.executedQty ?? info.filledQty ?? info.cumQty ?? 0) || undefined, executedQty: Number(info.executedQty ?? 0) || undefined, status: info.status }
+          }
           throw new Error(`BingX API error (code=${retryData.code}): ${retryData.msg || "Unknown error"}`)
         }
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1405,7 +1386,26 @@ export class BingXConnector extends BaseExchangeConnector {
         return []
       }
 
-      return Array.isArray(data.data) ? data.data : []
+      const raw = Array.isArray(data.data) ? data.data : []
+      // Normalize BingX raw position fields to a consistent interface so
+      // callers (live-stage fill-fallback, closePosition) use standard names:
+      //   positionAmt  — BingX v3 perpetual (primary qty field)
+      //   entryPrice   — BingX v3 perpetual (average entry price)
+      //   positionSide — "LONG" | "SHORT" (hedge mode) or "BOTH" (one-way)
+      //   unrealizedPnl, markPrice, liquidationPrice — ancillary fields
+      return raw.map((p: any) => ({
+        ...p,
+        // Canonical quantity: BingX uses `positionAmt` in v3; expose it
+        // under that name AND under `contracts` so both callers succeed.
+        positionAmt:   p.positionAmt  ?? p.contracts ?? p.positionSize ?? 0,
+        contracts:     p.positionAmt  ?? p.contracts ?? p.positionSize ?? 0,
+        size:          p.positionAmt  ?? p.contracts ?? p.positionSize ?? 0,
+        // Canonical entry price: BingX uses `avgPrice` OR `entryPrice`.
+        entryPrice:    p.entryPrice   ?? p.avgPrice  ?? p.openPrice    ?? 0,
+        avgPrice:      p.entryPrice   ?? p.avgPrice  ?? p.openPrice    ?? 0,
+        // Normalise positionSide capitalisation.
+        positionSide:  String(p.positionSide ?? p.side ?? "BOTH").toUpperCase(),
+      }))
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch positions: ${errorMsg}`)
@@ -1413,9 +1413,32 @@ export class BingXConnector extends BaseExchangeConnector {
     }
   }
 
-  async getPosition(symbol: string): Promise<any> {
+  /**
+   * Get a single open position for the given symbol.
+   *
+   * @param symbol      Canonical symbol (e.g. "BTCUSDT").
+   * @param direction   Optional "long" | "short" filter. In hedge mode the
+   *                    exchange holds separate LONG and SHORT entries; without
+   *                    a filter the first non-zero entry is returned, which
+   *                    may be the wrong side for close/fill-fallback callers.
+   */
+  async getPosition(symbol: string, direction?: "long" | "short"): Promise<any> {
     const positions = await this.getPositions(symbol)
-    return positions.length > 0 ? positions[0] : null
+    if (positions.length === 0) return null
+
+    if (direction) {
+      const wantSide = direction.toUpperCase() // "LONG" | "SHORT"
+      // Find the matching direction; prefer exact positionSide match.
+      const match = positions.find((p: any) => {
+        const side = String(p.positionSide ?? "BOTH").toUpperCase()
+        return side === wantSide || side === "BOTH"
+      })
+      return match ?? null
+    }
+
+    // No direction specified — return the first position with a non-zero qty.
+    const nonZero = positions.find((p: any) => Math.abs(Number(p.positionAmt ?? p.contracts ?? p.size ?? 0)) > 0)
+    return nonZero ?? positions[0] ?? null
   }
 
   async modifyPosition(
@@ -1467,7 +1490,10 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Closing position ${symbol}${positionSide ? ` (${positionSide})` : ""}`)
 
-      const position = await this.getPosition(symbol)
+      // Pass the requested direction so getPosition() returns the correct
+      // hedge-mode slot (LONG vs SHORT) rather than the first entry in the
+      // array (which may be the opposite side or a zero-sized slot).
+      const position = await this.getPosition(symbol, positionSide)
       if (!position) {
         return { success: false, error: "Position not found" }
       }

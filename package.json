@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "private": true,
   "scripts": {
-    "build": "NODE_OPTIONS='--max-old-space-size=6144 --max-semi-space-size=256' next build",
+    "build": "NODE_OPTIONS='--max-old-space-size=4096 --max-semi-space-size=128' next build",
     "dev": "NODE_OPTIONS='--max-old-space-size=4096 --max-semi-space-size=128 --expose-gc' next dev -p 3002",
     "dev:debug": "node scripts/dev-debug.js",
     "dev:debug:verbose": "node scripts/dev-debug.js verbose",

@@ -9,6 +9,8 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { toRedisFlag } from "@/lib/boolean-utils"
 
 export const dynamic = "force-dynamic"
+export const maxDuration = 30
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -18,7 +20,7 @@ export async function GET(
     await initRedis()
     const client = getRedisClient()
 
-    const [connection, trades, positions, connSettingsHash] = await Promise.all([
+    const [connection, trades, positions, connSettingsHashRaw, connSettingsPrefixedRaw, tradeEngineStateRaw] = await Promise.all([
       getConnection(id),
       RedisTrades.getTradesByConnection(id).catch(() => []),
       RedisPositions.getPositionsByConnection(id).catch(() => []),
@@ -30,7 +32,24 @@ export async function GET(
       // mirror existed. We must merge both sources so the dialog can hydrate
       // all saved values on open.
       client.hgetall(`connection_settings:${id}`).catch(() => null),
+      // ensureBaseConnections and migrations seed into `settings:connection_settings:{id}`
+      // (settings:-prefixed). Fall back to this key when the bare key is empty
+      // so the dialog always shows the seeded defaults on first boot.
+      client.hgetall(`settings:connection_settings:${id}`).catch(() => null),
+      // Migrations 055/057/059 and ensureBaseConnections seed symbol_count,
+      // live_volume_factor, symbol_order etc. into settings:trade_engine_state:{id}.
+      // Read this as an additional source for fields the other hashes may not have yet.
+      client.hgetall(`settings:trade_engine_state:${id}`).catch(() => null),
     ])
+
+    // Merge all three hashes: bare key wins over settings:-prefixed wins over trade_engine_state.
+    // This ensures symbol_count and live_volume_factor are always available from the
+    // migration-seeded trade_engine_state hash even before the user opens the settings dialog.
+    const connSettingsHash: Record<string, string> = {
+      ...(tradeEngineStateRaw ?? {}),
+      ...(connSettingsPrefixedRaw ?? {}),
+      ...(connSettingsHashRaw ?? {}),
+    }
 
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
@@ -55,6 +74,9 @@ export async function GET(
           "symbol_count", "symbolCount", "leveragePercentage",
           "prevPosMinCount", "prevPosWindow", "mainEvalPosCount",
           "realEvalPosCount", "minStep", "trailingMinStep",
+          // Volume / live trading factors
+          "live_volume_factor", "volume_factor_live", "preset_volume_factor",
+          "volume_step_ratio", "block_volume_step_ratio",
           // Axis max-window values
           "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
           // Block strategy tuning
@@ -385,13 +407,19 @@ export async function PATCH(
       // persist a separate "Base volume factor" knob, because the base stage
       // never places exchange orders.
       {
-        const vfl = Number((merged as Record<string, unknown>).volume_factor_live)
+        // Accept both field names: the dialog sends volume_factor_live, API callers may send live_volume_factor
+        const vflRaw = (merged as Record<string, unknown>).volume_factor_live
+          ?? (merged as Record<string, unknown>).live_volume_factor
+        const vfl = Number(vflRaw)
         if (Number.isFinite(vfl) && vfl > 0) {
           flatKnobs.volume_factor_live   = String(Math.max(0.1, Math.min(10, vfl)))
+          flatKnobs.live_volume_factor   = String(Math.max(0.1, Math.min(10, vfl)))
         }
-        const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
+        const vfp = Number((merged as Record<string, unknown>).volume_factor_preset
+          ?? (merged as Record<string, unknown>).preset_volume_factor)
         if (Number.isFinite(vfp) && vfp > 0) {
-          flatKnobs.volume_factor_preset = String(Math.max(0.1, Math.min(10, vfp)))
+          flatKnobs.volume_factor_preset  = String(Math.max(0.1, Math.min(10, vfp)))
+          flatKnobs.preset_volume_factor  = String(Math.max(0.1, Math.min(10, vfp)))
         }
         const vsr = Number((merged as Record<string, unknown>).volume_step_ratio ?? (merged as Record<string, unknown>).volumeStepRatio)
         if (Number.isFinite(vsr) && vsr > 0) {

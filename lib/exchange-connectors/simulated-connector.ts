@@ -63,7 +63,7 @@ export class SimulatedConnector extends BaseExchangeConnector {
     return []
   }
 
-  async getPosition(symbol: string): Promise<any> {
+  async getPosition(symbol: string, _direction?: "long" | "short"): Promise<any> {
     // Return null (no open position) rather than a zeroed stub so the live
     // reconcile path correctly treats this symbol as having no exchange position.
     return null

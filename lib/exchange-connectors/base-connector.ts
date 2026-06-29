@@ -318,7 +318,7 @@ export abstract class BaseExchangeConnector {
   // Position Methods (Perpetual/Futures Only)
   abstract getPositions(symbol?: string): Promise<ExchangePosition[]>
 
-  abstract getPosition(symbol: string): Promise<ExchangePosition | null>
+  abstract getPosition(symbol: string, direction?: "long" | "short"): Promise<ExchangePosition | null>
 
   abstract modifyPosition(
     symbol: string,

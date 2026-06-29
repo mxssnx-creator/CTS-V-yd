@@ -372,7 +372,7 @@ export class OKXConnector extends BaseExchangeConnector {
     }
   }
 
-  async getPosition(symbol: string): Promise<any> {
+  async getPosition(symbol: string, _direction?: "long" | "short"): Promise<any> {
     const positions = await this.getPositions(symbol)
     return positions.length > 0 ? positions[0] : null
   }

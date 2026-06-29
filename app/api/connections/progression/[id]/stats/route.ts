@@ -7,6 +7,7 @@ import { normalizeSymbolList } from "@/lib/trade-engine/symbol-selection-ownersh
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
+export const maxDuration = 30
 export const revalidate = 0
 
   function n(v: unknown): number {

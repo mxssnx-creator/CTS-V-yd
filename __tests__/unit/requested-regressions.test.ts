@@ -323,7 +323,7 @@ describe("requested regression guardrails", () => {
     expect(source).toContain(": 50")
     expect(source).toContain("STRATEGY_REAL_SETS_SAFETY_CEILING")
     expect(source).toContain(": 100")
-    expect(source).toContain("private static readonly _AXIS_LRU_MAX = 8_000")
+    expect(source).toContain("private static readonly _AXIS_LRU_MAX = (() =>")
   })
 
   test("coordinator startEngine is guarded in production UI workers", () => {

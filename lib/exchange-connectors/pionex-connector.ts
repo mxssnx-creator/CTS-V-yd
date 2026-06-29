@@ -331,7 +331,7 @@ export class PionexConnector extends BaseExchangeConnector {
     return []
   }
 
-  async getPosition(symbol: string): Promise<any> {
+  async getPosition(symbol: string, _direction?: "long" | "short"): Promise<any> {
     return null
   }
 

@@ -7,6 +7,7 @@ import { getConnectionCounts } from "@/lib/connection-count-service"
  * PHASE 2 FIX: Single source of truth for connection counts
  */
 export const dynamic = "force-dynamic"
+export const maxDuration = 30
 export async function GET(request: NextRequest) {
   try {
     const counts = await getConnectionCounts()

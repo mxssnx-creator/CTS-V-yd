@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { initRedis, getAllConnections } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
+export const maxDuration = 30
 
 /**
  * GET /api/connections

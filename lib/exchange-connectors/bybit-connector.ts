@@ -763,7 +763,7 @@ export class BybitConnector extends BaseExchangeConnector {
     }
   }
 
-  async getPosition(symbol: string): Promise<any> {
+  async getPosition(symbol: string, _direction?: "long" | "short"): Promise<any> {
     const positions = await this.getPositions(symbol)
     return positions.find((p: any) => Number.parseFloat(p.size || "0") > 0) || positions[0] || null
   }

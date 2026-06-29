@@ -14,11 +14,14 @@ export interface ConnectionState {
  * Parse connection state to understand its role in Main Connections
  */
 export function getConnectionState(conn: any): ConnectionState {
-  const toBoolean = (val: any) => val === true || val === "1" || val === "true"
+  // Handle boolean, string "1"/"true", and integer 1 (after numeric parseHash fix)
+  const toBoolean = (val: any) => val === true || val === 1 || val === "1" || val === "true"
   
   return {
     main_assigned: toBoolean(conn.is_assigned) || toBoolean(conn.is_active_inserted),
-    main_enabled: toBoolean(conn.is_enabled_dashboard) || toBoolean(conn.is_active),
+    // main_enabled: true when either is_enabled_dashboard or is_active_inserted is set.
+    // Migrations seed is_active_inserted without is_enabled_dashboard; OR keeps them equivalent.
+    main_enabled: toBoolean(conn.is_enabled_dashboard) || toBoolean(conn.is_active_inserted),
     is_inserted: toBoolean(conn.is_inserted),
     is_enabled_dashboard: toBoolean(conn.is_enabled_dashboard),
   }
@@ -54,8 +57,8 @@ export function buildMainConnectionDisableUpdate(conn: any): Record<string, any>
   return {
     ...conn,
     is_assigned: "1",          // keep card visible after disable
-    is_active_inserted: "1",   // keep is_active_inserted in sync
-    is_enabled_dashboard: "0",
+    is_active_inserted: "0",   // disable from active panel so engine skips this connection
+    is_enabled_dashboard: "0", // keep both flags in sync
     is_active: "0",
     updated_at: new Date().toISOString(),
   }
@@ -85,11 +88,12 @@ export function buildMainConnectionRemoveUpdate(conn: any): Record<string, any> 
  * (assigned, enabled, with valid API type)
  */
 export function isConnectionReadyForEngine(conn: any): boolean {
-  const toBoolean = (val: any) => val === true || val === "1" || val === "true"
+  const toBoolean = (val: any) => val === true || val === 1 || val === "1" || val === "true"
   
   return (
     toBoolean(conn.is_assigned) &&
-    toBoolean(conn.is_enabled_dashboard) &&
+    // Use OR: either flag being set means the connection is active/ready
+    (toBoolean(conn.is_enabled_dashboard) || toBoolean(conn.is_active_inserted)) &&
     !!conn.exchange &&
     !!conn.api_type
   )

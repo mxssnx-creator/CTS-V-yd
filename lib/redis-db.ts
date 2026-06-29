@@ -406,10 +406,11 @@ export class InlineLocalRedis {
     // 4 GB VM: RSS at boot is ~2.3 GB (Next.js + InlineLocalRedis migrations).
     // Evict aggressively at 250 MB heap / 1400 MB RSS so the prehistoric
     // burst (which adds ~300-400 MB) never pushes RSS past the kernel OOM limit.
-    // Heap eviction trigger: fire at 1200 MB in dev (dev heap cap is now 4096 MB)
-    // and 1500 MB in prod. These are ~30% of the respective heap caps, leaving
-    // ample room for the prehistoric burst (~300 MB) before hitting the V8 limit.
-    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 1_200 : 1_500
+    // Heap eviction trigger: fire at 800 MB in dev (dev heap cap 4096 MB, engine
+    // runs ~900-1100 MB heap at peak so this fires proactively before bursts).
+    // Prod: 1200 MB (serverless invocations rarely exceed 512 MB so this is
+    // a safety net for long-lived containers).
+    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 800 : 1_200
 
     // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
     // to clear volatile key families that accumulate across hot-reload cycles
@@ -587,6 +588,9 @@ export class InlineLocalRedis {
         console.warn(`[v0] [Redis Memory] Dev startup flush error:`, err)
       }
 
+    // Throttle eviction log output: only print once per 60 s when stuck above
+    // the key limit so the server log stays readable.
+    let _lastEvictionLogMs = 0
     const ttlCleanupTimer = setInterval(() => {
       try {
         // First, clean up expired keys
@@ -601,12 +605,11 @@ export class InlineLocalRedis {
         const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
-        // RSS trigger: in dev, Next.js idle RSS is ~1.9–2.5 GB so the trigger
-        // must be set high enough to avoid false-positives at idle, yet low
-        // enough to fire before kernel OOM (which kills at ~8 GB on this VM).
-        // 5 GB gives a comfortable eviction runway on the 8.4 GB VM.
-        // In prod (real Redis, off-heap) RSS trigger fires at 3.5 GB.
-        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 5_000 : 3_500
+        // RSS trigger: in dev, Next.js + engine idle RSS is ~1.8–2.4 GB.
+        // Trigger at 2200 MB so eviction runs before the engine prehistoric burst
+        // (which adds 300-400 MB) pushes RSS past 2.5 GB and routes start timing out.
+        // Prod: 3000 MB (serverless containers rarely hit this; safety net only).
+        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 2_200 : 3_000
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         // Scale the key-count eviction trigger with symbol count so the threshold
@@ -620,14 +623,20 @@ export class InlineLocalRedis {
           : 15_000
         const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
-          if (rssMB > RSS_PRESSURE_MB) {
-            console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
-          } else if (heapUsedMB > HEAP_PRESSURE_MB) {
-            console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
-          } else {
-            console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
+          const now = Date.now()
+          // Only log once per 60 s to avoid flooding the server log when stuck
+          // above the threshold (e.g. a large snapshot with mostly-protected keys).
+          if (now - _lastEvictionLogMs > 60_000) {
+            _lastEvictionLogMs = now
+            if (rssMB > RSS_PRESSURE_MB) {
+              console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
+            } else if (heapUsedMB > HEAP_PRESSURE_MB) {
+              console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
+            } else {
+              console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
+            }
+            console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
           }
-          console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
           this.evictOldRecords()
           // Nudge GC if exposed (dev runs with --expose-gc sometimes); the
           // emulator frees Map references above, this returns them to the OS.
@@ -763,34 +772,36 @@ export class InlineLocalRedis {
       ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
       : 1  // prod caps don't scale (real Redis is off-heap)
 
-    // Caps indexed by bucket name (shared between hash and string passes)
+    // Caps indexed by bucket name (shared between hash and string passes).
+    // Dev caps are deliberately tight to keep RSS below 2.2 GB so the eviction
+    // interval fires before routes start timing out. Prod caps are generous
+    // because real Redis is off-heap and these are only safety-net guards.
     const CAPS: Record<string, number> = {
-      // N × per-symbol baseline keeps the active evaluation window alive across
-      // all symbols without letting any one family blow up the heap.
-      pseudo_position:              isDev ? _N * 200  : 2000,
-      s_pseudo_position:            isDev ? _N * 150  : 1500,
-      strategies:                   isDev ? _N * 50   : 100,
-      s_strategies:                 isDev ? _N * 20   : 20,
-      config_set:                   isDev ? _N * 60   : 1500,
-      strategy_positions:           isDev ? _N * 30   : 1000,
-      strategy_detail:              isDev ? _N * 30   : 1000,
-      real_stage:                   isDev ? _N * 30   : 1000,
-      indication:                   isDev ? _N * 100  : 500,
-      indications:                  isDev ? _N * 20   : 100,
-      // indication_set:* — per-cycle per-symbol indication set hashes.
-      // 150 sets per symbol keeps the most-recent evaluation window alive.
-      // At 10 symbols: 1500 keys × ~6.6 KB each ≈ 10 MB (manageable).
-      indication_set:               isDev ? _N * 150  : 5000,
-      // indication_outcomes_pending:* — rolling outcome list, one per symbol.
-      // 15 per symbol is enough to track recent outcomes across all types.
-      indication_outcomes_pending:  isDev ? _N * 15   : 200,
-      // axis_pos_acc:* — axis position accumulator (one per connection, ~200 KB).
+      // Pseudo-positions: reduced from N*200 → N*80. A single-symbol engine
+      // realistically holds ≤ 50 open pseudo positions at any time; the extra
+      // capacity was just hot waste in the Map.
+      pseudo_position:              isDev ? _N * 80   : 2000,
+      s_pseudo_position:            isDev ? _N * 60   : 1500,
+      strategies:                   isDev ? _N * 30   : 100,
+      s_strategies:                 isDev ? _N * 15   : 20,
+      config_set:                   isDev ? _N * 40   : 1500,
+      strategy_positions:           isDev ? _N * 20   : 1000,
+      strategy_detail:              isDev ? _N * 20   : 1000,
+      real_stage:                   isDev ? _N * 20   : 1000,
+      indication:                   isDev ? _N * 60   : 500,
+      indications:                  isDev ? _N * 15   : 100,
+      // indication_set: reduced from N*150 → N*80. The pipeline reads the most
+      // recent 50-80 sets per symbol; keeping 150 was unnecessary headroom.
+      indication_set:               isDev ? _N * 80   : 5000,
+      // indication_outcomes_pending: reduced from N*15 → N*10 (tight list).
+      indication_outcomes_pending:  isDev ? _N * 10   : 200,
+      // axis_pos_acc: one per connection.
       axis_pos_acc:                 5,
       prehistoric:                  20,
-      live_history:                 isDev ? _N * 30   : 500,
+      live_history:                 isDev ? _N * 20   : 500,
       // string-only
-      indications_str:              isDev ? _N * 20   : 50,
-      dedup:                        isDev ? _N * 100  : 3000,
+      indications_str:              isDev ? _N * 15   : 50,
+      dedup:                        isDev ? _N * 60   : 3000,
       candle_cache:                 isDev ? _N * 4    : 20,
       candles:                      isDev ? _N * 4    : 20,
     }
@@ -902,8 +913,26 @@ export class InlineLocalRedis {
       }
     }
 
+    // ── TTL expiry sweep ─────────────────────────────────────────────────────
+    // Eagerly delete any keys whose TTL has already passed. Without this, expired
+    // keys stay in the Map until a reader calls isExpired(), so the eviction
+    // loop above sees them as live entries and keeps them under caps.
+    if (this.data.ttl) {
+      const now = Date.now()
+      for (const [key, expireAt] of this.data.ttl.entries()) {
+        if (expireAt <= now) {
+          this.deleteKey(key)
+          evicted++
+        }
+      }
+    }
+
     if (evicted > 10) {
       console.log(`[v0] [Redis Memory] Evicted ${evicted} old records to reduce memory pressure`)
+      // Nudge V8 GC if --expose-gc was passed (dev start script uses it).
+      // After trimming Map entries the GC needs a hint to return the freed
+      // memory to the OS heap rather than keeping it as V8 slack capacity.
+      ;(globalThis as any).gc?.()
     }
     return evicted
   }
@@ -1967,6 +1996,42 @@ function parseHashValue(value: unknown): unknown {
   return strValue
 }
 
+// Fields that are genuinely numeric but whose raw Redis values are "1", "2",
+// etc. — strings that `parseHashValue` would coerce to boolean `true` because
+// of the "1"→true shorthand.  For these fields we force a Number() parse so
+// the UI slider/input always receives an integer, not `true`/`false`.
+const NUMERIC_HASH_FIELDS = new Set([
+  "symbol_count", "symbolCount",
+  "block_max_stack", "blockMaxStack",
+  "block_volume_ratio", "blockVolumeRatio",
+  "block_pause_count_ratio", "blockPauseCountRatio",
+  "max_concurrent_trades", "maxConcurrentTrades",
+  "prev_pos_min_count", "prevPosMinCount",
+  "prev_pos_window", "prevPosWindow",
+  "main_eval_pos_count", "mainEvalPosCount",
+  "real_eval_pos_count", "realEvalPosCount",
+  "min_step", "minStep",
+  "trailing_min_step", "trailingMinStep",
+  "leverage_percentage", "leveragePercentage",
+  "live_volume_factor", "preset_volume_factor",
+  "volume_factor", "volume_factor_live", "volume_factor_preset",
+  "volume_step_ratio",
+  "axis_prev_max_window", "axisPrevMaxWindow",
+  "axis_last_max_window", "axisLastMaxWindow",
+  "axis_cont_max_window", "axisContMaxWindow",
+  "axis_pause_max_window", "axisPauseMaxWindow",
+  "base_profit_factor", "baseProfitFactor",
+  "main_profit_factor", "mainProfitFactor",
+  "real_profit_factor", "realProfitFactor",
+  "live_profit_factor", "liveProfitFactor",
+  "max_drawdown_time_main_hours", "maxDrawdownTimeMainHours",
+  "max_drawdown_time_real_hours", "maxDrawdownTimeRealHours",
+  "max_drawdown_time_live_hours", "maxDrawdownTimeLiveHours",
+  "stage_min_pos_count_base", "stageMinPosCountBase",
+  "stage_min_pos_count_main", "stageMinPosCountMain",
+  "stage_min_pos_count_real", "stageMinPosCountReal",
+])
+
 function parseHash(hash: Record<string, string> | null): Record<string, any> | null {
   // Empty hash → null. Real Redis hGetAll returns {} for missing keys (the
   // emulator now matches that), but getSettings' contract is `any | null`
@@ -1976,7 +2041,13 @@ function parseHash(hash: Record<string, string> | null): Record<string, any> | n
   if (!hash || Object.keys(hash).length === 0) return null
   const result: Record<string, any> = {}
   for (const [key, value] of Object.entries(hash)) {
-    result[key] = parseHashValue(value)
+    if (NUMERIC_HASH_FIELDS.has(key) && typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) {
+      // Force numeric parse — these fields legitimately hold numbers like "1",
+      // "2", "0.1" that parseHashValue would wrongly coerce to true/false/0.
+      result[key] = value.includes(".") ? parseFloat(value) : parseInt(value, 10)
+    } else {
+      result[key] = parseHashValue(value)
+    }
   }
   return result
 }
@@ -2055,7 +2126,10 @@ export async function getAllConnections(): Promise<any[]> {
 
           if (id && name && exchange) return true
 
-          console.warn("[v0] [redis-db] getAllConnections: ignoring malformed connection hash", {
+          // Not a crash — ghost keys left from an aborted save or a partial
+          // migration are silently skipped. Downgraded from warn to debug to
+          // avoid polluting server logs on every poll interval.
+          console.debug("[v0] [redis-db] getAllConnections: skipping malformed connection hash", {
             id: id || undefined,
             name: name || undefined,
             exchange: exchange || undefined,
@@ -2176,7 +2250,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
 // `getAppSettings()` returns a merged record with `app_settings` winning
 // on conflict (it's the canonical UI-facing key). Missing keys silently
 // fall back to an empty object so callers can use `?? default` patterns.
-// ─��───────────────────────────────────────────────────────────────────
+// ─��─��─────────────────────────────────────────────────────────────────
 
 const APP_SETTINGS_KEY_CANONICAL = "app_settings" as const
 const APP_SETTINGS_KEY_LEGACY    = "all_settings" as const

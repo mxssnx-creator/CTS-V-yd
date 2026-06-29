@@ -378,6 +378,16 @@ export function QuickstartSection() {
   })
 
   const [starting, setStarting] = useState(false)
+  // Ref that mirrors `starting` but is mutated synchronously so fetchStats'
+  // race guard always reads the current value regardless of closure age.
+  const startingRef = useRef(false)
+  // Grace period ref: stays true for 45 s after a successful start POST while
+  // the engine boots through prehistoric (no indication cycles yet).
+  // Prevents fetchStats from flipping isRunning back to false before the server
+  // writes its first engineRunning=true, which only happens after the first
+  // realtime cycle completes (~30-120 s depending on prehistoric length).
+  const startingGraceRef = useRef(false)
+  const startingGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Persisted across reloads (via localStorage) so QuickStart restores the
   // exact running/expanded/situation state of the current session.
   // IMPORTANT (hydration): initialise to the SAME values the server renders
@@ -517,7 +527,7 @@ export function QuickstartSection() {
         },
       }
 
-      setStats({
+      const nextStats: LiveStats = {
         historicSymbols:       s.historic?.symbolsProcessed    || 0,
         historicSymbolsTotal:  s.historic?.symbolsTotal        || 0,
         historicCycles:        s.historic?.cyclesCompleted     || 0,
@@ -635,15 +645,19 @@ export function QuickstartSection() {
         historicPerSymbolProgress: s.historic?.details?.perSymbolProgress || [],
         realtimeGatingStatus: s.realtimeGatingStatus || { isGated: false, reason: null, firstRealtimeCycleAt: null },
         stageEvalPercent: s.stageEvalPercent ?? null,
-      })
+      }
+      setStats(nextStats)
       // Persist stats to sessionStorage so a page reload can restore the last
       // known values instantly (before the first polling fetch returns).
+      // Use nextStats (the freshly-built value) rather than the stale `stats`
+      // closure variable — React state updates are async so `stats` still holds
+      // the previous value at this point in the function.
       // Key is per-connection so switching connections doesn't show stale data.
       try {
         if (connectionId) {
           sessionStorage.setItem(
             `qs:stats:${connectionId}`,
-            JSON.stringify({ ...stats, updatedAt: Date.now() })
+            JSON.stringify({ ...nextStats, updatedAt: Date.now() })
           )
         }
       } catch { /* sessionStorage unavailable */ }
@@ -659,8 +673,21 @@ export function QuickstartSection() {
       // to initialise Redis and write engineRunning=true. Without this guard,
       // the polling fetchStats returns false during that window and flips the
       // button back to "Start Engine" mid-initialisation.
-      if (s.metadata?.engineRunning === true) setIsRunning(true)
-      if (s.metadata?.engineRunning === false && !starting) setIsRunning(false)
+      // Use startingRef (mutated synchronously) rather than the `starting` state
+      // variable, which may be stale inside this useCallback closure in production.
+      if (s.metadata?.engineRunning === true) {
+        setIsRunning(true)
+        // Engine confirmed running — cancel the grace period immediately so a
+        // later stop (engineRunning=false) is applied without the 45s delay.
+        if (startingGraceRef.current) {
+          startingGraceRef.current = false
+          if (startingGraceTimerRef.current !== null) {
+            clearTimeout(startingGraceTimerRef.current)
+            startingGraceTimerRef.current = null
+          }
+        }
+      }
+      if (s.metadata?.engineRunning === false && !startingRef.current && !startingGraceRef.current) setIsRunning(false)
     } catch { /* non-critical */ }
     finally { if (!silent) setLoadingStats(false) }
   }, [connectionId])
@@ -779,6 +806,7 @@ export function QuickstartSection() {
     }
 
     setStarting(true)
+    startingRef.current = true
     setLogs([])
     addLog("Initializing connection...", "info")
     try {
@@ -843,9 +871,19 @@ export function QuickstartSection() {
         addLog(body?.message || "Engine already running — monitoring active", "warning")
         setIsRunning(true)
       }
+      // Activate a 45 s grace period so the polling fetchStats does NOT flip
+      // isRunning back to false while the engine boots through prehistoric.
+      // The grace is cleared early when the server confirms engineRunning=true.
+      if (startingGraceTimerRef.current !== null) clearTimeout(startingGraceTimerRef.current)
+      startingGraceRef.current = true
+      startingGraceTimerRef.current = setTimeout(() => {
+        startingGraceRef.current = false
+        startingGraceTimerRef.current = null
+      }, 45_000)
     } catch (err) {
       addLog(`Error: ${err instanceof Error ? err.message : String(err)}`, "error")
     } finally {
+      startingRef.current = false
       setStarting(false)
     }
   }
@@ -995,8 +1033,12 @@ export function QuickstartSection() {
         setActiveConnectionId(ac)
         // Restore last-known stats for this connection so the UI shows
         // continuous progress immediately, not zeros, on page reload.
+        // Prefer connectionId (the live ExchangeContext selection) over
+        // the stale localStorage value so we never hydrate stats for the
+        // wrong connection after a picker change.
+        const statsKey = connectionId ?? ac
         try {
-          const cached = sessionStorage.getItem(`qs:stats:${ac}`)
+          const cached = sessionStorage.getItem(`qs:stats:${statsKey}`)
           if (cached) {
             const parsed = JSON.parse(cached) as LiveStats
             // Only hydrate if the snapshot is reasonably fresh (< 10 min).
@@ -1077,8 +1119,10 @@ export function QuickstartSection() {
     const indShare = 33
     const indActive = stats.indicationCycles > 0
     if (!indActive) return prehistoricShare
-    // Use a soft cap: treat 5 cycles as "fully into the indication segment"
-    const indPct = Math.min(100, (stats.indicationCycles / Math.max(5, stats.indicationCycles)) * 100)
+    // Ramp over 50 cycles to "fully into the indication segment".
+    // The previous denominator (Math.max(5, indicationCycles)) always simplified
+    // to 100 on the first cycle — the segment jumped to full instantly.
+    const indPct = Math.min(100, (stats.indicationCycles / 50) * 100)
     if (stats.strategyCycles === 0) return prehistoricShare + (indPct / 100) * indShare
 
     // Segment 3 — strategies / real / live (66–100)
@@ -1157,7 +1201,7 @@ export function QuickstartSection() {
         {(stats.engineRunning || isRunning) && (
           <Badge variant="default" className="h-4 text-[10px] px-1.5 py-0">Running</Badge>
         )}
-        {stats.phase && stats.phase !== "—" && (
+        {stats.phase && stats.phase !== "—" && stats.phase !== "idle" && (
           <Badge variant="outline" className="h-4 text-[9px] px-1.5 py-0 capitalize hidden sm:inline-flex">
             {stats.phase.replace(/_/g, " ")}
           </Badge>
@@ -1588,7 +1632,7 @@ export function QuickstartSection() {
                 {stats.historicIndicators > 0 && (
                   <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
                 )}
-                {/* ── Spec-mandated Historic overview tiles ──────────────
+                {/* ── Spec-mandated Historic overview tiles ─────────────���
                       • ExecPos �� cumulative live exchange positions created.
                       • Base PF — overall Profit Factor across all closed
                         Base pseudo positions in the prehistoric run

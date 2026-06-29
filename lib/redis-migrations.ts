@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ��������
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ����������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -1361,7 +1361,7 @@ const migrations: Migration[] = [
       //      (which never clobbers operator-tuned values) is satisfied.
       //
       // Defaults per spec:
-      //   baseProfitFactor=0.9   — admission floor for Base stage
+      //   baseProfitFactor=0.9   �� admission floor for Base stage
       //   main/real/liveProfitFactor=1.0
       //   maxDrawdownTimeMainHours=4  maxDrawdownTimeRealHours=4  maxDrawdownTimeLiveHours=4
       //   stageMinPosCountBase=1  stageMinPosCountMain=1  stageMinPosCountReal=1
@@ -3216,6 +3216,106 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "58")
+    },
+  },
+  {
+    version: 60,
+    name: "060-purge-ghost-connection-hashes",
+    up: async (client: any) => {
+      // Purge `connection:*` keys whose hash has no `id` field — these are
+      // leftover ghost entries from aborted saves or partial migrations that
+      // trigger a recurring `getAllConnections: skipping malformed connection
+      // hash` log on every poll interval. Safe to delete: any legitimate
+      // connection always has at least `id`, `name`, and `exchange` written
+      // atomically by `saveConnection`.
+      let purged = 0
+      try {
+        const allKeys: string[] = await client.keys("connection:*")
+        for (const key of allKeys) {
+          try {
+            const id = await client.hget(key, "id")
+            const name = await client.hget(key, "name")
+            const exchange = await client.hget(key, "exchange")
+            if (!id || !name || !exchange) {
+              await client.del(key)
+              purged++
+              console.log(`[v0] Migration 060: deleted ghost key ${key}`)
+            }
+          } catch { /* skip individual key errors */ }
+        }
+      } catch (err) {
+        console.warn("[v0] Migration 060: keys scan failed (non-fatal):", err)
+      }
+      console.log(`[v0] Migration 060: purged ${purged} ghost connection hashes`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "59")
+    },
+  },
+  {
+    // Purge multi-symbol stale state so the local server (dev or local prod build)
+    // can boot on a single BTCUSDT symbol without OOM-killing from leftover keys
+    // written by a previous 10-symbol run.
+    //
+    // Deleted key families:
+    //   live:position:*          — sim positions for non-BTCUSDT symbols
+    //   live:position:tracking:* — tracking pointers
+    //   prehistoric:bingx-x01:*  — prehistoric candle/progress data per symbol
+    //   pseudo_position:*        — sim pseudo-positions that belonged to
+    //                             non-BTCUSDT symbols
+    //   realtime:bingx-x01       — stale cycle counters (reset to 0 on next cycle)
+    //   real:sets:bingx-x01:*    — stale set evaluations for non-BTCUSDT symbols
+    //   strategy:bingx-x01:*     — stale strategy variant data
+    //
+    // In production (VERCEL=1) this migration is a no-op.
+    version: 61,
+    name: "061-purge-multi-symbol-stale-state",
+    up: async (client: any) => {
+      const isLocal = process.env.NODE_ENV === "development" ||
+        (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")
+      if (!isLocal) {
+        console.log("[v0] Migration 061: skipped (Vercel production — no purge needed)")
+        return
+      }
+      const KEEP_SYMBOL = "BTCUSDT"
+      let purged = 0
+      // Helper: delete all keys in a family that do NOT contain KEEP_SYMBOL
+      const purgeFamily = async (prefix: string) => {
+        try {
+          const keys: string[] = await client.keys(`${prefix}*`)
+          for (const key of keys) {
+            // Keep BTCUSDT keys and any pure-container keys (no symbol suffix)
+            if (!key.includes(":") || key.toUpperCase().includes(KEEP_SYMBOL)) continue
+            await client.del(key).catch(() => 0)
+            purged++
+          }
+        } catch { /* non-fatal */ }
+      }
+      await purgeFamily("live:position:")
+      await purgeFamily("prehistoric:bingx-x01:")
+      await purgeFamily("pseudo_position:bingx-x01:")
+      await purgeFamily("real:sets:bingx-x01:")
+      await purgeFamily("strategy:bingx-x01:")
+      await purgeFamily("indication_outcomes_pending:")
+      // Also purge bybit-x03 engine state so it doesn't try to restart
+      try {
+        const bybitKeys: string[] = await client.keys("*bybit-x03*")
+        for (const key of bybitKeys) {
+          if (key.startsWith("connection:") || key.startsWith("settings:")) continue
+          await client.del(key).catch(() => 0)
+          purged++
+        }
+      } catch { /* non-fatal */ }
+      // Reset live position counters on the bingx-x01 progression hash
+      await client.hset("progression:bingx-x01", {
+        live_positions_open: "0",
+        live_orders_placed_count: "0",
+        live_positions_closed: "0",
+      }).catch(() => 0)
+      console.log(`[v0] Migration 061: purged ${purged} stale multi-symbol keys (kept ${KEEP_SYMBOL})`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "60")
     },
   },
 ]

@@ -8,6 +8,7 @@ import { normalizeSymbolList } from "@/lib/trade-engine/symbol-selection-ownersh
 export const dynamic = "force-dynamic"
 export const dynamicParams = true
 export const runtime = "nodejs"
+export const maxDuration = 30
 export const revalidate = 0
 export const fetchCache = "force-no-store"
 
