@@ -291,14 +291,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           ...disableGlobalState,
           updated_at: new Date().toISOString(),
           active_connections: String(activeCount),
-          // When stopping/disabling a connection, keep the global status as
-          // "stopped" unless other connections are enabled AND the engine was
-          // already running. Never promote to "running" from a disable action.
-          status: (() => {
-            if (activeCount === 0) return "stopped"
-            // Only keep "running" if the engine was running before this disable
-            return (disableGlobalState?.status === "running" && activeCount > 0) ? "running" : "stopped"
-          })(),
+          // Disabling a single connection is a per-engine action. It must not
+          // tear down or mark the Global Trade Coordinator as stopped: the
+          // coordinator is the process-level supervisor and should keep running
+          // so the operator can re-enable this or another connection without a
+          // global restart. Only /api/trade-engine/stop owns global shutdown.
+          status: disableGlobalState?.status || "running",
+          coordinator_ready: disableGlobalState?.coordinator_ready || "true",
         })
         
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling
