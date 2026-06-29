@@ -24,7 +24,9 @@
     "deploy:local": "vercel",
     "deploy:prod": "vercel --prod",
     "prebuild": "node scripts/verify-source-syntax.mjs && rm -rf .next",
-    "prevercel-build": "node scripts/verify-source-syntax.mjs && rm -rf .next"
+    "prevercel-build": "node scripts/verify-source-syntax.mjs && rm -rf .next",
+    "setup:github-cli": "bash scripts/setup-github-cli.sh",
+    "maintain:github-origin": "bash scripts/maintain-github-origin.sh"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
