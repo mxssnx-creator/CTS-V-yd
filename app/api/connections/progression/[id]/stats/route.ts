@@ -236,17 +236,25 @@ export async function GET(
         if (Array.isArray(parsed)) symbolsFromArray = parsed.length
       } catch { /* ignore */ }
     }
+    const quickstartSymbols = normalizeSymbolList((es as any).quickstart_symbols)
+    const quickstartCount = n((es as any).quickstart_symbol_count)
+    const activeSelectionEpoch = String((es as any).symbol_selection_epoch || (es as any).quickstart_symbol_generation || "")
+    const prehistoricSelectionEpoch = String((prehistoricHash as any).symbol_selection_epoch || "")
+    const prehistoricTotalIsActive = !activeSelectionEpoch || !prehistoricSelectionEpoch || activeSelectionEpoch === prehistoricSelectionEpoch
     const canonicalSelectedSymbols = normalizeSymbolList(es.selected_symbols)
-    const canonicalCurrentTotal = Math.max(
-      n(es.config_set_symbols_total),
-      canonicalSelectedSymbols.length,
-      symbolsFromArray,
-    )
+    const activeQuickstartTotal = Math.max(quickstartCount, quickstartSymbols.length)
+    const canonicalCurrentTotal = activeQuickstartTotal > 0
+      ? activeQuickstartTotal
+      : Math.max(
+        n(es.config_set_symbols_total),
+        canonicalSelectedSymbols.length,
+        symbolsFromArray,
+      )
     const historicSymbolsTotal = canonicalCurrentTotal > 0
       ? Math.max(Math.min(historicSymbolsProcessed, canonicalCurrentTotal), canonicalCurrentTotal)
       : Math.max(
           historicSymbolsProcessed,
-          n(prehistoricHash.symbols_total),
+          prehistoricTotalIsActive ? n(prehistoricHash.symbols_total) : 0,
           symbolsFromArray,
           1,
         )

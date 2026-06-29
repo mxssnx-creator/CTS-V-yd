@@ -179,7 +179,7 @@ function getCyclePauseMsSync(): number {
 refreshCyclePauseMsAsync()
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync, getAppSettings, getAppSetting, getSettingsVersion } from "@/lib/redis-db"
-import { canonicalTotalForSymbols, clampProcessedToTotal, ownsCanonicalSymbolSelection } from "@/lib/trade-engine/symbol-selection-ownership"
+import { canonicalTotalForSymbols, clampProcessedToTotal, getCanonicalSymbolSelection, ownsCanonicalSymbolSelection, ownsCanonicalSymbolSelectionEpoch } from "@/lib/trade-engine/symbol-selection-ownership"
 import { DataSyncManager } from "@/lib/data-sync-manager"
 import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor, clearFlowThrottleForConnection } from "./strategy-processor"
@@ -837,10 +837,13 @@ export class TradeEngineManager {
         // cached state.
         try {
           const symbols = await this.getSymbols()
-          const ownsCacheSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+          const cacheSelection = await getCanonicalSymbolSelection(this.connectionId)
+          const writerSelectionEpoch = cacheSelection?.epoch || ""
+          const ownsCacheSelection = await ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
           const canonicalCacheTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
-          await redisClient.hset(`prehistoric:${this.connectionId}`, {
+          if (ownsCacheSelection) await redisClient.hset(`prehistoric:${this.connectionId}`, {
             is_complete: "1",
+            symbol_selection_epoch: writerSelectionEpoch,
             symbols_processed: String(clampProcessedToTotal(symbols.length, canonicalCacheTotal)),
             symbols_total: String(canonicalCacheTotal),
             updated_at: new Date().toISOString(),
@@ -1561,7 +1564,9 @@ export class TradeEngineManager {
       // From this point ConfigSetProcessor is the SOLE incremental writer of
       // symbols_processed (always derived from scard of the SET it owns), so
       // the displayed count can never disagree with symbols_total.
-      const ownsCurrentSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+      const initialSelection = await getCanonicalSymbolSelection(this.connectionId)
+      const writerSelectionEpoch = initialSelection?.epoch || ""
+      const ownsCurrentSelection = await ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
       const canonicalSymbolsTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
       if (ownsCurrentSelection) {
         await redisClient.del(`prehistoric:${this.connectionId}:symbols`).catch(() => {})
@@ -1573,9 +1578,12 @@ export class TradeEngineManager {
         range_days: String(storedRangeDays),
         timeframe_seconds: String(storedTimeframeSec),
         is_complete: "0",
-        symbols_processed: "0",
-        symbols_total: String(canonicalSymbolsTotal),
-        ...(ownsCurrentSelection ? { prehistoric_symbols_processed_count: "0" } : {}),
+        ...(ownsCurrentSelection ? {
+          symbol_selection_epoch: writerSelectionEpoch,
+          symbols_processed: "0",
+          symbols_total: String(canonicalSymbolsTotal),
+          prehistoric_symbols_processed_count: "0",
+        } : {}),
         started_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
@@ -1620,9 +1628,14 @@ export class TradeEngineManager {
         .scard(`prehistoric:${this.connectionId}:symbols`)
         .catch(() => processingResult.symbolsProcessed)
       const finalScard = clampProcessedToTotal(finalScardRaw, processingResult.symbolsTotal)
+      const ownsCurrentSelectionAtCompletion = await ownsCanonicalSymbolSelectionEpoch(this.connectionId, symbols, writerSelectionEpoch)
       await redisClient.hset(`prehistoric:${this.connectionId}`, {
         is_complete: "1",
-        symbols_processed: String(finalScard),
+        ...(ownsCurrentSelectionAtCompletion ? {
+          symbol_selection_epoch: writerSelectionEpoch,
+          symbols_processed: String(finalScard),
+          symbols_total: String(processingResult.symbolsTotal),
+        } : {}),
         candles_loaded: String(processingResult.candlesProcessed),
         indicators_calculated: String(processingResult.indicationResults),
         total_duration_ms: String(totalPrehistoricDurationMs),
