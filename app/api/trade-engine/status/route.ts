@@ -160,6 +160,14 @@ export async function GET() {
           const connectionRunning =
             effectivelyRunning && !isGloballyPaused && (hasLocalEngineRuntime || hasFreshDistributedHeartbeat)
 
+          // Determine if this connection's engine is actively running in THIS
+          // web worker. Redis `status=running` is operator intent; after moving
+          // auto-start to an explicit dedicated-worker opt-in, the dashboard must
+          // not display a local engine as running when this process has no local
+          // manager attached. This prevents stale Redis intent from looking like
+          // active production progress after a deploy/restart.
+          const connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime
+
           return {
             id: conn.id,
             name: conn.name,
@@ -210,6 +218,7 @@ export async function GET() {
 
     const distributedEngineCount = connectionStatuses.filter((c: any) => c.distributedHeartbeatFresh).length
     const activeEngineCount = Math.max(coordinatorEngineCount, distributedEngineCount)
+    const activeEngineCount = coordinatorEngineCount
 
     const responseBody = {
       success: true,
@@ -227,6 +236,7 @@ export async function GET() {
             : null,
         requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 (and ENABLE_IN_PROCESS_CONTINUITY=1 for in-process timers) on exactly one dedicated worker/process",
       },
+      operatorStatus: engineHash.status || "stopped",
       connections: connectionStatuses,
       summary,
     }

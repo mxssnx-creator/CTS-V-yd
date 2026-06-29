@@ -295,6 +295,13 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("not clearing distributed running flag")
   })
 
+    expect(source).toContain("connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime")
+    expect(source).toContain("workerAttached: hasLocalEngineRuntime")
+    expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")
+    expect(source).toContain("const activeEngineCount = coordinatorEngineCount")
+    expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
+  })
+
   test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
     const source = read("lib/connection-recoordinator.ts")
 
