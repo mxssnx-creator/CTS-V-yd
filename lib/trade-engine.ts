@@ -255,7 +255,6 @@ export class GlobalTradeEngineCoordinator {
         console.warn(
           `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
         )
-        return false
         try {
           const { getRedisClient } = await import("@/lib/redis-db")
           const client = getRedisClient()
@@ -851,14 +850,23 @@ export class GlobalTradeEngineCoordinator {
       for (const connection of connections) {
         if (!runningIds.has(connection.id)) {
           try {
-            const hasCredentials = (connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret)
+            const hasCredentials = Boolean((connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret))
             if (!hasCredentials) {
-              console.log(`[v0] [Coordinator] SKIP: ${connection.name} - no credentials`)
-              await logProgressionEvent(connection.id, "engine_skip", "warning", "Engine start skipped - missing credentials", {
-                connectionId: connection.id,
-                connectionName: connection.name,
-              })
-              continue
+              console.log(
+                `[v0] [Coordinator] START: ${connection.name} (${connection.exchange}) without credentials ` +
+                  "— running Main/strategy pipeline only; exchange order placement remains credential-gated",
+              )
+              await logProgressionEvent(
+                connection.id,
+                "engine_starting_without_credentials",
+                "warning",
+                "Coordinator starting engine without credentials; live order placement remains blocked",
+                {
+                  connectionId: connection.id,
+                  connectionName: connection.name,
+                  exchange: connection.exchange,
+                },
+              )
             }
             
             console.log(`[v0] [Coordinator] START: ${connection.name} (${connection.exchange})`)
@@ -970,15 +978,23 @@ export class GlobalTradeEngineCoordinator {
       for (const connection of enabledConnections) {
         if (!runningIds.has(connection.id)) {
           try {
-            const hasCredentials = (connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret)
+            const hasCredentials = Boolean((connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret))
             if (!hasCredentials) {
-              console.log(`[v0] [Coordinator] SKIP: ${connection.name} - no credentials`)
-              await logProgressionEvent(connection.id, "engine_skip", "warning", "Engine start skipped - missing credentials", {
-                connectionId: connection.id,
-                connectionName: connection.name,
-              })
-              skipped++
-              continue
+              console.log(
+                `[v0] [Coordinator] START: ${connection.name} (${connection.exchange}) without credentials ` +
+                  "— running Main/strategy pipeline only; exchange order placement remains credential-gated",
+              )
+              await logProgressionEvent(
+                connection.id,
+                "engine_starting_without_credentials",
+                "warning",
+                "Coordinator starting engine without credentials; live order placement remains blocked",
+                {
+                  connectionId: connection.id,
+                  connectionName: connection.name,
+                  exchange: connection.exchange,
+                },
+              )
             }
             
             console.log(`[v0] [Coordinator] START: ${connection.name} (${connection.exchange})`)

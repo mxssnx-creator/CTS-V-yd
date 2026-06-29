@@ -202,7 +202,7 @@ export class IndicationConfigManager {
       if (client) {
         const raw = await client.hget(`connection_settings:${this.connectionId}`, "minStep")
         const parsed = Number(raw)
-        if (Number.isFinite(parsed) && parsed >= 3 && parsed <= 30) {
+        if (Number.isFinite(parsed) && parsed >= 2 && parsed <= 30) {
           minStep = Math.floor(parsed)
         }
       }
@@ -211,9 +211,9 @@ export class IndicationConfigManager {
     }
 
     const types = ["SMA", "EMA", "RSI", "MACD"]
-    // Full candidate pool 3–30 at practical intervals.
+    // Full candidate pool 2–30 at practical intervals.
     // Filter by operator-configured minStep floor.
-    const ALL_STEPS = [3, 5, 10, 15, 20, 25, 30]
+    const ALL_STEPS = [2, 3, 5, 10, 15, 20, 25, 30]
     const stepsOptions = ALL_STEPS.filter(s => s >= minStep)
     const drawdownOptions = [0.05, 0.1, 0.15]
     const activeRatioOptions = [0.6, 0.7, 0.8]

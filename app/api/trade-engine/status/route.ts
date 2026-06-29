@@ -89,6 +89,8 @@ export async function GET() {
     
     // Get active connections
     const connections = await getActiveConnectionsForEngine()
+    const coordinatorEngineCount = coordinator?.getActiveEngineCount() || 0
+    const hasLocalEngineRuntime = coordinatorEngineCount > 0
     
     if (connections.length === 0) {
       // Get all connections to explain why none are active
@@ -145,8 +147,13 @@ export async function GET() {
           const positionsCount = await client.scard(positionsKey)
           const tradesCount = await client.scard(tradesKey)
 
-          // Determine if this connection's engine is actively running
-          const connectionRunning = effectivelyRunning && !isGloballyPaused
+          // Determine if this connection's engine is actively running in THIS
+          // web worker. Redis `status=running` is operator intent; after moving
+          // auto-start to an explicit dedicated-worker opt-in, the dashboard must
+          // not display a local engine as running when this process has no local
+          // manager attached. This prevents stale Redis intent from looking like
+          // active production progress after a deploy/restart.
+          const connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime
 
           return {
             id: conn.id,
@@ -193,16 +200,7 @@ export async function GET() {
       errors: connectionStatuses.filter((c: any) => c.error).length,
     }
 
-    // In Next dev, route handlers may execute in a freshly compiled module
-    // instance whose in-memory coordinator has no local managers, while Redis
-    // correctly records operator intent and progression state. Report the
-    // effective running connection count as a floor so the UI does not flicker
-    // `activeEngineCount: 0` during hot-route recompiles even though the
-    // connection status remains running.
-    const coordinatorEngineCount = coordinator?.getActiveEngineCount() || 0
-    const activeEngineCount = effectivelyRunning
-      ? Math.max(coordinatorEngineCount, summary.running)
-      : coordinatorEngineCount
+    const activeEngineCount = coordinatorEngineCount
 
     const responseBody = {
       success: true,
@@ -210,6 +208,8 @@ export async function GET() {
       paused: isGloballyPaused,
       status: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "stopped"),
       activeEngineCount,
+      workerAttached: hasLocalEngineRuntime,
+      operatorStatus: engineHash.status || "stopped",
       connections: connectionStatuses,
       summary,
     }

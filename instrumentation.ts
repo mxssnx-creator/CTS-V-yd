@@ -52,24 +52,33 @@ export async function register(): Promise<void> {
     console.error("[v0] [Instrumentation] completeStartup failed (continuing):", err instanceof Error ? err.message : err)
   }
 
-  // Bring up the engine auto-start monitor so any user-enabled connections
-  // resume running headlessly (without waiting for a browser mount). This is
-  // idempotent and does NOT force-enable connections — it only syncs engines
-  // for connections the operator has already enabled.
-  try {
-    const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
-    await initializeTradeEngineAutoStart()
-  } catch (err) {
-    console.error("[v0] [Instrumentation] auto-start init failed (continuing):", err instanceof Error ? err.message : err)
+  // Production web workers must stay responsive for UI/API health probes.
+  // Starting heavy trade-engine loops inside the same Next.js request worker on
+  // cold boot can monopolize the event loop and make /api/health time out before
+  // operators can even open the dashboard. Run the in-process engine monitor only
+  // when a dedicated worker explicitly opts in; otherwise users still start the
+  // engine from the UI/API and hosted deployments can use external cron/worker
+  // processes for continuity.
+  if (process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1") {
+    try {
+      const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
+      await initializeTradeEngineAutoStart()
+    } catch (err) {
+      console.error("[v0] [Instrumentation] auto-start init failed (continuing):", err instanceof Error ? err.message : err)
+    }
+  } else {
+    console.log("[v0] [Instrumentation] trade-engine auto-start skipped; set ENABLE_TRADE_ENGINE_AUTOSTART=1 in a dedicated worker to opt in")
   }
 
-  // Start the server-side continuity runner so realtime processing continues
-  // without depending on a browser tab or external cron.
-  try {
-    const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
-    startServerContinuityRunner()
-  } catch (err) {
-    console.error("[v0] [Instrumentation] continuity runner failed (continuing):", err instanceof Error ? err.message : err)
+  if (process.env.ENABLE_IN_PROCESS_CONTINUITY === "1") {
+    try {
+      const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
+      startServerContinuityRunner()
+    } catch (err) {
+      console.error("[v0] [Instrumentation] continuity runner failed (continuing):", err instanceof Error ? err.message : err)
+    }
+  } else {
+    console.log("[v0] [Instrumentation] in-process continuity skipped; use ENABLE_IN_PROCESS_CONTINUITY=1 only for a dedicated worker")
   }
 
   console.log("[v0] [Instrumentation] ✓ Server boot complete")

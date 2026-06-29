@@ -77,12 +77,13 @@ async function main() {
   }
   const data = publicData && Array.isArray(publicData.json.data) ? publicData.json.data : []
   const symbolSet = new Set(data.map((d) => String(d.symbol || d.contract || '').replace('-', '')).filter(Boolean))
-  const available = symbols.filter((s) => symbolSet.size === 0 || symbolSet.has(s) || symbolSet.has(s.replace('USDT', '-USDT')))
+  const available = symbols.filter((s) => symbolSet.has(s) || symbolSet.has(s.replace('USDT', '-USDT')))
   const missing = symbols.filter((s) => !available.includes(s))
   const credentials = hasBingxCredentials()
+  const publicApiReachable = Boolean(publicData?.url && !publicApiWarning)
 
   const result = {
-    success: true,
+    success: publicApiReachable && available.length > 0,
     mode: 'standalone-readiness-no-orders',
     publicApi: publicData?.url || null,
     publicApiWarning,
@@ -92,15 +93,17 @@ async function main() {
     missingSymbols: missing,
     lowestVolumeFactor: 0.1,
     hasCredentials: credentials,
-    canPlaceLiveOrders: credentials,
+    canPlaceLiveOrders: credentials && publicApiReachable && available.length > 0,
     note: credentials
-      ? 'Credentials detected. Run the Next.js quickstart API to perform real order-path testing.'
+      ? publicApiReachable
+        ? 'Credentials detected and BingX public API is reachable. Run the Next.js quickstart API only when intentional live order placement is acceptable.'
+        : 'Credentials detected, but BingX public API is not reachable from this environment; live order-path testing was not attempted.'
       : 'No BingX credentials detected in this environment; real order placement was intentionally not attempted.',
   }
   console.log(JSON.stringify(result, null, 2))
 
   if (symbols.length < 1 || symbols.length > 32) process.exit(1)
-  if (available.length === 0 && !publicApiWarning) process.exit(1)
+  if (!result.success) process.exit(1)
 }
 
 main().catch((err) => {

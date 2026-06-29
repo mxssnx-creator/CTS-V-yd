@@ -184,36 +184,40 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
         }
         
-        // Update global engine state — but ONLY propagate/mirror, never force
-        // status="running" if the operator has stopped the global engine.
-        // Previously this block unconditionally wrote status:"running", causing
-        // the engine to resurrect itself after every connection-enable even when
-        // the operator had explicitly pressed Stop.
+        // Update global engine state. A real explicit enable action is allowed
+        // to start the coordinator because `startEngine()` refuses to start
+        // when `trade_engine:global.status` is not "running". No-op dashboard
+        // reads/repeats still never reach this branch because engineAction is
+        // only set for an explicit enable state transition/re-enable request.
         const toggleClient = getRedisClient()
         const globalState: Record<string, string> = await toggleClient.hgetall("trade_engine:global").catch(() => ({})) || {}
-        const isGlobalRunning = globalState.status === "running"
         const allConnections = await getAllConnections()
         // Use clean helper function for counting main-enabled connections
         const activeDashboardCount = allConnections.filter((c: any) => 
           c.id === resolvedId || isConnectionReadyForEngine(c)
         ).length
-        // Only update status if already running — never flip from stopped→running
-        // on a per-connection enable. The operator must explicitly start the
-        // global engine via /api/trade-engine/start.
-        const newGlobalStatus = isGlobalRunning ? "running" : (globalState.status || "stopped")
         await toggleClient.hset("trade_engine:global", {
           ...globalState,
-          status: newGlobalStatus,
-          ...(isGlobalRunning && !globalState.started_at ? { started_at: new Date().toISOString() } : {}),
+          status: "running",
+          coordinator_ready: "true",
+          started_at: globalState.started_at || new Date().toISOString(),
           updated_at: new Date().toISOString(),
           active_connections: String(activeDashboardCount),
         })
         
-        // DIRECTLY START THE ENGINE - don't rely on coordinator polling
+        // Start in-process only when this worker is explicitly allowed to own
+        // engine loops or it already has a local coordinator running. In
+        // production/OpenNext the UI/API worker must stay responsive: enabling a
+        // connection should persist operator intent and request the dedicated
+        // coordinator to reconcile, not spin a heavy trade loop inside the
+        // request handler and starve subsequent status/UI requests.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          const settings = await loadSettingsAsync()
-            
+          const localStartAllowed =
+            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
+
+          if (localStartAllowed) {
+            const settings = await loadSettingsAsync()
             const engineConfig = {
               connectionId: resolvedId,
               connection_name: connection.name,
@@ -223,38 +227,48 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            setImmediate(() => {
-              coordinator.startEngine(resolvedId, engineConfig).catch(async (engineStartError: unknown) => {
-                console.error(`[v0] [Toggle] Background engine start failed:`, engineStartError)
-                await getRedisClient().set(`engine_is_running:${resolvedId}`, "0").catch(() => {})
-                await logProgressionEvent(
-                  resolvedId,
-                  "engine_start_failed",
-                  "error",
-                  engineStartError instanceof Error ? engineStartError.message : String(engineStartError),
-                  { connectionId: resolvedId, connectionName: connection.name, exchange: connection.exchange },
-                ).catch(() => {})
-              })
-            })
+            const started = await coordinator.startEngine(resolvedId, engineConfig)
+            if (!started && !coordinator.isEngineRunning(resolvedId)) {
+              throw new Error("Coordinator did not start the engine after enable; startup lock may be held by another worker")
+            }
             
-            console.log(`[v0] [Toggle] ✓ Engine start queued for ${connection.name}`)
+            console.log(`[v0] [Toggle] ✓ Engine ${started ? "started" : "already running"} directly for ${connection.name}`)
             await logProgressionEvent(resolvedId, "engine_started_direct", "info", "Main Trade Engine started directly from enable", {
               connectionId: resolvedId,
               connectionName: connection.name,
               exchange: connection.exchange,
             })
-          } catch (engineStartError) {
-            console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
-            // Still set the flag as fallback - coordinator may pick it up
+            engineStatus = "started"
+          } else {
             await setSettings("engine_coordinator:refresh_requested", {
               timestamp: new Date().toISOString(),
               connectionId: resolvedId,
               action: "start",
+              reason: "dashboard_toggle_enable",
             })
+            await logProgressionEvent(resolvedId, "engine_start_queued", "info", "Connection enabled; start queued for coordinator worker", {
+              connectionId: resolvedId,
+              connectionName: connection.name,
+              exchange: connection.exchange,
+              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+            })
+            engineStatus = "queued"
+            console.log(
+              `[v0] [Toggle] Engine start queued for ${connection.name}; this UI worker is not opted in for local engine loops`,
+            )
           }
+        } catch (engineStartError) {
+          console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
+          // Still set the flag as fallback - coordinator may pick it up
+          await setSettings("engine_coordinator:refresh_requested", {
+            timestamp: new Date().toISOString(),
+            connectionId: resolvedId,
+            action: "start",
+          })
+          engineStatus = "queued"
+        }
           
-          engineStatus = "started"
-          console.log(`[v0] [Toggle] Engine progression initialized for ${connection.name}`)
+        console.log(`[v0] [Toggle] Engine progression initialized for ${connection.name}`)
       } catch (engineError) {
         console.error(`[v0] [Toggle] Failed to initialize engine:`, engineError)
         engineStatus = "error"
@@ -291,14 +305,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           ...disableGlobalState,
           updated_at: new Date().toISOString(),
           active_connections: String(activeCount),
-          // When stopping/disabling a connection, keep the global status as
-          // "stopped" unless other connections are enabled AND the engine was
-          // already running. Never promote to "running" from a disable action.
-          status: (() => {
-            if (activeCount === 0) return "stopped"
-            // Only keep "running" if the engine was running before this disable
-            return (disableGlobalState?.status === "running" && activeCount > 0) ? "running" : "stopped"
-          })(),
+          // Disabling a single connection is a per-engine action. It must not
+          // tear down or mark the Global Trade Coordinator as stopped: the
+          // coordinator is the process-level supervisor and should keep running
+          // so the operator can re-enable this or another connection without a
+          // global restart. Only /api/trade-engine/stop owns global shutdown.
+          status: disableGlobalState?.status || "running",
+          coordinator_ready: disableGlobalState?.coordinator_ready || "true",
         })
         
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling

@@ -32,7 +32,7 @@ export interface Settings {
   /**
    * Minimal Step — pseudo-position window floor.
    * Only indication step-window sizes >= minStep are generated.
-   * Range 3–30 step 1, default 5.
+   * Range 2–30 step 1, default 5.
    */
   minStep: number
   trailingMinStep: number
