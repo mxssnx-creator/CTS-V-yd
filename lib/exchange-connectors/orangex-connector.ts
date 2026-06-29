@@ -294,7 +294,7 @@ export class OrangeXConnector extends BaseExchangeConnector {
     }
   }
 
-  async getPosition(symbol: string): Promise<any> {
+  async getPosition(symbol: string, _direction?: "long" | "short"): Promise<any> {
     try {
       const positions = await this.getPositions(symbol)
       return positions[0] || null

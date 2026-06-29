@@ -3084,8 +3084,15 @@ export async function executeLivePosition(
       if (typeof exchangeConnector.getPosition === "function") {
         for (let attempt = 0; attempt < 3; attempt += 1) {
           try {
-            const exPos = await exchangeConnector.getPosition(realPosition.symbol)
-            const exSize = parseFloat(String(exPos?.size ?? exPos?.positionAmt ?? exPos?.quantity ?? exPos?.contracts ?? "0")) || 0
+            // Pass direction so hedge-mode connectors return the correct
+            // LONG vs SHORT slot rather than whichever is first in the array.
+            const exPos = await exchangeConnector.getPosition(
+              realPosition.symbol,
+              realPosition.direction as "long" | "short",
+            )
+            // BingX v3 perpetual: qty is in `positionAmt`; normalised output
+            // also exposes `contracts` and `size` aliases (set in getPositions).
+            const exSize = parseFloat(String(exPos?.positionAmt ?? exPos?.contracts ?? exPos?.size ?? exPos?.quantity ?? "0")) || 0
             const exEntry = parseFloat(String(exPos?.entryPrice ?? exPos?.avgPrice ?? exPos?.averagePrice ?? "0")) || 0
             if (Math.abs(exSize) > 0) {
               console.log(`${LOG_PREFIX} getPosition() fallback fill for ${realPosition.symbol}: size=${exSize} entry=${exEntry} (attempt=${attempt + 1})`)
@@ -3190,7 +3197,11 @@ export async function executeLivePosition(
     if (livePosition.executedQuantity > 0) {
       if (typeof exchangeConnector.getPosition === "function") {
         try {
-          const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+          // Pass direction so hedge-mode accounts return the correct slot.
+          const exPos = await exchangeConnector.getPosition(
+            realPosition.symbol,
+            realPosition.direction as "long" | "short",
+          )
           if (exPos) {
             livePosition.exchangeData = {
               ...(livePosition.exchangeData || {}),
@@ -3363,7 +3374,11 @@ export async function executeLivePosition(
     // ── Step 8: Sync with exchange for position data ───────────────────────
     if (typeof exchangeConnector.getPosition === "function") {
       try {
-        const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+        // Pass direction for hedge-mode accounts.
+        const exPos = await exchangeConnector.getPosition(
+          realPosition.symbol,
+          realPosition.direction as "long" | "short",
+        )
         if (exPos) {
           livePosition.exchangeData = {
             marginType: (exPos as any).marginType,
