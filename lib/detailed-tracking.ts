@@ -361,6 +361,10 @@ export async function getIndicationTracking(
 /**
  * Get strategy stage tracking. Reflects the canonical pipeline:
  *   Base (independent) → Main (variants per Base) → Real (accumulation) → Live (top 500)
+ *
+ * Keep this export at module top-level. The deployment syntax verifier asserts
+ * it is not nested inside `getIndicationTracking`; this guards against the
+ * merge-truncation regression that previously left an unclosed block above.
  */
 export async function getStrategyTracking(
   connectionId: string,
