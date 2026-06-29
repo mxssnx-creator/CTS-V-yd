@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs"
 import { relative, resolve } from "node:path"
+import ts from "typescript"
 
 const root = process.cwd()
 const checks = [
@@ -17,6 +18,10 @@ const checks = [
   },
 ]
 
+const syntaxFiles = [
+  "app/api/trade-engine/start/route.ts",
+]
+
 let failed = false
 
 for (const check of checks) {
@@ -25,6 +30,29 @@ for (const check of checks) {
   if (check.pattern.test(source)) {
     failed = true
     console.error(`[source-syntax] ${relative(root, abs)}: ${check.message}`)
+  }
+}
+
+for (const file of syntaxFiles) {
+  const abs = resolve(root, file)
+  const source = readFileSync(abs, "utf8")
+  const result = ts.transpileModule(source, {
+    compilerOptions: {
+      jsx: ts.JsxEmit.Preserve,
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ESNext,
+    },
+    fileName: abs,
+    reportDiagnostics: true,
+  })
+
+  const syntaxErrors = result.diagnostics?.filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error) ?? []
+  for (const diagnostic of syntaxErrors) {
+    failed = true
+    const position = diagnostic.file?.getLineAndCharacterOfPosition(diagnostic.start ?? 0)
+    const location = position ? `:${position.line + 1}:${position.character + 1}` : ""
+    const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")
+    console.error(`[source-syntax] ${relative(root, abs)}${location}: ${message}`)
   }
 }
 
