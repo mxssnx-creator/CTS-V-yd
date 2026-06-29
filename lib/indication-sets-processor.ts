@@ -949,7 +949,11 @@ export class IndicationSetsProcessor {
       // into the InlineLocalRedis Map every boot). 1000 pending signals/symbol is
       // far more than the low-RAM dev VM needs; 100 is plenty to evaluate forward
       // outcomes. Production keeps the full 1000-entry window.
-      const pendingCap = this._isDev ? 100 : 1000
+      // Scale with symbol count: 30 per symbol in dev (e.g. 300 for 10 symbols).
+      const _nDevSyms = this._isDev
+        ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+        : 1
+      const pendingCap = this._isDev ? Math.max(100, _nDevSyms * 30) : 1000
       await client.ltrim(key, -pendingCap, -1)
       await client.expire(key, 86400)
     } catch { /* non-critical */ }

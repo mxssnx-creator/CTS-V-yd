@@ -406,9 +406,10 @@ export class InlineLocalRedis {
     // 4 GB VM: RSS at boot is ~2.3 GB (Next.js + InlineLocalRedis migrations).
     // Evict aggressively at 250 MB heap / 1400 MB RSS so the prehistoric
     // burst (which adds ~300-400 MB) never pushes RSS past the kernel OOM limit.
-    // Trigger GC-assisted eviction at 650 MB heap (half of --max-old-space-size=1024).
-    // 250 MB was too aggressive — fired at idle and wasted CPU on every interval.
-    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 650 : 800
+    // Heap eviction trigger: fire at 1200 MB in dev (dev heap cap is now 4096 MB)
+    // and 1500 MB in prod. These are ~30% of the respective heap caps, leaving
+    // ample room for the prehistoric burst (~300 MB) before hitting the V8 limit.
+    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 1_200 : 1_500
 
     // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
     // to clear volatile key families that accumulate across hot-reload cycles
@@ -600,17 +601,23 @@ export class InlineLocalRedis {
         const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
-        // RSS trigger: disabled in dev because Next.js itself sits at ~1.9 GB RSS
-        // at idle (compiled routes + module cache), so the trigger fires constantly
-        // even when there's nothing to evict. Only heap + key-count triggers are
-        // actionable in the dev environment.
-        // In prod (real Redis, smaller binary) RSS trigger fires at 2.5 GB.
-        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? Infinity : 2_500
+        // RSS trigger: in dev, Next.js idle RSS is ~1.9–2.5 GB so the trigger
+        // must be set high enough to avoid false-positives at idle, yet low
+        // enough to fire before kernel OOM (which kills at ~8 GB on this VM).
+        // 5 GB gives a comfortable eviction runway on the 8.4 GB VM.
+        // In prod (real Redis, off-heap) RSS trigger fires at 3.5 GB.
+        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 5_000 : 3_500
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        // Dev: lower threshold so eviction fires before indication_set keys accumulate.
-        // 144 indication_set keys/cycle × 3 cycles = 432; 5000 fires after ~10 cycles.
-        const MAX_TOTAL_KEYS = process.env.NODE_ENV === "development" ? 5_000 : 8_000
+        // Scale the key-count eviction trigger with symbol count so the threshold
+        // fires proportionally rather than immediately at 10 symbols.
+        // Baseline: 1000 protected keys + N × 800 pipeline keys ≈ max active window.
+        const _nSymsForKeys = process.env.NODE_ENV === "development"
+          ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+          : 1
+        const MAX_TOTAL_KEYS = process.env.NODE_ENV === "development"
+          ? 1_000 + _nSymsForKeys * 800
+          : 15_000
         const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
           if (rssMB > RSS_PRESSURE_MB) {
@@ -747,42 +754,45 @@ export class InlineLocalRedis {
     // Bucket names mirror the old family rules, so the cap values are unchanged.
     const isDev = process.env.NODE_ENV === "development"
 
+    // ── Per-symbol-aware eviction caps ────────────────────────────────────
+    // All dev caps scale linearly with V0_DEV_SYMBOL_COUNT so a 10-symbol
+    // run gets 10× more key slots for the hot pipeline families without
+    // raising prod numbers (prod uses real Redis, off-heap — caps are just
+    // safety nets there, not memory limiters).
+    const _N = isDev
+      ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+      : 1  // prod caps don't scale (real Redis is off-heap)
+
     // Caps indexed by bucket name (shared between hash and string passes)
     const CAPS: Record<string, number> = {
-      // Dev used to evict several active calculation families down to zero.
-      // That protected the heap, but it also made the running engine lose the
-      // very data it needs for dashboard progress, strategy evaluation, and
-      // follow-up real/live decisions. Keep a bounded active window instead:
-      // small enough for the in-memory Redis emulator, large enough for the
-      // current quickstart fan-out to remain observable and evaluable.
-      pseudo_position:              isDev ? 500  : 2000,
-      s_pseudo_position:            isDev ? 500  : 1500,  // settings:pseudo_position
-      strategies:                   isDev ? 250  : 100,
-      s_strategies:                 isDev ? 100  : 20,    // settings:strategies
-      config_set:                   isDev ? 200  : 1500,
-      strategy_positions:           isDev ? 100  : 1000,
-      strategy_detail:              isDev ? 100  : 1000,
-      real_stage:                   isDev ? 100  : 1000,
-      indication:                   isDev ? 500  : 500,
-      indications:                  isDev ? 100  : 100,
-      // indication_set:* — per-cycle per-symbol indication set hashes produced by
-      // IndicationProcessor v5. With 3 symbols × ~4700 sets each = ~14,100 keys
-      // at ~6.6 KB each = 93 MB — the primary OOM driver. Cap tightly in dev:
-      // 300 keys keeps the most-recent evaluation window, older ones re-derive.
-      indication_set:               isDev ? 300  : 5000,
-      // indication_outcomes_pending:* — pending outcome resolution hashes (one
-      // per active indication). Cap at 30 in dev (3 symbols × ~10 active each).
-      indication_outcomes_pending:  isDev ? 30   : 200,
-      // axis_pos_acc:* — axis position accumulator hashes written per-cycle.
-      // Each entry is ~200 KB (one per connection). Cap at 5 to be safe.
+      // N × per-symbol baseline keeps the active evaluation window alive across
+      // all symbols without letting any one family blow up the heap.
+      pseudo_position:              isDev ? _N * 200  : 2000,
+      s_pseudo_position:            isDev ? _N * 150  : 1500,
+      strategies:                   isDev ? _N * 50   : 100,
+      s_strategies:                 isDev ? _N * 20   : 20,
+      config_set:                   isDev ? _N * 60   : 1500,
+      strategy_positions:           isDev ? _N * 30   : 1000,
+      strategy_detail:              isDev ? _N * 30   : 1000,
+      real_stage:                   isDev ? _N * 30   : 1000,
+      indication:                   isDev ? _N * 100  : 500,
+      indications:                  isDev ? _N * 20   : 100,
+      // indication_set:* — per-cycle per-symbol indication set hashes.
+      // 150 sets per symbol keeps the most-recent evaluation window alive.
+      // At 10 symbols: 1500 keys × ~6.6 KB each ≈ 10 MB (manageable).
+      indication_set:               isDev ? _N * 150  : 5000,
+      // indication_outcomes_pending:* — rolling outcome list, one per symbol.
+      // 15 per symbol is enough to track recent outcomes across all types.
+      indication_outcomes_pending:  isDev ? _N * 15   : 200,
+      // axis_pos_acc:* — axis position accumulator (one per connection, ~200 KB).
       axis_pos_acc:                 5,
       prehistoric:                  20,
-      live_history:                 isDev ? 100  : 500,
+      live_history:                 isDev ? _N * 30   : 500,
       // string-only
-      indications_str:              50,
-      dedup:                        isDev ? 500  : 3000,
-      candle_cache:                 20,
-      candles:                      20,
+      indications_str:              isDev ? _N * 20   : 50,
+      dedup:                        isDev ? _N * 100  : 3000,
+      candle_cache:                 isDev ? _N * 4    : 20,
+      candles:                      isDev ? _N * 4    : 20,
     }
 
     // Classify a key into a bucket name; returns null for protected/untracked keys.
@@ -2248,7 +2258,7 @@ export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
 }
 
-// ──────────���────────────────────────���──────────────���─���────────────────
+// ──────────���────────────────────────���──────────────���─���────────────���───
 // Live-settings version counter
 //
 // When an operator hits Save in the Settings UI, the server updates the

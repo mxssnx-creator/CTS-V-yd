@@ -242,11 +242,17 @@ import { fetchTopSymbols } from "@/lib/top-symbols"
  * 5 concurrent keeps the event loop blocked long enough that the eviction
  * setInterval callback cannot fire between batches.
  *
- * DEV NOTE: Set to 1 in development. Combined with MAIN_AXIS_SETS_CEILING=400
- * and REAL_SETS_SAFETY_CEILING=600 this keeps peak in-flight StrategySet
- * objects at 1000 vs 9000 in prod (3 × 3000), cutting V8 heap by ~90%.
+ * DEV NOTE: Scales with V0_DEV_SYMBOL_COUNT. With 1 symbol it stays 1;
+ * with 10 symbols it rises to min(3, ceil(N/4)) so at most 3 symbols
+ * are processed in parallel even in dev, keeping in-flight StrategySet
+ * count manageable (3 × MAIN_AXIS_SETS_CEILING per cycle peak).
  */
-const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 1 : 3
+const _devSymCount = process.env.NODE_ENV === "development"
+  ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+  : 0
+const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development"
+  ? Math.min(3, Math.max(1, Math.ceil(_devSymCount / 4)))
+  : 3
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -683,7 +689,7 @@ export class TradeEngineManager {
           updated_at: new Date().toISOString(),
         }
 
-        // ── Critical Write with Retry ─────────────────────────────────���──
+        // ── Critical Write with Retry ─────────────────────────────────�����──
         // The progression snapshot (symbol_count, settings_version, etc.) is
         // CRITICAL for "unique + solid" progress. If this write fails, the
         // entire progression becomes stale and UI will show incorrect counters.
@@ -3616,14 +3622,28 @@ export class TradeEngineManager {
           getSettings(`connection:${this.connectionId}`),
         ])
 
-        // ── DEV HARD CAP: always trade only BTCUSDT in development ──────────
-        // Every other path (force_symbols, self-written symbols, volatility
-        // fetch) can be clobbered by snapshot state or dynamic API results.
-        // A direct early-return here is the only reliable way to keep the dev
-        // worker's RSS under the OOM threshold (1 symbol = ~700 MB vs 20
-        // symbols = ~3.5 GB). Production is completely unaffected.
+        // ── DEV SYMBOL CAP ────────────────────────────────────────────────
+        // In development the InlineLocalRedis emulator holds ALL state on the
+        // Node.js heap, so symbol count directly controls peak RSS. The cap
+        // is controlled by V0_DEV_SYMBOL_COUNT (env var, default "1") so it
+        // can be raised to 10+ on a larger-RAM VM without touching code.
+        //
+        // Behaviour:
+        //   V0_DEV_SYMBOL_COUNT=1  → always ["BTCUSDT"] (minimum safe, old default)
+        //   V0_DEV_SYMBOL_COUNT=10 → normal resolution below, then slice to 10
+        //   unset                  → default 1, same as before
+        //
+        // Production (NODE_ENV !== "development") is COMPLETELY UNAFFECTED —
+        // this block only runs in the dev Next.js worker.
         if (process.env.NODE_ENV === "development") {
-          return ["BTCUSDT"]
+          const devCap = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
+          // Fast path for the default single-symbol case — skip the Redis
+          // resolution chain entirely; BTCUSDT is the canonical dev fixture.
+          if (devCap === 1) return ["BTCUSDT"]
+          // For devCap > 1 fall through to the full resolution chain below
+          // (force_symbols → self-written symbols → volatility fetch).
+          // The resolved list is sliced to devCap at the end of this function.
+          ;(resolve as any)._devCap = devCap
         }
 
         if (connState && typeof connState === "object") {
@@ -3722,7 +3742,17 @@ export class TradeEngineManager {
       }
     }
 
-    const resolved = await resolve()
+    let resolved = await resolve()
+    // Apply dev symbol cap when V0_DEV_SYMBOL_COUNT > 1 (devCap was stashed
+    // on the resolve function to avoid a closure variable that could race
+    // with concurrent calls during hot-reload).
+    if (process.env.NODE_ENV === "development") {
+      const devCap = (resolve as any)._devCap
+      if (typeof devCap === "number" && devCap > 1 && resolved.length > devCap) {
+        resolved = resolved.slice(0, devCap)
+        console.log(`[v0] [getSymbols] Dev cap ${devCap}: using ${resolved.join(",")}`)
+      }
+    }
     this._symbolsCache = resolved
     this._symbolsCachedAt = now
     return resolved
