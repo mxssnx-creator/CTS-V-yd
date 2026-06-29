@@ -110,15 +110,18 @@ export class StrategyProcessor {
           try {
             const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
             const manager = getGlobalTradeEngineCoordinator()?.getEngineManager?.(this.connectionId)
+            if (manager && typeof (manager as any).invalidateStrategyAndCoordinationCaches === "function") {
+              ;(manager as any).invalidateStrategyAndCoordinationCaches([], "dirty-flag:strategy")
+            }
             if (manager && typeof (manager as any).triggerImmediateStrategyReevaluation === "function") {
-              ;(manager as any).triggerImmediateStrategyReevaluation("settings-dirty")
+              ;(manager as any).triggerImmediateStrategyReevaluation("dirty-flag:strategy")
             }
           } catch {
             /* Cross-process or test environments may not have a manager. */
           }
           
           console.log(
-            `[v0] [StrategyProcessor] Settings reloaded for ${this.connectionId} - flow throttle cleared, immediate re-evaluation requested`
+            `[v0] [StrategyProcessor] Dirty flag consumed for ${this.connectionId}; flow throttle cleared and immediate re-evaluation requested`
           )
         }
       } catch (settingsErr) {

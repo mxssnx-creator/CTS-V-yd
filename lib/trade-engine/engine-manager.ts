@@ -1944,8 +1944,10 @@ export class TradeEngineManager {
             if (isDirty) {
               // Clear the dirty flag
               await client.del(dirtyKey)
+              this.invalidateStrategyAndCoordinationCaches([], "dirty-flag:indication")
+              this.triggerImmediateStrategyReevaluation("dirty-flag:indication")
               console.log(
-                `[v0] [IndicationProcessor] Settings reloaded for ${this.connectionId}`
+                `[v0] [IndicationProcessor] Dirty flag consumed for ${this.connectionId}; settings reloaded and immediate strategy re-evaluation requested`
               )
             }
           }
@@ -3851,6 +3853,42 @@ export class TradeEngineManager {
   public invalidateSymbolsCache(): void {
     this._symbolsCache = null
     this._symbolsCachedAt = 0
+  }
+
+  /**
+   * Force-expire strategy/coordination settings that are cached across ticks.
+   * Used by settings-save fast paths and dirty-flag consumers for PF, DDT,
+   * coordination, and variant changes; symbol-only invalidation is not enough
+   * for those settings because StrategyCoordinator memoizes thresholds.
+   */
+  public invalidateStrategyAndCoordinationCaches(changedFields: string[] = [], reason = "settings-change"): void {
+    const invalidatedCaches: string[] = []
+    try {
+      clearFlowThrottleForConnection(this.connectionId)
+      invalidatedCaches.push("strategy.flowThrottle")
+    } catch { /* best-effort */ }
+
+    let coordinatorReloadGeneration = 0
+    try {
+      coordinatorReloadGeneration = StrategyCoordinator.forceNextSettingsReload(this.connectionId)
+      invalidatedCaches.push(
+        "strategyCoordinator.PFThresholds",
+        "strategyCoordinator.DDTThresholds",
+        "strategyCoordinator.trailingSettings",
+        "strategyCoordinator.minStepSettings",
+        "strategyCoordinator.coordinationSettings",
+      )
+    } catch { /* best-effort */ }
+
+    try {
+      this.realtimeProcessor.invalidatePrevSet(undefined)
+      ;(this.realtimeProcessor as any).prevSetCache?.clear?.()
+      invalidatedCaches.push("realtime.prevSetCache")
+    } catch { /* best-effort */ }
+
+    console.log(
+      `[v0] [Engine ${this.connectionId}] strategy/coordination caches invalidated (${reason}); generation=${coordinatorReloadGeneration}; fields=[${changedFields.join(",")}]; caches=[${invalidatedCaches.join(",")}]`,
+    )
   }
 
   /**

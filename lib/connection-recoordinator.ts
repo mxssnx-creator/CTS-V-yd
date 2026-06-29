@@ -137,6 +137,27 @@ export async function recoordinateAfterSettingsChange(
     changedFields.includes("active_symbols") ||
     changedFields.includes("symbols") ||
     changedFields.includes("symbol_order")
+  const strategyOrCoordinationChanged = changedFields.some((field) => {
+    const normalized = field.startsWith("connection_settings.")
+      ? field.slice("connection_settings.".length)
+      : field
+    return (
+      field === "connection_settings" ||
+      normalized === "strategies" ||
+      normalized === "coordination_settings" ||
+      normalized.includes("ProfitFactor") ||
+      normalized.includes("Drawdown") ||
+      normalized.startsWith("variant") ||
+      normalized.startsWith("axis") ||
+      normalized.startsWith("block") ||
+      normalized.includes("EvalPosCount") ||
+      normalized.includes("PosWindow") ||
+      normalized.includes("PosMinCount") ||
+      normalized === "minimal_step_count" ||
+      normalized === "minimalStepCount" ||
+      normalized === "minStep"
+    )
+  })
   if (symbolsChanged) {
     try {
       const { ProgressionStateManager } = await import("@/lib/progression-state-manager")
@@ -209,23 +230,30 @@ export async function recoordinateAfterSettingsChange(
       return
     }
 
-    // ── Invalidate symbol cache if symbols changed ──────────────────────
-    // When force_symbols or active_symbols are updated, the engine's cached
-    // symbol list must be invalidated so getSymbols() re-reads from Redis
-    // immediately instead of using the 5s TTL cache.
-    if (symbolsChanged && (coordinator as any).getEngineManager) {
+    // ── Invalidate in-memory caches if significant settings changed ─────
+    // Symbol changes need the symbol cache; PF/DDT/coordination/variant
+    // changes need strategy + coordination caches too. Do both before the
+    // pending-change fast path so the next tick cannot reuse stale values.
+    if ((symbolsChanged || strategyOrCoordinationChanged) && (coordinator as any).getEngineManager) {
       try {
         const manager = (coordinator as any).getEngineManager(id)
-        if (manager && typeof (manager as any).invalidateSymbolsCache === "function") {
+        if (symbolsChanged && manager && typeof (manager as any).invalidateSymbolsCache === "function") {
           (manager as any).invalidateSymbolsCache()
           console.log(`[v0] [${opts.logTag}] Symbol cache invalidated for ${id}`)
         }
+        if (
+          strategyOrCoordinationChanged &&
+          manager &&
+          typeof (manager as any).invalidateStrategyAndCoordinationCaches === "function"
+        ) {
+          ;(manager as any).invalidateStrategyAndCoordinationCaches(changedFields, `${opts.logTag}:settings-save`)
+        }
       } catch (cacheErr) {
         console.warn(
-          `[v0] [${opts.logTag}] Failed to invalidate symbol cache for ${id}:`,
+          `[v0] [${opts.logTag}] Failed to invalidate engine settings caches for ${id}:`,
           cacheErr instanceof Error ? cacheErr.message : String(cacheErr),
         )
-        // Non-fatal — engine will pick up the new symbols on the next 5s cache refresh
+        // Non-fatal — engine will pick up changes via the durable settings event.
       }
     }
 

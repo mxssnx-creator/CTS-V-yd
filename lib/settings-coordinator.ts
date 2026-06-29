@@ -30,6 +30,14 @@ const HOT_RELOAD_FIELDS = [
   "is_live_trade", "is_preset_trade", "connection_method",
   "live_volume_factor", "preset_volume_factor", "volume_factor_live",
   "volume_factor_preset", "volume_step_ratio",
+  "profitFactorMin", "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+  "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+  "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
+  "coordination_settings", "variantTrailingEnabled", "variantBlockEnabled", "variantDcaEnabled",
+  "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+  "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+  "blockVolumeRatio", "blockMaxStack", "minimal_step_count", "minimalStepCount", "minStep",
+  "prevPosWindow", "prevPosMinCount", "mainEvalPosCount", "realEvalPosCount",
 ]
 
 export type ChangeType = "restart" | "reload" | "cosmetic"
@@ -109,6 +117,9 @@ export async function notifySettingsChanged(
   //    PATCH response must not report success until both signals are persisted.
   await setSettings(`settings_change:${connectionId}`, event)
   await setSettings(`settings:dirty:${connectionId}`, "1")
+  console.log(
+    `[v0] [SettingsCoordinator] Dirty flag set for ${connectionId}: key=settings:dirty:${connectionId}, fields=[${changedFields.join(",")}]`,
+  )
   
   // Increment a global change counter for this connection
   const counter = await getSettings(`settings_change_counter:${connectionId}`)
