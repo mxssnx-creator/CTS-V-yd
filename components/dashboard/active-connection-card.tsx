@@ -1086,7 +1086,7 @@ export function ActiveConnectionCard({
                             ? "Flag is ON but engine is not running — will reconcile shortly"
                             : "Engine is running but flag is OFF — will stop shortly"}
                           className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
-                          aria-label="engine state drift"
+                          aria-hidden="true"
                         />
                       )}
                     </span>
@@ -1124,7 +1124,7 @@ export function ActiveConnectionCard({
                         <span
                           title="Live flag ON but engine state differs — reconciling"
                           className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
-                          aria-label="live engine state drift"
+                          aria-hidden="true"
                         />
                       )}
                     </span>
@@ -1160,7 +1160,7 @@ export function ActiveConnectionCard({
                         <span
                           title="Preset flag ON but engine state differs — reconciling"
                           className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
-                          aria-label="preset engine state drift"
+                          aria-hidden="true"
                         />
                       )}
                     </span>
