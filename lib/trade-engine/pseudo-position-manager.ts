@@ -9,6 +9,7 @@ import { VolumeCalculator } from "@/lib/volume-calculator"
 import { resolveStopLossPercent } from "@/lib/tp-sl-ratio"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
+import { calculatePseudoClosePnl, PSEUDO_POSITION_CLOSE_COST_RATIO } from "@/lib/pseudo-position-costs"
 
 /**
  * Cryptographically-strong short ID generator.
@@ -586,9 +587,14 @@ export class PseudoPositionManager {
       const quantity = parseFloat(position.quantity || "0")
       const side = position.side || "long"
 
-      const pnl = side === "long"
-        ? (currentPrice - entryPrice) * quantity
-        : (entryPrice - currentPrice) * quantity
+      const {
+        grossPnl,
+        positionCost,
+        netPnl: pnl,
+        grossPnlPct,
+        netPnlPct,
+        notional,
+      } = calculatePseudoClosePnl({ entryPrice, currentPrice, quantity, side })
 
       const client = getRedisClient()
       const closedAtIso = new Date().toISOString()
@@ -611,6 +617,11 @@ export class PseudoPositionManager {
         closed_at: closedAtIso,
         close_reason: reason,
         realized_pnl: String(pnl),
+        gross_realized_pnl: String(grossPnl),
+        position_cost: String(positionCost),
+        position_cost_ratio: String(PSEUDO_POSITION_CLOSE_COST_RATIO),
+        realized_pnl_pct: String(netPnlPct),
+        gross_realized_pnl_pct: String(grossPnlPct),
       })
       pipeline.srem(this.positionsSetKey(), positionId)
       if (configSetKey) {
@@ -697,8 +708,7 @@ export class PseudoPositionManager {
       }
 
       if (configId) {
-        const notional = entryPrice * quantity
-        const resultPct = notional > 0 ? (pnl / notional) * 100 : 0
+        const resultPct = netPnlPct
         // Canonical field on a live `pseudo_position` hash is `opened_at` (see
         // createPosition()). Historical/fill rows use `entry_time`. Legacy
         // rows used `created_at`. Fall through in priority order so the
@@ -774,7 +784,7 @@ export class PseudoPositionManager {
         try {
           const notional = entryPrice * quantity
           // Use any already-tracked adverse excursion, otherwise fall back
-          // to `max(0, -pnl)` as a coarse loss-only proxy. Realtime
+          // to `max(0, -netPnl)` as a coarse loss-only proxy. Realtime
           // processor writes `max_drawdown` on every tick when the live
           // unrealised PnL is lower than any prior sample.
           const storedDrawdown = parseFloat(position.max_drawdown || "0")
@@ -801,8 +811,7 @@ export class PseudoPositionManager {
         symbol: position.symbol,
         currentPrice,
         unrealizedPnl: pnl,
-        unrealizedPnlPercent:
-          entryPrice > 0 && quantity > 0 ? (pnl / (entryPrice * quantity)) * 100 : 0,
+        unrealizedPnlPercent: netPnlPct,
         status: "closed",
       })
     } catch (error) {
@@ -985,7 +994,7 @@ export class PseudoPositionManager {
           const entry = parseFloat(p.entry_price || "0")
           const current = parseFloat(p.current_price || "0")
           const qty = parseFloat(p.quantity || "0")
-          pnl = side === "long" ? (current - entry) * qty : (entry - current) * qty
+          pnl = calculatePseudoClosePnl({ entryPrice: entry, currentPrice: current, quantity: qty, side }).netPnl
         }
         totalPnl += pnl
         if (side === "long") {
@@ -1009,7 +1018,7 @@ export class PseudoPositionManager {
               : (() => {
                   const current = parseFloat(p.current_price || "0")
                   const side = p.side || "long"
-                  return side === "long" ? (current - entry) * qty : (entry - current) * qty
+                  return calculatePseudoClosePnl({ entryPrice: entry, currentPrice: current, quantity: qty, side }).netPnl
                 })()
             return acc + (pnl / notional) * 100
           }, 0)

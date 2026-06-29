@@ -2048,6 +2048,20 @@ export async function getAllConnections(): Promise<any[]> {
       const connections = hashes
         .filter((h): h is Record<string, any> => !!h && Object.keys(h).length > 0)
         .map(parseHash)
+        .filter((conn) => {
+          const id = String(conn?.id ?? "").trim()
+          const name = String(conn?.name ?? "").trim()
+          const exchange = String(conn?.exchange ?? "").trim()
+
+          if (id && name && exchange) return true
+
+          console.warn("[v0] [redis-db] getAllConnections: ignoring malformed connection hash", {
+            id: id || undefined,
+            name: name || undefined,
+            exchange: exchange || undefined,
+          })
+          return false
+        })
 
       __connCache = { at: Date.now(), value: connections }
       return connections
