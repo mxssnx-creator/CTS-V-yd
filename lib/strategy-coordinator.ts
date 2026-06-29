@@ -2921,6 +2921,7 @@ export class StrategyCoordinator {
    * block-count overlays remain a Live-dispatch expansion, while these options
    * mirror currently running exposure as Real-stage block Sets.
    */
+  private async buildActivePositionBlockOverlaysForReal(
   private async buildActiveRealBlockOverlaysForReal(
     symbol: string,
     sourceSets: StrategySet[],
@@ -3343,21 +3344,21 @@ export class StrategyCoordinator {
     )
 
     try {
+      const activePositionBlockOverlays = await this.buildActivePositionBlockOverlaysForReal(
       const activeLiveBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
         symbol,
         realPostHedge,
         metrics,
         coordIndex,
       )
-      if (activeLiveBlockOverlays.length > 0) {
+      if (activePositionBlockOverlays.length > 0) {
         realPostHedge = realPostHedge
-          .concat(activeLiveBlockOverlays)
+          .concat(activePositionBlockOverlays)
           .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       }
     } catch (err) {
       console.warn(
-        `[v0] [StrategyFlow] ${symbol} Real-stage active-real Block overlay failed:`,
-        `[v0] [StrategyFlow] ${symbol} Real-stage active-live Block overlay failed:`,
+        `[v0] [StrategyFlow] ${symbol} Real-stage active-position Block overlay failed:`,
         err instanceof Error ? err.message : String(err),
       )
     }
@@ -5482,7 +5483,6 @@ export class StrategyCoordinator {
         // overlays generated at Live dispatch, not open-position gates. ─────
         //
         // The cap (`blockMaxStack`) is operator-controlled (defaults to 10).
-        // The cap (`blockMaxStack`) is operator-controlled (defaults to 3).
         // Each blockCount 1..blockMaxStack is emitted independently as a
         // transient execution overlay over the selected Set.
         gate: () => true,

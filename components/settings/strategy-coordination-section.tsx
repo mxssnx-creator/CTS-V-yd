@@ -953,6 +953,7 @@ export function StrategyCoordinationSection({
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.minStep ?? 5]}
+                min={2}
                 min={1}
                 max={30}
                 step={1}
