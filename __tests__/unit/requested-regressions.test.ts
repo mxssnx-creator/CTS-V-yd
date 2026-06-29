@@ -292,6 +292,11 @@ describe("requested regression guardrails", () => {
     expect(coordinator).toContain("Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))")
   })
 
+    expect(source).toContain('if (set.variant === "block") return 3')
+    expect(source).toContain('if (set.variant === "dca") return 4')
+    expect(source).toContain("mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))")
+  })
+
   test("production strategy fan-out has env-overridable liveness ceilings", () => {
     const source = read("lib/strategy-coordinator.ts")
 
@@ -336,6 +341,13 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Date.now() - remoteHeartbeat < 90_000")
     expect(source).toContain("is owned by another worker with a fresh heartbeat")
     expect(source).toContain("not clearing distributed running flag")
+  })
+
+    expect(source).toContain("connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime")
+    expect(source).toContain("workerAttached: hasLocalEngineRuntime")
+    expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")
+    expect(source).toContain("const activeEngineCount = coordinatorEngineCount")
+    expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
   })
 
   test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {

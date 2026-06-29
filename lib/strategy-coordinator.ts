@@ -2529,6 +2529,14 @@ export class StrategyCoordinator {
       if ((set.variant ?? "default") === "default" && set.axisWindows?.axisKey) return 1
       if (set.variant === "block") return 2
       if (set.variant === "dca") return 3
+    //   3. additional trailing Sets (independent Base-derived Sets)
+    //   4. Adjust Sets (block, then DCA)
+    const mainSetOrder = (set: StrategySet): number => {
+      if ((set.variant ?? "default") === "default" && !set.axisWindows?.axisKey) return 0
+      if ((set.variant ?? "default") === "default" && set.axisWindows?.axisKey) return 1
+      if (set.variant === "trailing") return 2
+      if (set.variant === "block") return 3
+      if (set.variant === "dca") return 4
       return 5
     }
     mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))
