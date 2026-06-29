@@ -587,6 +587,9 @@ export class InlineLocalRedis {
         console.warn(`[v0] [Redis Memory] Dev startup flush error:`, err)
       }
 
+    // Throttle eviction log output: only print once per 60 s when stuck above
+    // the key limit so the server log stays readable.
+    let _lastEvictionLogMs = 0
     const ttlCleanupTimer = setInterval(() => {
       try {
         // First, clean up expired keys
@@ -620,14 +623,20 @@ export class InlineLocalRedis {
           : 15_000
         const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
-          if (rssMB > RSS_PRESSURE_MB) {
-            console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
-          } else if (heapUsedMB > HEAP_PRESSURE_MB) {
-            console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
-          } else {
-            console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
+          const now = Date.now()
+          // Only log once per 60 s to avoid flooding the server log when stuck
+          // above the threshold (e.g. a large snapshot with mostly-protected keys).
+          if (now - _lastEvictionLogMs > 60_000) {
+            _lastEvictionLogMs = now
+            if (rssMB > RSS_PRESSURE_MB) {
+              console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
+            } else if (heapUsedMB > HEAP_PRESSURE_MB) {
+              console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
+            } else {
+              console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
+            }
+            console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
           }
-          console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
           this.evictOldRecords()
           // Nudge GC if exposed (dev runs with --expose-gc sometimes); the
           // emulator frees Map references above, this returns them to the OS.

@@ -568,14 +568,21 @@ export function ActiveConnectionCard({
     const handleLiveTradeToggled = (event: Event) => {
       const customEvent = event as CustomEvent
       if (customEvent.detail?.connectionId === connection.connectionId) {
-        // `live-trade-toggled` carries { connectionId, newState } from QuickstartOptionsBar.
-        // Apply it directly so this card's switch syncs without waiting for the
-        // 3–8 s engine-states poll — but only when the toggle isn't already
-        // in-flight from this card itself (guard matches handleLiveTradeToggle).
-        if (typeof customEvent.detail?.newState === "boolean" && !liveTradeLoadingRef.current) {
-          setLiveTrade(customEvent.detail.newState)
-        }
-
+        // `live-trade-toggled` is fired by QuickstartOptionsBar when the user
+        // toggles "Control Orders".  We do NOT apply newState here because:
+        //   1. The card already has its own optimistic state when the card
+        //      itself fires this event (handleLiveTradeToggle).
+        //   2. Applying newState = true optimistically and then having the
+        //      engine-states poll return flag: false causes the switch to
+        //      visibly revert 3-8 s later — confusing and incorrect.
+        // Instead, we just schedule an immediate re-fetch so the card picks
+        // up the server's canonical live.flag as soon as possible.
+        fetchProgression()
+      }
+    }
+    const handleSettingsUpdated = (event: Event) => {
+      const customEvent = event as CustomEvent
+      if (customEvent.detail?.connectionId === connection.connectionId) {
         // `connection-settings-updated` carries { connectionId, settings } from volume sliders.
         // Apply any volume changes embedded in the settings bag.
         const updatedSettings = customEvent.detail?.settings || {}
@@ -599,7 +606,7 @@ export function ActiveConnectionCard({
       window.addEventListener("connection-toggled", handleConnectionToggled)
       window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
       window.addEventListener("engine-state-changed", handleConnectionToggled)
-      window.addEventListener("connection-settings-updated", handleLiveTradeToggled)
+      window.addEventListener("connection-settings-updated", handleSettingsUpdated)
     }
 
     return () => {
@@ -608,7 +615,7 @@ export function ActiveConnectionCard({
         window.removeEventListener("connection-toggled", handleConnectionToggled)
         window.removeEventListener("live-trade-toggled", handleLiveTradeToggled)
         window.removeEventListener("engine-state-changed", handleConnectionToggled)
-        window.removeEventListener("connection-settings-updated", handleLiveTradeToggled)
+        window.removeEventListener("connection-settings-updated", handleSettingsUpdated)
       }
     }
   }, [fetchProgression, connection.connectionId])

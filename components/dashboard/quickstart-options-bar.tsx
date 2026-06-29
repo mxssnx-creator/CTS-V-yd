@@ -268,8 +268,15 @@ export function QuickstartOptionsBar() {
           ? data.settings
           : {}
 
+        // Prefer `live_trade_requested` — set by the server to the operator's
+        // intended state even when the actual `is_live_trade` flag stays false
+        // (e.g. because API credentials aren't configured yet).  This way the
+        // switch correctly shows "ON" after a page reload when the user had
+        // previously enabled Control Orders.
+        const liveRequested = conn.live_trade_requested
+        const liveEffective = conn.is_live_trade === "1" || conn.is_live_trade === true || conn.is_live_trade === 1
         setControlOrders(
-          conn.is_live_trade === "1" || conn.is_live_trade === true,
+          typeof liveRequested === "boolean" ? liveRequested : liveEffective,
         )
 
         // Profit-factor min — fall through both the new namespaced

@@ -1201,7 +1201,7 @@ export function QuickstartSection() {
         {(stats.engineRunning || isRunning) && (
           <Badge variant="default" className="h-4 text-[10px] px-1.5 py-0">Running</Badge>
         )}
-        {stats.phase && stats.phase !== "—" && (
+        {stats.phase && stats.phase !== "—" && stats.phase !== "idle" && (
           <Badge variant="outline" className="h-4 text-[9px] px-1.5 py-0 capitalize hidden sm:inline-flex">
             {stats.phase.replace(/_/g, " ")}
           </Badge>
