@@ -146,6 +146,19 @@ export async function GET() {
           
           const positionsCount = await client.scard(positionsKey)
           const tradesCount = await client.scard(tradesKey)
+          const engineState = await client.hgetall(`trade_engine_state:${conn.id}`).catch(() => ({} as Record<string, string>))
+          const processorHeartbeat = Number((engineState as any)?.last_processor_heartbeat || 0)
+          const hasFreshDistributedHeartbeat =
+            Number.isFinite(processorHeartbeat) && processorHeartbeat > 0 && Date.now() - processorHeartbeat < 90_000
+
+          // Determine if this connection's engine is actively running either in
+          // THIS worker or in another production worker with a fresh Redis
+          // heartbeat. Redis `trade_engine:global.status=running` is only
+          // operator intent; the heartbeat is the distributed proof of real
+          // engine progress and avoids both false "running" and false "stopped"
+          // in multi-worker/OpenNext deployments.
+          const connectionRunning =
+            effectivelyRunning && !isGloballyPaused && (hasLocalEngineRuntime || hasFreshDistributedHeartbeat)
 
           // Determine if this connection's engine is actively running in THIS
           // web worker. Redis `status=running` is operator intent; after moving
@@ -160,6 +173,9 @@ export async function GET() {
             name: conn.name,
             exchange: conn.exchange,
             status: connectionRunning ? "running" : "stopped",
+            workerAttached: hasLocalEngineRuntime,
+            distributedHeartbeatFresh: hasFreshDistributedHeartbeat,
+            lastProcessorHeartbeat: processorHeartbeat || null,
             enabled: conn.is_enabled_dashboard === true || conn.is_enabled_dashboard === "1",
             activelyUsing: conn.is_enabled_dashboard === true || conn.is_enabled_dashboard === "1",
             positions: positionsCount,
@@ -200,6 +216,8 @@ export async function GET() {
       errors: connectionStatuses.filter((c: any) => c.error).length,
     }
 
+    const distributedEngineCount = connectionStatuses.filter((c: any) => c.distributedHeartbeatFresh).length
+    const activeEngineCount = Math.max(coordinatorEngineCount, distributedEngineCount)
     const activeEngineCount = coordinatorEngineCount
 
     const responseBody = {
@@ -209,6 +227,15 @@ export async function GET() {
       status: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "stopped"),
       activeEngineCount,
       workerAttached: hasLocalEngineRuntime,
+      distributedEngineCount,
+      operatorStatus: engineHash.status || "stopped",
+      diagnostics: {
+        rootCause:
+          effectivelyRunning && activeEngineCount === 0
+            ? "Global Redis status is running, but no local manager or fresh distributed processor heartbeat is attached. In production this means the UI worker only has operator intent; a dedicated opted-in engine worker/cron heartbeat is not actually running."
+            : null,
+        requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 (and ENABLE_IN_PROCESS_CONTINUITY=1 for in-process timers) on exactly one dedicated worker/process",
+      },
       operatorStatus: engineHash.status || "stopped",
       connections: connectionStatuses,
       summary,

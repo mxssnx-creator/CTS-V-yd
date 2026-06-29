@@ -275,6 +275,26 @@ describe("requested regression guardrails", () => {
 
     expect(source).toContain("const coordinatorEngineCount = coordinator?.getActiveEngineCount() || 0")
     expect(source).toContain("const hasLocalEngineRuntime = coordinatorEngineCount > 0")
+    expect(source).toContain("const hasFreshDistributedHeartbeat")
+    expect(source).toContain("hasLocalEngineRuntime || hasFreshDistributedHeartbeat")
+    expect(source).toContain("workerAttached: hasLocalEngineRuntime")
+    expect(source).toContain("distributedHeartbeatFresh: hasFreshDistributedHeartbeat")
+    expect(source).toContain("distributedEngineCount")
+    expect(source).toContain("no local manager or fresh distributed processor heartbeat is attached")
+    expect(source).toContain("ENABLE_TRADE_ENGINE_AUTOSTART=1")
+    expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")
+    expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
+  })
+
+  test("startup lock preserves a fresh remote engine owner instead of clearing its Redis flag", () => {
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain("const remoteHeartbeatFresh")
+    expect(source).toContain("Date.now() - remoteHeartbeat < 90_000")
+    expect(source).toContain("is owned by another worker with a fresh heartbeat")
+    expect(source).toContain("not clearing distributed running flag")
+  })
+
     expect(source).toContain("connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime")
     expect(source).toContain("workerAttached: hasLocalEngineRuntime")
     expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")

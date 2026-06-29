@@ -215,11 +215,22 @@ export class GlobalTradeEngineCoordinator {
           console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
           return true
         }
+        const remoteState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+        const remoteHeartbeat = Number((remoteState as any)?.last_processor_heartbeat || 0)
+        const remoteHeartbeatFresh =
+          Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
+        if (remoteHeartbeatFresh) {
+          console.log(
+            `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker with a fresh heartbeat; not clearing distributed running flag`,
+          )
+          return true
+        }
         // Redis flag can become stale across crashes/restarts; clear stale state
         // before continuing. Leaving it set made status endpoints report a
         // phantom running engine while startEngine was still trying to recover,
         // and prevented later diagnostics from distinguishing a real owner from
-        // a dead flag.
+        // a dead flag. A fresh remote heartbeat above is the proof that the flag
+        // belongs to a real engine in another worker and must not be cleared.
         console.warn(`[v0] [STARTUP LOCK] Stale running flag detected for ${connectionId}; clearing and continuing with startup`)
         await client.del(`engine_is_running:${connectionId}`).catch(() => 0)
       }
