@@ -405,13 +405,19 @@ export async function PATCH(
       // persist a separate "Base volume factor" knob, because the base stage
       // never places exchange orders.
       {
-        const vfl = Number((merged as Record<string, unknown>).volume_factor_live)
+        // Accept both field names: the dialog sends volume_factor_live, API callers may send live_volume_factor
+        const vflRaw = (merged as Record<string, unknown>).volume_factor_live
+          ?? (merged as Record<string, unknown>).live_volume_factor
+        const vfl = Number(vflRaw)
         if (Number.isFinite(vfl) && vfl > 0) {
           flatKnobs.volume_factor_live   = String(Math.max(0.1, Math.min(10, vfl)))
+          flatKnobs.live_volume_factor   = String(Math.max(0.1, Math.min(10, vfl)))
         }
-        const vfp = Number((merged as Record<string, unknown>).volume_factor_preset)
+        const vfp = Number((merged as Record<string, unknown>).volume_factor_preset
+          ?? (merged as Record<string, unknown>).preset_volume_factor)
         if (Number.isFinite(vfp) && vfp > 0) {
-          flatKnobs.volume_factor_preset = String(Math.max(0.1, Math.min(10, vfp)))
+          flatKnobs.volume_factor_preset  = String(Math.max(0.1, Math.min(10, vfp)))
+          flatKnobs.preset_volume_factor  = String(Math.max(0.1, Math.min(10, vfp)))
         }
         const vsr = Number((merged as Record<string, unknown>).volume_step_ratio ?? (merged as Record<string, unknown>).volumeStepRatio)
         if (Number.isFinite(vsr) && vsr > 0) {
