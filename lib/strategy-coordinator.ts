@@ -856,8 +856,6 @@ export class StrategyCoordinator {
     blockMaxStack:    10,
     blockPauseCountRatio: 1.0,
     blockActiveRealEnabled: true,
-    blockMaxStack:    3,
-    blockPauseCountRatio: 1.0,
     blockActiveLiveEnabled: true,
     mainEvalPosCount: 15,
     realEvalPosCount: 10,
@@ -1363,10 +1361,6 @@ export class StrategyCoordinator {
         this._coordinationSettings.blockPauseCountRatio = Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))
       }
       this._coordinationSettings.blockActiveRealEnabled = bool(s.blockActiveRealEnabled ?? s.blockActiveLiveEnabled, true)
-      const bpcr = Number(s.blockPauseCountRatio)
-      if (Number.isFinite(bpcr) && bpcr > 0) {
-        this._coordinationSettings.blockPauseCountRatio = Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))
-      }
       this._coordinationSettings.blockActiveLiveEnabled = bool(s.blockActiveLiveEnabled, true)
     } catch {
       // use last-known values on any Redis error
@@ -2537,11 +2531,6 @@ export class StrategyCoordinator {
     //   3. Adjust Sets (block, then DCA)
     // Trailing Sets are already Base-derived Standard Sets with
     // trailingProfile, not a separate Main-stage Adjust bucket.
-    const mainSetOrder = (set: StrategySet): number => {
-      if ((set.variant ?? "default") === "default" && !set.axisWindows?.axisKey) return 0
-      if ((set.variant ?? "default") === "default" && set.axisWindows?.axisKey) return 1
-      if (set.variant === "block") return 2
-      if (set.variant === "dca") return 3
     //   3. additional trailing Sets (independent Base-derived Sets)
     //   4. Adjust Sets (block, then DCA)
     const mainSetOrder = (set: StrategySet): number => {
@@ -2924,31 +2913,24 @@ export class StrategyCoordinator {
   }
 
   /**
-   * Real-stage Active Real Position Block overlay.
+   * Real-stage active-position Block overlay.
    *
-   * Active Real-position Block handling belongs to REAL, not only final Live
+   * Active Real/Live-position Block handling belongs to REAL, not only final Live
    * dispatch: the running exposure must be visible to Real-stage stats, caps,
    * tuning and lineage before Live chooses exchange candidates. Completed-position
-   * block-count overlays remain a Live-dispatch expansion, while this option
-   * mirrors currently running Real-stage exposure as Real-stage block Sets.
+   * block-count overlays remain a Live-dispatch expansion, while these options
+   * mirror currently running exposure as Real-stage block Sets.
    */
   private async buildActiveRealBlockOverlaysForReal(
-   * Real-stage Active Live Position Block overlay.
-   *
-   * Active live-position Block handling belongs to REAL, not only final Live
-   * dispatch: the running exposure must be visible to Real-stage stats, caps,
-   * tuning and lineage before Live chooses exchange candidates. Completed-position
-   * block-count overlays remain a Live-dispatch expansion, while this option
-   * mirrors currently running live exposure as Real-stage block Sets.
-   */
-  private async buildActiveLiveBlockOverlaysForReal(
     symbol: string,
     sourceSets: StrategySet[],
     metrics: EvaluationMetrics,
     coordIndex?: CoordIndex,
   ): Promise<StrategySet[]> {
-    if (!this._coordinationSettings.variants.block || !this._coordinationSettings.blockActiveRealEnabled) {
-    if (!this._coordinationSettings.variants.block || !this._coordinationSettings.blockActiveLiveEnabled) {
+    if (
+      !this._coordinationSettings.variants.block ||
+      (!this._coordinationSettings.blockActiveRealEnabled && !this._coordinationSettings.blockActiveLiveEnabled)
+    ) {
       return []
     }
 
@@ -2964,7 +2946,6 @@ export class StrategyCoordinator {
       activeByDir[dir]++
     }
 
-    const maxStack = Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))
     const maxStack = Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))
     const ratio = this._coordinationSettings.blockVolumeRatio
     const pauseRatio = this._coordinationSettings.blockPauseCountRatio
@@ -3363,7 +3344,6 @@ export class StrategyCoordinator {
 
     try {
       const activeLiveBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
-      const activeLiveBlockOverlays = await this.buildActiveLiveBlockOverlaysForReal(
         symbol,
         realPostHedge,
         metrics,
@@ -4547,7 +4527,6 @@ export class StrategyCoordinator {
             let dispatchCandidates = qualifying
             if (this._coordinationSettings.variants.block) {
               try {
-                const maxStack = Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))
                 const maxStack = Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))
                 const ratio = this._coordinationSettings.blockVolumeRatio
                 const pauseRatio = this._coordinationSettings.blockPauseCountRatio

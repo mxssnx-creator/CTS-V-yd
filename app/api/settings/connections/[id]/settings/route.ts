@@ -373,10 +373,6 @@ export async function PATCH(
           if (typeof blockActiveReal === "boolean") {
             flatKnobs.blockActiveRealEnabled = String(blockActiveReal)
           }
-          const bpcr = Number(coord.blockPauseCountRatio)
-          if (Number.isFinite(bpcr) && bpcr > 0) {
-            flatKnobs.blockPauseCountRatio = String(Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2)))
-          }
           if (typeof coord.blockActiveLiveEnabled === "boolean") {
             flatKnobs.blockActiveLiveEnabled = String(coord.blockActiveLiveEnabled)
           }
