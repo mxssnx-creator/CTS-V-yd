@@ -153,6 +153,44 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // status to the UI instead of reporting "starting" for work that may
         // never begin.
         try {
+          const localStartAllowed =
+            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"
+
+          if (localStartAllowed) {
+            const settings = await loadSettingsAsync()
+            const engineConfig = {
+              connectionId,
+              connection_name: connName,
+              exchange: connection.exchange,
+              engine_type: "live",
+              indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
+              strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
+              realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+            }
+            const started = await coordinator.startEngine(connectionId, engineConfig)
+            if (!started && !coordinator.isEngineRunning(connectionId)) {
+              throw new Error("Coordinator did not start the engine; startup lock may still be owned by another worker")
+            }
+            engineStatus = "running"
+            engineStartedNow = started
+            console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
+          } else {
+            await getRedisClient().hset("engine_coordinator:refresh_requested", {
+              timestamp: new Date().toISOString(),
+              connectionId,
+              action: "start",
+              reason: "live_trade_enable",
+            })
+            await logProgressionEvent(connectionId, "engine_start_queued", "info", "Live Trade enabled; start queued for coordinator worker", {
+              connectionId,
+              connectionName: connName,
+              exchange: connection.exchange,
+              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+            })
+            engineStatus = "starting"
+            engineStartedNow = false
+            console.log(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
+          }
           const settings = await loadSettingsAsync()
           const engineConfig = {
             connectionId,

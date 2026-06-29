@@ -188,6 +188,23 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
   async startEngine(connectionId: string, config: EngineConfig): Promise<boolean> {
+    const inProcessStartAllowed =
+      process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" ||
+      (config as any)?.allowInProcessStart === true
+    const runningUnderProdStart =
+      process.env.npm_lifecycle_event === "start" ||
+      process.env.NODE_ENV === "production" ||
+      process.env.VERCEL === "1" ||
+      process.env.CF_PAGES === "1"
+
+    if (!inProcessStartAllowed && runningUnderProdStart) {
+      console.log(
+        `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped in production UI worker; ` +
+          `set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engine loops in-process`,
+      )
+      return false
+    }
+
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()

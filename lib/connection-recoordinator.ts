@@ -301,6 +301,7 @@ export async function recoordinateAfterSettingsChange(
         globalRunning = false
       }
       const localStartAllowed =
+        process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"
         process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
       if (globalRunning && localStartAllowed) {
         console.log(

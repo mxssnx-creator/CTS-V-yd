@@ -63,6 +63,9 @@ export interface CoordinationSettings {
   // for every blockCount in [1..blockMaxStack]. pause count is derived as
   // round(blockCount × blockPauseCountRatio).
   blockVolumeRatio: number // 0.25..3.0 per spec band (UI clamps; engine re-clamps)
+  blockMaxStack:    number // 1..10 block sizes processed independently
+  blockPauseCountRatio: number // 1..4, step 0.5
+  blockActiveRealEnabled: boolean // active real-position Block overlay, default true
   blockMaxStack:    number // 2..8 block sizes processed independently
   blockPauseCountRatio: number // 1..4, step 0.5
   blockActiveLiveEnabled: boolean // active live-position Block overlay, default true
@@ -154,6 +157,9 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
     dca:      false, // off by default per operator spec
   },
   blockVolumeRatio: 1.0,
+  blockMaxStack:    10,
+  blockPauseCountRatio: 1.0,
+  blockActiveRealEnabled: true,
   blockMaxStack:    3,
   blockPauseCountRatio: 1.0,
   blockActiveLiveEnabled: true,
@@ -587,6 +593,13 @@ export function StrategyCoordinationSection({
             </div>
           </div>
 
+          {/* Active Real position overlay */}
+          <div className="rounded-lg border border-border/60 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="space-y-1">
+                <Label className="text-sm font-semibold">Active Real Position Block</Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Adds an independent Block overlay for currently running Real-stage
           {/* Active live position overlay */}
           <div className="rounded-lg border border-border/60 p-3">
             <div className="flex items-center justify-between gap-3">
@@ -598,6 +611,9 @@ export function StrategyCoordinationSection({
                 </p>
               </div>
               <Switch
+                checked={value.blockActiveRealEnabled}
+                onCheckedChange={(checked) =>
+                  onChange({ ...value, blockActiveRealEnabled: checked })
                 checked={value.blockActiveLiveEnabled}
                 onCheckedChange={(checked) =>
                   onChange({ ...value, blockActiveLiveEnabled: checked })
@@ -614,18 +630,19 @@ export function StrategyCoordinationSection({
                 <Label className="text-sm font-semibold">Max Stack</Label>
                 <p className="text-xs text-muted-foreground leading-relaxed">
                   Number of independent Block sizes processed in parallel.
+                  Default 10 emits all block counts 1 through 10. Engine clamps to 1–10.
                   Default 3 emits block counts 1, 2, and 3. Engine clamps to 2–8.
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] tabular-nums">
-                2–8
+                1–10
               </Badge>
             </div>
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.blockMaxStack]}
-                min={2}
-                max={8}
+                min={1}
+                max={10}
                 step={1}
                 onValueChange={(v) =>
                   onChange({ ...value, blockMaxStack: v[0] })
@@ -930,6 +947,7 @@ export function StrategyCoordinationSection({
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.minStep ?? 5]}
+                min={1}
                 min={2}
                 max={30}
                 step={1}

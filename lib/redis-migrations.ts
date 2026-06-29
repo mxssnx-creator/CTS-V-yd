@@ -1679,7 +1679,7 @@ const migrations: Migration[] = [
     //   axes:      all disabled by default, including pause-axis; maxWindow seeded to spec defaults
     //   variants:  trailing=true, block=true, dca=false, pause=true
     //   axes:      all disabled by default, maxWindow seeded to spec defaults
-    //   block knobs: blockVolumeRatio=1.0, blockMaxStack=3
+    //   block knobs: blockVolumeRatio=1.0, blockMaxStack=10
     //
     // Also seeds app_settings so global fallback works the same way.
     name: "030-coordination-variant-axis-block-defaults",
@@ -1704,6 +1704,9 @@ const migrations: Migration[] = [
         axisPauseMaxWindow: "8",
         // Block strategy tuning
         blockVolumeRatio: "1.0",
+        blockMaxStack:    "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
         blockMaxStack:    "3",
         blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",
@@ -2029,6 +2032,9 @@ const migrations: Migration[] = [
         variantPauseEnabled:    "true",
         // Block knobs
         blockVolumeRatio:     "1.0",
+        blockMaxStack:        "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
         blockMaxStack:        "3",
         blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",
@@ -2411,6 +2417,9 @@ const migrations: Migration[] = [
         variantDcaEnabled:      "false",
         variantPauseEnabled:    "true",
         blockVolumeRatio:       "1.0",
+        blockMaxStack:          "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
         blockMaxStack:          "3",
         blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",
@@ -3038,6 +3047,9 @@ const migrations: Migration[] = [
         variantBlockEnabled:    "true",
         variantDcaEnabled:      "false", // spec: DCA OFF by default
         blockVolumeRatio:       "1.0",
+        blockMaxStack:          "10",
+        blockPauseCountRatio: "1.0",
+        blockActiveRealEnabled: "true",
         blockMaxStack:          "3",
         blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",

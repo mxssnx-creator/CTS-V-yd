@@ -59,6 +59,9 @@ describe("requested regression guardrails", () => {
     expect(coordinator).toContain("settings:dirty:${connectionId}")
     expect(recoordinator).toContain("invalidateStrategyAndCoordinationCaches")
     expect(recoordinator).toContain("applyPendingChangesNow")
+    const settingsCoordinator = read("lib/settings-coordinator.ts")
+    expect(settingsCoordinator).toContain("settings:settings_change:${connectionId}")
+    expect(settingsCoordinator).not.toContain("setSettings(`settings_change:${connectionId}`, null)")
     expect(recoordinator).toContain("ProfitFactor")
     expect(recoordinator).toContain("Drawdown")
     expect(recoordinator).toContain("variant")
@@ -87,6 +90,8 @@ describe("requested regression guardrails", () => {
     expect(startBranch).toContain('status: "running"')
     expect(startBranch).toContain('coordinator_ready: "true"')
     expect(startBranch).toContain("const started = await coordinator.startEngine")
+    expect(startBranch).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(startBranch).toContain('engineStatus = "queued"')
     expect(startBranch).not.toContain("setImmediate")
   })
 
@@ -121,6 +126,9 @@ describe("requested regression guardrails", () => {
 
     expect(source).toContain('export const runtime = "nodejs"')
     expect(source).toContain("const started = await coordinator.startEngine")
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(source).toContain('reason: "live_trade_enable"')
+    expect(source).toContain("Engine start queued for")
     expect(source).toContain('live_trade_requested: "1"')
     expect(source).toContain('mode: hasCredentials ? "live" : "live_requested"')
     expect(source).not.toContain("setImmediate")
@@ -261,12 +269,19 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("legacy placeholder only; real trailing Sets are created at BASE")
   })
 
+  test("block overlays completed-position counts and active-real exposure at Real stage", () => {
   test("block overlays completed-position counts and active-live exposure at Real stage", () => {
     const source = read("lib/strategy-coordinator.ts")
 
     expect(source).toContain("Block is not materialized as its own Main/Real Set")
     expect(source).toContain('activeVariants.filter((p) => p.name !== "block")')
     expect(source).toContain("EVERY block size [1..blockMaxStack]")
+    expect(source).toContain("blockMaxStack:    10")
+    expect(source).toContain("Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))")
+    expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
+    expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
+    expect(source).toContain("Real-stage Active Real Position Block overlay")
+    expect(source).toContain("buildActiveRealBlockOverlaysForReal")
     expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
     expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
     expect(source).toContain("Real-stage Active Live Position Block overlay")
@@ -282,6 +297,20 @@ describe("requested regression guardrails", () => {
     const coordinator = read("lib/strategy-coordinator.ts")
 
     expect(section).toContain("blockPauseCountRatio: number")
+    expect(section).toContain("blockActiveRealEnabled: boolean")
+    expect(section).toContain("blockMaxStack:    10")
+    expect(section).toContain("max={10}")
+    expect(section).toContain("min={1}")
+    expect(section).toContain("Pause Count Ratio")
+    expect(section).toContain("Active Real Position Block")
+    expect(route).toContain("flatKnobs.blockPauseCountRatio")
+    expect(route).toContain("flatKnobs.blockActiveRealEnabled")
+    expect(route).toContain("Math.min(10, Math.max(1, Math.floor(bms)))")
+    expect(coordinator).toContain("this._coordinationSettings.blockPauseCountRatio")
+    expect(coordinator).toContain("this._coordinationSettings.blockActiveRealEnabled")
+    expect(coordinator).toContain("Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))")
+  })
+
     expect(section).toContain("blockActiveLiveEnabled: boolean")
     expect(section).toContain("Pause Count Ratio")
     expect(section).toContain("Active Live Position Block")
@@ -305,6 +334,14 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("STRATEGY_REAL_SETS_SAFETY_CEILING")
     expect(source).toContain(": 100")
     expect(source).toContain("private static readonly _AXIS_LRU_MAX = 8_000")
+  })
+
+  test("coordinator startEngine is guarded in production UI workers", () => {
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(source).toContain('process.env.npm_lifecycle_event === "start"')
+    expect(source).toContain('startEngine(${connectionId}) queued/skipped in production UI worker')
   })
 
   test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
@@ -343,6 +380,10 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("not clearing distributed running flag")
   })
 
+  test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
+    const source = read("lib/connection-recoordinator.ts")
+
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
     expect(source).toContain("connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime")
     expect(source).toContain("workerAttached: hasLocalEngineRuntime")
     expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")
@@ -361,6 +402,7 @@ describe("requested regression guardrails", () => {
   test("dashboard enable queues engine start instead of blocking an unopted production UI worker", () => {
     const source = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
 
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
     expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
     expect(source).toContain("Connection enabled; start queued for coordinator worker")
     expect(source).toContain("this UI worker is not opted in for local engine loops")

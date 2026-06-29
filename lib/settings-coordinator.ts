@@ -190,7 +190,14 @@ export async function getPendingChanges(connectionId: string): Promise<SettingsC
  */
 export async function clearPendingChanges(connectionId: string): Promise<void> {
   await initRedis()
-  await setSettings(`settings_change:${connectionId}`, null)
+  const client = getRedisClient()
+  await client.del(`settings:settings_change:${connectionId}`).catch(async () => {
+    // Fallback for Redis-like clients without DEL support. Do not call
+    // setSettings(..., null): flattenForHmset expects an object and throws
+    // Object.entries(null), which made production hot-reload log false
+    // applyPendingSettingsChange failures after settings-dialog saves.
+    await client.hdel?.(`settings:settings_change:${connectionId}`, "connectionId", "changedFields", "changeType", "timestamp", "previousValues", "newValues")
+  })
   
   // Also clear restart/reload flags from engine state
   const engineState = await getSettings(`trade_engine_state:${connectionId}`)
