@@ -179,6 +179,7 @@ function getCyclePauseMsSync(): number {
 refreshCyclePauseMsAsync()
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync, getAppSettings, getAppSetting, getSettingsVersion } from "@/lib/redis-db"
+import { canonicalTotalForSymbols, clampProcessedToTotal, ownsCanonicalSymbolSelection } from "@/lib/trade-engine/symbol-selection-ownership"
 import { DataSyncManager } from "@/lib/data-sync-manager"
 import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor, clearFlowThrottleForConnection } from "./strategy-processor"
@@ -654,6 +655,7 @@ export class TradeEngineManager {
       // Load market data for all symbols
       await this.updateProgressionPhase("market_data", 8, "Loading market data...")
       const symbols = await this.getSymbols()
+      const ownsCurrentSelectionAtStart = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
       await setSettings(`trade_engine_state:${this.connectionId}`, {
         // Store as JSON so readers can JSON.parse reliably. Storing a raw array
         // here let the Redis emulator coerce it to a comma-joined string, which
@@ -662,8 +664,10 @@ export class TradeEngineManager {
         symbols: JSON.stringify(symbols),
         active_symbols: JSON.stringify(symbols),
         symbol_count: String(symbols.length),
-        config_set_symbols_total: symbols.length,
-        config_set_symbols_processed: 0,
+        ...(ownsCurrentSelectionAtStart ? {
+          config_set_symbols_total: symbols.length,
+          config_set_symbols_processed: 0,
+        } : {}),
         updated_at: new Date().toISOString(),
       })
 
@@ -774,12 +778,14 @@ export class TradeEngineManager {
         // cached state.
         try {
           const symbols = await this.getSymbols()
+          const ownsCacheSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+          const canonicalCacheTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
           await redisClient.hset(`prehistoric:${this.connectionId}`, {
             is_complete: "1",
-            symbols_processed: String(symbols.length),
-            symbols_total: String(symbols.length),
+            symbols_processed: String(clampProcessedToTotal(symbols.length, canonicalCacheTotal)),
+            symbols_total: String(canonicalCacheTotal),
             updated_at: new Date().toISOString(),
-            data_source: "cache",
+            data_source: ownsCacheSelection ? "cache" : "stale-cache-ignored",
           })
           await redisClient.expire(`prehistoric:${this.connectionId}`, 86400)
           console.log(`[v0] [Engine] Prehistoric cache hit — restored hash for ${symbols.length} symbols (${this.connectionId})`)
@@ -1496,7 +1502,11 @@ export class TradeEngineManager {
       // From this point ConfigSetProcessor is the SOLE incremental writer of
       // symbols_processed (always derived from scard of the SET it owns), so
       // the displayed count can never disagree with symbols_total.
-      await redisClient.del(`prehistoric:${this.connectionId}:symbols`).catch(() => {})
+      const ownsCurrentSelection = await ownsCanonicalSymbolSelection(this.connectionId, symbols)
+      const canonicalSymbolsTotal = await canonicalTotalForSymbols(this.connectionId, symbols)
+      if (ownsCurrentSelection) {
+        await redisClient.del(`prehistoric:${this.connectionId}:symbols`).catch(() => {})
+      }
       await redisClient.hset(`prehistoric:${this.connectionId}`, {
         range_start: prehistoricStart.toISOString(),
         range_end: prehistoricEnd.toISOString(),
@@ -1505,8 +1515,8 @@ export class TradeEngineManager {
         timeframe_seconds: String(storedTimeframeSec),
         is_complete: "0",
         symbols_processed: "0",
-        symbols_total: String(symbols.length),
-        prehistoric_symbols_processed_count: "0",
+        symbols_total: String(canonicalSymbolsTotal),
+        ...(ownsCurrentSelection ? { prehistoric_symbols_processed_count: "0" } : {}),
         started_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
@@ -1547,9 +1557,10 @@ export class TradeEngineManager {
       // SET that ConfigSetProcessor owned during the run. The local
       // `processingResult.symbolsProcessed` counter raced under parallelism and
       // can be lower than reality; SCARD is always the monotonic ground truth.
-      const finalScard = await redisClient
+      const finalScardRaw = await redisClient
         .scard(`prehistoric:${this.connectionId}:symbols`)
         .catch(() => processingResult.symbolsProcessed)
+      const finalScard = clampProcessedToTotal(finalScardRaw, processingResult.symbolsTotal)
       await redisClient.hset(`prehistoric:${this.connectionId}`, {
         is_complete: "1",
         symbols_processed: String(finalScard),
@@ -1619,8 +1630,10 @@ export class TradeEngineManager {
         config_sets_initialized: true,
         config_set_indication_results: processingResult.indicationResults,
         config_set_strategy_positions: processingResult.strategyPositions,
-        config_set_symbols_total: processingResult.symbolsTotal,
-        config_set_symbols_processed: finalScard,
+        ...(ownsCurrentSelection ? {
+          config_set_symbols_total: processingResult.symbolsTotal,
+          config_set_symbols_processed: finalScard,
+        } : {}),
         config_set_candles_processed: processingResult.candlesProcessed,
         config_set_errors: processingResult.errors,
         config_set_duration_ms: processingResult.duration,
