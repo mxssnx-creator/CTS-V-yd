@@ -249,6 +249,56 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))")
   })
 
+  test("production strategy fan-out has env-overridable liveness ceilings", () => {
+    const source = read("lib/strategy-coordinator.ts")
+
+    expect(source).toContain("STRATEGY_MAIN_AXIS_SETS_CEILING")
+    expect(source).toContain(": 50")
+    expect(source).toContain("STRATEGY_REAL_SETS_SAFETY_CEILING")
+    expect(source).toContain(": 100")
+    expect(source).toContain("private static readonly _AXIS_LRU_MAX = 8_000")
+  })
+
+  test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
+    const instrumentation = read("instrumentation.ts")
+    const continuityRunner = read("lib/server-continuity-runner.ts")
+
+    expect(instrumentation).toContain('ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(instrumentation).toContain("trade-engine auto-start skipped")
+    expect(instrumentation).toContain('ENABLE_IN_PROCESS_CONTINUITY === "1"')
+    expect(continuityRunner).toContain('ENABLE_IN_PROCESS_CONTINUITY !== "1"')
+    expect(continuityRunner).toContain("web/UI process")
+  })
+
+  test("status route does not report stale Redis running intent as local engine progress", () => {
+    const source = read("app/api/trade-engine/status/route.ts")
+
+    expect(source).toContain("const coordinatorEngineCount = coordinator?.getActiveEngineCount() || 0")
+    expect(source).toContain("const hasLocalEngineRuntime = coordinatorEngineCount > 0")
+    expect(source).toContain("connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime")
+    expect(source).toContain("workerAttached: hasLocalEngineRuntime")
+    expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")
+    expect(source).toContain("const activeEngineCount = coordinatorEngineCount")
+    expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
+  })
+
+  test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
+    const source = read("lib/connection-recoordinator.ts")
+
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
+    expect(source).toContain("web worker has no local engine runtime/opt-in")
+    expect(source).toContain("settings apply on next explicit Start or dedicated worker tick")
+  })
+
+  test("dashboard enable queues engine start instead of blocking an unopted production UI worker", () => {
+    const source = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
+
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
+    expect(source).toContain("Connection enabled; start queued for coordinator worker")
+    expect(source).toContain("this UI worker is not opted in for local engine loops")
+    expect(source).toContain('engineStatus = "queued"')
+  })
+
   test("dashboard detailed logs header action scrolls within the log dialog", () => {
     const button = read("components/dashboard/detailed-logs-button.tsx")
     const scrollArea = read("components/ui/scroll-area.tsx")

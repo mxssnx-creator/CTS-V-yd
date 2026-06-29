@@ -948,11 +948,10 @@ export class StrategyCoordinator {
   // Axis Set objects are pure value objects once the tuner writes sizeDelta
   // onto the CoordRecord instead of mutating entries[] in-place.  Safe to
   // reuse across cycles without cloning.  Key = "${parentKey}:${axisKey}:ec${ec}".
-  // 20 symbols × MAIN_AXIS_SETS_CEILING(6000) = up to 120k unique axis keys.
-  // 32k fits ~2 full-ceiling symbols without eviction, making the cache effective
-  // for the hot symbols that consistently clear the 6000-set ceiling.
-  // Previously 16k caused constant eviction+re-allocation on the 6000-set ceiling.
-  private static readonly _AXIS_LRU_MAX = 32_000
+  // Bounded tightly because production workers can be restarted with already-
+  // active engines. Keeping tens of thousands of axis objects resident across
+  // warmup cycles caused OOM kills before health probes could complete.
+  private static readonly _AXIS_LRU_MAX = 8_000
   private static readonly _axisLruMap: Map<string, StrategySet> = new Map()
   private static _axisLruGet(key: string): StrategySet | undefined {
     const hit = StrategyCoordinator._axisLruMap.get(key)
@@ -2398,22 +2397,30 @@ export class StrategyCoordinator {
       // symbols the InlineLocalRedis coord-record Map grew to 4058 MB of LIVE
       // (reachable) objects — Mark-Compact cannot reclaim live objects so the
       // heap ceiling is dominated by simultaneous coord-record count.
-      // 2500 keeps the per-symbol footprint ≈ the 5-symbol total divided by 4.
-      // In dev: 1500 per symbol × SYMBOL_CONCURRENCY(3) = 4500 in-flight at peak.
-      // Raised from 400 so 15-symbol test sessions exercise the same code paths
-      // as prod (400 was hitting the ceiling every cycle and masking correct behaviour).
-      // Still well below the prod 2500 × 20 symbol × 6 concurrency = 300k worst-case.
+      // Production repro (2026-06-29): a Next `start` worker with an already
+      // active BingX engine was first SIGKILLed at the old 2500-axis ceiling,
+      // then stayed too CPU-bound for UI health/API requests at 800 and 200. Startup
+      // must prioritize worker liveness and top-ranked axis candidates over
+      // full Cartesian materialization.
       // Scale with symbol count so multi-symbol dev runs don't OOM.
-      // Base: 300 sets per symbol in dev, 2500 in prod.
+      // Base: 300 sets per symbol in dev, 50 in prod by default.
+      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING for controlled load tests.
       // V0_DEV_SYMBOL_COUNT controls the dev symbol count (default 1).
       // At 10 symbols: 10 × 300 = 3000 ceiling (well within 4GB heap with
       // the new per-symbol eviction caps in redis-db).
       const _devSyms = process.env.NODE_ENV === "development"
         ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
         : 1
-      const MAIN_AXIS_SETS_CEILING = process.env.NODE_ENV === "development"
-        ? Math.max(300, _devSyms * 300)
-        : 2500
+      const rawAxisCeiling = Number(process.env.STRATEGY_MAIN_AXIS_SETS_CEILING ?? "")
+      const configuredAxisCeiling =
+        Number.isFinite(rawAxisCeiling) && rawAxisCeiling > 0
+          ? Math.floor(rawAxisCeiling)
+          : null
+      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (
+        process.env.NODE_ENV === "development"
+          ? Math.max(300, _devSyms * 300)
+          : 50
+      )
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3250,22 +3257,30 @@ export class StrategyCoordinator {
     //
     // OOM calibration (2026-06-16): 20000 was calibrated for 5 symbols; at
     // 20 symbols the cumulative coord-record Map hit 4058 MB LIVE objects.
-    // 3000 per symbol × 20 symbols concurrently = 60000 coord records maximum
-    // alive at once, keeping the InlineLocalRedis heap well within the 6144 MB
-    // budget with room for eviction to operate before the next burst.
+    // Production repro (2026-06-29): 3000 Real Sets after a large axis warmup
+    // was still too aggressive for small workers with a warm active engine.
+    // Keep the best-ranked subset and allow explicit env overrides for load
+    // tests instead of risking SIGKILL in production mode.
     // In dev: 600 ceiling × SYMBOL_CONCURRENCY(3) = 1800 Real sets peak vs
     // 9000 at 3000 ceiling — cuts per-cycle V8 heap pressure by 5x while
     // keeping the full Real-stage pipeline exercised.
     // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
     // candidates for the live dispatch to find qualifying PF-positive sets.
-    // Scale with dev symbol count: 60 real sets per symbol in dev, 3000 in prod.
+    // Scale with dev symbol count: 60 real sets per symbol in dev, 100 in prod.
     const _devSymsReal = process.env.NODE_ENV === "development"
       ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
       : 1
-    const REAL_SETS_SAFETY_CEILING = process.env.NODE_ENV === "development"
-      ? Math.max(200, _devSymsReal * 60)
-      : 3000
+    const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_SAFETY_CEILING ?? "")
+    const configuredRealCeiling =
+      Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
+        ? Math.floor(rawRealCeiling)
+        : null
+    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (
+      process.env.NODE_ENV === "development"
+        ? Math.max(200, _devSymsReal * 60)
+        : 100
+    )
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at

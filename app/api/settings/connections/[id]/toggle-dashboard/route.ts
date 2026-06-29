@@ -205,11 +205,19 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           active_connections: String(activeDashboardCount),
         })
         
-        // DIRECTLY START THE ENGINE - don't rely on coordinator polling
+        // Start in-process only when this worker is explicitly allowed to own
+        // engine loops or it already has a local coordinator running. In
+        // production/OpenNext the UI/API worker must stay responsive: enabling a
+        // connection should persist operator intent and request the dedicated
+        // coordinator to reconcile, not spin a heavy trade loop inside the
+        // request handler and starve subsequent status/UI requests.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          const settings = await loadSettingsAsync()
-            
+          const localStartAllowed =
+            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
+
+          if (localStartAllowed) {
+            const settings = await loadSettingsAsync()
             const engineConfig = {
               connectionId: resolvedId,
               connection_name: connection.name,
@@ -230,18 +238,37 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               connectionName: connection.name,
               exchange: connection.exchange,
             })
-          } catch (engineStartError) {
-            console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
-            // Still set the flag as fallback - coordinator may pick it up
+            engineStatus = "started"
+          } else {
             await setSettings("engine_coordinator:refresh_requested", {
               timestamp: new Date().toISOString(),
               connectionId: resolvedId,
               action: "start",
+              reason: "dashboard_toggle_enable",
             })
+            await logProgressionEvent(resolvedId, "engine_start_queued", "info", "Connection enabled; start queued for coordinator worker", {
+              connectionId: resolvedId,
+              connectionName: connection.name,
+              exchange: connection.exchange,
+              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+            })
+            engineStatus = "queued"
+            console.log(
+              `[v0] [Toggle] Engine start queued for ${connection.name}; this UI worker is not opted in for local engine loops`,
+            )
           }
+        } catch (engineStartError) {
+          console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
+          // Still set the flag as fallback - coordinator may pick it up
+          await setSettings("engine_coordinator:refresh_requested", {
+            timestamp: new Date().toISOString(),
+            connectionId: resolvedId,
+            action: "start",
+          })
+          engineStatus = "queued"
+        }
           
-          engineStatus = "started"
-          console.log(`[v0] [Toggle] Engine progression initialized for ${connection.name}`)
+        console.log(`[v0] [Toggle] Engine progression initialized for ${connection.name}`)
       } catch (engineError) {
         console.error(`[v0] [Toggle] Failed to initialize engine:`, engineError)
         engineStatus = "error"
