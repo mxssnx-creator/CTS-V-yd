@@ -1707,8 +1707,6 @@ const migrations: Migration[] = [
         blockMaxStack:    "10",
         blockPauseCountRatio: "1.0",
         blockActiveRealEnabled: "true",
-        blockMaxStack:    "3",
-        blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",
       }
 
@@ -2035,8 +2033,6 @@ const migrations: Migration[] = [
         blockMaxStack:        "10",
         blockPauseCountRatio: "1.0",
         blockActiveRealEnabled: "true",
-        blockMaxStack:        "3",
-        blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",
         // Eval thresholds
         mainEvalPosCount:     "3",
@@ -2420,8 +2416,6 @@ const migrations: Migration[] = [
         blockMaxStack:          "10",
         blockPauseCountRatio: "1.0",
         blockActiveRealEnabled: "true",
-        blockMaxStack:          "3",
-        blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",
         mainEvalPosCount:       "3",
         realEvalPosCount:       "3",
@@ -3050,8 +3044,6 @@ const migrations: Migration[] = [
         blockMaxStack:          "10",
         blockPauseCountRatio: "1.0",
         blockActiveRealEnabled: "true",
-        blockMaxStack:          "3",
-        blockPauseCountRatio: "1.0",
         blockActiveLiveEnabled: "true",
       }
       const seedIfAbsent = async (hashKey: string) => {
