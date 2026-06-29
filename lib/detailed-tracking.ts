@@ -334,10 +334,6 @@ export async function getIndicationTracking(
       if (!(type in totals)) continue
       if (idx <= 0 && hasSymbolField[type]) continue
       totals[type] += Number(raw) || 0
-    for (const [field, raw] of Object.entries(hash)) {
-      const idx = field.lastIndexOf(":")
-      const type = idx > 0 ? field.slice(idx + 1) : field
-      if (type in totals) totals[type] += Number(raw) || 0
     }
 
     return totals

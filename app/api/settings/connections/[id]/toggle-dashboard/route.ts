@@ -214,7 +214,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           const localStartAllowed =
-            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"
             process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
 
           if (localStartAllowed) {
@@ -224,6 +223,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               connection_name: connection.name,
               exchange: connection.exchange,
               engine_type: "main",
+              allowInProcessStart: true,
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,

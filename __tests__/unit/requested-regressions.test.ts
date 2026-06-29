@@ -247,13 +247,14 @@ describe("requested regression guardrails", () => {
     expect(coordinationSection).toContain("Setting to 2 adds the fastest 2 and 3 step windows")
   })
 
-  test("standard and position-count sets are ordered before adjust variants", () => {
+  test("standard, axis and trailing sets are ordered before adjust variants", () => {
     const source = read("lib/strategy-coordinator.ts")
 
     expect(source).toContain("Operator rule: process the Standard strategy outputs first")
     expect(source).toContain("const mainSetOrder = (set: StrategySet): number")
-    expect(source).toContain('if (set.variant === "block") return 2')
-    expect(source).toContain('if (set.variant === "dca") return 3')
+    expect(source).toContain('if (set.variant === "trailing") return 2')
+    expect(source).toContain('if (set.variant === "block") return 3')
+    expect(source).toContain('if (set.variant === "dca") return 4')
     expect(source).toContain("mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))")
   })
 
@@ -269,23 +270,19 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("legacy placeholder only; real trailing Sets are created at BASE")
   })
 
-  test("block overlays completed-position counts and active-real exposure at Real stage", () => {
-  test("block overlays completed-position counts and active-live exposure at Real stage", () => {
+  test("block overlays completed-position counts and active-position exposure at Real stage", () => {
     const source = read("lib/strategy-coordinator.ts")
 
     expect(source).toContain("Block is not materialized as its own Main/Real Set")
     expect(source).toContain('activeVariants.filter((p) => p.name !== "block")')
     expect(source).toContain("EVERY block size [1..blockMaxStack]")
     expect(source).toContain("blockMaxStack:    10")
-    expect(source).toContain("Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))")
+    expect(source).toContain("Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))")
     expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
     expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
-    expect(source).toContain("Real-stage Active Real Position Block overlay")
-    expect(source).toContain("buildActiveRealBlockOverlaysForReal")
-    expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
-    expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
-    expect(source).toContain("Real-stage Active Live Position Block overlay")
-    expect(source).toContain("buildActiveLiveBlockOverlaysForReal")
+    expect(source).toContain("Active Real/Live-position Block handling belongs to REAL")
+    expect(source).toContain("buildActivePositionBlockOverlaysForReal")
+    expect(source).toContain("blockActiveRealEnabled && !this._coordinationSettings.blockActiveLiveEnabled")
     expect(source).toContain("setKey: `${source.setKey}#block:active:${boundedCount}`")
     expect(source).toContain("variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6))")
     expect(source).toContain("variant: \"block\"")
@@ -309,8 +306,6 @@ describe("requested regression guardrails", () => {
     expect(coordinator).toContain("this._coordinationSettings.blockPauseCountRatio")
     expect(coordinator).toContain("this._coordinationSettings.blockActiveRealEnabled")
     expect(coordinator).toContain("Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))")
-  })
-
     expect(section).toContain("blockActiveLiveEnabled: boolean")
     expect(section).toContain("Pause Count Ratio")
     expect(section).toContain("Active Live Position Block")
@@ -319,11 +314,6 @@ describe("requested regression guardrails", () => {
     expect(coordinator).toContain("this._coordinationSettings.blockPauseCountRatio")
     expect(coordinator).toContain("this._coordinationSettings.blockActiveLiveEnabled")
     expect(coordinator).toContain("Math.max(1, Math.min(4, Math.round(bpcr * 2) / 2))")
-  })
-
-    expect(source).toContain('if (set.variant === "block") return 3')
-    expect(source).toContain('if (set.variant === "dca") return 4')
-    expect(source).toContain("mainSets.sort((a, b) => mainSetOrder(a) - mainSetOrder(b))")
   })
 
   test("production strategy fan-out has env-overridable liveness ceilings", () => {
@@ -344,6 +334,23 @@ describe("requested regression guardrails", () => {
     expect(source).toContain('startEngine(${connectionId}) queued/skipped in production UI worker')
   })
 
+  test("base connection migrations preserve existing live-trade operator state", () => {
+    const source = read("lib/redis-migrations.ts")
+    const existingBlock = source.slice(
+      source.indexOf("Existing connection: repair missing selection defaults only."),
+      source.indexOf("// Existing connection: PRESERVE every operator-controlled field."),
+    )
+
+    expect(existingBlock).toContain("Never re-enable `is_live_trade` here")
+    expect(existingBlock).toContain('existing row with')
+    expect(existingBlock).toContain("const needsSelectionRepair =")
+    expect(existingBlock).toContain("!hasOrder || !existing")
+    expect(existingBlock).toContain('if (cfg.autoActive && cfg.exchange === "bingx" && needsSelectionRepair)')
+    expect(existingBlock).toContain('patchData["symbol_order"] = "volatility_1h"')
+    expect(existingBlock).not.toContain('patchData["is_live_trade"] = "1"')
+    expect(existingBlock).not.toContain("!hasLiveTrade")
+  })
+
   test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
@@ -353,6 +360,19 @@ describe("requested regression guardrails", () => {
     expect(instrumentation).toContain('ENABLE_IN_PROCESS_CONTINUITY === "1"')
     expect(continuityRunner).toContain('ENABLE_IN_PROCESS_CONTINUITY !== "1"')
     expect(continuityRunner).toContain("web/UI process")
+  })
+
+  test("Cloudflare deployment has scheduled continuity worker config", () => {
+    const wrangler = read("wrangler.jsonc")
+    const customWorker = read("custom-worker.ts")
+
+    expect(wrangler).toContain('"main": "./custom-worker.ts"')
+    expect(wrangler).toContain('"compatibility_flags": ["nodejs_compat"]')
+    expect(wrangler).toContain('"crons": ["* * * * *"]')
+    expect(customWorker).toContain("fetch: handler.fetch")
+    expect(customWorker).toContain("async scheduled")
+    expect(customWorker).toContain("/api/cron/server-continuity")
+    expect(customWorker).toContain("/api/cron/sync-live-positions")
   })
 
   test("status route does not report stale Redis running intent as local engine progress", () => {
@@ -378,17 +398,6 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Date.now() - remoteHeartbeat < 90_000")
     expect(source).toContain("is owned by another worker with a fresh heartbeat")
     expect(source).toContain("not clearing distributed running flag")
-  })
-
-  test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
-    const source = read("lib/connection-recoordinator.ts")
-
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(source).toContain("connectionRunning = effectivelyRunning && !isGloballyPaused && hasLocalEngineRuntime")
-    expect(source).toContain("workerAttached: hasLocalEngineRuntime")
-    expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")
-    expect(source).toContain("const activeEngineCount = coordinatorEngineCount")
-    expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
   })
 
   test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
