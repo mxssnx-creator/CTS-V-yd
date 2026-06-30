@@ -3133,8 +3133,9 @@ export async function executeLivePosition(
               minQty,
               undefined,
               "market",
-              "IOC",
-              { leverage: livePosition.leverage },
+              {
+                positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
+              },
             )
             
             if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {
