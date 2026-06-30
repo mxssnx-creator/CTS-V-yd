@@ -2097,7 +2097,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 2: MAIN ──────────────────────���────────────────────────────────────
+  // ─── STAGE 2: MAIN ──────────────────────���─────────────────────────────────���──
 
   /**
    * Validate BASE Sets (avgPF >= 1.2, avgConf >= 0.5, DDT <= 24h) AND create
@@ -2498,12 +2498,12 @@ export class StrategyCoordinator {
       // Dev: 150 per symbol keeps the pipeline fed without the memory spike
       // that 300/sym caused (300 × ~2 KB entries × 2 variants = ~1.2 MB/sym
       // in-flight; at 1 sym the cycle footprint drops from ~600 KB to ~300 KB).
-      // Prod: 200 (increased from 50 for production trading — sufficient for
-      // healthy strategy generation without OOM at 3.5GB heap in production).
+      // Prod: 2000 (system generates up to ~1200 Main sets per cycle; ceiling
+      // ensures no truncation while memory stays bounded at ~3.5GB production heap).
       const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (
         process.env.NODE_ENV === "development"
           ? Math.max(150, _devSyms * 150)
-          : 200
+          : 2000
       )
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
@@ -3480,7 +3480,7 @@ export class StrategyCoordinator {
     const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (
       process.env.NODE_ENV === "development"
         ? Math.max(200, _devSymsReal * 60)
-        : 300  // Production: increased from 100 to 300 for sufficient strategy diversity
+        : 2000  // Production: increased from 1000 to handle high diversity without truncation
     )
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
@@ -4541,7 +4541,7 @@ export class StrategyCoordinator {
           if (connector) {
             // Dispatch live positions. Each pipeline call is heavyweight:
             // price fetch → volume calc → leverage → order → fill poll →
-            // SL/TP → sync. With 10+ symbols × N qualifying Sets per symbol,
+            // SL/TP → sync. With 10+ symbols �� N qualifying Sets per symbol,
             // dispatching every Set serially creates a blocking storm that
             // saturates the cycle budget.
             //
@@ -4808,7 +4808,7 @@ export class StrategyCoordinator {
                     // already incorporated the CoordRecord sizeDelta from the
                     // Real-stage tuner — no extra entry scan needed.
                     sizeMultiplier: effectiveSizeMult,
-                    // ── Set-config propagation to Live ──────────────────────
+                    // ── Set-config propagation to Live ───���──────────────────
                     // Forward the Set's trailing profile and historical
                     // performance snapshot into the RealPosition so that
                     // `executeLivePosition` can (a) anchor the initial SL at
@@ -5477,7 +5477,7 @@ export class StrategyCoordinator {
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
               //   �� per-axis Pos-acc ledger has a non-zero delta to record
-              // ── Axis-Set LRU cache ────────��──���─────────────────────────��─
+              // ── Axis-Set LRU cache ────────��──�����─────────────────────���───��─
               // Axis Set objects are now pure value objects (the Real-stage tuner
               // writes sizeDelta onto the CoordRecord instead of mutating entries).
               // They can be safely reused across cycles without cloning.

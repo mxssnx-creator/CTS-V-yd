@@ -1437,11 +1437,11 @@ async function placeProtectionOrder(
 async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
   if (!connector || typeof connector.getOpenOrders !== "function") return null
   try {
-    // 10 s upper bound — production increased from 5s to handle exchange network
-    // latency. On timeout we degrade gracefully to drift-only reconciliation.
+    // 20 s upper bound — production timeout for real exchange network latency.
+    // On timeout we degrade gracefully to drift-only reconciliation.
     const orders = (await withTimeout(
       connector.getOpenOrders() as Promise<any>,
-      10000,
+      20000,
       "getOpenOrders(reconcile-tick)",
     )) as any[] | undefined
     if (!Array.isArray(orders)) return null
@@ -1723,7 +1723,7 @@ async function updateProtectionOrders(
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
 
-  // ── System-close-only mode (cached) ────────────────────────────────
+  // ── System-close-only mode (cached) ────────────────────────────��──���
   // Reconcile fans out across every live position on every tick, so
   // calling `getAppSettings()` here would issue one HGETALL per
   // position per tick — at 50 positions × 1 Hz that's 50 round-trips
@@ -2774,7 +2774,7 @@ export async function executeLivePosition(
             .catch((err: unknown) => ({ ok: false, note: String(err) }))
         : Promise.resolve({
             ok: true,
-            note: "connector does not expose setLeverage — skipping",
+            note: "connector does not expose setLeverage ��� skipping",
           })
 
     const setMarginTypePromise: Promise<{ ok: boolean; note: string }> =
@@ -3096,7 +3096,7 @@ export async function executeLivePosition(
     // an order that never existed. That created the exact class of live-order
     // errors operators saw: fake local positions, repeated protection-order
     // failures, and confusing "position not exist" exchange responses.
-    const entryOrderId = orderResult?.orderId || orderResult?.id
+    let entryOrderId = orderResult?.orderId || orderResult?.id
     if (!orderResult?.success || !entryOrderId) {
       const reason =
         orderResult?.error ||
@@ -3133,8 +3133,9 @@ export async function executeLivePosition(
               minQty,
               undefined,
               "market",
-              "IOC",
-              { leverage: livePosition.leverage },
+              {
+                positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
+              },
             )
             
             if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {
@@ -3145,6 +3146,7 @@ export async function executeLivePosition(
               Object.assign(orderResult, retryOrderResult)
               computedVolume = minQty  // Update for subsequent logging
               retryWasAttempted = false  // Signal success
+              entryOrderId = retryOrderResult?.orderId || retryOrderResult?.id
             } else {
               // Retry also failed
               console.warn(

@@ -15,11 +15,19 @@ const _ENGINE_BUILD_VERSION = "11.0.0"
 // This allows stale closures from old code to continue without ReferenceError
 // The variable is defined but not used - new code doesn't reference it
 declare global {
-
   var totalStrategiesEvaluated: number
+  var __memory_monitor__: {
+    lastGC?: number
+    highWaterMark?: number
+  } | undefined
 }
 if (typeof globalThis.totalStrategiesEvaluated === "undefined") {
   globalThis.totalStrategiesEvaluated = 0
+}
+
+// Memory monitoring to prevent OOM crashes
+if (!globalThis.__memory_monitor__) {
+  globalThis.__memory_monitor__ = { lastGC: Date.now(), highWaterMark: 0 }
 }
 
 // Type for global engine state
@@ -52,6 +60,35 @@ async function isGloballyPausedCached(): Promise<boolean> {
     return paused
   } catch {
     return _globalPauseCache?.paused ?? false
+  }
+}
+
+// Memory monitoring to prevent OOM crashes
+function checkMemoryAndTriggerGC(): void {
+  try {
+    const memUsage = process.memoryUsage()
+    const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024)
+    const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024)
+    
+    // Update high water mark
+    if (!globalThis.__memory_monitor__) globalThis.__memory_monitor__ = {}
+    if (heapUsedMB > (globalThis.__memory_monitor__.highWaterMark ?? 0)) {
+      globalThis.__memory_monitor__.highWaterMark = heapUsedMB
+    }
+    
+    // If heap usage exceeds 80% of total, trigger GC and log warning
+    if (heapUsedMB > heapTotalMB * 0.8) {
+      if (global.gc) {
+        global.gc()
+        globalThis.__memory_monitor__.lastGC = Date.now()
+      }
+      console.warn(
+        `[v0] Memory pressure: ${heapUsedMB}MB / ${heapTotalMB}MB ` +
+        `(${Math.round((heapUsedMB / heapTotalMB) * 100)}%) - GC triggered`
+      )
+    }
+  } catch (err) {
+    // Silently ignore memory check errors
   }
 }
 
@@ -4057,6 +4094,9 @@ export class TradeEngineManager {
       heartbeatCount++
 
       try {
+        // Memory monitoring: check and trigger GC if needed (every 10s)
+        checkMemoryAndTriggerGC()
+        
         const stateKey = `trade_engine_state:${this.connectionId}`
         await setSettings(stateKey, {
           status: "running",
