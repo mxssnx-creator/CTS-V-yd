@@ -1723,7 +1723,7 @@ async function updateProtectionOrders(
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
 
-  // ── System-close-only mode (cached) ────────────────────────────��───
+  // ── System-close-only mode (cached) ────────────────────────────��──���
   // Reconcile fans out across every live position on every tick, so
   // calling `getAppSettings()` here would issue one HGETALL per
   // position per tick — at 50 positions × 1 Hz that's 50 round-trips
@@ -2774,7 +2774,7 @@ export async function executeLivePosition(
             .catch((err: unknown) => ({ ok: false, note: String(err) }))
         : Promise.resolve({
             ok: true,
-            note: "connector does not expose setLeverage — skipping",
+            note: "connector does not expose setLeverage ��� skipping",
           })
 
     const setMarginTypePromise: Promise<{ ok: boolean; note: string }> =
@@ -3096,7 +3096,7 @@ export async function executeLivePosition(
     // an order that never existed. That created the exact class of live-order
     // errors operators saw: fake local positions, repeated protection-order
     // failures, and confusing "position not exist" exchange responses.
-    const entryOrderId = orderResult?.orderId || orderResult?.id
+    let entryOrderId = orderResult?.orderId || orderResult?.id
     if (!orderResult?.success || !entryOrderId) {
       const reason =
         orderResult?.error ||
@@ -3127,6 +3127,9 @@ export async function executeLivePosition(
             )
             
             // Retry immediately with corrected quantity
+            console.log(
+              `${LOG_PREFIX} [101400 Retry] Calling placeOrder with corrected qty=${minQty.toFixed(8)} for ${realPosition.symbol}`,
+            )
             const retryOrderResult = await exchangeConnector.placeOrder(
               realPosition.symbol,
               exchangeSide,
@@ -3138,6 +3141,11 @@ export async function executeLivePosition(
               },
             )
             
+            console.log(
+              `${LOG_PREFIX} [101400 Retry] Result:`,
+              retryOrderResult ? `success=${retryOrderResult.success}, orderId=${retryOrderResult?.orderId || retryOrderResult?.id}, error=${retryOrderResult?.error}` : "null",
+            )
+            
             if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {
               console.log(
                 `${LOG_PREFIX} [101400 Retry] Successfully placed order with corrected volume ${minQty.toFixed(8)} for ${realPosition.symbol}`,
@@ -3146,6 +3154,7 @@ export async function executeLivePosition(
               Object.assign(orderResult, retryOrderResult)
               computedVolume = minQty  // Update for subsequent logging
               retryWasAttempted = false  // Signal success
+              entryOrderId = retryOrderResult?.orderId || retryOrderResult?.id
             } else {
               // Retry also failed
               console.warn(
