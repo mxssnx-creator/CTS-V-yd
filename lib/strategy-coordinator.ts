@@ -3232,7 +3232,7 @@ export class StrategyCoordinator {
         continue
       }
 
-      // ── 3. PF/DDT gate ─────────────────────────��──────────────────────────
+      // ── 3. PF/DDT gate ────────────────────────����──────────────────────────
       const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                      s.avgDrawdownTime  <= metrics.maxDrawdownTime
       if (passes) {
@@ -3480,7 +3480,7 @@ export class StrategyCoordinator {
     const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (
       process.env.NODE_ENV === "development"
         ? Math.max(200, _devSymsReal * 60)
-        : 100
+        : 300  // Production: increased from 100 to 300 for sufficient strategy diversity
     )
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
@@ -4153,7 +4153,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────�����───��───────────��──────���───────��
+  // ─── STAGE 4: LIVE ─────────����──────────��─────�����───��─────��─────��──────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -5477,7 +5477,7 @@ export class StrategyCoordinator {
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
               //   �� per-axis Pos-acc ledger has a non-zero delta to record
-              // ── Axis-Set LRU cache ────────��──���───────────────────────────
+              // ── Axis-Set LRU cache ────────��──���─────────────────────────��─
               // Axis Set objects are now pure value objects (the Real-stage tuner
               // writes sizeDelta onto the CoordRecord instead of mutating entries).
               // They can be safely reused across cycles without cloning.
