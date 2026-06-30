@@ -2603,6 +2603,19 @@ export async function savePosition(position: any): Promise<void> {
         // Mark moved so closeLivePosition can detect duplicate increments
         await client.set(`live:positions:${connId}:moved:${id}`, String(Date.now())).catch(() => null)
         await client.expire(`live:positions:${connId}:moved:${id}`, 60 * 60).catch(() => 0)
+        
+        // Perf: Remove setKey/parentSetKey from live_set_keys index when position closes
+        // so getOpenLiveSetKeys fast-path (coordinator's getOpenLiveSetKeys) returns only
+        // keys for currently-open positions. This prevents stale keys from accumulating.
+        if (position.setKey || position.parentSetKey) {
+          try {
+            const indexKey = `live_set_keys:${connId}`
+            if (position.setKey) await client.srem(indexKey, position.setKey).catch(() => 0)
+            if (position.parentSetKey) await client.srem(indexKey, position.parentSetKey).catch(() => 0)
+          } catch {
+            // best-effort index maintenance
+          }
+        }
       } catch {
         // best-effort
       }
@@ -2611,6 +2624,23 @@ export async function savePosition(position: any): Promise<void> {
       try {
         await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
         await client.lpush(`live:positions:${connId}`, id).catch(() => 0)
+        
+        // Perf: Add setKey/parentSetKey to live_set_keys index when position opens so
+        // coordinator's getOpenLiveSetKeys can retrieve all active set keys via O(1) SMEMBERS
+        // instead of fetching all positions and iterating. Index is maintained as open positions
+        // are placed/closed, automatically staying in sync with the live index.
+        if (position.setKey || position.parentSetKey) {
+          try {
+            const indexKey = `live_set_keys:${connId}`
+            if (position.setKey) await client.sadd(indexKey, position.setKey).catch(() => 0)
+            if (position.parentSetKey) await client.sadd(indexKey, position.parentSetKey).catch(() => 0)
+            // TTL: index is ephemeral and auto-maintained; 24h TTL allows recovery if a close
+            // marker somehow fails to fire. Fallback scans in getLivePositions will repopulate if needed.
+            await client.expire(indexKey, 86400).catch(() => 0)
+          } catch {
+            // best-effort index maintenance; coordinator falls back to scan on empty index
+          }
+        }
       } catch {
         // best-effort
       }
