@@ -12,7 +12,8 @@ const PERP_TYPES = new Set(["perpetual", "perpetual_futures", "perp", "swap", "f
 
 /**
  * Convert API type to what the exchange actually accepts.
- * bingx needs "perpetual_futures", pionex/orangex need "perpetual", etc.
+ * bingx needs "perpetual_futures", bybit needs "contract" or "unified",
+ * pionex/orangex need "perpetual", etc.
  */
 function convertApiType(apiType: string | undefined, exchangeSupported: string[] | undefined): string | undefined {
   if (!apiType || !exchangeSupported) return apiType
@@ -23,6 +24,9 @@ function convertApiType(apiType: string | undefined, exchangeSupported: string[]
     if (exchangeSupported.includes("perpetual_futures")) return "perpetual_futures"
     if (exchangeSupported.includes("perpetual")) return "perpetual"
     if (exchangeSupported.includes("swap")) return "swap"
+    if (exchangeSupported.includes("contract")) return "contract"  // Bybit V5 perpetuals
+    if (exchangeSupported.includes("unified")) return "unified"      // Bybit V5 unified account
+    if (exchangeSupported.includes("inverse")) return "inverse"      // Bybit inverse
   }
   
   return apiType
