@@ -1200,6 +1200,9 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async getOrder(symbol: string, orderId: string): Promise<any> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`Fetching order ${orderId} for ${symbol}`)
 
       // Perp swap: GET /openApi/swap/v2/trade/order (same path as place/cancel, different method).
@@ -1265,6 +1268,9 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async getOpenOrders(symbol?: string): Promise<any[]> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`Fetching open orders${symbol ? ` for ${symbol}` : ""}`)
 
       // Perp: /openApi/swap/v2/trade/openOrders (not v3).
@@ -1303,6 +1309,9 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async getOrderHistory(symbol?: string, limit: number = 50): Promise<any[]> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`Fetching order history${symbol ? ` for ${symbol}` : ""} (limit: ${limit})`)
 
       // Perp: /openApi/swap/v2/trade/allOrders (not v3).
@@ -1340,6 +1349,13 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   async getPositions(symbol?: string): Promise<any[]> {
+    try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+    } catch (e) {
+      // Non-fatal; sync errors are already logged
+    }
+
     const contractType = this.credentials.contractType
     const apiType = this.credentials.apiType || "perpetual_futures"
     
@@ -2172,6 +2188,9 @@ export class BingXConnector extends BaseExchangeConnector {
    */
   async closeAllPositions(symbol?: string): Promise<{ success: boolean; successful?: string[]; failed?: any[]; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`[API] Closing all positions${symbol ? ` for ${symbol}` : ""}`)
       
       const params: Record<string, any> = {
@@ -2225,6 +2244,9 @@ export class BingXConnector extends BaseExchangeConnector {
    */
   async closePositionById(positionId: string): Promise<{ success: boolean; orderId?: string; positionId?: string; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`[API] Closing position by ID: ${positionId}`)
       
       const params: Record<string, any> = {
@@ -2369,6 +2391,9 @@ export class BingXConnector extends BaseExchangeConnector {
    */
   async batchCancelOrders(symbol: string, orderIds: string[]): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       if (!Array.isArray(orderIds) || orderIds.length === 0) {
         throw new Error("Order IDs must be a non-empty array")
       }
@@ -2431,6 +2456,9 @@ export class BingXConnector extends BaseExchangeConnector {
    */
   async cancelAllOrders(symbol?: string, type?: string): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`[API] Cancelling all open orders${symbol ? ` for ${symbol}` : ""}${type ? ` (type: ${type})` : ""}`)
       
       const params: Record<string, any> = {

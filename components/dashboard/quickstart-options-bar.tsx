@@ -208,7 +208,7 @@ export function QuickstartOptionsBar() {
   // flash before the first fetch resolved.
   const [controlOrders, setControlOrders] = useState(false)
   const [pfMin, setPfMin] = useState<ProfitFactorMin>(DEFAULT_PF_MIN)
-  const [volumeFactor, setVolumeFactor] = useState<number>(1.0)
+  const [volumeFactor, setVolumeFactor] = useState<number>(0.1)
   const [minimalStepCount, setMinimalStepCount] = useState<number>(3)
   const [maxConcurrentTrades, setMaxConcurrentTrades] = useState<number>(10)
   const [blockEnabled, setBlockEnabled] = useState(true)

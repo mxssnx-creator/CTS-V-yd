@@ -154,8 +154,8 @@ export function ActiveConnectionCard({
   // read the current value without stale-closure issues.
   const liveTradeLoadingRef  = useRef(false)
   const presetModeLoadingRef = useRef(false)
-  const [liveVolumeFactor, setLiveVolumeFactor] = useState(1.0)
-  const [presetVolumeFactor, setPresetVolumeFactor] = useState(1.0)
+  const [liveVolumeFactor, setLiveVolumeFactor] = useState(0.1)
+  const [presetVolumeFactor, setPresetVolumeFactor] = useState(0.1)
   const [volumeStepRatio, setVolumeStepRatio] = useState(DEFAULT_VOLUME_STEP_RATIO)
   const [orderType, setOrderType] = useState<"market" | "limit">("market")
   const [volumeType, setVolumeType] = useState<"usdt" | "contract">("usdt")
@@ -836,7 +836,7 @@ export function ActiveConnectionCard({
     return () => clearInterval(interval)
   }, [globalEngineRunning, connection.connectionId, connection.isActive])
 
-  // Handle Live Trade toggle — no longer gated on connection.isActive:
+  // Handle Live Trade toggle ��� no longer gated on connection.isActive:
   // the /live-trade route auto-starts the engine when Live is turned on,
   // so the user can flip Live and the engine comes up with the flag set.
   const handleLiveTradeToggle = async (newState: boolean) => {
