@@ -744,6 +744,8 @@ export async function POST(request: Request) {
         // Persist coordinator-ready marker. Cheap hset — does not await engine boot.
         client.hset("trade_engine:global", {
           status: "running",
+          desired_status: "running",
+          operator_intent: "running",
           started_at: new Date().toISOString(),
           coordinator_ready: "true",
         }).catch(() => {})

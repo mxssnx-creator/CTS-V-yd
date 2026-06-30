@@ -57,7 +57,8 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
     await initRedis()
     const client = getRedisClient()
     const globalState = await client.hgetall("trade_engine:global")
-    const globalRunning = globalState?.status === "running"
+    const operatorIntent = globalState?.operator_intent || globalState?.desired_status || globalState?.status || ""
+    const globalRunning = operatorIntent === "running"
     
     if (!globalRunning) {
       console.log("[v0] [Auto-Start] Global Trade Engine is not running - monitor initialized, waiting for global start.")
@@ -127,7 +128,8 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
         // matching the reported "low counts, no progressions" symptom.
         const operatorStopped =
           monGlobalState?.operator_stopped === "1" || monGlobalState?.operator_stopped === "true"
-        const currentStatus = monGlobalState?.status || ""
+        const operatorIntent = monGlobalState?.operator_intent || monGlobalState?.desired_status || monGlobalState?.status || ""
+        const currentStatus = operatorIntent
         const isPaused = currentStatus === "paused"
 
         // ── Skip healing sweep if paused ─────────────────────────────────
@@ -147,7 +149,7 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
         if (currentStatus !== "running") {
           // AUTO-START DISABLED: never auto-resurrect the global engine.
           // Only the operator's explicit Start action (via dashboard / QuickStart)
-          // may set trade_engine:global status=running. The monitor just skips
+          // may set trade_engine:global operator intent to running. The monitor just skips
           // its sweep and waits for the next tick.
           if (isStartup) {
             console.log(

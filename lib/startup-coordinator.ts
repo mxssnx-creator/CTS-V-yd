@@ -221,23 +221,29 @@ export async function completeStartup() {
     const coordinator = getGlobalTradeEngineCoordinator()
     console.log(`[v0] [Startup] ✓ Engine coordinator initialized (ready for manual start)\n`)
 
-    // Step 6b: Initialize global trade engine status so coordinator watchdog and
-    // auto-start monitor have a valid state to check. AUTO-START is disabled
-    // (status="running" does NOT auto-start engines), but the coordinator needs
-    // this to be set so it can perform background maintenance tasks and enable
-    // the monitor to synchronize enabled connections when the operator manually
-    // starts the engine via the dashboard or API.
-    console.log(`[v0] [Startup] Initializing global trade engine status...`)
+    // Step 6b: Initialize boot metadata without claiming runtime liveness.
+    // `trade_engine:global.status` is legacy operator intent in several routes;
+    // startup must not write status="running" because that conflates desired
+    // state with proof that an engine worker is actually alive.  Runtime proof
+    // is written separately by engine heartbeats (`actual_status`,
+    // `active_worker_id`, `last_heartbeat_at`).
+    console.log(`[v0] [Startup] Initializing global trade engine boot metadata...`)
     try {
       const client = getRedisClient()
+      const now = String(Date.now())
       await client.hset("trade_engine:global", {
-        status: "running",
-        initialized_at: String(Date.now()),
+        desired_status: "running",
+        operator_intent: "running",
+        boot_status: "initialized",
+        actual_status: "stopped",
+        active_worker_id: "",
+        last_heartbeat_at: "",
+        initialized_at: now,
         process_version: "1.0",
       })
-      console.log(`[v0] [Startup] ✓ Global trade engine status initialized\n`)
+      console.log(`[v0] [Startup] ✓ Global trade engine boot metadata initialized\n`)
     } catch (err) {
-      console.warn(`[v0] [Startup] ⚠ Failed to initialize global trade engine status (non-fatal):`, err)
+      console.warn(`[v0] [Startup] ⚠ Failed to initialize global trade engine boot metadata (non-fatal):`, err)
     }
 
     // Step 7: Clean up orphaned progress flags from incomplete shutdowns
