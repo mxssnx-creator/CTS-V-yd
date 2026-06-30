@@ -362,6 +362,18 @@ describe("requested regression guardrails", () => {
     expect(continuityRunner).toContain("web/UI process")
   })
 
+  test("server continuity cron awaits direct healing sweep instead of relying on auto-start timers", () => {
+    const cronRoute = read("app/api/cron/server-continuity/route.ts")
+    const autoStart = read("lib/trade-engine-auto-start.ts")
+
+    expect(autoStart).toContain("export async function runTradeEngineHealingSweep")
+    expect(autoStart).toContain("armTimer = false")
+    expect(autoStart).toContain("await runTradeEngineHealingSweep({ isStartup: true, armTimer: true })")
+    expect(cronRoute).toContain("runTradeEngineHealingSweep")
+    expect(cronRoute).toContain('runCronTask("auto-start-healing-sweep", () => runTradeEngineHealingSweep({ isStartup: true }))')
+    expect(cronRoute).not.toContain("initializeTradeEngineAutoStart")
+  })
+
   test("Cloudflare deployment has scheduled continuity worker config", () => {
     const wrangler = read("wrangler.jsonc")
     const customWorker = read("custom-worker.ts")

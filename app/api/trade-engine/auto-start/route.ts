@@ -22,6 +22,7 @@ export async function POST() {
     return NextResponse.json({
       success: true,
       message: "Trade engine auto-start initialized successfully",
+      startupSweepCompleted: true,
     })
   } catch (error) {
     console.error("[v0] Failed to manually start trade engine auto-start:", error)
