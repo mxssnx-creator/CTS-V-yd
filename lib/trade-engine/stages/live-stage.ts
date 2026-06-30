@@ -908,9 +908,16 @@ async function pollOrderFill(
     } catch (err) {
       console.warn(`${LOG_PREFIX} poll error:`, err instanceof Error ? err.message : String(err))
     }
+    
+    // Calculate wait time with exponential backoff
     const wait = intervals[Math.min(pollIdx, intervals.length - 1)]
     pollIdx += 1
-    await new Promise(r => setTimeout(r, wait))
+    
+    // Early return on next poll attempt if near deadline (avoid wasting final poll)
+    const remainingTime = deadline - Date.now()
+    if (remainingTime <= 50) break
+    
+    await new Promise(r => setTimeout(r, Math.min(wait, remainingTime)))
   }
   // Timeout — return whatever partial qty we managed to see rather than zero.
   // A non-zero bestPartialQty means the exchange has transacted at least some
@@ -921,6 +928,43 @@ async function pollOrderFill(
   return { filled: false, filledQty: 0, filledPrice: 0, status: lastStatus }
 }
 
+
+/**
+ * Batch poll multiple orders for fills in parallel.
+ * 
+ * When multiple orders are in-flight during live trading, polling each
+ * individually wastes time waiting for sequential getOrder calls. This
+ * function polls all orders concurrently against the same deadline,
+ * reducing total fill detection time from N*100ms to ~100ms.
+ * 
+ * Example: 5 orders in-flight
+ *   Sequential: 5 × 100ms = 500ms minimum
+ *   Batch: 1 × 100ms = 100ms minimum (50% faster)
+ */
+async function batchPollOrderFills(
+  connector: any,
+  orders: Array<{ symbol: string; orderId: string }>,
+  timeoutMs = 15000,
+): Promise<Record<string, { filled: boolean; filledQty: number; filledPrice: number; status: string }>> {
+  if (!orders || orders.length === 0) return {}
+  
+  // Poll all orders in parallel instead of sequentially
+  const pollPromises = orders.map(({ symbol, orderId }) =>
+    pollOrderFill(connector, symbol, orderId, timeoutMs).catch(err => {
+      console.warn(`${LOG_PREFIX} batch poll failed for ${orderId}:`, err instanceof Error ? err.message : String(err))
+      return { filled: false, filledQty: 0, filledPrice: 0, status: "error" }
+    })
+  )
+  
+  const results = await Promise.all(pollPromises)
+  const output: Record<string, any> = {}
+  
+  orders.forEach((order, idx) => {
+    output[order.orderId] = results[idx]
+  })
+  
+  return output
+}
 
 /**
  * Cancel an SL/TP order on the exchange. Tolerates "order not found" and
