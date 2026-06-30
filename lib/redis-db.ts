@@ -380,6 +380,60 @@ export class InlineLocalRedis {
     return true
   }
   
+
+  async cleanupVolatileRuntimeState({
+    mode = process.env.NODE_ENV === "production" ? "production" : "development",
+    reason = "startup",
+  }: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+    const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
+    const now = Date.now()
+    let deleted = 0
+    let preserved = 0
+
+    const deleteKey = (key: string) => {
+      const before = this.data.strings.has(key) || this.data.hashes.has(key) || this.data.sets.has(key) || this.data.lists.has(key) || this.data.sorted_sets.has(key)
+      this.deleteKey(key)
+      if (before) deleted++
+    }
+    const olderThanThreshold = (key: string, raw?: string | null): boolean => {
+      const ttl = this.data.ttl?.get(key)
+      if (ttl && ttl <= now) return true
+      const timestamp = Number(raw || "")
+      if (Number.isFinite(timestamp) && timestamp > 0 && now - timestamp > staleMs) return true
+      return !ttl && !timestamp
+    }
+    const isDev = mode !== "production"
+    const shouldDelete = (key: string, raw?: string | null): boolean => {
+      // Explicit volatile-state policy:
+      // live:position:* / live:positions:* / settings:live:*: dev clears all; prod preserves authoritative
+      // open-position records and only drops tracking/moved/transient indexes.
+      if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
+        return isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+      }
+      // live:lock:* is a transient gate: prod deletes only expired/old/missing-TTL locks.
+      if (key.startsWith("live:lock:")) return isDev || olderThanThreshold(key, raw)
+      // Prehistoric gates/progress are boot cache gates, not authoritative data.
+      if (key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) return isDev || olderThanThreshold(key, raw)
+      // Pipeline/runtime caches are non-authoritative and can be rebuilt.
+      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return true
+      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return true
+      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return true
+      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return true
+      return false
+    }
+
+    for (const [key, value] of Array.from(this.data.strings.entries())) shouldDelete(key, value) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.hashes.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.sets.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.lists.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.sorted_sets.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+
+    if (deleted > 0) {
+      console.log(`[v0] [Redis Memory] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+    }
+    return { deleted, preserved }
+  }
+
   private startTTLCleanup(): void {
     // TTL-based cleanup + LRU eviction when heap memory exceeds threshold.
     // In dev mode the InlineLocalRedis emulator holds the ENTIRE dataset on
@@ -420,173 +474,7 @@ export class InlineLocalRedis {
     // in dev — even if totalKeys is low — because the OOM-causing families
     // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
     // 20+ MB each while only occupying a few hundred key slots.
-      try {
-        if (process.env.NODE_ENV === "development") {
-          let flushed = 0
-
-          // 1. strategies:{conn}:{symbol}:* — per-cycle set blobs (real:sets,
-          //    base:sets, main:sets) and fp:v2 fingerprint caches. Written by
-          //    strategy-coordinator.ts on every realtime cycle; dev bypasses
-          //    are throttled (every 50th cycle) or gated on NODE_ENV, but stale
-          //    keys from prior hot-reload cycles remain in the Map.
-          //    Also covers lpush lists from strategy-evaluator.ts (storeStrategyResult
-          //    now returns early in dev, but pre-bypass runs left stale list keys).
-          //    
-          //    PRESERVE: strategies_active:{conn} — coordinator current counts
-          //    (per-symbol per-stage). This hash is read by the stats API every
-          //    second and must survive hot-reloads.
-          for (const key of this.data.lists.keys()) {
-            // `indication_outcomes_pending:*` is stored as a LIST (rpush/ltrim),
-            // not a string/hash, so the strings+hashes flush below never reached
-            // it — letting it accumulate (~150 KB/symbol, multiple MB) and
-            // persist across boots via the snapshot. Flush it here so dev starts
-            // each session clean; the runtime ltrim cap (100 in dev) keeps it
-            // bounded thereafter.
-            if (key.startsWith("strategies:") || key.startsWith("indication_outcomes_pending:")) {
-              this.data.lists.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.hashes.keys()) {
-            // Preserve strategies_active hash — it contains live coordinator counts
-            if (key.startsWith("strategies_active:")) continue
-            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-
-          // 2. indication:{conn}:{symbol} — per-symbol indication strings/hashes
-          //    (200 keys × ~3 KB each = 0.6 MB). Written every indication cycle;
-          //    stale copies from hot-reload cycles remain.
-          // 2a. indication_set:{conn}:* — the #1 OOM driver: IndicationProcessor v5
-          //    writes ~4700 hashes per symbol per cycle (14,184 keys = 93.9 MB for 3
-          //    symbols). These are transient; flush entirely on startup and cap to 300
-          //    via eviction CAPS during runtime.
-          // 2b. indication_outcomes_pending:{conn} — pending outcome resolution hashes.
-          // 2c. axis_pos_acc:{conn} — axis position accumulator (~200 KB each).
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("indication:") || key.startsWith("indications:") ||
-                key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("indication:") || key.startsWith("indications:") ||
-                key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
-                key.startsWith("axis_pos_acc:")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-
-          // 2b. prehistoric cache-gate + progress-tracker keys only.
-          //
-          // The engine uses TWO separate keys to decide whether to re-run prehistoric:
-          //   a) `prehistoric_loaded:{conn}` (plain string "1") — the 24-h cache gate
-          //      in engine-manager.ts. If this key survives a sandbox reset / full-DB
-          //      wipe the engine skips the entire ConfigSetProcessor pass and stamps
-          //      fake completion fields with 0 candles/indicators. Wipe it so every
-          //      fresh-DB session re-runs prehistoric from scratch.
-          //   b) `prehistoric:progress:{conn}` — the PrehistoricProgressTracker hash.
-          //      Stale from prior session; wipe so the UI progress bar resets cleanly.
-          //
-          // DO NOT wipe:
-          //   - `prehistoric:{conn}` hash (is_complete, symbols_processed, etc.) —
-          //     the stats route reads this; wiping causes candlesLoaded=0 forever.
-          //   - `progression:{conn}` hash (placed_count, filled_count, cycle counters)
-          //     — live counters that must survive hot-reloads.
-          //   - `strategies_active:{conn}` — written by coordinator each cycle.
-          //   - `pi_history:*` — written by ConfigSetProcessor; must survive.
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("prehistoric_loaded:")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("prehistoric:progress:")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-
-          // 3. pseudo_position:{conn}:{id} + pseudo_positions:{conn} set —
-          //    createPseudoPositionsFromRealSets() bypassed in dev but prior runs
-          //    left 400 position hashes (0.6 MB) + membership sets.
-          for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.sets.keys()) {
-            if (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) {
-              this.data.sets.delete(key); flushed++
-            }
-          }
-
-          // 4. live:position:{id} hashes + live:positions:{conn} lists —
-          //    In dev, live positions are real BingX orders whose orderId/SL/TP
-          //    are valid only for the session that placed them.  On hot-reload
-          //    the in-memory InlineLocalRedis is fresh but the persisted dev DB
-          //    still holds the old position hashes.  The reconcile loop then
-          //    issues exchange API calls for each stale position (×44 = 44 API
-          //    calls on startup), blowing ~200-400 MB and sometimes triggering
-          //    OOM before prehistoric can complete.  Wipe them unconditionally
-          //    on dev startup so each session begins with a clean slate.
-          //    NOTE: setSettings("live:position:…") prepends "settings:" so we
-          //    must clear both "live:position:*" AND "settings:live:position:*".
-          for (const key of this.data.hashes.keys()) {
-            if (
-              key.startsWith("live:position:") ||
-              key.startsWith("settings:live:position:")
-            ) { this.data.hashes.delete(key); flushed++ }
-          }
-          for (const key of this.data.lists.keys()) {
-            if (
-              key.startsWith("live:positions:") ||
-              key.startsWith("settings:live:positions:")
-            ) { this.data.lists.delete(key); flushed++ }
-          }
-          for (const key of this.data.strings.keys()) {
-            if (
-              key.startsWith("live:positions:") ||
-              key.startsWith("live:position:")  ||
-              key.startsWith("settings:live:position:") ||
-              key.startsWith("settings:live:positions:")
-            ) { this.data.strings.delete(key); flushed++ }
-          }
-          for (const key of this.data.sets.keys()) {
-            if (
-              key.startsWith("live:positions:") ||
-              key.startsWith("settings:live:positions:")
-            ) { this.data.sets.delete(key); flushed++ }
-          }
-
-          if (flushed > 0) {
-            console.log(`[v0] [Redis Memory] Dev startup flush: cleared ${flushed} stale volatile keys`)
-          }
-        }
-
-        // Full eviction pass for remaining pressure (covers non-dev or larger leftovers).
-        const totalKeys = this.data.strings.size + this.data.hashes.size +
-                          this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        if (totalKeys > 5_000) {
-          console.log(`[v0] [Redis Memory] Startup: ${totalKeys} stale keys after flush, evicting...`)
-          this.evictOldRecords()
-          ;(globalThis as any).gc?.()
-          const after = this.data.strings.size + this.data.hashes.size +
-                        this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-          console.log(`[v0] [Redis Memory] Startup eviction complete: ${totalKeys} → ${after} keys`)
-        }
-      } catch (err) {
-        console.warn(`[v0] [Redis Memory] Dev startup flush error:`, err)
-      }
+    void this.cleanupVolatileRuntimeState({ mode: process.env.NODE_ENV === "production" ? "production" : "development", reason: "inline-startup" })
 
     // Throttle eviction log output: only print once per 60 s when stuck above
     // the key limit so the server log stays readable.
@@ -1738,6 +1626,58 @@ export async function ensureCoreRedis(): Promise<void> {
   }
 }
 
+
+export async function cleanupVolatileRuntimeState({
+  mode = process.env.NODE_ENV === "production" ? "production" : "development",
+  reason = "startup",
+}: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+  const client = getRedisClient()
+  if (typeof (client as any).cleanupVolatileRuntimeState === "function") {
+    return (client as any).cleanupVolatileRuntimeState({ mode, reason })
+  }
+
+  const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
+  const now = Date.now()
+  const isDev = mode !== "production"
+  const allKeys = await client.keys("*").catch(() => [] as string[])
+  const toDelete: string[] = []
+  let preserved = 0
+
+  const staleStringKey = async (key: string) => {
+    const [raw, ttl] = await Promise.all([
+      client.get(key).catch(() => null),
+      typeof (client as any).ttl === "function" ? (client as any).ttl(key).catch(() => -1) : Promise.resolve(-1),
+    ])
+    const ts = Number(raw || "")
+    return ttl === -2 || (!Number.isFinite(ts) || ts <= 0 ? ttl < 0 : now - ts > staleMs)
+  }
+
+  for (const key of allKeys) {
+    let del = false
+    if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
+      del = isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+    } else if (key.startsWith("live:lock:") || key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) {
+      del = isDev || await staleStringKey(key)
+    } else if (
+      key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:") ||
+      key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:") ||
+      key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
+      key.startsWith("strategies:") || key.startsWith("settings:strategies")
+    ) {
+      del = true
+    }
+    if (del) toDelete.push(key)
+    else preserved++
+  }
+
+  let deleted = 0
+  for (let i = 0; i < toDelete.length; i += 500) {
+    deleted += await client.del(...toDelete.slice(i, i + 500)).catch(() => 0)
+  }
+  if (deleted > 0) console.log(`[v0] [Redis] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+  return { deleted, preserved }
+}
+
 /**
  * Full initialisation: core Redis + schema migrations. `isConnected` only
  * becomes true AFTER migrations have completed, and every caller awaits the
@@ -1779,50 +1719,13 @@ export async function initRedis(): Promise<void> {
   }
   if (isConnected) return
 
-  // DEV ONLY — flush stale live positions on every initRedis() call.
-  //
-  // The InlineLocalRedis instance lives on globalThis.__redis_data and is
-  // reused across Next.js hot-reloads (the constructor only fires once per
-  // process). Each hot-reload resets module-level `isConnected` to false and
-  // calls initRedis() again — but __redis_init_promise is still set, so the
-  // async IIFE below is skipped.  We must flush HERE, before the promise guard,
-  // so stale live:position:* keys (44 from the previous session) and dedup
-  // locks don't carry over and silently block all new live order placement.
-  //
-  // A __redis_live_flush_token prevents double-clearing within a single module
-  // evaluation cycle (e.g. if two routes call initRedis() concurrently).
-  if (process.env.NODE_ENV === "development") {
-    const token = Date.now()
-    const g = globalForRedis as any
-    if (!g.__redis_live_flush_token || g.__redis_live_flush_token !== g.__redis_live_flush_applied) {
-      g.__redis_live_flush_applied = token
-      g.__redis_live_flush_token  = token
-      try {
-        const data = g.__redis_data as typeof globalForRedis.__redis_data | undefined
-        if (data) {
-          let cleared = 0
-          const isLiveKey = (k: string) =>
-            k.startsWith("live:position:") ||
-            k.startsWith("live:positions:") ||
-            k.startsWith("settings:live:position:") ||
-            k.startsWith("settings:live:positions:") ||
-            k.startsWith("live:lock:")
-          for (const key of data.strings.keys()) {
-            if (isLiveKey(key)) { data.strings.delete(key); cleared++ }
-          }
-          for (const key of data.lists.keys()) {
-            if (isLiveKey(key)) { data.lists.delete(key); cleared++ }
-          }
-          for (const key of data.hashes.keys()) {
-            if (isLiveKey(key)) { data.hashes.delete(key); cleared++ }
-          }
-          if (cleared > 0) {
-            console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys`)
-          }
-        }
-      } catch { /* non-fatal */ }
-    }
-  }
+  // Startup volatile cleanup is environment-aware: development clears stale
+  // hot-reload runtime state aggressively, while production preserves
+  // authoritative live positions and removes only stale gates/locks/caches.
+  await cleanupVolatileRuntimeState({
+    mode: process.env.NODE_ENV === "production" ? "production" : "development",
+    reason: "initRedis",
+  }).catch(() => null)
 
   if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
 
