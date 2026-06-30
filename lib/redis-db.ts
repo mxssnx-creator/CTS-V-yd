@@ -1624,7 +1624,7 @@ class NodeRedisClientAdapter implements RedisClientLike {
   private connectPromise: Promise<any> | null = null
   constructor(private readonly url: string) {}
   private async c(): Promise<any> {
-    if (this.client?.isOpen) return this.client
+    if (this.client) return this.client
     if (!this.connectPromise) {
       this.connectPromise = import("redis").then(async ({ createClient }) => {
         const client = createClient({ url: this.url })

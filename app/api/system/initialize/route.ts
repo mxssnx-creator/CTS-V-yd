@@ -33,7 +33,7 @@ export async function POST(_req: NextRequest) {
       // browser page mount.
       const { initializeTradeEngineAutoStart, runTradeEngineHealingSweep } = await import("@/lib/trade-engine-auto-start")
       await initializeTradeEngineAutoStart().catch(() => {})
-      const healing = await runTradeEngineHealingSweep(true).catch((error) => ({
+      const healing = await runTradeEngineHealingSweep({ isStartup: true }).catch((error) => ({
         startedCount: 0,
         eligibleCount: 0,
         error: error instanceof Error ? error.message : String(error),
@@ -41,11 +41,6 @@ export async function POST(_req: NextRequest) {
       const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
       startServerContinuityRunner()
       return NextResponse.json({ success: true, healing })
-      const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
-      await initializeTradeEngineAutoStart()
-      const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
-      startServerContinuityRunner()
-      return NextResponse.json({ success: true, startupSweepCompleted: true })
     } finally {
       const current = await client.get(INIT_LOCK_KEY).catch(() => null)
       if (current === token) {
