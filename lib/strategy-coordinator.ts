@@ -3479,7 +3479,7 @@ export class StrategyCoordinator {
     const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (
       process.env.NODE_ENV === "development"
         ? Math.max(200, _devSymsReal * 60)
-        : 1000  // Production: no truncation; all Real Sets pass through
+        : 2000  // Production: increased from 1000 to handle high diversity without truncation
     )
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
