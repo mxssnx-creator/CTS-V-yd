@@ -130,6 +130,8 @@ export async function POST(req: NextRequest) {
           symbol: symbolKey,
           side: exchangeSide,
           direction,
+          symbol,
+          side,
           quantity,
           leverage,
           timestamp: Date.now(),
