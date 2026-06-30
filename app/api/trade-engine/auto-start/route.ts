@@ -8,7 +8,7 @@ export async function POST() {
     console.log("[v0] Manual trade engine auto-start triggered")
 
     if (isAutoStartInitialized()) {
-      const healing = await runTradeEngineHealingSweep(true)
+      const healing = await runTradeEngineHealingSweep({ isStartup: true })
       return NextResponse.json({
         success: true,
         message: "Trade engine auto-start is already initialized and running",
@@ -18,7 +18,7 @@ export async function POST() {
     }
 
     await initializeTradeEngineAutoStart()
-    const healing = await runTradeEngineHealingSweep(true)
+    const healing = await runTradeEngineHealingSweep({ isStartup: true })
 
     await SystemLogger.logTradeEngine("Trade engine auto-start manually triggered", "info")
 

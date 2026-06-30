@@ -31,6 +31,8 @@
 // process (register() is only meant to run once per real process start).
 const bootGuard = globalThis as unknown as { __v0_instrumentation_booted?: boolean }
 
+const dynamicServerImport = new Function("specifier", "return import(specifier)") as <T>(specifier: string) => Promise<T>
+
 export async function register(): Promise<void> {
   // Only run in the Node.js runtime. The Edge runtime stubs out `fs`, `path`,
   // etc. (see next.config.mjs), so any server bootstrap that touches the
@@ -61,7 +63,7 @@ export async function register(): Promise<void> {
   // processes for continuity.
   if (process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1") {
     try {
-      const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
+      const { initializeTradeEngineAutoStart } = await dynamicServerImport<typeof import("@/lib/trade-engine-auto-start")>("@/lib/trade-engine-auto-start")
       await initializeTradeEngineAutoStart()
     } catch (err) {
       console.error("[v0] [Instrumentation] auto-start init failed (continuing):", err instanceof Error ? err.message : err)
@@ -72,7 +74,7 @@ export async function register(): Promise<void> {
 
   if (process.env.ENABLE_IN_PROCESS_CONTINUITY === "1") {
     try {
-      const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
+      const { startServerContinuityRunner } = await dynamicServerImport<typeof import("@/lib/server-continuity-runner")>("@/lib/server-continuity-runner")
       startServerContinuityRunner()
     } catch (err) {
       console.error("[v0] [Instrumentation] continuity runner failed (continuing):", err instanceof Error ? err.message : err)
