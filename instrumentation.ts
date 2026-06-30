@@ -34,10 +34,13 @@ const bootGuard = globalThis as unknown as { __v0_instrumentation_booted?: boole
 const dynamicServerImport = new Function("specifier", "return import(specifier)") as <T>(specifier: string) => Promise<T>
 
 export async function register(): Promise<void> {
-  // Only run in the Node.js runtime. The Edge runtime stubs out `fs`, `path`,
-  // etc. (see next.config.mjs), so any server bootstrap that touches the
-  // snapshot/filesystem must never execute there.
-  if (process.env.NEXT_RUNTIME !== "nodejs") return
+  // Only skip the Edge runtime. In `next start` / OpenNext production workers
+  // `NEXT_RUNTIME` can be undefined during instrumentation registration, while
+  // the runtime is still a normal Node-compatible server process. Requiring the
+  // value to be exactly "nodejs" skipped deterministic boot in production and
+  // reproduced the dev/prod divergence: migrations, orphan cleanup, and
+  // stranded-position reconciliation did not run until a later request path.
+  if (process.env.NEXT_RUNTIME === "edge") return
 
   if (bootGuard.__v0_instrumentation_booted) return
   bootGuard.__v0_instrumentation_booted = true

@@ -446,6 +446,8 @@ describe("requested regression guardrails", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
 
+    expect(instrumentation).toContain('process.env.NEXT_RUNTIME === "edge"')
+    expect(instrumentation).not.toContain('process.env.NEXT_RUNTIME !== "nodejs"')
     expect(instrumentation).toContain('ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
     expect(instrumentation).toContain("trade-engine auto-start skipped")
     expect(instrumentation).toContain('ENABLE_IN_PROCESS_CONTINUITY === "1"')
