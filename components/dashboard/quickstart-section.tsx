@@ -933,7 +933,7 @@ export function QuickstartSection() {
   // because the dependency array is evaluated synchronously during
   // render, before the `useCallback` further down has executed.
 
-  // ── live-trade toggle ─────────────────────────────────────���───────────────
+  // ── live-trade toggle ────────────────────���────────────────���───────────────
   // Enables or disables real exchange trading for the active connection via
   // /api/settings/connections/[id]/live-trade. The server validates that
   // credentials exist and starts the independent live-trade engine.
@@ -1136,10 +1136,14 @@ export function QuickstartSection() {
 
     // Segment 3 — strategies / real / live (66–100)
     const stratShare = 34
-    // stageReal.createdSets > 0 → approaching full; live positions → final
+    // Use liveOrdersFilled > 0 as the 100% signal — it persists between cycles
+    // unlike livePositionsOpen which can hit 0 briefly when all positions just
+    // closed (causing the bar to stutter back to 95%). livePositionsOpen is
+    // kept as the additional live signal for connections with open positions now.
+    const liveActive = stats.livePositionsOpen > 0 || stats.liveOrdersFilled > 0
     const stratPct = stats.stratReal > 0
-      ? (stats.livePositionsOpen > 0 ? 100 : Math.min(95, 50 + (stats.strategyCycles / Math.max(10, stats.strategyCycles)) * 45))
-      : Math.min(50, (stats.strategyCycles / Math.max(5, stats.strategyCycles)) * 50)
+      ? (liveActive ? 100 : Math.min(95, 50 + Math.min(1, stats.strategyCycles / 50) * 45))
+      : Math.min(50, Math.min(1, stats.strategyCycles / 20) * 50)
     return prehistoricShare + indShare + (stratPct / 100) * stratShare
   })()
 
@@ -1173,8 +1177,11 @@ export function QuickstartSection() {
     {
       key:    "live",
       label:  "Live",
-      done:   stats.livePositionsOpen > 0 || stats.liveOrdersFilled > 0,
-      active: stats.livePositionsOpen > 0 || (stats.engineRunning && stats.stratReal > 0),
+      // liveOrdersFilled persists between cycles and is used as the primary
+      // "live is fully active" signal; livePositionsOpen supplements it when
+      // positions are currently open.
+      done:   stats.liveOrdersFilled > 0 || stats.livePositionsOpen > 0,
+      active: stats.livePositionsOpen > 0 || (stats.engineRunning && stats.stratReal > 0 && stats.liveOrdersFilled === 0),
     },
   ]
 
