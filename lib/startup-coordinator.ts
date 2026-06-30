@@ -227,7 +227,7 @@ export async function completeStartup() {
 
     // Step 6b: Initialize boot metadata without claiming runtime liveness.
     // `trade_engine:global.status` is legacy operator intent in several routes;
-    // startup must not write status="running" because that conflates desired
+    // startup must not write legacy status="running" because that conflates desired
     // state with proof that an engine worker is actually alive.  Runtime proof
     // is written separately by engine heartbeats (`actual_status`,
     // `active_worker_id`, `last_heartbeat_at`).
@@ -235,9 +235,22 @@ export async function completeStartup() {
     try {
       const client = getRedisClient()
       const now = String(Date.now())
+      const existingGlobalState = (await client.hgetall("trade_engine:global")) as Record<string, string> | null
+      const operatorStopped =
+        existingGlobalState?.operator_stopped === "1" || existingGlobalState?.operator_stopped === "true"
+      const preservedIntent = operatorStopped
+        ? "stopped"
+        : existingGlobalState?.operator_intent ||
+          existingGlobalState?.desired_status ||
+          existingGlobalState?.status ||
+          "running"
+
       await client.hset("trade_engine:global", {
-        desired_status: "running",
-        operator_intent: "running",
+        // Fresh installs and restored snapshots default to desired_status: "running"
+        // and operator_intent: "running" so unattended continuity can resume;
+        // a sticky operator_stopped flag above remains an explicit stop veto.
+        desired_status: preservedIntent,
+        operator_intent: preservedIntent,
         boot_status: "initialized",
         actual_status: "stopped",
         active_worker_id: "",
@@ -266,8 +279,8 @@ export async function completeStartup() {
     console.log(`[v0] [Startup] ✓ Pre-startup sequence complete`)
     console.log(`[v0] [Startup] ========================================`)
     console.log(`[v0] [Startup] Ready for user interaction`)
-    console.log(`[v0] [Startup] Engines will NOT start automatically`)
-    console.log(`[v0] [Startup] User must enable connections in Dashboard`)
+    console.log(`[v0] [Startup] Engines resume when operator intent is running or unattended default allows continuity`)
+    console.log(`[v0] [Startup] User must enable/start connections in Dashboard`)
     console.log(`[v0] [Startup] ========================================\n`)
   } catch (error) {
     console.error(`[v0] [Startup] ✗ Fatal error during startup:`, error)

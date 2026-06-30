@@ -4017,6 +4017,65 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
   }
 }
 
+function createMigrationExecutionClient(client: any): any {
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      if (prop === "set") {
+        return async (key: string, value: unknown, ...args: unknown[]) => {
+          if (key === "_schema_version") {
+            return "OK"
+          }
+          return target.set(key, value, ...args)
+        }
+      }
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === "function" ? value.bind(target) : value
+    },
+  })
+}
+
+async function runPendingMigrationBatch({
+  client,
+  pendingMigrations,
+  deadlineMs,
+}: {
+  client: any
+  pendingMigrations: Migration[]
+  deadlineMs: number
+}): Promise<void> {
+  const migrationClient = createMigrationExecutionClient(client)
+  const startedAt = Date.now()
+
+  for (const migration of pendingMigrations) {
+    const elapsed = Date.now() - startedAt
+    const remainingMs = Math.max(1, deadlineMs - elapsed)
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      console.log(`[v0] [Migrations] Running: ${migration.name} (v${migration.version})`)
+      await Promise.race([
+        migration.up(migrationClient),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error(`Migration ${migration.name} exceeded remaining batch deadline (${remainingMs}ms)`)),
+            remainingMs,
+          )
+        }),
+      ]).finally(() => {
+        if (timeout) clearTimeout(timeout)
+      })
+      // Stamp `_schema_version` after EACH migration from the runner. Individual
+      // migration bodies often contain legacy `_schema_version` writes; the
+      // proxy above suppresses those duplicate writes so fresh installs execute
+      // as one optimized batch while retaining crash/restart-safe step progress.
+      await client.set("_schema_version", migration.version.toString())
+      console.log(`[v0] [Migrations] ✓ Completed: ${migration.name} (schema now v${migration.version})`)
+    } catch (error) {
+      console.error(`[v0] [Migrations] ✗ Failed during ${migration.name}:`, error)
+      throw error
+    }
+  }
+}
+
 /**
  * Run all pending migrations
  */
@@ -4144,35 +4203,13 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
       return { success: true, message: `Already at latest version ${finalVersion}`, version: finalVersion }
     }
 
-    // Per-migration deadline: 30 s is very generous for any individual
-    // migration. If a migration hangs (e.g. due to a circular initRedis
-    // call or an infinite Redis await), we fail-fast with a clear error
-    // rather than blocking the entire event loop until the process dies.
-    const MIGRATION_DEADLINE_MS = 30_000
-    console.log(`[v0] [Migrations] Running ${pendingMigrations.length} pending migrations...`)
-    for (const migration of pendingMigrations) {
-      try {
-        console.log(`[v0] [Migrations] Running: ${migration.name} (v${migration.version})`)
-        await Promise.race([
-          migration.up(client),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () => reject(new Error(`Migration ${migration.name} exceeded ${MIGRATION_DEADLINE_MS}ms deadline`)),
-              MIGRATION_DEADLINE_MS,
-            ),
-          ),
-        ])
-        // Stamp `_schema_version` after EACH migration (not just once at the
-        // end). Durable per-step progress means a crash/restart mid-batch never
-        // re-runs already-applied migrations and never leaves the schema in a
-        // half-state that a later boot misreads.
-        await client.set("_schema_version", migration.version.toString())
-        console.log(`[v0] [Migrations] ✓ Completed: ${migration.name} (schema now v${migration.version})`)
-      } catch (error) {
-        console.error(`[v0] [Migrations] ✗ Failed during ${migration.name}:`, error)
-        throw error
-      }
-    }
+    // Run pending migrations as one optimized batch. The batch client suppresses
+    // duplicate legacy `_schema_version` writes inside individual migration
+    // bodies; this runner remains the single place that stamps durable per-step
+    // progress after each migration completes.
+    const MIGRATION_DEADLINE_MS = Math.max(30_000, pendingMigrations.length * 30_000)
+    console.log(`[v0] [Migrations] Running ${pendingMigrations.length} pending migrations as a combined batch...`)
+    await runPendingMigrationBatch({ client, pendingMigrations, deadlineMs: MIGRATION_DEADLINE_MS })
 
     // Ensure schema version reflects the final target (defensive; the loop
     // already stamped the last migration's version).
