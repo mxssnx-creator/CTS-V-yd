@@ -106,7 +106,7 @@ export async function POST(request: NextRequest) {
     }
 
     logs.push(`Database Statistics:`)
-    logs.push(`  - Schema Version: ${status.latestVersion}`)
+    logs.push(`  - Schema Version: ${status.currentVersion}`)
     logs.push(`  - Stored Connections: ${keyCount}`)
     logs.push(`  - Database Type: Redis`)
     logs.push(`  - Indexes: Created`)
@@ -119,7 +119,8 @@ export async function POST(request: NextRequest) {
         database_type: "redis",
         initialized_at: new Date().toISOString(),
         version: "3.2",
-        schema_version: status.latestVersion,
+        schema_version: status.currentVersion,
+        target_schema_version: status.latestVersion,
         features: {
           live_trading: true,
           preset_trading: true,
@@ -155,7 +156,8 @@ export async function POST(request: NextRequest) {
         message: "Redis database migration completed successfully",
         database_type: "redis",
         status: {
-          schema_version: status.latestVersion,
+          schema_version: status.currentVersion,
+          target_schema_version: status.latestVersion,
           is_up_to_date: status.currentVersion === status.latestVersion,
           indexes_created: true,
           ttl_configured: true,

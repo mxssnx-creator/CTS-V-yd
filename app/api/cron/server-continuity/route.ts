@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
-import { initializeTradeEngineAutoStart } from "@/lib/trade-engine-auto-start"
+import { initializeTradeEngineAutoStart, runTradeEngineHealingSweep } from "@/lib/trade-engine-auto-start"
 import { startServerContinuityRunner } from "@/lib/server-continuity-runner"
 
 export const dynamic = "force-dynamic"
@@ -75,7 +75,10 @@ export async function GET() {
       // runs; the dedicated sync cron is the engine-down safety net).
       startServerContinuityRunner()
       const tasks = await Promise.all([
-        runCronTask("auto-start", () => initializeTradeEngineAutoStart()),
+        runCronTask("auto-start", async () => {
+          await initializeTradeEngineAutoStart()
+          return runTradeEngineHealingSweep(true)
+        }),
         runCronTask("generate-indications", async () => {
           const mod = await import("@/app/api/cron/generate-indications/route")
           return mod.GET()

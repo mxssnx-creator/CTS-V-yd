@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient, isRedisConnected } from "@/lib/redis-db"
+import { initRedis, getRedisClient, isRedisConnected, getAllConnections } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 export async function GET() {
@@ -8,7 +8,7 @@ export async function GET() {
     const client = getRedisClient()
     const connected = isRedisConnected()
     
-    const connectionCount = connected ? await client.scard("connections") : 0
+    const connectionCount = connected ? (await getAllConnections()).length : 0
     const schemaVersion = connected ? (await client.get("_schema_version") || "0") : "0"
     
     return NextResponse.json({

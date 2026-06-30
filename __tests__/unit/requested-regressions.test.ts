@@ -375,6 +375,16 @@ describe("requested regression guardrails", () => {
     expect(customWorker).toContain("/api/cron/sync-live-positions")
   })
 
+  test("production continuity cron awaits a real auto-start sweep before returning", () => {
+    const cron = read("app/api/cron/server-continuity/route.ts")
+    const autoStart = read("lib/trade-engine-auto-start.ts")
+
+    expect(autoStart).toContain("export async function runTradeEngineHealingSweep")
+    expect(autoStart).toContain("cron callers must await this function directly")
+    expect(cron).toContain("runTradeEngineHealingSweep(true)")
+    expect(cron).toContain("await initializeTradeEngineAutoStart()")
+  })
+
   test("status route does not report stale Redis running intent as local engine progress", () => {
     const source = read("app/api/trade-engine/status/route.ts")
 

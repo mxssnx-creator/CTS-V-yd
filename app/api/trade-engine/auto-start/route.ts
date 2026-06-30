@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initializeTradeEngineAutoStart, isAutoStartInitialized } from "@/lib/trade-engine-auto-start"
+import { initializeTradeEngineAutoStart, isAutoStartInitialized, runTradeEngineHealingSweep } from "@/lib/trade-engine-auto-start"
 import { SystemLogger } from "@/lib/system-logger"
 
 export const dynamic = "force-dynamic"
@@ -8,20 +8,24 @@ export async function POST() {
     console.log("[v0] Manual trade engine auto-start triggered")
 
     if (isAutoStartInitialized()) {
+      const healing = await runTradeEngineHealingSweep(true)
       return NextResponse.json({
         success: true,
         message: "Trade engine auto-start is already initialized and running",
         alreadyRunning: true,
+        healing,
       })
     }
 
     await initializeTradeEngineAutoStart()
+    const healing = await runTradeEngineHealingSweep(true)
 
     await SystemLogger.logTradeEngine("Trade engine auto-start manually triggered", "info")
 
     return NextResponse.json({
       success: true,
       message: "Trade engine auto-start initialized successfully",
+      healing,
     })
   } catch (error) {
     console.error("[v0] Failed to manually start trade engine auto-start:", error)

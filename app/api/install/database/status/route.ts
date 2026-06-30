@@ -28,9 +28,9 @@ export async function GET() {
       database_type: "redis",
       table_count: keyCount,
       migrations: {
-        current_version: migrationStatus.latestVersion,
-        applied: migrationStatus.latestVersion,
-        pending: 0,
+        current_version: migrationStatus.currentVersion,
+        applied: migrationStatus.currentVersion,
+        pending: migrationStatus.pendingMigrations?.length ?? Math.max(0, migrationStatus.latestVersion - migrationStatus.currentVersion),
       },
       database_stats: {
         connected: true,
