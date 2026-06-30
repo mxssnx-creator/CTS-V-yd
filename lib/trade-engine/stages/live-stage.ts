@@ -1437,11 +1437,11 @@ async function placeProtectionOrder(
 async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
   if (!connector || typeof connector.getOpenOrders !== "function") return null
   try {
-    // 10 s upper bound — production increased from 5s to handle exchange network
-    // latency. On timeout we degrade gracefully to drift-only reconciliation.
+    // 20 s upper bound — production timeout for real exchange network latency.
+    // On timeout we degrade gracefully to drift-only reconciliation.
     const orders = (await withTimeout(
       connector.getOpenOrders() as Promise<any>,
-      10000,
+      20000,
       "getOpenOrders(reconcile-tick)",
     )) as any[] | undefined
     if (!Array.isArray(orders)) return null
@@ -1723,7 +1723,7 @@ async function updateProtectionOrders(
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
 
-  // ── System-close-only mode (cached) ────────────────────────────────
+  // ── System-close-only mode (cached) ────────────────────────────��───
   // Reconcile fans out across every live position on every tick, so
   // calling `getAppSettings()` here would issue one HGETALL per
   // position per tick — at 50 positions × 1 Hz that's 50 round-trips
