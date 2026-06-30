@@ -86,7 +86,7 @@ export function ConnectionCard({
   const [showStrategyDialog, setShowStrategyDialog] = useState(false)
   const [showActivateTradeDialog, setShowActivateTradeDialog] = useState(false)
   const [presetConfig, setPresetConfig] = useState({
-    volumeFactor: 1.0,
+    volumeFactor: 0.1,
     profitFactorMin: 0.6,
     maxDrawdownTime: 12,
     trailingEnabled: true,
@@ -96,9 +96,9 @@ export function ConnectionCard({
   const [connectionInfo, setConnectionInfo] = useState({
     marginMode: "cross",
     positionType: "single",
-    baseVolumeFactor: 1.0,
-    liveTradeVolumeFactor: 1.0,
-    presetTradeVolumeFactor: 1.0,
+    baseVolumeFactor: 0.1,
+    liveTradeVolumeFactor: 0.1,
+    presetTradeVolumeFactor: 0.1,
     profitFactorBase: 0.6,
     profitFactorMain: 0.6,
     profitFactorReal: 0.6,
@@ -116,8 +116,8 @@ export function ConnectionCard({
   const [availablePresetTypes, setAvailablePresetTypes] = useState<PresetType[]>([])
   const [engineStatus, setEngineStatus] = useState<any>(null)
   const [testingProgress, setTestingProgress] = useState(0)
-  const [volumeFactorLive, setVolumeFactorLive] = useState(1.0)
-  const [volumeFactorPreset, setVolumeFactorPreset] = useState(1.0)
+  const [volumeFactorLive, setVolumeFactorLive] = useState(0.1)
+  const [volumeFactorPreset, setVolumeFactorPreset] = useState(0.1)
 
   // Added state for strategy configuration
   const [activeIndications, setActiveIndications] = useState<ActiveIndicationConfig>({
@@ -234,9 +234,9 @@ export function ConnectionCard({
           setConnectionInfo({
             marginMode: data.marginMode || "cross",
             positionType: data.hedgingMode || "single",
-            baseVolumeFactor: 1.0,
-            liveTradeVolumeFactor: data.liveTradeVolumeFactor || 1.0,
-            presetTradeVolumeFactor: data.presetTradeVolumeFactor || 1.0,
+            baseVolumeFactor: 0.1,
+            liveTradeVolumeFactor: data.liveTradeVolumeFactor || 0.1,
+            presetTradeVolumeFactor: data.presetTradeVolumeFactor || 0.1,
             profitFactorBase: data.profitFactorBase || 0.7,
             profitFactorMain: data.profitFactorMain || 0.8,
             profitFactorReal: data.profitFactorReal || 0.9,
@@ -266,7 +266,7 @@ export function ConnectionCard({
         if (response.ok) {
           const data = await response.json()
           setPresetConfig({
-            volumeFactor: data.volume_factor || 1.0,
+            volumeFactor: data.volume_factor || 0.1,
             profitFactorMin: data.profit_factor_min || 0.6,
             maxDrawdownTime: data.max_drawdown_time || 12,
             trailingEnabled: data.trailing_enabled !== false,
@@ -288,8 +288,8 @@ export function ConnectionCard({
         const response = await fetch(`/api/settings/connections/${connection.id}/settings`)
         if (response.ok) {
           const settings = await response.json()
-          setVolumeFactorLive(settings.baseVolumeFactorLive || 1.0)
-          setVolumeFactorPreset(settings.baseVolumeFactorPreset || 1.0)
+          setVolumeFactorLive(settings.baseVolumeFactorLive || 0.1)
+          setVolumeFactorPreset(settings.baseVolumeFactorPreset || 0.1)
         }
       } catch { /* non-critical */ }
     }

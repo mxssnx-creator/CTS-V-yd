@@ -542,7 +542,7 @@ function getDefaultConnections(): Connection[] {
 function getDefaultSettings(): Settings {
   return {
     // Overall / Main
-    base_volume_factor: 1.0,
+    base_volume_factor: 0.1,
     volume_step_ratio: 0.6,
     // Default raised 50 → 300 so volume math divides by 300 by
     // default — see components/settings/utils.ts for the rationale.
