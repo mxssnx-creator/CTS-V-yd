@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server"
+import { initRedis, getRedisClient, isRedisConnected, getRedisBackend } from "@/lib/redis-db"
 import { initRedis, getRedisClient, isRedisConnected, getConnectionCountDiagnostics } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
@@ -18,6 +19,7 @@ export async function GET() {
       isInstalled: connected && connectionCount > 0,
       databaseType: "redis",
       databaseConnected: connected,
+      redisBackend: getRedisBackend(),
       tablesExist: connectionCount > 0,
       tableCount: connectionCount,
       connection_hash_count: connectionCounts.connection_hash_count,
