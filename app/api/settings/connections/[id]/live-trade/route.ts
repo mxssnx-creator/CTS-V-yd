@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { initRedis, getConnection, updateConnection, persistNow, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getConnection, updateConnection, persistNow, getRedisClient, setSettings } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
@@ -138,7 +138,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     })
 
     const coordinator = getGlobalTradeEngineCoordinator()
-    let engineStatus: "running" | "starting" | "stopped" | "error" = "stopped"
+    let engineStatus: "running" | "starting" | "queued" | "stopped" | "error" = "stopped"
     let engineStartedNow = false
 
     if (isLiveTrade) {
@@ -179,7 +179,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engineStartedNow = started
             console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
           } else {
-            await getRedisClient().hset("engine_coordinator:refresh_requested", {
+            await setSettings("engine_coordinator:refresh_requested", {
               timestamp: new Date().toISOString(),
               connectionId,
               action: "start",
@@ -191,7 +191,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               exchange: connection.exchange,
               hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
             })
-            engineStatus = "starting"
+            engineStatus = "queued"
             engineStartedNow = false
             console.log(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
           }

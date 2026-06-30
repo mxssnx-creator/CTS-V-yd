@@ -24,6 +24,7 @@ describe("requested regression guardrails", () => {
     expect(placeOrder).toContain('`${symbolKey}:${direction}:placed`')
     expect(placeOrder).toContain('`${symbolKey}:${direction}:filled`')
     expect(placeOrder).not.toContain('JSON.stringify(existing)')
+    expect(placeOrder).not.toContain("symbol,\n          side,")
     expect(liveOrdersTest).toContain('getLiveOrderSafetyFailure(body)')
     expect(liveOrdersTest).toContain('mode: "blocked_live_order_safety"')
   })
@@ -85,6 +86,14 @@ describe("requested regression guardrails", () => {
     expect(intentBlock).toContain('desired_status: "running"')
     expect(intentBlock).toContain('operator_intent: "running"')
     expect(intentBlock).toContain('mode: hasCredentials ? "live" : "live_requested"')
+  })
+
+  test("live-trade queued starts use settings namespace consumed by coordinator", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+
+    expect(source).toContain('setSettings("engine_coordinator:refresh_requested"')
+    expect(source).not.toContain('hset("engine_coordinator:refresh_requested"')
+    expect(source).toContain('engineStatus = "queued"')
   })
 
   test("live-trade enable preserves requested state when credentials are missing", () => {
