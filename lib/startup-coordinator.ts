@@ -221,6 +221,25 @@ export async function completeStartup() {
     const coordinator = getGlobalTradeEngineCoordinator()
     console.log(`[v0] [Startup] ✓ Engine coordinator initialized (ready for manual start)\n`)
 
+    // Step 6b: Initialize global trade engine status so coordinator watchdog and
+    // auto-start monitor have a valid state to check. AUTO-START is disabled
+    // (status="running" does NOT auto-start engines), but the coordinator needs
+    // this to be set so it can perform background maintenance tasks and enable
+    // the monitor to synchronize enabled connections when the operator manually
+    // starts the engine via the dashboard or API.
+    console.log(`[v0] [Startup] Initializing global trade engine status...`)
+    try {
+      const client = getRedisClient()
+      await client.hset("trade_engine:global", {
+        status: "running",
+        initialized_at: String(Date.now()),
+        process_version: "1.0",
+      })
+      console.log(`[v0] [Startup] ✓ Global trade engine status initialized\n`)
+    } catch (err) {
+      console.warn(`[v0] [Startup] ⚠ Failed to initialize global trade engine status (non-fatal):`, err)
+    }
+
     // Step 7: Clean up orphaned progress flags from incomplete shutdowns
     console.log(`[v0] [Startup] Step 7/8: Cleaning up orphaned engine state...`)
     await cleanupOrphanedProgress()
