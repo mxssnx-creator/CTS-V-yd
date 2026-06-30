@@ -1,3 +1,5 @@
+import { readEnvByAliases } from "@/lib/env-credentials"
+
 export type BaseConnectionId = "bingx-x01" | "bybit-x03" | "pionex-x01" | "orangex-x01"
 
 export type BaseConnectionCredentials = {
@@ -24,20 +26,11 @@ const ENV_ALIASES: Record<BaseConnectionId, { key: string[]; secret: string[] }>
   },
 }
 
-function readFirstEnv(names: string[]): string {
-  if (typeof process === "undefined") return ""
-  for (const name of names) {
-    const value = process.env[name]?.trim()
-    if (value) return value
-  }
-  return ""
-}
-
 export function getBaseConnectionCredentials(id: BaseConnectionId): BaseConnectionCredentials {
   const aliases = ENV_ALIASES[id]
   return {
-    apiKey: readFirstEnv(aliases.key),
-    apiSecret: readFirstEnv(aliases.secret),
+    apiKey: readEnvByAliases(aliases.key),
+    apiSecret: readEnvByAliases(aliases.secret),
   }
 }
 
