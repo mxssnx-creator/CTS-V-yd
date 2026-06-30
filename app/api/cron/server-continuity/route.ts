@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
-import { initializeTradeEngineAutoStart, runTradeEngineHealingSweep } from "@/lib/trade-engine-auto-start"
 import { runTradeEngineHealingSweep } from "@/lib/trade-engine-auto-start"
 import { startServerContinuityRunner } from "@/lib/server-continuity-runner"
 
