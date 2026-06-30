@@ -2123,7 +2123,11 @@ export class TradeEngineManager {
             }
           }
         }
-        void pipelineStrategiesEvaluated; void pipelineLiveReady; void pipelinePseudoUpdates
+        // These are used in the Redis write block below to gate strategy/live counters.
+        // Previously they were voided (counter writes were in unreachable strategy processor code).
+        const stratEvaluatedThisCycle = pipelineStrategiesEvaluated
+        const liveReadyThisCycle = pipelineLiveReady
+        void pipelinePseudoUpdates
 
         const totalIndications = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
         // producedIndications = totalIndications > 0
@@ -2244,6 +2248,25 @@ export class TradeEngineManager {
               writes.push(client.hincrby(redisKey, `indications_${type}_count`, count))
             }
             writes.push(client.hincrby(redisKey, "indications_count", totalIndications))
+          }
+          // ── Strategy + live-ready counters (three-progression refactor) ──────
+          // The standalone startStrategyProcessor loop is now a heartbeat-only
+          // no-op (returns early after arming its timer). All strategy work runs
+          // inside this realtime pipeline. Write the counters here where the work
+          // actually happens, using the pipeline-aggregated values.
+          //   strategy_cycle_count       — every realtime cycle (mirrors indication cadence)
+          //   strategy_live_cycle_count  — only cycles where ≥1 strategy was evaluated
+          //   strategies_count           — cumulative real-stage set count
+          //   realtime_live_cycle_count  — only cycles that produced ≥1 live-ready set
+          //   strategies_live_ready      — current-cycle live-ready count (hset overwrites)
+          writes.push(client.hincrby(redisKey, "strategy_cycle_count", 1))
+          if (stratEvaluatedThisCycle > 0) {
+            writes.push(client.hincrby(redisKey, "strategy_live_cycle_count", 1))
+            writes.push(client.hincrby(redisKey, "strategies_count", stratEvaluatedThisCycle))
+          }
+          if (liveReadyThisCycle > 0) {
+            writes.push(client.hincrby(redisKey, "realtime_live_cycle_count", 1))
+            writes.push(client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle)))
           }
           // ── Per-symbol error counters are now written inline inside each
           // task's .catch() handler (see withCycleDeadline call above).

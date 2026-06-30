@@ -819,19 +819,20 @@ export async function GET(
     // by a few seconds. These scan-derived values are the authoritative
     // "right now" view for the coordination UI.
     const liveOpenScanned = livePositionSetRelations.length
-    
-    // positionsOpen in the realtime block = the canonical LIVE exchange positions
-    // that are currently open (scan-derived, authoritative). Pseudo and real-stage
-    // positions are pipeline evaluation rows — not real exchange exposure — and
-    // should not inflate this count. They are separately accessible via the
-    // openPositions breakdown (pseudo, real, live branches).
-    // Exception: before live_trading starts (no live positions yet), fall back to
-    // pseudo so the tile shows meaningful progress.
+
+    // positionsOpen = authoritative open count from atomic counters.
+    // The live:positions:{connId} list scan (liveOpenScanned) is used only for
+    // the per-position detail rows and set-key relations. Using it as the count
+    // causes inflation: the list accumulates all positions since boot (lrem on
+    // close is best-effort) and many remain in non-closed status even after
+    // the exchange position closes (simulated connector never sets price to trigger
+    // TP/SL). Counter arithmetic from hincrby writes is exact and race-free.
     const phaseCurrent = String(progHash.phase || es.phase || "").toLowerCase()
-    positionsOpen = liveOpenScanned > 0
-      ? liveOpenScanned
+    const liveCounterOpen = Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count))
+    positionsOpen = liveCounterOpen > 0
+      ? liveCounterOpen
       : phaseCurrent === "live_trading"
-        ? Math.max(0, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count))
+        ? 0
         : pseudoOpen + realOpen
     const liveResolvedViaPseudo = livePositionSetRelations.filter(
       (p) => p.resolution === "pseudo",
