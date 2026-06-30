@@ -3105,6 +3105,33 @@ export async function executeLivePosition(
       livePosition.status = "rejected"
       livePosition.statusReason = String(reason)
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      
+      // ── 101400 Minimum Order Amount Error Correction ────────────────────
+      // When BingX rejects with code=101400, extract the minimum from the
+      // error message and save it to Redis. Next cycle's volume calculator
+      // will respect this minimum, eliminating repeated 101400 errors.
+      if (isMinOrderSizeError(reason)) {
+        const minQty = extractMinOrderQty(reason)
+        if (minQty && minQty > 0) {
+          try {
+            const { setSettings } = await import("@/lib/redis-db")
+            await setSettings(`trading_pair:${realPosition.symbol}`, {
+              min_order_size: minQty,
+              updated_at: new Date().toISOString(),
+              source: "101400_error_extraction",
+            })
+            console.warn(
+              `${LOG_PREFIX} [101400 Correction] Saved min_order_size=${minQty} for ${realPosition.symbol} (was ${computedVolume})`,
+            )
+          } catch (err) {
+            console.warn(
+              `${LOG_PREFIX} [101400 Correction] Failed to save min_order_size:`,
+              err instanceof Error ? err.message : String(err),
+            )
+          }
+        }
+      }
+      
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
       await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "failed")
