@@ -281,7 +281,7 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
     expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
     expect(source).toContain("Active Real/Live-position Block handling belongs to REAL")
-    expect(source).toContain("buildActivePositionBlockOverlaysForReal")
+    expect(source).toContain("buildActiveRealBlockOverlaysForReal")
     expect(source).toContain("blockActiveRealEnabled && !this._coordinationSettings.blockActiveLiveEnabled")
     expect(source).toContain("setKey: `${source.setKey}#block:active:${boundedCount}`")
     expect(source).toContain("variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6))")
