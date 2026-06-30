@@ -14,6 +14,7 @@ import {
   getAllConnections,
   getRedisClient,
   setSettings,
+  cleanupVolatileRuntimeState,
 } from "@/lib/redis-db"
 import { validateDatabase } from "@/lib/database-validator"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
@@ -177,7 +178,10 @@ export async function completeStartup() {
     // Step 1: Initialize Redis
     console.log(`[v0] [Startup] Step 1/8: Initializing Redis...`)
     await initRedis()
-    console.log(`[v0] [Startup] ✓ Redis initialized\n`)
+    console.log(`[v0] [Startup] ✓ Redis initialized`)
+    const volatileCleanupMode = process.env.NODE_ENV === "production" ? "production" : "development"
+    const volatileCleanup = await cleanupVolatileRuntimeState({ mode: volatileCleanupMode, reason: "completeStartup" })
+    console.log(`[v0] [Startup] ✓ Volatile runtime cleanup complete (deleted ${volatileCleanup.deleted}, preserved ${volatileCleanup.preserved})\n`)
 
     // Step 2: Skip — migrations already ran inside initRedis() above.
     // Keeping the sequential step numbering for log consistency.
