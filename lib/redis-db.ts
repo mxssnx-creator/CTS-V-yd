@@ -1798,7 +1798,14 @@ function createRedisInstance(): RedisClientLike {
     return new UpstashRestRedisClient(restUrl, restToken)
   }
   if (isProductionEnvironment() && !hasSharedRedisConfig()) {
-    throw new Error("Production Redis configuration missing: set REDIS_URL, KV_URL, or Upstash REST env vars for shared Redis")
+    const strict = process.env.STRICT_REDIS_REQUIRED === "1" || process.env.REQUIRE_SHARED_REDIS === "1"
+    if (strict) {
+      throw new Error("Production Redis configuration missing: set REDIS_URL, KV_URL, or Upstash REST env vars for shared Redis")
+    }
+    console.warn(
+      "[v0] [Redis] Production Redis configuration missing; falling back to InlineLocalRedis. " +
+        "Set REDIS_URL/KV_URL/Upstash env vars for shared durable storage, or STRICT_REDIS_REQUIRED=1 to fail fast.",
+    )
   }
   globalForRedis.__redis_backend = "inline-local"
   return new InlineLocalRedis()
