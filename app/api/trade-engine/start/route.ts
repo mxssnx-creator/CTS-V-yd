@@ -124,6 +124,8 @@ export async function POST(request: NextRequest) {
     // engines, even though the operator just pressed Start.
     await client.hset("trade_engine:global", { 
       status: "running", 
+      desired_status: "running",
+      operator_intent: "running",
       started_at: new Date().toISOString(),
       coordinator_ready: "true",
       operator_stopped: "0",

@@ -2220,6 +2220,12 @@ export class TradeEngineManager {
               last_processor_heartbeat: String(nowMs),
               last_indication_run: nowIso,
             }),
+            client.hset("trade_engine:global", {
+              actual_status: "running",
+              active_worker_id: `${process.pid}:${this.connectionId}`,
+              last_heartbeat_at: String(nowMs),
+              last_heartbeat_iso: nowIso,
+            }),
           ]
           // Gate expire to every 500 cycles — TTL is 7 days so resetting
           // it every tick wastes one Redis round-trip per cycle (~20/s).

@@ -100,6 +100,11 @@ export async function POST(request: NextRequest) {
       // engines the operator just stopped.
       await client.hset("trade_engine:global", { 
         status: "stopped", 
+        desired_status: "stopped",
+        operator_intent: "stopped",
+        actual_status: "stopped",
+        active_worker_id: "",
+        last_heartbeat_at: "",
         stopped_at: new Date().toISOString(),
         coordinator_ready: "false",
         operator_stopped: "1",

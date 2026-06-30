@@ -399,7 +399,7 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("distributedEngineCount")
     expect(source).toContain("no local manager or fresh distributed processor heartbeat is attached")
     expect(source).toContain("ENABLE_TRADE_ENGINE_AUTOSTART=1")
-    expect(source).toContain("operatorStatus: engineHash.status || \"stopped\"")
+    expect(source).toContain("operatorStatus: operatorIntent")
     expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
   })
 
@@ -441,4 +441,23 @@ describe("requested regression guardrails", () => {
     expect(scrollArea).toContain("viewportRef?: React.Ref<HTMLDivElement>")
     expect(scrollArea).toContain("ref={viewportRef}")
   })
+  test("startup intent without worker heartbeat reports degraded/not running", () => {
+    const startup = read("lib/startup-coordinator.ts")
+    const statusRoute = read("app/api/trade-engine/status/route.ts")
+
+    const bootBlock = startup.slice(
+      startup.indexOf("Initializing global trade engine boot metadata"),
+      startup.indexOf("Step 7/8", startup.indexOf("Initializing global trade engine boot metadata")),
+    )
+
+    expect(bootBlock).toContain('desired_status: "running"')
+    expect(bootBlock).toContain('operator_intent: "running"')
+    expect(bootBlock).toContain('actual_status: "stopped"')
+    expect(bootBlock).not.toMatch(/^\s*status: "running"/m)
+
+    expect(statusRoute).toContain("const effectivelyRunning = isGloballyRunning && !isGloballyPaused && (hasRuntimeProof || distributedEngineCount > 0)")
+    expect(statusRoute).toContain('actualStatus: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "degraded")')
+    expect(statusRoute).toContain("last_heartbeat_at")
+  })
+
 })
