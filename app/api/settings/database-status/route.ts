@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient, isRedisConnected, getAllConnections } from "@/lib/redis-db"
 import { initRedis, getRedisClient, isRedisConnected, getConnectionCountDiagnostics } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
@@ -15,7 +14,6 @@ export async function GET() {
     let schemaVersion = "0"
     
     if (connected) {
-      connectionCount = (await getAllConnections()).length
       connectionCounts = await getConnectionCountDiagnostics()
       connectionCount = connectionCounts.connection_hash_count
       schemaVersion = (await client.get("_schema_version") || "0") as string

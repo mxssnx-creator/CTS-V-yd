@@ -95,7 +95,9 @@ const PHASE_LABELS: Record<string, string> = {
   unknown: "Starting Up",
 }
 
-const toBoolean = (value: unknown): boolean => value === true || value === "1" || value === "true"
+const toBoolean = (value: unknown): boolean => value === true || value === 1 || value === "1" || value === "true" || value === "yes" || value === "on"
+const liveTradeUiFlag = (details: any): boolean =>
+  toBoolean(details?.live_trade_requested) || toBoolean(details?.is_live_trade)
 
 interface ActiveConnectionCardProps {
   connection: ActiveConnection & { details?: Connection }
@@ -140,7 +142,7 @@ export function ActiveConnectionCard({
   const toInitBool = (v: unknown) =>
     v === true || v === 1 || v === "1" || v === "true"
   const [liveTrade, setLiveTrade] = useState(() =>
-    toInitBool((connection.details as any)?.is_live_trade)
+    liveTradeUiFlag(connection.details as any)
   )
   const [presetMode, setPresetMode] = useState(() =>
     toInitBool((connection.details as any)?.is_preset_trade)
@@ -292,7 +294,7 @@ export function ActiveConnectionCard({
   // Sync local toggle states and volume factors from connection details
   useEffect(() => {
     if (details) {
-      setLiveTrade(toBoolean(details.is_live_trade))
+      setLiveTrade(liveTradeUiFlag(details))
       setPresetMode(toBoolean(details.is_preset_trade))
       setLiveVolumeFactor(Number(details.live_volume_factor) || 1.0)
       setPresetVolumeFactor(Number(details.preset_volume_factor) || 1.0)
@@ -852,11 +854,17 @@ export function ActiveConnectionCard({
       const data = await res.json().catch(() => ({ error: "Failed to parse response" }))
 
       if (res.ok && data.success) {
-        setLiveTrade(newState)
-        toast.success(newState ? `Live Trading starting on ${connName}...` : `Live Trading stopped on ${connName}`)
+        const requestedState = typeof data.live_trade_requested === "boolean" ? data.live_trade_requested : newState
+        const effectiveState = typeof data.is_live_trade === "boolean" ? data.is_live_trade : requestedState
+        setLiveTrade(requestedState)
+        toast.success(
+          requestedState
+            ? (effectiveState ? `Live Trading starting on ${connName}...` : `Live Trading requested on ${connName}; waiting for valid credentials`)
+            : `Live Trading stopped on ${connName}`,
+        )
         if (typeof window !== "undefined") {
           window.dispatchEvent(new CustomEvent("live-trade-toggled", {
-            detail: { connectionId: connection.connectionId, newState }
+            detail: { connectionId: connection.connectionId, newState: requestedState, effectiveState }
           }))
         }
       } else {

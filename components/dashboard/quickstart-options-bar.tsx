@@ -94,6 +94,8 @@ interface ProfitFactorMin {
   real: number
   live: number
 }
+const toBooleanFlag = (value: unknown): boolean =>
+  value === true || value === 1 || value === "1" || value === "true" || value === "yes" || value === "on"
 const DEFAULT_PF_MIN: ProfitFactorMin = {
   base: 0.9,
   main: 0.9,
@@ -273,11 +275,9 @@ export function QuickstartOptionsBar() {
         // (e.g. because API credentials aren't configured yet).  This way the
         // switch correctly shows "ON" after a page reload when the user had
         // previously enabled Control Orders.
-        const liveRequested = conn.live_trade_requested
-        const liveEffective = conn.is_live_trade === "1" || conn.is_live_trade === true || conn.is_live_trade === 1
-        setControlOrders(
-          typeof liveRequested === "boolean" ? liveRequested : liveEffective,
-        )
+        const liveRequested = toBooleanFlag(conn.live_trade_requested)
+        const liveEffective = toBooleanFlag(conn.is_live_trade)
+        setControlOrders(liveRequested || liveEffective)
 
         // Profit-factor min — fall through both the new namespaced
         // location and a legacy flat one in case older settings drafts
