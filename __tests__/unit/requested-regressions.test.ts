@@ -88,6 +88,14 @@ describe("requested regression guardrails", () => {
     expect(intentBlock).toContain('mode: hasCredentials ? "live" : "live_requested"')
   })
 
+  test("live-trade queued starts use settings namespace consumed by coordinator", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+
+    expect(source).toContain('setSettings("engine_coordinator:refresh_requested"')
+    expect(source).not.toContain('hset("engine_coordinator:refresh_requested"')
+    expect(source).toContain('engineStatus = "queued"')
+  })
+
   test("live-trade enable preserves requested state when credentials are missing", () => {
     const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
 
