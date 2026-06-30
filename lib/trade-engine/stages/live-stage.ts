@@ -3097,9 +3097,6 @@ export async function executeLivePosition(
     // errors operators saw: fake local positions, repeated protection-order
     // failures, and confusing "position not exist" exchange responses.
     let entryOrderId = orderResult?.orderId || orderResult?.id
-    console.log(
-      `${LOG_PREFIX} [Order Check] success=${orderResult?.success}, orderId=${entryOrderId}, error=${orderResult?.error}`,
-    )
     if (!orderResult?.success || !entryOrderId) {
       const reason =
         orderResult?.error ||
@@ -3111,9 +3108,6 @@ export async function executeLivePosition(
       // message and retry IMMEDIATELY with corrected volume in THIS cycle.
       // This prevents wasting cycles on repeated sub-minimum rejections.
       let retryWasAttempted = false
-      console.log(
-        `${LOG_PREFIX} [101400 Debug] isMinOrderSizeError=${isMinOrderSizeError(reason)}, placeAttempt=${placeAttempt}, reason="${reason}"`,
-      )
       if (isMinOrderSizeError(reason) && placeAttempt < 3) {
         const minQty = extractMinOrderQty(reason)
         if (minQty && minQty > 0 && minQty > computedVolume) {
@@ -3133,9 +3127,6 @@ export async function executeLivePosition(
             )
             
             // Retry immediately with corrected quantity
-            console.log(
-              `${LOG_PREFIX} [101400 Retry] Calling placeOrder with corrected qty=${minQty.toFixed(8)} for ${realPosition.symbol}`,
-            )
             const retryOrderResult = await exchangeConnector.placeOrder(
               realPosition.symbol,
               exchangeSide,
@@ -3145,11 +3136,6 @@ export async function executeLivePosition(
               {
                 positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
               },
-            )
-            
-            console.log(
-              `${LOG_PREFIX} [101400 Retry] Result:`,
-              retryOrderResult ? `success=${retryOrderResult.success}, orderId=${retryOrderResult?.orderId || retryOrderResult?.id}, error=${retryOrderResult?.error}` : "null",
             )
             
             if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {
