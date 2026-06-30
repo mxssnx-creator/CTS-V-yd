@@ -1,5 +1,26 @@
-import fs from "node:fs"
-import path from "node:path"
+type MinimalFs = {
+  existsSync: (path: string) => boolean
+  readFileSync: (path: string, encoding: "utf8") => string
+}
+
+function loadFs(): MinimalFs | null {
+  if (typeof window !== "undefined") return null
+  try {
+    // Avoid a static `fs` import because base credential helpers are imported by
+    // some client-bundled settings/predefinition modules. Server code can still
+    // read local dotenv files during `next start`; browser bundles get a safe
+    // no-file fallback and rely only on inlined process.env values.
+    const req = eval("require") as (id: string) => MinimalFs
+    return req("node:fs")
+  } catch {
+    return null
+  }
+}
+
+function cwdFile(name: string): string {
+  const cwd = typeof process !== "undefined" && typeof process.cwd === "function" ? process.cwd() : ""
+  return `${cwd.replace(/\/$/, "")}/${name}`
+}
 
 const BINGX_KEY_ALIASES = ["BINGX_API_KEY", "BINGX_APIKEY", "NEXT_BINGX_API_KEY", "NEXT_PUBLIC_BINGX_API_KEY"]
 const BINGX_SECRET_ALIASES = ["BINGX_API_SECRET", "BINGX_SECRET", "NEXT_BINGX_API_SECRET", "NEXT_PUBLIC_BINGX_API_SECRET"]
@@ -19,9 +40,21 @@ function parseDotenvLine(line: string): [string, string] | null {
 function loadDotenvFallback(): Record<string, string> {
   if (parsedDotenv) return parsedDotenv
 
+  const fs = loadFs()
+  if (!fs) {
+    parsedDotenv = {}
+    return parsedDotenv
+  }
+
   const files = [
-    path.join(process.cwd(), ".env.local"),
-    path.join(process.cwd(), ".env"),
+    // Match the files operators actually use with `next dev` and
+    // local `next start`/production smoke tests. Values earlier in this
+    // list win, while real process.env still wins over every file below.
+    cwdFile(`.env.${process.env.NODE_ENV || "development"}.local`),
+    cwdFile(".env.local"),
+    cwdFile(".env.production.local"),
+    cwdFile(".env.development.local"),
+    cwdFile(".env"),
   ]
 
   const loaded: Record<string, string> = {}

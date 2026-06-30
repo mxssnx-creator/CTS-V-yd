@@ -77,7 +77,14 @@ export async function GET(
     // the first manual toggle.
     const flagEnabled = toBoolean((connection as any).is_enabled_dashboard)
                      || toBoolean((connection as any).is_active_inserted)
-    const flagLive    = toBoolean((connection as any).is_live_trade)
+    // UI sliders represent the operator's requested state, not only the
+    // immediately executable/effective flag. When credentials are missing the
+    // live-trade endpoint preserves `live_trade_requested=1` while keeping
+    // `is_live_trade=0`; if this endpoint reports only the effective flag, the
+    // slider flips itself back off on the next poll and looks unstable.
+    const liveEffective = toBoolean((connection as any).is_live_trade)
+    const liveRequested = toBoolean((connection as any).live_trade_requested)
+    const flagLive    = liveRequested || liveEffective
     const flagPreset  = toBoolean((connection as any).is_preset_trade)
 
     // Correct semantics now that Live/Preset are mode flags on a single engine
@@ -95,13 +102,15 @@ export async function GET(
       running: engineRunning,
       inSync: flag === engineRunning,
     })
-    const buildModeState = (flag: boolean) => ({
+    const buildModeState = (flag: boolean, effective = flag) => ({
       flag,
+      effective,
       // "running" for mode flags = "engine is up and will pick up this flag"
       running: engineRunning,
-      // Mode flag is in sync whenever it is OFF, or when it is ON and the
-      // engine is actually running to service it.
-      inSync: flag ? engineRunning : true,
+      // Requested-but-blocked live trade is still a stable requested UI state;
+      // surface effective=false so the UI can explain it without reverting the
+      // switch. Only require a running engine once the mode is actually active.
+      inSync: !flag || !effective || engineRunning,
     })
 
     return NextResponse.json(
@@ -111,7 +120,7 @@ export async function GET(
         engineRunning,
         runningHint,
         enabled: buildEnableState(flagEnabled),
-        live: buildModeState(flagLive),
+        live: buildModeState(flagLive, liveEffective),
         preset: buildModeState(flagPreset),
         timestamp: new Date().toISOString(),
       },

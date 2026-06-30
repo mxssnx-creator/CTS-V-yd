@@ -119,6 +119,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     if (isLiveTrade) {
       await getRedisClient().hset("trade_engine:global", {
         status: "running",
+        desired_status: "running",
+        operator_intent: "running",
         mode: hasCredentials ? "live" : "live_requested",
         updated_at: new Date().toISOString(),
       }).catch((stateErr: unknown) => {
