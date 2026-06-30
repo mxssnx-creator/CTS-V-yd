@@ -23,9 +23,9 @@ export async function GET() {
       connection_hash_count: connectionCounts.connection_hash_count,
       legacy_connection_set_count: connectionCounts.legacy_connection_set_count,
       migrations: {
-        current_version: migrationStatus.latestVersion,
-        applied: migrationStatus.latestVersion,
-        pending: 0,
+        current_version: migrationStatus.currentVersion,
+        applied: migrationStatus.currentVersion,
+        pending: migrationStatus.pendingMigrations?.length ?? Math.max(0, migrationStatus.latestVersion - migrationStatus.currentVersion),
       },
       database_stats: {
         connected: true,

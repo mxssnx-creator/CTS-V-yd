@@ -80,6 +80,68 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
   }
 }
 
+/**
+ * Execute one auto-start/healing sweep immediately.
+ *
+ * This is exported for production cron/serverless paths where delayed
+ * setTimeout/setInterval callbacks are not durable after the HTTP response
+ * returns. Long-lived dev/Node processes still call this from the monitor
+ * interval below, but cron callers must await this function directly so both
+ * modes perform the same real work before reporting success.
+ */
+export async function runTradeEngineHealingSweep(isStartup: boolean): Promise<{ startedCount: number; eligibleCount: number; skipped?: string }> {
+  try {
+    await initRedis()
+    const monClient = getRedisClient()
+    const monGlobalState = (await monClient.hgetall("trade_engine:global")) as Record<string, string> | null
+
+    const currentStatus = monGlobalState?.status || ""
+    const isPaused = currentStatus === "paused"
+
+    if (isPaused) {
+      if (isStartup) {
+        console.log(
+          "[v0] [AutoStart] Startup sweep skipped: global coordinator is paused. " +
+            "Engine will resume when coordinator is resumed.",
+        )
+      }
+      return { startedCount: 0, eligibleCount: 0, skipped: "paused" }
+    }
+
+    if (currentStatus !== "running") {
+      if (isStartup) {
+        console.log(
+          `[v0] [AutoStart] Startup sweep skipped: global engine not running (status="${currentStatus || "empty"}"). ` +
+            "Engine will start only when operator clicks Start.",
+        )
+      }
+      return { startedCount: 0, eligibleCount: 0, skipped: currentStatus || "not_running" }
+    }
+
+    const connections = await getAllConnections()
+    if (!Array.isArray(connections)) {
+      console.warn("[v0] [AutoStart] Connections not array, skipping sweep")
+      return { startedCount: 0, eligibleCount: 0, skipped: "connections_not_array" }
+    }
+
+    const connectionsThatShouldBeRunning = connections.filter((c) => isConnectionEligibleForEngine(c))
+
+    // Settings load is best-effort; engines consult Redis on each tick.
+    try { await loadSettingsAsync() } catch { /* non-critical */ }
+
+    const coordinator = getGlobalTradeEngineCoordinator()
+    const startedCount = await coordinator.startMissingEngines(connectionsThatShouldBeRunning)
+    if (startedCount > 0 || isStartup) {
+      console.log(
+        `[v0] [AutoStart] Healing sweep: ${startedCount} engines started ` +
+          `(${connectionsThatShouldBeRunning.length} connections eligible)`,
+      )
+    }
+    return { startedCount, eligibleCount: connectionsThatShouldBeRunning.length }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("Redis credentials")) {
+      console.warn("[v0] [AutoStart] Redis not configured - skipping healing sweep")
+      return { startedCount: 0, eligibleCount: 0, skipped: "redis_not_configured" }
 
 /**
  * Execute one trade-engine self-healing sweep immediately.
@@ -276,6 +338,23 @@ export async function runTradeEngineHealingSweep({
   }
 }
 
+    console.warn(
+      "[v0] [AutoStart] Error during healing sweep:",
+      error instanceof Error ? error.message : String(error),
+    )
+    throw error
+  }
+}
+
+/**
+ * Persistent self-healing monitor.
+ *
+ * Replaces the former one-shot `setTimeout`. Runs an initial sweep
+ * 2 seconds after init (to let migrations settle) then repeats every
+ * 30 seconds. On each tick it starts any enabled connection whose engine
+ * is not currently running.
+ */
+function startConnectionMonitoring(): void {
 /**
  * Persistent self-healing monitor.
  *
@@ -293,6 +372,19 @@ function armConnectionMonitoringInterval(): void {
     return
   }
 
+  const startupDelay = setTimeout(async () => {
+    await runTradeEngineHealingSweep(true).catch(() => {})
+
+    const intervalHandle = setInterval(async () => {
+      await runTradeEngineHealingSweep(false).catch(() => {})
+    }, 30_000)
+
+    intervalHandle.unref?.()
+    autoStartTimer = intervalHandle
+  }, 2000)
+
+  startupDelay.unref?.()
+  autoStartTimer = startupDelay
   const intervalHandle = setInterval(async () => {
     await runTradeEngineHealingSweep({ isStartup: false })
   }, 30_000) // 30 seconds
