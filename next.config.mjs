@@ -33,6 +33,10 @@ const nextConfig = {
     serverActions: {
       allowedOrigins: ["*"],
     },
+    // Enable instrumentation hook for deterministic server-side boot sequence
+    // (migrations, global state initialization, orphan cleanup) on every
+    // process start. Critical for production stability.
+    instrumentationHook: true,
   },
   // Production-specific headers for performance
   async headers() {
