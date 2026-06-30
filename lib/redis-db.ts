@@ -51,9 +51,69 @@ const globalForRedis = globalThis as unknown as {
   // Next.js dev route modules (which re-evaluate and get isConnected=false) to
   // see the real connected state without re-running initRedis/migrations.
   __redis_fully_connected?: boolean
+  __redis_backend?: RedisBackend
 }
 
-export class InlineLocalRedis {
+export type RedisBackend = "inline-local" | "redis-network"
+
+export interface RedisClientLike {
+  ping(): Promise<string>
+  info(): Promise<string>
+  get(key: string): Promise<string | null>
+  mget(...keys: string[]): Promise<Array<string | null>>
+  set(key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }): Promise<string | null>
+  setex(key: string, seconds: number, value: string): Promise<void | string>
+  incr(key: string): Promise<number>
+  incrby(key: string, increment: number): Promise<number>
+  del(...keys: string[]): Promise<number>
+  flushDb(): Promise<void>
+  hset(key: string, dataOrField: Record<string, string> | string, value?: string): Promise<number>
+  hmset(...args: string[]): Promise<void>
+  hgetall(key: string): Promise<Record<string, string>>
+  hlen(key: string): Promise<number>
+  hget(key: string, field: string): Promise<string | null>
+  hdel(key: string, ...fields: string[]): Promise<number>
+  hincrby(key: string, field: string, increment: number): Promise<number>
+  hincrbyfloat(key: string, field: string, increment: number): Promise<number>
+  sadd(key: string, ...members: string[]): Promise<number>
+  scard(key: string): Promise<number>
+  smembers(key: string): Promise<string[]>
+  sismember(key: string, member: string): Promise<number>
+  srem(key: string, ...members: string[]): Promise<number>
+  expire(key: string, seconds: number): Promise<number>
+  lpush(key: string, ...values: string[]): Promise<number>
+  rpush(key: string, ...values: string[]): Promise<number>
+  lrange(key: string, start: number, stop: number): Promise<string[]>
+  ltrim(key: string, start: number, stop: number): Promise<void>
+  llen(key: string): Promise<number>
+  lrem(key: string, count: number, value: string): Promise<number>
+  lpos(key: string, value: string): Promise<number | null>
+  lpop(key: string): Promise<string | null>
+  rpop(key: string): Promise<string | null>
+  dbSize(): Promise<number>
+  keys(pattern: string): Promise<string[]>
+  zadd(key: string, score: number, member: string): Promise<number>
+  zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]>
+  zremrangebyscore(key: string, min: number | string, max: number | string): Promise<number>
+  zrange(key: string, start: number, stop: number): Promise<string[]>
+  zrevrange(key: string, start: number, stop: number): Promise<string[]>
+  zscore(key: string, member: string): Promise<string | null>
+  zcard(key: string): Promise<number>
+  exists(key: string): Promise<number>
+  ttl(key: string): Promise<number>
+  multi(): { [k: string]: any; exec: () => Promise<any[]> }
+  pipeline(): { [k: string]: any; exec: () => Promise<any[]> }
+  saveToDisk(): Promise<boolean>
+  loadFromDisk(): Promise<boolean>
+  saveToDiskSync(): boolean
+  persistNow(): Promise<boolean>
+  cleanupExpiredKeysPublic(): Promise<number>
+  trackDatabaseOperation(limit: number): Promise<{ current: number; limit: number; exceeded: boolean }>
+  getDatabaseOperationCount(): Promise<number>
+}
+
+
+export class InlineLocalRedis implements RedisClientLike {
   private data: RedisData
 
   constructor() {
@@ -1302,8 +1362,8 @@ export class InlineLocalRedis {
 
   async lpush(key: string, ...values: string[]): Promise<number> {
     const list = this.data.lists.get(key) || []
-    for (let i = values.length - 1; i >= 0; i--) {
-      list.unshift(values[i])
+    for (const value of values) {
+      list.unshift(value)
     }
     this.data.lists.set(key, list)
     return list.length
@@ -1661,7 +1721,206 @@ export class InlineLocalRedis {
   }
 }
 
-let redisInstance: InlineLocalRedis | null = null
+
+function hasSharedRedisConfig(): boolean {
+  return !!(
+    process.env.REDIS_URL ||
+    (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) ||
+    process.env.KV_URL ||
+    (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN)
+  )
+}
+
+class NodeRedisClientAdapter implements RedisClientLike {
+  private client: any | null = null
+  private connectPromise: Promise<any> | null = null
+  constructor(private readonly url: string) {}
+  private async c(): Promise<any> {
+    if (this.client?.isOpen) return this.client
+    if (!this.connectPromise) {
+      this.connectPromise = import("redis").then(async ({ createClient }) => {
+        const client = createClient({ url: this.url })
+        client.on?.("error", (err: unknown) => console.error("[v0] [Redis] network client error:", err))
+        await client.connect()
+        this.client = client
+        return client
+      }).finally(() => { this.connectPromise = null })
+    }
+    return this.connectPromise
+  }
+  async ping() { return String(await (await this.c()).ping()) }
+  async info() { return String(await (await this.c()).info()) }
+  async get(key: string) { return await (await this.c()).get(key) }
+  async mget(...keys: string[]) { return await (await this.c()).mGet(keys) }
+  async set(key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }) { return await (await this.c()).set(key, value, options as any) }
+  async setex(key: string, seconds: number, value: string) { return await (await this.c()).setEx(key, seconds, value) }
+  async incr(key: string) { return await (await this.c()).incr(key) }
+  async incrby(key: string, increment: number) { return await (await this.c()).incrBy(key, increment) }
+  async del(...keys: string[]) { return await (await this.c()).del(keys) }
+  async flushDb() { await (await this.c()).flushDb() }
+  async hset(key: string, dataOrField: Record<string, string> | string, value?: string) { return typeof dataOrField === "string" ? await (await this.c()).hSet(key, dataOrField, value ?? "") : await (await this.c()).hSet(key, dataOrField) }
+  async hmset(...args: string[]) { const [key, ...rest] = args; const obj: Record<string, string> = {}; for (let i = 0; i < rest.length; i += 2) obj[rest[i]] = rest[i + 1]; await this.hset(key, obj) }
+  async hgetall(key: string) { return await (await this.c()).hGetAll(key) }
+  async hlen(key: string) { return await (await this.c()).hLen(key) }
+  async hget(key: string, field: string) { return await (await this.c()).hGet(key, field) }
+  async hdel(key: string, ...fields: string[]) { return await (await this.c()).hDel(key, fields) }
+  async hincrby(key: string, field: string, increment: number) { return await (await this.c()).hIncrBy(key, field, increment) }
+  async hincrbyfloat(key: string, field: string, increment: number) { return await (await this.c()).hIncrByFloat(key, field, increment) }
+  async sadd(key: string, ...members: string[]) { return await (await this.c()).sAdd(key, members) }
+  async scard(key: string) { return await (await this.c()).sCard(key) }
+  async smembers(key: string) { return await (await this.c()).sMembers(key) }
+  async sismember(key: string, member: string) { return await (await this.c()).sIsMember(key, member) ? 1 : 0 }
+  async srem(key: string, ...members: string[]) { return await (await this.c()).sRem(key, members) }
+  async expire(key: string, seconds: number) { return await (await this.c()).expire(key, seconds) }
+  async lpush(key: string, ...values: string[]) { return await (await this.c()).lPush(key, values) }
+  async rpush(key: string, ...values: string[]) { return await (await this.c()).rPush(key, values) }
+  async lrange(key: string, start: number, stop: number) { return await (await this.c()).lRange(key, start, stop) }
+  async ltrim(key: string, start: number, stop: number) { await (await this.c()).lTrim(key, start, stop) }
+  async llen(key: string) { return await (await this.c()).lLen(key) }
+  async lrem(key: string, count: number, value: string) { return await (await this.c()).lRem(key, count, value) }
+  async lpos(key: string, value: string) { return await (await this.c()).lPos(key, value) }
+  async lpop(key: string) { return await (await this.c()).lPop(key) }
+  async rpop(key: string) { return await (await this.c()).rPop(key) }
+  async dbSize() { return await (await this.c()).dbSize() }
+  async keys(pattern: string) { return await (await this.c()).keys(pattern) }
+  async zadd(key: string, score: number, member: string) { return await (await this.c()).zAdd(key, { score, value: member }) }
+  async zrangebyscore(key: string, min: number | string, max: number | string) { return await (await this.c()).zRangeByScore(key, min as any, max as any) }
+  async zremrangebyscore(key: string, min: number | string, max: number | string) { return await (await this.c()).zRemRangeByScore(key, min as any, max as any) }
+  async zrange(key: string, start: number, stop: number) { return await (await this.c()).zRange(key, start, stop) }
+  async zrevrange(key: string, start: number, stop: number) { return await (await this.c()).zRange(key, start, stop, { REV: true } as any) }
+  async zscore(key: string, member: string) { const score = await (await this.c()).zScore(key, member); return score == null ? null : String(score) }
+  async zcard(key: string) { return await (await this.c()).zCard(key) }
+  async exists(key: string) { return await (await this.c()).exists(key) }
+  async ttl(key: string) { return await (await this.c()).ttl(key) }
+  async saveToDisk() { return false }
+  async loadFromDisk() { return false }
+  saveToDiskSync() { return false }
+  async persistNow() { return false }
+  async cleanupExpiredKeysPublic() { return 0 }
+  async trackDatabaseOperation(limit: number) { return { current: 0, limit, exceeded: false } }
+  async getDatabaseOperationCount() { return 0 }
+  multi() {
+    const ops: Array<{ method: string; args: any[] }> = []
+    const self = this as unknown as Record<string, any>
+    const queue = new Proxy({}, {
+      get: (_target, prop: string) => {
+        if (prop === "exec") {
+          return async () => {
+            const client = await this.c()
+            if (typeof client.multi === "function") {
+              const tx = client.multi()
+              for (const { method, args } of ops) {
+                if (typeof tx[method] === "function") tx[method](...args)
+              }
+              return tx.exec()
+            }
+            const results: any[] = []
+            for (const { method, args } of ops) results.push(await self[method]?.(...args))
+            return results
+          }
+        }
+        return (...args: any[]) => { ops.push({ method: prop, args }); return queue }
+      },
+    }) as { [k: string]: any; exec: () => Promise<any[]> }
+    return queue
+  }
+  pipeline() { return this.multi() }
+}
+
+
+class UpstashRestRedisClient implements RedisClientLike {
+  constructor(private readonly url: string, private readonly token: string) {}
+  private async command<T = any>(command: Array<string | number>): Promise<T> {
+    const response = await fetch(this.url.replace(/\/$/, "") + "/pipeline", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify([command]),
+    })
+    if (!response.ok) throw new Error(`Upstash Redis command failed: ${response.status} ${response.statusText}`)
+    const payload = await response.json()
+    const item = Array.isArray(payload) ? payload[0] : payload
+    if (item?.error) throw new Error(String(item.error))
+    return item?.result as T
+  }
+  async ping() { return String(await this.command(["PING"])) }
+  async info() { return "redis_version:upstash-rest" }
+  async get(key: string) { return await this.command<string | null>(["GET", key]) }
+  async mget(...keys: string[]) { return await this.command<Array<string | null>>(["MGET", ...keys]) }
+  async set(key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }) { const cmd: Array<string | number> = ["SET", key, value]; if (options?.NX) cmd.push("NX"); if (options?.XX) cmd.push("XX"); if (options?.EX) cmd.push("EX", options.EX); return await this.command<string | null>(cmd) }
+  async setex(key: string, seconds: number, value: string) { await this.command(["SETEX", key, seconds, value]) }
+  async incr(key: string) { return await this.command<number>(["INCR", key]) }
+  async incrby(key: string, increment: number) { return await this.command<number>(["INCRBY", key, increment]) }
+  async del(...keys: string[]) { return await this.command<number>(["DEL", ...keys]) }
+  async flushDb() { await this.command(["FLUSHDB"]) }
+  async hset(key: string, dataOrField: Record<string, string> | string, value?: string) { const cmd: Array<string | number> = ["HSET", key]; if (typeof dataOrField === "string") cmd.push(dataOrField, value ?? ""); else for (const [f, v] of Object.entries(dataOrField)) cmd.push(f, v); return await this.command<number>(cmd) }
+  async hmset(...args: string[]) { await this.command(["HSET", ...args]) }
+  async hgetall(key: string) { const result = await this.command<any>(["HGETALL", key]); if (!Array.isArray(result)) return result || {}; const obj: Record<string, string> = {}; for (let i = 0; i < result.length; i += 2) obj[String(result[i])] = String(result[i + 1]); return obj }
+  async hlen(key: string) { return await this.command<number>(["HLEN", key]) }
+  async hget(key: string, field: string) { return await this.command<string | null>(["HGET", key, field]) }
+  async hdel(key: string, ...fields: string[]) { return await this.command<number>(["HDEL", key, ...fields]) }
+  async hincrby(key: string, field: string, increment: number) { return await this.command<number>(["HINCRBY", key, field, increment]) }
+  async hincrbyfloat(key: string, field: string, increment: number) { return await this.command<number>(["HINCRBYFLOAT", key, field, increment]) }
+  async sadd(key: string, ...members: string[]) { return await this.command<number>(["SADD", key, ...members]) }
+  async scard(key: string) { return await this.command<number>(["SCARD", key]) }
+  async smembers(key: string) { return await this.command<string[]>(["SMEMBERS", key]) }
+  async sismember(key: string, member: string) { return await this.command<number>(["SISMEMBER", key, member]) }
+  async srem(key: string, ...members: string[]) { return await this.command<number>(["SREM", key, ...members]) }
+  async expire(key: string, seconds: number) { return await this.command<number>(["EXPIRE", key, seconds]) }
+  async lpush(key: string, ...values: string[]) { return await this.command<number>(["LPUSH", key, ...values]) }
+  async rpush(key: string, ...values: string[]) { return await this.command<number>(["RPUSH", key, ...values]) }
+  async lrange(key: string, start: number, stop: number) { return await this.command<string[]>(["LRANGE", key, start, stop]) }
+  async ltrim(key: string, start: number, stop: number) { await this.command(["LTRIM", key, start, stop]) }
+  async llen(key: string) { return await this.command<number>(["LLEN", key]) }
+  async lrem(key: string, count: number, value: string) { return await this.command<number>(["LREM", key, count, value]) }
+  async lpos(key: string, value: string) { return await this.command<number | null>(["LPOS", key, value]) }
+  async lpop(key: string) { return await this.command<string | null>(["LPOP", key]) }
+  async rpop(key: string) { return await this.command<string | null>(["RPOP", key]) }
+  async dbSize() { return await this.command<number>(["DBSIZE"]) }
+  async keys(pattern: string) { return await this.command<string[]>(["KEYS", pattern]) }
+  async zadd(key: string, score: number, member: string) { return await this.command<number>(["ZADD", key, score, member]) }
+  async zrangebyscore(key: string, min: number | string, max: number | string) { return await this.command<string[]>(["ZRANGEBYSCORE", key, min, max]) }
+  async zremrangebyscore(key: string, min: number | string, max: number | string) { return await this.command<number>(["ZREMRANGEBYSCORE", key, min, max]) }
+  async zrange(key: string, start: number, stop: number) { return await this.command<string[]>(["ZRANGE", key, start, stop]) }
+  async zrevrange(key: string, start: number, stop: number) { return await this.command<string[]>(["ZREVRANGE", key, start, stop]) }
+  async zscore(key: string, member: string) { const score = await this.command<string | number | null>(["ZSCORE", key, member]); return score == null ? null : String(score) }
+  async zcard(key: string) { return await this.command<number>(["ZCARD", key]) }
+  async exists(key: string) { return await this.command<number>(["EXISTS", key]) }
+  async ttl(key: string) { return await this.command<number>(["TTL", key]) }
+  async saveToDisk() { return false }
+  async loadFromDisk() { return false }
+  saveToDiskSync() { return false }
+  async persistNow() { return false }
+  async cleanupExpiredKeysPublic() { return 0 }
+  async trackDatabaseOperation(limit: number) { return { current: 0, limit, exceeded: false } }
+  async getDatabaseOperationCount() { return 0 }
+  multi() { const ops: Array<Array<string | number>> = []; const queue = new Proxy({}, { get: (_t, prop: string) => prop === "exec" ? async () => Promise.all(ops.map((op) => this.command(op))) : (...args: Array<string | number>) => { ops.push([prop.toUpperCase(), ...args]); return queue } }) as { [k: string]: any; exec: () => Promise<any[]> }; return queue }
+  pipeline() { return this.multi() }
+}
+
+function createRedisInstance(): RedisClientLike {
+  const url = process.env.REDIS_URL || process.env.KV_URL
+  if (url) {
+    globalForRedis.__redis_backend = "redis-network"
+    return new NodeRedisClientAdapter(url)
+  }
+  const restUrl = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL
+  const restToken = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN
+  if (restUrl && restToken) {
+    globalForRedis.__redis_backend = "redis-network"
+    return new UpstashRestRedisClient(restUrl, restToken)
+  }
+  if (isProductionEnvironment() && !hasSharedRedisConfig()) {
+    throw new Error("Production Redis configuration missing: set REDIS_URL, KV_URL, or Upstash REST env vars for shared Redis")
+  }
+  globalForRedis.__redis_backend = "inline-local"
+  return new InlineLocalRedis()
+}
+
+export function getRedisBackend(): RedisBackend {
+  return globalForRedis.__redis_backend || (redisInstance instanceof InlineLocalRedis ? "inline-local" : "redis-network")
+}
+
+let redisInstance: RedisClientLike | null = null
 let isConnected = false          // FULLY ready: core + migrations complete
 let coreInitialized = false      // core ready: client constructed + snapshot loaded + ping ok
 let connectionsInitialized = false
@@ -1701,7 +1960,7 @@ export async function ensureCoreRedis(): Promise<void> {
     // have constructed it already; the constructor only initialises empty Maps
     // and never loads the snapshot — that is done explicitly below.
     if (!redisInstance) {
-      redisInstance = new InlineLocalRedis()
+      redisInstance = createRedisInstance()
     }
 
     // Load the on-disk snapshot EXACTLY ONCE per process, gated on the global
@@ -1711,10 +1970,10 @@ export async function ensureCoreRedis(): Promise<void> {
     // state. Concurrent callers across module scopes share one load promise.
     if (!globalForRedis.__redis_snapshot_loaded) {
       if (!globalForRedis.__redis_load_promise) {
-        globalForRedis.__redis_load_promise = redisInstance
+        globalForRedis.__redis_load_promise = redisInstance instanceof InlineLocalRedis ? redisInstance
           .loadFromDisk()
           .then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
-          .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false })
+          .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false }) : Promise.resolve(false).then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
         globalForRedis.__redis_load_promise.finally(() => {
           globalForRedis.__redis_load_promise = undefined
         })
@@ -1753,7 +2012,10 @@ export async function initRedis(): Promise<void> {
   // can exceed hosted builder deadlines (kilo.ai). Provide an empty, connected
   // in-memory client for build-time reads and defer real migrations to runtime.
   if (isNextBuildPhase()) {
-    if (!redisInstance) redisInstance = new InlineLocalRedis()
+    if (!redisInstance) {
+      globalForRedis.__redis_backend = "inline-local"
+      redisInstance = new InlineLocalRedis()
+    }
     isConnected = true
     coreInitialized = true
     connectionsInitialized = true
@@ -1903,16 +2165,16 @@ export async function initRedis(): Promise<void> {
 // initRedis() (e.g. import-time code), initRedis() would early-return and SKIP
 // MIGRATIONS and the snapshot load entirely. They now only guarantee a non-null
 // client; ensureCoreRedis()/initRedis() own readiness state and snapshot load.
-export function getClient(): InlineLocalRedis {
+export function getClient(): RedisClientLike {
   if (!redisInstance) {
-    redisInstance = new InlineLocalRedis()
+    redisInstance = createRedisInstance()
   }
   return redisInstance
 }
 
-export function getRedisClient(): InlineLocalRedis {
+export function getRedisClient(): RedisClientLike {
   if (!redisInstance) {
-    redisInstance = new InlineLocalRedis()
+    redisInstance = createRedisInstance()
   }
   return redisInstance
 }

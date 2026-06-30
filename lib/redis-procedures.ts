@@ -1,4 +1,4 @@
-import { InlineLocalRedis, getClient, getRedisRequestsPerSecond } from './redis-db'
+import { RedisClientLike, getClient, getRedisRequestsPerSecond } from './redis-db'
 
 export interface RedisHealthStatus {
   status: 'healthy' | 'degraded' | 'unhealthy'
@@ -10,7 +10,7 @@ export interface RedisHealthStatus {
 }
 
 export class RedisProcedures {
-  private client: InlineLocalRedis
+  private client: RedisClientLike
   private timer: NodeJS.Timeout | null = null
 
   constructor() {

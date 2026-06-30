@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getRedisBackend } from "@/lib/redis-db"
 import { getMigrationStatus } from "@/lib/redis-migrations"
 
 export const dynamic = "force-dynamic"
@@ -25,6 +25,7 @@ export async function GET() {
       status: "success",
       is_installed: migrationStatus.latestVersion >= 1,
       database_connected: true,
+      redis_backend: getRedisBackend(),
       database_type: "redis",
       table_count: keyCount,
       migrations: {
@@ -35,6 +36,7 @@ export async function GET() {
       database_stats: {
         connected: true,
         mode: "redis",
+        backend: getRedisBackend(),
         total_keys: keyCount,
         is_fallback: false,
       },
