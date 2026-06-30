@@ -3108,6 +3108,9 @@ export async function executeLivePosition(
       // message and retry IMMEDIATELY with corrected volume in THIS cycle.
       // This prevents wasting cycles on repeated sub-minimum rejections.
       let retryWasAttempted = false
+      console.log(
+        `${LOG_PREFIX} [101400 Debug] isMinOrderSizeError=${isMinOrderSizeError(reason)}, placeAttempt=${placeAttempt}, reason="${reason}"`,
+      )
       if (isMinOrderSizeError(reason) && placeAttempt < 3) {
         const minQty = extractMinOrderQty(reason)
         if (minQty && minQty > 0 && minQty > computedVolume) {
