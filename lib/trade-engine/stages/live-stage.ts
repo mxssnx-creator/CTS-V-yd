@@ -527,6 +527,15 @@ async function releaseLock(connId: string, symbol: string, direction: string): P
   }
 }
 function resolveMaxHoldMs(connId: string): number {
+  // DEV/SIM override: the simulated connector uses a constant price so
+  // positions never hit TP/SL organically. Without a short max-hold the
+  // live:positions:{connId} list fills up unboundedly (500+ entries in a
+  // few minutes), making positionsOpen stat nonsensical and consuming memory.
+  // Cap at 2 minutes in non-production so positions roll quickly and the
+  // open-book stays small. Real production runs use the configured value.
+  if (process.env.NODE_ENV !== "production") {
+    return 2 * 60 * 1000 // 2 minutes
+  }
   // Delegate to the centralised engine-timings snapshot rather than a
   // bespoke settings read. `maxPositionHoldMs` is the single source of
   // truth (Redis `settings:system`, default 4h, `0` disables). The sync
@@ -4273,7 +4282,7 @@ async function checkAndForceCloseOnSltpCross(
  *
  * Returns a summary usable for logging / API responses.
  *
- * ── Hedge-Net Reconciliation Hook (operator spec, Position-Count axis) ──────
+ * ── Hedge-Net Reconciliation Hook (operator spec, Position-Count axis) ─��────
  * `strategy-coordinator.evaluateRealSets` writes per-bucket net targets to
  * the Redis hash `live_net_target:{connectionId}`. Each field is keyed by
  *

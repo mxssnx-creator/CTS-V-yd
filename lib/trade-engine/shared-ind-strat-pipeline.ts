@@ -378,12 +378,15 @@ export async function runIndStratCycle(
       }
     }
 
-    // ── Phase 3: Strategy evaluation (UNIFIED, gated on Phase 1) ──────
-    // Same `processStrategy` for both modes. The BASE→MAIN→REAL→LIVE
-    // coordinator behind it is responsible for any execution-side
-    // gating (e.g. suppressing real-order placement during replay) by
-    // inspecting the indication timestamp it receives.
-    if (result.indicationCount > 0) {
+    // ── Phase 3: Strategy evaluation (UNIFIED, runs every cycle) ──────
+    // processStrategy self-fetches active indications from Redis when none
+    // are passed (line 136 of strategy-processor.ts), so it runs correctly
+    // on cycles where Phase 1 produced 0 new indications. The previous
+    // `if (result.indicationCount > 0)` gate caused `strategiesEvaluated`
+    // to return 0 on ~95% of cycles (most cycles have no new signals), which
+    // made `strategy_live_cycle_count` stay at 0 indefinitely.
+    // Always call — processStrategy returns early if no stored indications exist.
+    {
       const stratResult = await deps.strategy
         .processStrategy(symbol, indications)
         .catch((err) => {
