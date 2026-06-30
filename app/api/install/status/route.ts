@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient, isRedisConnected, getRedisBackend } from "@/lib/redis-db"
+import { initRedis, getRedisClient, isRedisConnected, getConnectionCountDiagnostics } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 export async function GET() {
@@ -8,7 +9,10 @@ export async function GET() {
     const client = getRedisClient()
     const connected = isRedisConnected()
     
-    const connectionCount = connected ? await client.scard("connections") : 0
+    const connectionCounts = connected
+      ? await getConnectionCountDiagnostics()
+      : { connection_hash_count: 0, legacy_connection_set_count: 0 }
+    const connectionCount = connectionCounts.connection_hash_count
     const schemaVersion = connected ? (await client.get("_schema_version") || "0") : "0"
     
     return NextResponse.json({
@@ -18,6 +22,8 @@ export async function GET() {
       redisBackend: getRedisBackend(),
       tablesExist: connectionCount > 0,
       tableCount: connectionCount,
+      connection_hash_count: connectionCounts.connection_hash_count,
+      legacy_connection_set_count: connectionCounts.legacy_connection_set_count,
       hasMigrations: true,
       migrationsApplied: parseInt(schemaVersion as string),
       error: !connected ? "Redis not connected" : null,
@@ -29,6 +35,8 @@ export async function GET() {
       databaseConnected: false,
       tablesExist: false,
       tableCount: 0,
+      connection_hash_count: 0,
+      legacy_connection_set_count: 0,
       migrationsApplied: 0,
       error: error instanceof Error ? error.message : "Failed to check install status",
     })

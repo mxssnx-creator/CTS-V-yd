@@ -200,6 +200,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         await toggleClient.hset("trade_engine:global", {
           ...globalState,
           status: "running",
+          desired_status: "running",
+          operator_intent: "running",
           coordinator_ready: "true",
           started_at: globalState.started_at || new Date().toISOString(),
           updated_at: new Date().toISOString(),
