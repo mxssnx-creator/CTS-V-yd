@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors/factory"
+import { getLiveOrderSafetyFailure } from "@/lib/live-order-safety"
 import type { ExchangeConnection } from "@/lib/types"
 
 export const dynamic = "force-dynamic"
@@ -41,9 +42,27 @@ export async function POST(req: NextRequest) {
 
     console.log(`[PlaceOrder] Placing ${side} order for ${symbol} x${leverage} with ${quantity} coins`)
 
-    // Choose connector: prefer simulated when FORCE_SIMULATED=1 or missing API keys
+    // Choose connector: prefer simulated when FORCE_SIMULATED=1 or missing API keys.
+    // Real exchange order placement is intentionally blocked unless both a
+    // server-side enable flag and an explicit per-request confirmation are present.
     let connector: any = null
     const forceSim = process.env.FORCE_SIMULATED === "1"
+    const willUseRealExchange = !forceSim && !!connection.api_key && !!connection.api_secret
+    const orderMode = willUseRealExchange ? "live" : "simulated"
+    if (willUseRealExchange) {
+      const safetyFailure = getLiveOrderSafetyFailure(body)
+      if (safetyFailure) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: safetyFailure,
+            mode: "blocked_live_order_safety",
+          },
+          { status: 403 },
+        )
+      }
+    }
+
     if (forceSim || !connection.api_key || !connection.api_secret) {
       try {
         const { SimulatedConnector } = await import("@/lib/exchange-connectors/simulated-connector")
@@ -92,11 +111,25 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // Persist a live position record and update progression counters so
-    // the dashboard reflects this test order immediately. Treat the
-    // order as filled for testing purposes if no explicit fill info exists.
+    // Persist real exchange results to the live counters. Simulated fallback
+    // orders must not inflate live order/position counts because that makes
+    // dashboard relations and percentages look like real exchange execution.
     try {
-      const { getRedisClient, saveMarketData, savePosition, getMarketData } = await import("@/lib/redis-db")
+      const { getRedisClient, savePosition, getMarketData } = await import("@/lib/redis-db")
+      if (!willUseRealExchange) {
+        await (getRedisClient() as any).hincrby(`progression:${connectionId}`, "live_orders_simulated_count", 1)
+        return NextResponse.json({
+          success: true,
+          mode: orderMode,
+          orderId: (result as any)?.orderId || (result as any)?.order_id || "N/A",
+          symbol,
+          side,
+          quantity,
+          leverage,
+          timestamp: Date.now(),
+          details: (result as any)?.details || result,
+        })
+      }
       const client = getRedisClient()
       // Determine fill price: prefer exchange-provided, else market data
       let fillPrice = (result as any)?.filledPrice || (result as any)?.avgPrice || 0
@@ -163,6 +196,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       success: true,
+      mode: orderMode,
       orderId: (result as any)?.orderId || (result as any)?.order_id || "N/A",
       symbol,
       side,

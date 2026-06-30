@@ -11,7 +11,6 @@ describe('Progression Flow - E2E Tests', () => {
     const response = await fetch(`${baseUrl}/api/health`, {
       signal: AbortSignal.timeout(1500),
     }).catch(() => null)
-    const response = await fetch(`${baseUrl}/api/health`).catch(() => null)
     serverAvailable = Boolean(response && response.status < 500)
   })
 
