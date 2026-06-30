@@ -305,6 +305,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         const activeCount = allConnsForDisable.filter((c: any) => 
           c.id !== resolvedId && isConnectionReadyForEngine(c)
         ).length
+        const preservedCoordinatorIntent =
+          disableGlobalState?.operator_intent ||
+          disableGlobalState?.desired_status ||
+          disableGlobalState?.status ||
+          "running"
         await disableClient.hset("trade_engine:global", {
           ...disableGlobalState,
           updated_at: new Date().toISOString(),
@@ -315,6 +320,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           // so the operator can re-enable this or another connection without a
           // global restart. Only /api/trade-engine/stop owns global shutdown.
           status: disableGlobalState?.status || "running",
+          desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent,
+          operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent,
           coordinator_ready: disableGlobalState?.coordinator_ready || "true",
         })
         

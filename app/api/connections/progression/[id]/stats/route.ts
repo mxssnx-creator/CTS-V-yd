@@ -2366,13 +2366,12 @@ export async function GET(
           // Live is the final dispatch stage (sets actually selected for order dispatch).
           // Written per-cycle by createLiveSets into strategies_active:{conn} hash.
           live:  stratCounts.live  || 0,
-          // `total` = cumulative across ALL stages so the operator sees the full
-          // pipeline throughput (base+main+real are additive creation passes;
-          // live is the subset actually sent to the exchange this session).
-          // NOTE: base/main/real/live are all current-cycle snapshot values, so
-          // summing them gives the current-cycle pipeline total — the same logic
-          // that makes stratTotal = Real (the canonical filtered output).
-          total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0) + (stratCounts.live || 0),
+          // Pipeline-aware total: Base → Main → Real → Live is a cascade, not
+          // four independent populations. Summing stage counts double/triple
+          // counts the same logical Sets and is the source of inflated Main/
+          // Real totals in production dashboards. `stratTotal` is the canonical
+          // deepest surviving Set count (Real, with safe fallback).
+          total: stratTotal,
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),
@@ -2409,10 +2408,10 @@ export async function GET(
           main: stratCounts.main || 0,
           real: stratCounts.real || 0,
           live: stratCounts.live || 0,
-          // Total = full pipeline throughput across all stages.
-          // Use the same sum as realtime.setsCreated.total (not stratTotal
-          // which = real only and misleads as a "total" figure).
-          total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0) + (stratCounts.live || 0),
+          // Pipeline-aware total — do not sum cascade stages. Base/Main/Real
+          // contain the same logical Sets at successive filters, so summing
+          // stages inflates counts and makes Main look too high in prod.
+          total: stratTotal,
           baseEvaluated: (() => {
             // Validate constraint: eval <= sets
             const base = stratCounts.base || 0
@@ -2975,6 +2974,36 @@ export async function GET(
             short: { placed: number; filled: number }
           }>()
           for (const [field, raw] of Object.entries(ordersBySymbolHash)) {
+            // Legacy/testing route compatibility: older simulated order helpers
+            // stored one JSON object under `{SYMBOL}` instead of the canonical
+            // `{SYMBOL}:{direction}:{kind}` fields. Do not let that malformed
+            // shape disappear or crash the aggregation; fold it into the same
+            // independent long/short buckets.
+            if (!field.includes(":") && typeof raw === "string" && raw.trim().startsWith("{")) {
+              try {
+                const parsed = JSON.parse(raw)
+                const rawSide = String(parsed?.side ?? parsed?.direction ?? "").trim().toLowerCase()
+                const legacyDirection: "long" | "short" =
+                  rawSide.includes("short") || rawSide === "sell" ? "short" : "long"
+                const entry = map.get(field) || {
+                  long:  { placed: 0, filled: 0 },
+                  short: { placed: 0, filled: 0 },
+                }
+                const legacyCount = n(parsed?.count ?? 0)
+                entry[legacyDirection].placed += n(parsed?.placed ?? parsed?.ordersPlaced ?? legacyCount)
+                // Old test-order rows were written only after a successful
+                // endpoint response and did not carry a separate filled field.
+                // Mirror `count` into filled when no explicit fill count exists
+                // so the per-symbol row reconciles with the global filled
+                // counter instead of showing L:1/0 for an already-open test
+                // position restored from a production/dev snapshot.
+                entry[legacyDirection].filled += n(parsed?.filled ?? parsed?.ordersFilled ?? legacyCount)
+                map.set(field, entry)
+              } catch {
+                // Ignore malformed legacy values; canonical fields below remain authoritative.
+              }
+              continue
+            }
             // Field format: `{SYMBOL}:{direction}:{kind}`. Direction must
             // be one of long|short and kind one of placed|filled — anything
             // else is treated as malformed and skipped.
@@ -2993,7 +3022,10 @@ export async function GET(
               long:  { placed: 0, filled: 0 },
               short: { placed: 0, filled: 0 },
             }
-            entry[direction][kind] = value
+            // Accumulate rather than assign so canonical counters and legacy
+            // backfilled rows can coexist without one direction overwriting the
+            // other. This preserves independent long/short totals.
+            entry[direction][kind] += value
             map.set(symbol, entry)
           }
           return Array.from(map.entries())

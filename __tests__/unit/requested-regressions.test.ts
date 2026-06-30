@@ -19,8 +19,39 @@ describe("requested regression guardrails", () => {
     expect(placeOrder).toContain('mode: "blocked_live_order_safety"')
     expect(placeOrder).toContain('const orderMode = willUseRealExchange ? "live" : "simulated"')
     expect(placeOrder).toContain('"live_orders_simulated_count"')
+    expect(placeOrder).toContain('const direction: "long" | "short" = sideKey === "short" || sideKey === "sell" ? "short" : "long"')
+    expect(placeOrder).toContain('const exchangeSide: "buy" | "sell" = direction === "long" ? "buy" : "sell"')
+    expect(placeOrder).toContain('`${symbolKey}:${direction}:placed`')
+    expect(placeOrder).toContain('`${symbolKey}:${direction}:filled`')
+    expect(placeOrder).not.toContain('JSON.stringify(existing)')
     expect(liveOrdersTest).toContain('getLiveOrderSafetyFailure(body)')
     expect(liveOrdersTest).toContain('mode: "blocked_live_order_safety"')
+  })
+
+  test("live order statistics keep long and short buckets independent", () => {
+    const liveStage = read("lib/trade-engine/stages/live-stage.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+
+    expect(liveStage).toContain('const sideKey = String(side || "").trim().toLowerCase()')
+    expect(liveStage).toContain('sideKey.includes("short") || sideKey === "sell"')
+    expect(liveStage).toContain('const symbolKey = String(symbol || "").trim().toUpperCase()')
+    expect(liveStage).toContain('const field = `${symbolKey}:${dir}:${metric}`')
+
+    expect(statsRoute).toContain("Legacy/testing route compatibility")
+    expect(statsRoute).toContain('rawSide.includes("short") || rawSide === "sell"')
+    expect(statsRoute).toContain("const legacyCount = n(parsed?.count ?? 0)")
+    expect(statsRoute).toContain("parsed?.filled ?? parsed?.ordersFilled ?? legacyCount")
+    expect(statsRoute).toContain("entry[direction][kind] += value")
+    expect(statsRoute).not.toContain("entry[direction][kind] = value")
+  })
+
+  test("progression strategy totals are pipeline-aware and do not sum cascade stages", () => {
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+
+    expect(statsRoute).toContain("Pipeline-aware total: Base → Main → Real → Live is a cascade")
+    expect(statsRoute).toContain("total: stratTotal")
+    expect(statsRoute).not.toContain("total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0) + (stratCounts.live || 0)")
+    expect(statsRoute).not.toContain("full pipeline throughput across all stages")
   })
 
 
@@ -489,6 +520,23 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Connection enabled; start queued for coordinator worker")
     expect(source).toContain("this UI worker is not opted in for local engine loops")
     expect(source).toContain('engineStatus = "queued"')
+  })
+
+  test("connection enable paths keep global coordinator intent stable when engines can run", () => {
+    const enableRoute = read("app/api/settings/connections/[id]/enable/route.ts")
+    const dashboardRoute = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
+
+    expect(enableRoute).toContain('hgetall("trade_engine:global")')
+    expect(enableRoute).toContain('status: "running"')
+    expect(enableRoute).toContain('desired_status: "running"')
+    expect(enableRoute).toContain('operator_intent: "running"')
+    expect(enableRoute).toContain('coordinator_ready: "true"')
+    expect(enableRoute.indexOf('operator_intent: "running"')).toBeLessThan(enableRoute.indexOf("await coordinator.startMissingEngines"))
+
+    expect(dashboardRoute).toContain("const preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain("desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain("operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain("Only /api/trade-engine/stop owns global shutdown")
   })
 
   test("dashboard detailed logs header action scrolls within the log dialog", () => {
