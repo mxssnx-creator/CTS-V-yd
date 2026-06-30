@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient, getAllConnections } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getConnectionCountDiagnostics } from "@/lib/redis-db"
 import { getMigrationStatus } from "@/lib/redis-migrations"
 
 export const dynamic = "force-dynamic"
@@ -16,6 +17,8 @@ export async function GET() {
     
     // Check key patterns in Redis to determine what data exists
     const connectionCount = (await getAllConnections()).length
+    const connectionCounts = await getConnectionCountDiagnostics()
+    const connectionCount = connectionCounts.connection_hash_count
     const schemaVersion = await client.get("_schema_version") || "0"
     
     return NextResponse.json({
@@ -30,6 +33,8 @@ export async function GET() {
       },
       data: {
         connections: connectionCount,
+        connection_hash_count: connectionCounts.connection_hash_count,
+        legacy_connection_set_count: connectionCounts.legacy_connection_set_count,
       },
       status: "complete",
       timestamp: new Date().toISOString()

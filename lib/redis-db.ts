@@ -51,9 +51,69 @@ const globalForRedis = globalThis as unknown as {
   // Next.js dev route modules (which re-evaluate and get isConnected=false) to
   // see the real connected state without re-running initRedis/migrations.
   __redis_fully_connected?: boolean
+  __redis_backend?: RedisBackend
 }
 
-export class InlineLocalRedis {
+export type RedisBackend = "inline-local" | "redis-network"
+
+export interface RedisClientLike {
+  ping(): Promise<string>
+  info(): Promise<string>
+  get(key: string): Promise<string | null>
+  mget(...keys: string[]): Promise<Array<string | null>>
+  set(key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }): Promise<string | null>
+  setex(key: string, seconds: number, value: string): Promise<void | string>
+  incr(key: string): Promise<number>
+  incrby(key: string, increment: number): Promise<number>
+  del(...keys: string[]): Promise<number>
+  flushDb(): Promise<void>
+  hset(key: string, dataOrField: Record<string, string> | string, value?: string): Promise<number>
+  hmset(...args: string[]): Promise<void>
+  hgetall(key: string): Promise<Record<string, string>>
+  hlen(key: string): Promise<number>
+  hget(key: string, field: string): Promise<string | null>
+  hdel(key: string, ...fields: string[]): Promise<number>
+  hincrby(key: string, field: string, increment: number): Promise<number>
+  hincrbyfloat(key: string, field: string, increment: number): Promise<number>
+  sadd(key: string, ...members: string[]): Promise<number>
+  scard(key: string): Promise<number>
+  smembers(key: string): Promise<string[]>
+  sismember(key: string, member: string): Promise<number>
+  srem(key: string, ...members: string[]): Promise<number>
+  expire(key: string, seconds: number): Promise<number>
+  lpush(key: string, ...values: string[]): Promise<number>
+  rpush(key: string, ...values: string[]): Promise<number>
+  lrange(key: string, start: number, stop: number): Promise<string[]>
+  ltrim(key: string, start: number, stop: number): Promise<void>
+  llen(key: string): Promise<number>
+  lrem(key: string, count: number, value: string): Promise<number>
+  lpos(key: string, value: string): Promise<number | null>
+  lpop(key: string): Promise<string | null>
+  rpop(key: string): Promise<string | null>
+  dbSize(): Promise<number>
+  keys(pattern: string): Promise<string[]>
+  zadd(key: string, score: number, member: string): Promise<number>
+  zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]>
+  zremrangebyscore(key: string, min: number | string, max: number | string): Promise<number>
+  zrange(key: string, start: number, stop: number): Promise<string[]>
+  zrevrange(key: string, start: number, stop: number): Promise<string[]>
+  zscore(key: string, member: string): Promise<string | null>
+  zcard(key: string): Promise<number>
+  exists(key: string): Promise<number>
+  ttl(key: string): Promise<number>
+  multi(): { [k: string]: any; exec: () => Promise<any[]> }
+  pipeline(): { [k: string]: any; exec: () => Promise<any[]> }
+  saveToDisk(): Promise<boolean>
+  loadFromDisk(): Promise<boolean>
+  saveToDiskSync(): boolean
+  persistNow(): Promise<boolean>
+  cleanupExpiredKeysPublic(): Promise<number>
+  trackDatabaseOperation(limit: number): Promise<{ current: number; limit: number; exceeded: boolean }>
+  getDatabaseOperationCount(): Promise<number>
+}
+
+
+export class InlineLocalRedis implements RedisClientLike {
   private data: RedisData
 
   constructor() {
@@ -380,6 +440,60 @@ export class InlineLocalRedis {
     return true
   }
   
+
+  async cleanupVolatileRuntimeState({
+    mode = process.env.NODE_ENV === "production" ? "production" : "development",
+    reason = "startup",
+  }: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+    const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
+    const now = Date.now()
+    let deleted = 0
+    let preserved = 0
+
+    const deleteKey = (key: string) => {
+      const before = this.data.strings.has(key) || this.data.hashes.has(key) || this.data.sets.has(key) || this.data.lists.has(key) || this.data.sorted_sets.has(key)
+      this.deleteKey(key)
+      if (before) deleted++
+    }
+    const olderThanThreshold = (key: string, raw?: string | null): boolean => {
+      const ttl = this.data.ttl?.get(key)
+      if (ttl && ttl <= now) return true
+      const timestamp = Number(raw || "")
+      if (Number.isFinite(timestamp) && timestamp > 0 && now - timestamp > staleMs) return true
+      return !ttl && !timestamp
+    }
+    const isDev = mode !== "production"
+    const shouldDelete = (key: string, raw?: string | null): boolean => {
+      // Explicit volatile-state policy:
+      // live:position:* / live:positions:* / settings:live:*: dev clears all; prod preserves authoritative
+      // open-position records and only drops tracking/moved/transient indexes.
+      if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
+        return isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+      }
+      // live:lock:* is a transient gate: prod deletes only expired/old/missing-TTL locks.
+      if (key.startsWith("live:lock:")) return isDev || olderThanThreshold(key, raw)
+      // Prehistoric gates/progress are boot cache gates, not authoritative data.
+      if (key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) return isDev || olderThanThreshold(key, raw)
+      // Pipeline/runtime caches are non-authoritative and can be rebuilt.
+      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return true
+      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return true
+      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return true
+      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return true
+      return false
+    }
+
+    for (const [key, value] of Array.from(this.data.strings.entries())) shouldDelete(key, value) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.hashes.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.sets.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.lists.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+    for (const key of Array.from(this.data.sorted_sets.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
+
+    if (deleted > 0) {
+      console.log(`[v0] [Redis Memory] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+    }
+    return { deleted, preserved }
+  }
+
   private startTTLCleanup(): void {
     // TTL-based cleanup + LRU eviction when heap memory exceeds threshold.
     // In dev mode the InlineLocalRedis emulator holds the ENTIRE dataset on
@@ -420,173 +534,7 @@ export class InlineLocalRedis {
     // in dev — even if totalKeys is low — because the OOM-causing families
     // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
     // 20+ MB each while only occupying a few hundred key slots.
-      try {
-        if (process.env.NODE_ENV === "development") {
-          let flushed = 0
-
-          // 1. strategies:{conn}:{symbol}:* — per-cycle set blobs (real:sets,
-          //    base:sets, main:sets) and fp:v2 fingerprint caches. Written by
-          //    strategy-coordinator.ts on every realtime cycle; dev bypasses
-          //    are throttled (every 50th cycle) or gated on NODE_ENV, but stale
-          //    keys from prior hot-reload cycles remain in the Map.
-          //    Also covers lpush lists from strategy-evaluator.ts (storeStrategyResult
-          //    now returns early in dev, but pre-bypass runs left stale list keys).
-          //    
-          //    PRESERVE: strategies_active:{conn} — coordinator current counts
-          //    (per-symbol per-stage). This hash is read by the stats API every
-          //    second and must survive hot-reloads.
-          for (const key of this.data.lists.keys()) {
-            // `indication_outcomes_pending:*` is stored as a LIST (rpush/ltrim),
-            // not a string/hash, so the strings+hashes flush below never reached
-            // it — letting it accumulate (~150 KB/symbol, multiple MB) and
-            // persist across boots via the snapshot. Flush it here so dev starts
-            // each session clean; the runtime ltrim cap (100 in dev) keeps it
-            // bounded thereafter.
-            if (key.startsWith("strategies:") || key.startsWith("indication_outcomes_pending:")) {
-              this.data.lists.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.hashes.keys()) {
-            // Preserve strategies_active hash — it contains live coordinator counts
-            if (key.startsWith("strategies_active:")) continue
-            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-
-          // 2. indication:{conn}:{symbol} — per-symbol indication strings/hashes
-          //    (200 keys × ~3 KB each = 0.6 MB). Written every indication cycle;
-          //    stale copies from hot-reload cycles remain.
-          // 2a. indication_set:{conn}:* — the #1 OOM driver: IndicationProcessor v5
-          //    writes ~4700 hashes per symbol per cycle (14,184 keys = 93.9 MB for 3
-          //    symbols). These are transient; flush entirely on startup and cap to 300
-          //    via eviction CAPS during runtime.
-          // 2b. indication_outcomes_pending:{conn} — pending outcome resolution hashes.
-          // 2c. axis_pos_acc:{conn} — axis position accumulator (~200 KB each).
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("indication:") || key.startsWith("indications:") ||
-                key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("indication:") || key.startsWith("indications:") ||
-                key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
-                key.startsWith("axis_pos_acc:")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-
-          // 2b. prehistoric cache-gate + progress-tracker keys only.
-          //
-          // The engine uses TWO separate keys to decide whether to re-run prehistoric:
-          //   a) `prehistoric_loaded:{conn}` (plain string "1") — the 24-h cache gate
-          //      in engine-manager.ts. If this key survives a sandbox reset / full-DB
-          //      wipe the engine skips the entire ConfigSetProcessor pass and stamps
-          //      fake completion fields with 0 candles/indicators. Wipe it so every
-          //      fresh-DB session re-runs prehistoric from scratch.
-          //   b) `prehistoric:progress:{conn}` — the PrehistoricProgressTracker hash.
-          //      Stale from prior session; wipe so the UI progress bar resets cleanly.
-          //
-          // DO NOT wipe:
-          //   - `prehistoric:{conn}` hash (is_complete, symbols_processed, etc.) —
-          //     the stats route reads this; wiping causes candlesLoaded=0 forever.
-          //   - `progression:{conn}` hash (placed_count, filled_count, cycle counters)
-          //     — live counters that must survive hot-reloads.
-          //   - `strategies_active:{conn}` — written by coordinator each cycle.
-          //   - `pi_history:*` — written by ConfigSetProcessor; must survive.
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("prehistoric_loaded:")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("prehistoric:progress:")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-
-          // 3. pseudo_position:{conn}:{id} + pseudo_positions:{conn} set —
-          //    createPseudoPositionsFromRealSets() bypassed in dev but prior runs
-          //    left 400 position hashes (0.6 MB) + membership sets.
-          for (const key of this.data.hashes.keys()) {
-            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
-              this.data.hashes.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.strings.keys()) {
-            if (key.startsWith("pseudo_position:") || key.startsWith("settings:pseudo_position")) {
-              this.data.strings.delete(key); flushed++
-            }
-          }
-          for (const key of this.data.sets.keys()) {
-            if (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) {
-              this.data.sets.delete(key); flushed++
-            }
-          }
-
-          // 4. live:position:{id} hashes + live:positions:{conn} lists —
-          //    In dev, live positions are real BingX orders whose orderId/SL/TP
-          //    are valid only for the session that placed them.  On hot-reload
-          //    the in-memory InlineLocalRedis is fresh but the persisted dev DB
-          //    still holds the old position hashes.  The reconcile loop then
-          //    issues exchange API calls for each stale position (×44 = 44 API
-          //    calls on startup), blowing ~200-400 MB and sometimes triggering
-          //    OOM before prehistoric can complete.  Wipe them unconditionally
-          //    on dev startup so each session begins with a clean slate.
-          //    NOTE: setSettings("live:position:…") prepends "settings:" so we
-          //    must clear both "live:position:*" AND "settings:live:position:*".
-          for (const key of this.data.hashes.keys()) {
-            if (
-              key.startsWith("live:position:") ||
-              key.startsWith("settings:live:position:")
-            ) { this.data.hashes.delete(key); flushed++ }
-          }
-          for (const key of this.data.lists.keys()) {
-            if (
-              key.startsWith("live:positions:") ||
-              key.startsWith("settings:live:positions:")
-            ) { this.data.lists.delete(key); flushed++ }
-          }
-          for (const key of this.data.strings.keys()) {
-            if (
-              key.startsWith("live:positions:") ||
-              key.startsWith("live:position:")  ||
-              key.startsWith("settings:live:position:") ||
-              key.startsWith("settings:live:positions:")
-            ) { this.data.strings.delete(key); flushed++ }
-          }
-          for (const key of this.data.sets.keys()) {
-            if (
-              key.startsWith("live:positions:") ||
-              key.startsWith("settings:live:positions:")
-            ) { this.data.sets.delete(key); flushed++ }
-          }
-
-          if (flushed > 0) {
-            console.log(`[v0] [Redis Memory] Dev startup flush: cleared ${flushed} stale volatile keys`)
-          }
-        }
-
-        // Full eviction pass for remaining pressure (covers non-dev or larger leftovers).
-        const totalKeys = this.data.strings.size + this.data.hashes.size +
-                          this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        if (totalKeys > 5_000) {
-          console.log(`[v0] [Redis Memory] Startup: ${totalKeys} stale keys after flush, evicting...`)
-          this.evictOldRecords()
-          ;(globalThis as any).gc?.()
-          const after = this.data.strings.size + this.data.hashes.size +
-                        this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-          console.log(`[v0] [Redis Memory] Startup eviction complete: ${totalKeys} → ${after} keys`)
-        }
-      } catch (err) {
-        console.warn(`[v0] [Redis Memory] Dev startup flush error:`, err)
-      }
+    void this.cleanupVolatileRuntimeState({ mode: process.env.NODE_ENV === "production" ? "production" : "development", reason: "inline-startup" })
 
     // Throttle eviction log output: only print once per 60 s when stuck above
     // the key limit so the server log stays readable.
@@ -1302,8 +1250,8 @@ export class InlineLocalRedis {
 
   async lpush(key: string, ...values: string[]): Promise<number> {
     const list = this.data.lists.get(key) || []
-    for (let i = values.length - 1; i >= 0; i--) {
-      list.unshift(values[i])
+    for (const value of values) {
+      list.unshift(value)
     }
     this.data.lists.set(key, list)
     return list.length
@@ -1661,7 +1609,206 @@ export class InlineLocalRedis {
   }
 }
 
-let redisInstance: InlineLocalRedis | null = null
+
+function hasSharedRedisConfig(): boolean {
+  return !!(
+    process.env.REDIS_URL ||
+    (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) ||
+    process.env.KV_URL ||
+    (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN)
+  )
+}
+
+class NodeRedisClientAdapter implements RedisClientLike {
+  private client: any | null = null
+  private connectPromise: Promise<any> | null = null
+  constructor(private readonly url: string) {}
+  private async c(): Promise<any> {
+    if (this.client?.isOpen) return this.client
+    if (!this.connectPromise) {
+      this.connectPromise = import("redis").then(async ({ createClient }) => {
+        const client = createClient({ url: this.url })
+        client.on?.("error", (err: unknown) => console.error("[v0] [Redis] network client error:", err))
+        await client.connect()
+        this.client = client
+        return client
+      }).finally(() => { this.connectPromise = null })
+    }
+    return this.connectPromise
+  }
+  async ping() { return String(await (await this.c()).ping()) }
+  async info() { return String(await (await this.c()).info()) }
+  async get(key: string) { return await (await this.c()).get(key) }
+  async mget(...keys: string[]) { return await (await this.c()).mGet(keys) }
+  async set(key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }) { return await (await this.c()).set(key, value, options as any) }
+  async setex(key: string, seconds: number, value: string) { return await (await this.c()).setEx(key, seconds, value) }
+  async incr(key: string) { return await (await this.c()).incr(key) }
+  async incrby(key: string, increment: number) { return await (await this.c()).incrBy(key, increment) }
+  async del(...keys: string[]) { return await (await this.c()).del(keys) }
+  async flushDb() { await (await this.c()).flushDb() }
+  async hset(key: string, dataOrField: Record<string, string> | string, value?: string) { return typeof dataOrField === "string" ? await (await this.c()).hSet(key, dataOrField, value ?? "") : await (await this.c()).hSet(key, dataOrField) }
+  async hmset(...args: string[]) { const [key, ...rest] = args; const obj: Record<string, string> = {}; for (let i = 0; i < rest.length; i += 2) obj[rest[i]] = rest[i + 1]; await this.hset(key, obj) }
+  async hgetall(key: string) { return await (await this.c()).hGetAll(key) }
+  async hlen(key: string) { return await (await this.c()).hLen(key) }
+  async hget(key: string, field: string) { return await (await this.c()).hGet(key, field) }
+  async hdel(key: string, ...fields: string[]) { return await (await this.c()).hDel(key, fields) }
+  async hincrby(key: string, field: string, increment: number) { return await (await this.c()).hIncrBy(key, field, increment) }
+  async hincrbyfloat(key: string, field: string, increment: number) { return await (await this.c()).hIncrByFloat(key, field, increment) }
+  async sadd(key: string, ...members: string[]) { return await (await this.c()).sAdd(key, members) }
+  async scard(key: string) { return await (await this.c()).sCard(key) }
+  async smembers(key: string) { return await (await this.c()).sMembers(key) }
+  async sismember(key: string, member: string) { return await (await this.c()).sIsMember(key, member) ? 1 : 0 }
+  async srem(key: string, ...members: string[]) { return await (await this.c()).sRem(key, members) }
+  async expire(key: string, seconds: number) { return await (await this.c()).expire(key, seconds) }
+  async lpush(key: string, ...values: string[]) { return await (await this.c()).lPush(key, values) }
+  async rpush(key: string, ...values: string[]) { return await (await this.c()).rPush(key, values) }
+  async lrange(key: string, start: number, stop: number) { return await (await this.c()).lRange(key, start, stop) }
+  async ltrim(key: string, start: number, stop: number) { await (await this.c()).lTrim(key, start, stop) }
+  async llen(key: string) { return await (await this.c()).lLen(key) }
+  async lrem(key: string, count: number, value: string) { return await (await this.c()).lRem(key, count, value) }
+  async lpos(key: string, value: string) { return await (await this.c()).lPos(key, value) }
+  async lpop(key: string) { return await (await this.c()).lPop(key) }
+  async rpop(key: string) { return await (await this.c()).rPop(key) }
+  async dbSize() { return await (await this.c()).dbSize() }
+  async keys(pattern: string) { return await (await this.c()).keys(pattern) }
+  async zadd(key: string, score: number, member: string) { return await (await this.c()).zAdd(key, { score, value: member }) }
+  async zrangebyscore(key: string, min: number | string, max: number | string) { return await (await this.c()).zRangeByScore(key, min as any, max as any) }
+  async zremrangebyscore(key: string, min: number | string, max: number | string) { return await (await this.c()).zRemRangeByScore(key, min as any, max as any) }
+  async zrange(key: string, start: number, stop: number) { return await (await this.c()).zRange(key, start, stop) }
+  async zrevrange(key: string, start: number, stop: number) { return await (await this.c()).zRange(key, start, stop, { REV: true } as any) }
+  async zscore(key: string, member: string) { const score = await (await this.c()).zScore(key, member); return score == null ? null : String(score) }
+  async zcard(key: string) { return await (await this.c()).zCard(key) }
+  async exists(key: string) { return await (await this.c()).exists(key) }
+  async ttl(key: string) { return await (await this.c()).ttl(key) }
+  async saveToDisk() { return false }
+  async loadFromDisk() { return false }
+  saveToDiskSync() { return false }
+  async persistNow() { return false }
+  async cleanupExpiredKeysPublic() { return 0 }
+  async trackDatabaseOperation(limit: number) { return { current: 0, limit, exceeded: false } }
+  async getDatabaseOperationCount() { return 0 }
+  multi() {
+    const ops: Array<{ method: string; args: any[] }> = []
+    const self = this as unknown as Record<string, any>
+    const queue = new Proxy({}, {
+      get: (_target, prop: string) => {
+        if (prop === "exec") {
+          return async () => {
+            const client = await this.c()
+            if (typeof client.multi === "function") {
+              const tx = client.multi()
+              for (const { method, args } of ops) {
+                if (typeof tx[method] === "function") tx[method](...args)
+              }
+              return tx.exec()
+            }
+            const results: any[] = []
+            for (const { method, args } of ops) results.push(await self[method]?.(...args))
+            return results
+          }
+        }
+        return (...args: any[]) => { ops.push({ method: prop, args }); return queue }
+      },
+    }) as { [k: string]: any; exec: () => Promise<any[]> }
+    return queue
+  }
+  pipeline() { return this.multi() }
+}
+
+
+class UpstashRestRedisClient implements RedisClientLike {
+  constructor(private readonly url: string, private readonly token: string) {}
+  private async command<T = any>(command: Array<string | number>): Promise<T> {
+    const response = await fetch(this.url.replace(/\/$/, "") + "/pipeline", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify([command]),
+    })
+    if (!response.ok) throw new Error(`Upstash Redis command failed: ${response.status} ${response.statusText}`)
+    const payload = await response.json()
+    const item = Array.isArray(payload) ? payload[0] : payload
+    if (item?.error) throw new Error(String(item.error))
+    return item?.result as T
+  }
+  async ping() { return String(await this.command(["PING"])) }
+  async info() { return "redis_version:upstash-rest" }
+  async get(key: string) { return await this.command<string | null>(["GET", key]) }
+  async mget(...keys: string[]) { return await this.command<Array<string | null>>(["MGET", ...keys]) }
+  async set(key: string, value: string, options?: { EX?: number; NX?: boolean; XX?: boolean }) { const cmd: Array<string | number> = ["SET", key, value]; if (options?.NX) cmd.push("NX"); if (options?.XX) cmd.push("XX"); if (options?.EX) cmd.push("EX", options.EX); return await this.command<string | null>(cmd) }
+  async setex(key: string, seconds: number, value: string) { await this.command(["SETEX", key, seconds, value]) }
+  async incr(key: string) { return await this.command<number>(["INCR", key]) }
+  async incrby(key: string, increment: number) { return await this.command<number>(["INCRBY", key, increment]) }
+  async del(...keys: string[]) { return await this.command<number>(["DEL", ...keys]) }
+  async flushDb() { await this.command(["FLUSHDB"]) }
+  async hset(key: string, dataOrField: Record<string, string> | string, value?: string) { const cmd: Array<string | number> = ["HSET", key]; if (typeof dataOrField === "string") cmd.push(dataOrField, value ?? ""); else for (const [f, v] of Object.entries(dataOrField)) cmd.push(f, v); return await this.command<number>(cmd) }
+  async hmset(...args: string[]) { await this.command(["HSET", ...args]) }
+  async hgetall(key: string) { const result = await this.command<any>(["HGETALL", key]); if (!Array.isArray(result)) return result || {}; const obj: Record<string, string> = {}; for (let i = 0; i < result.length; i += 2) obj[String(result[i])] = String(result[i + 1]); return obj }
+  async hlen(key: string) { return await this.command<number>(["HLEN", key]) }
+  async hget(key: string, field: string) { return await this.command<string | null>(["HGET", key, field]) }
+  async hdel(key: string, ...fields: string[]) { return await this.command<number>(["HDEL", key, ...fields]) }
+  async hincrby(key: string, field: string, increment: number) { return await this.command<number>(["HINCRBY", key, field, increment]) }
+  async hincrbyfloat(key: string, field: string, increment: number) { return await this.command<number>(["HINCRBYFLOAT", key, field, increment]) }
+  async sadd(key: string, ...members: string[]) { return await this.command<number>(["SADD", key, ...members]) }
+  async scard(key: string) { return await this.command<number>(["SCARD", key]) }
+  async smembers(key: string) { return await this.command<string[]>(["SMEMBERS", key]) }
+  async sismember(key: string, member: string) { return await this.command<number>(["SISMEMBER", key, member]) }
+  async srem(key: string, ...members: string[]) { return await this.command<number>(["SREM", key, ...members]) }
+  async expire(key: string, seconds: number) { return await this.command<number>(["EXPIRE", key, seconds]) }
+  async lpush(key: string, ...values: string[]) { return await this.command<number>(["LPUSH", key, ...values]) }
+  async rpush(key: string, ...values: string[]) { return await this.command<number>(["RPUSH", key, ...values]) }
+  async lrange(key: string, start: number, stop: number) { return await this.command<string[]>(["LRANGE", key, start, stop]) }
+  async ltrim(key: string, start: number, stop: number) { await this.command(["LTRIM", key, start, stop]) }
+  async llen(key: string) { return await this.command<number>(["LLEN", key]) }
+  async lrem(key: string, count: number, value: string) { return await this.command<number>(["LREM", key, count, value]) }
+  async lpos(key: string, value: string) { return await this.command<number | null>(["LPOS", key, value]) }
+  async lpop(key: string) { return await this.command<string | null>(["LPOP", key]) }
+  async rpop(key: string) { return await this.command<string | null>(["RPOP", key]) }
+  async dbSize() { return await this.command<number>(["DBSIZE"]) }
+  async keys(pattern: string) { return await this.command<string[]>(["KEYS", pattern]) }
+  async zadd(key: string, score: number, member: string) { return await this.command<number>(["ZADD", key, score, member]) }
+  async zrangebyscore(key: string, min: number | string, max: number | string) { return await this.command<string[]>(["ZRANGEBYSCORE", key, min, max]) }
+  async zremrangebyscore(key: string, min: number | string, max: number | string) { return await this.command<number>(["ZREMRANGEBYSCORE", key, min, max]) }
+  async zrange(key: string, start: number, stop: number) { return await this.command<string[]>(["ZRANGE", key, start, stop]) }
+  async zrevrange(key: string, start: number, stop: number) { return await this.command<string[]>(["ZREVRANGE", key, start, stop]) }
+  async zscore(key: string, member: string) { const score = await this.command<string | number | null>(["ZSCORE", key, member]); return score == null ? null : String(score) }
+  async zcard(key: string) { return await this.command<number>(["ZCARD", key]) }
+  async exists(key: string) { return await this.command<number>(["EXISTS", key]) }
+  async ttl(key: string) { return await this.command<number>(["TTL", key]) }
+  async saveToDisk() { return false }
+  async loadFromDisk() { return false }
+  saveToDiskSync() { return false }
+  async persistNow() { return false }
+  async cleanupExpiredKeysPublic() { return 0 }
+  async trackDatabaseOperation(limit: number) { return { current: 0, limit, exceeded: false } }
+  async getDatabaseOperationCount() { return 0 }
+  multi() { const ops: Array<Array<string | number>> = []; const queue = new Proxy({}, { get: (_t, prop: string) => prop === "exec" ? async () => Promise.all(ops.map((op) => this.command(op))) : (...args: Array<string | number>) => { ops.push([prop.toUpperCase(), ...args]); return queue } }) as { [k: string]: any; exec: () => Promise<any[]> }; return queue }
+  pipeline() { return this.multi() }
+}
+
+function createRedisInstance(): RedisClientLike {
+  const url = process.env.REDIS_URL || process.env.KV_URL
+  if (url) {
+    globalForRedis.__redis_backend = "redis-network"
+    return new NodeRedisClientAdapter(url)
+  }
+  const restUrl = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL
+  const restToken = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN
+  if (restUrl && restToken) {
+    globalForRedis.__redis_backend = "redis-network"
+    return new UpstashRestRedisClient(restUrl, restToken)
+  }
+  if (isProductionEnvironment() && !hasSharedRedisConfig()) {
+    throw new Error("Production Redis configuration missing: set REDIS_URL, KV_URL, or Upstash REST env vars for shared Redis")
+  }
+  globalForRedis.__redis_backend = "inline-local"
+  return new InlineLocalRedis()
+}
+
+export function getRedisBackend(): RedisBackend {
+  return globalForRedis.__redis_backend || (redisInstance instanceof InlineLocalRedis ? "inline-local" : "redis-network")
+}
+
+let redisInstance: RedisClientLike | null = null
 let isConnected = false          // FULLY ready: core + migrations complete
 let coreInitialized = false      // core ready: client constructed + snapshot loaded + ping ok
 let connectionsInitialized = false
@@ -1701,7 +1848,7 @@ export async function ensureCoreRedis(): Promise<void> {
     // have constructed it already; the constructor only initialises empty Maps
     // and never loads the snapshot — that is done explicitly below.
     if (!redisInstance) {
-      redisInstance = new InlineLocalRedis()
+      redisInstance = createRedisInstance()
     }
 
     // Load the on-disk snapshot EXACTLY ONCE per process, gated on the global
@@ -1711,10 +1858,10 @@ export async function ensureCoreRedis(): Promise<void> {
     // state. Concurrent callers across module scopes share one load promise.
     if (!globalForRedis.__redis_snapshot_loaded) {
       if (!globalForRedis.__redis_load_promise) {
-        globalForRedis.__redis_load_promise = redisInstance
+        globalForRedis.__redis_load_promise = redisInstance instanceof InlineLocalRedis ? redisInstance
           .loadFromDisk()
           .then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
-          .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false })
+          .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false }) : Promise.resolve(false).then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
         globalForRedis.__redis_load_promise.finally(() => {
           globalForRedis.__redis_load_promise = undefined
         })
@@ -1738,6 +1885,58 @@ export async function ensureCoreRedis(): Promise<void> {
   }
 }
 
+
+export async function cleanupVolatileRuntimeState({
+  mode = process.env.NODE_ENV === "production" ? "production" : "development",
+  reason = "startup",
+}: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+  const client = getRedisClient()
+  if (typeof (client as any).cleanupVolatileRuntimeState === "function") {
+    return (client as any).cleanupVolatileRuntimeState({ mode, reason })
+  }
+
+  const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
+  const now = Date.now()
+  const isDev = mode !== "production"
+  const allKeys = await client.keys("*").catch(() => [] as string[])
+  const toDelete: string[] = []
+  let preserved = 0
+
+  const staleStringKey = async (key: string) => {
+    const [raw, ttl] = await Promise.all([
+      client.get(key).catch(() => null),
+      typeof (client as any).ttl === "function" ? (client as any).ttl(key).catch(() => -1) : Promise.resolve(-1),
+    ])
+    const ts = Number(raw || "")
+    return ttl === -2 || (!Number.isFinite(ts) || ts <= 0 ? ttl < 0 : now - ts > staleMs)
+  }
+
+  for (const key of allKeys) {
+    let del = false
+    if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
+      del = isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+    } else if (key.startsWith("live:lock:") || key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) {
+      del = isDev || await staleStringKey(key)
+    } else if (
+      key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:") ||
+      key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:") ||
+      key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
+      key.startsWith("strategies:") || key.startsWith("settings:strategies")
+    ) {
+      del = true
+    }
+    if (del) toDelete.push(key)
+    else preserved++
+  }
+
+  let deleted = 0
+  for (let i = 0; i < toDelete.length; i += 500) {
+    deleted += await client.del(...toDelete.slice(i, i + 500)).catch(() => 0)
+  }
+  if (deleted > 0) console.log(`[v0] [Redis] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+  return { deleted, preserved }
+}
+
 /**
  * Full initialisation: core Redis + schema migrations. `isConnected` only
  * becomes true AFTER migrations have completed, and every caller awaits the
@@ -1753,7 +1952,10 @@ export async function initRedis(): Promise<void> {
   // can exceed hosted builder deadlines (kilo.ai). Provide an empty, connected
   // in-memory client for build-time reads and defer real migrations to runtime.
   if (isNextBuildPhase()) {
-    if (!redisInstance) redisInstance = new InlineLocalRedis()
+    if (!redisInstance) {
+      globalForRedis.__redis_backend = "inline-local"
+      redisInstance = new InlineLocalRedis()
+    }
     isConnected = true
     coreInitialized = true
     connectionsInitialized = true
@@ -1779,50 +1981,13 @@ export async function initRedis(): Promise<void> {
   }
   if (isConnected) return
 
-  // DEV ONLY — flush stale live positions on every initRedis() call.
-  //
-  // The InlineLocalRedis instance lives on globalThis.__redis_data and is
-  // reused across Next.js hot-reloads (the constructor only fires once per
-  // process). Each hot-reload resets module-level `isConnected` to false and
-  // calls initRedis() again — but __redis_init_promise is still set, so the
-  // async IIFE below is skipped.  We must flush HERE, before the promise guard,
-  // so stale live:position:* keys (44 from the previous session) and dedup
-  // locks don't carry over and silently block all new live order placement.
-  //
-  // A __redis_live_flush_token prevents double-clearing within a single module
-  // evaluation cycle (e.g. if two routes call initRedis() concurrently).
-  if (process.env.NODE_ENV === "development") {
-    const token = Date.now()
-    const g = globalForRedis as any
-    if (!g.__redis_live_flush_token || g.__redis_live_flush_token !== g.__redis_live_flush_applied) {
-      g.__redis_live_flush_applied = token
-      g.__redis_live_flush_token  = token
-      try {
-        const data = g.__redis_data as typeof globalForRedis.__redis_data | undefined
-        if (data) {
-          let cleared = 0
-          const isLiveKey = (k: string) =>
-            k.startsWith("live:position:") ||
-            k.startsWith("live:positions:") ||
-            k.startsWith("settings:live:position:") ||
-            k.startsWith("settings:live:positions:") ||
-            k.startsWith("live:lock:")
-          for (const key of data.strings.keys()) {
-            if (isLiveKey(key)) { data.strings.delete(key); cleared++ }
-          }
-          for (const key of data.lists.keys()) {
-            if (isLiveKey(key)) { data.lists.delete(key); cleared++ }
-          }
-          for (const key of data.hashes.keys()) {
-            if (isLiveKey(key)) { data.hashes.delete(key); cleared++ }
-          }
-          if (cleared > 0) {
-            console.log(`[v0] [Redis] Dev initRedis flush: cleared ${cleared} stale live position/lock keys`)
-          }
-        }
-      } catch { /* non-fatal */ }
-    }
-  }
+  // Startup volatile cleanup is environment-aware: development clears stale
+  // hot-reload runtime state aggressively, while production preserves
+  // authoritative live positions and removes only stale gates/locks/caches.
+  await cleanupVolatileRuntimeState({
+    mode: process.env.NODE_ENV === "production" ? "production" : "development",
+    reason: "initRedis",
+  }).catch(() => null)
 
   if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
 
@@ -1903,16 +2068,16 @@ export async function initRedis(): Promise<void> {
 // initRedis() (e.g. import-time code), initRedis() would early-return and SKIP
 // MIGRATIONS and the snapshot load entirely. They now only guarantee a non-null
 // client; ensureCoreRedis()/initRedis() own readiness state and snapshot load.
-export function getClient(): InlineLocalRedis {
+export function getClient(): RedisClientLike {
   if (!redisInstance) {
-    redisInstance = new InlineLocalRedis()
+    redisInstance = createRedisInstance()
   }
   return redisInstance
 }
 
-export function getRedisClient(): InlineLocalRedis {
+export function getRedisClient(): RedisClientLike {
   if (!redisInstance) {
-    redisInstance = new InlineLocalRedis()
+    redisInstance = createRedisInstance()
   }
   return redisInstance
 }
@@ -2147,6 +2312,52 @@ export async function getAllConnections(): Promise<any[]> {
   return __connInflight
 }
 
+
+export interface ConnectionCountDiagnostics {
+  connection_hash_count: number
+  legacy_connection_set_count: number
+}
+
+export async function getConnectionCountDiagnostics(): Promise<ConnectionCountDiagnostics> {
+  await initRedis()
+  const client = getClient()
+  const [connections, legacyCount] = await Promise.all([
+    getAllConnections(),
+    client.scard("connections").catch((error: unknown) => {
+      console.warn(
+        "[v0] [redis-db] Failed to count legacy connections set",
+        error instanceof Error ? error.message : error,
+      )
+      return 0
+    }),
+  ])
+
+  return {
+    connection_hash_count: connections.length,
+    legacy_connection_set_count: Number(legacyCount) || 0,
+  }
+}
+
+export async function reconcileLegacyConnectionsSetFromHashes(): Promise<ConnectionCountDiagnostics & { repaired: boolean }> {
+  await initRedis()
+  const client = getClient()
+  const connections = await getAllConnections()
+  const ids = connections
+    .map((connection) => String(connection?.id ?? "").trim())
+    .filter((id): id is string => id.length > 0)
+
+  await client.del("connections")
+  if (ids.length > 0) {
+    await client.sadd("connections", ...ids)
+  }
+
+  return {
+    connection_hash_count: connections.length,
+    legacy_connection_set_count: ids.length,
+    repaired: true,
+  }
+}
+
 export async function saveConnection(connection: any): Promise<void> {
   await initRedis()
   const client = getClient()
@@ -2161,14 +2372,20 @@ export async function saveConnection(connection: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
   
-  await client.hset(`connection:${id}`, data)
+  await Promise.all([
+    client.hset(`connection:${id}`, data),
+    client.sadd("connections", id),
+  ])
   invalidateConnectionsCache()
 }
 
 export async function deleteConnection(id: string): Promise<void> {
   await initRedis()
   const client = getClient()
-  await client.del(`connection:${id}`)
+  await Promise.all([
+    client.del(`connection:${id}`),
+    client.srem("connections", id),
+  ])
   invalidateConnectionsCache()
 }
 

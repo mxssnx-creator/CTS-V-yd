@@ -21,7 +21,7 @@ export async function POST(_req: NextRequest) {
     const client = getRedisClient()
     const acquired = await client.set(INIT_LOCK_KEY, token, { NX: true, EX: INIT_LOCK_TTL_SECONDS }).catch(() => null)
     if (acquired !== "OK") {
-      return NextResponse.json({ success: true, skipped: true, reason: "system initialization already running" })
+      return NextResponse.json({ success: true, skipped: true, queued: true, reason: "system initialization already running" })
     }
 
     try {
@@ -41,6 +41,11 @@ export async function POST(_req: NextRequest) {
       const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
       startServerContinuityRunner()
       return NextResponse.json({ success: true, healing })
+      const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
+      await initializeTradeEngineAutoStart()
+      const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
+      startServerContinuityRunner()
+      return NextResponse.json({ success: true, startupSweepCompleted: true })
     } finally {
       const current = await client.get(INIT_LOCK_KEY).catch(() => null)
       if (current === token) {

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getRedisBackend } from "@/lib/redis-db"
+import { initRedis, getConnectionCountDiagnostics } from "@/lib/redis-db"
 import { getMigrationStatus } from "@/lib/redis-migrations"
 
 export const dynamic = "force-dynamic"
@@ -9,24 +10,18 @@ export async function GET() {
     
     // Get actual migration status from database
     const migrationStatus = await getMigrationStatus()
-    const client = getRedisClient()
-    
-    // Count total keys using scard for connections set
-    let keyCount = 0
-    try {
-      const connectionsCount = await (client as any).scard("connections")
-      keyCount = connectionsCount || 0
-    } catch (e) {
-      console.warn("[v0] Failed to count connections")
-      keyCount = 0
-    }
+    const connectionCounts = await getConnectionCountDiagnostics()
+    const keyCount = connectionCounts.connection_hash_count
     
     return NextResponse.json({
       status: "success",
       is_installed: migrationStatus.latestVersion >= 1,
       database_connected: true,
+      redis_backend: getRedisBackend(),
       database_type: "redis",
       table_count: keyCount,
+      connection_hash_count: connectionCounts.connection_hash_count,
+      legacy_connection_set_count: connectionCounts.legacy_connection_set_count,
       migrations: {
         current_version: migrationStatus.currentVersion,
         applied: migrationStatus.currentVersion,
@@ -35,7 +30,10 @@ export async function GET() {
       database_stats: {
         connected: true,
         mode: "redis",
+        backend: getRedisBackend(),
         total_keys: keyCount,
+        connection_hash_count: connectionCounts.connection_hash_count,
+        legacy_connection_set_count: connectionCounts.legacy_connection_set_count,
         is_fallback: false,
       },
       migration_status: {

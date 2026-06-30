@@ -1,5 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { initRedis, getRedisClient, isRedisConnected, setSettings } from "@/lib/redis-db"
+import { initRedis, getRedisClient, isRedisConnected, setSettings, getConnectionCountDiagnostics } from "@/lib/redis-db"
 import { runMigrations, getMigrationStatus } from "@/lib/redis-migrations"
 import { SystemLogger } from "@/lib/system-logger"
 
@@ -93,21 +93,14 @@ export async function POST(request: NextRequest) {
 
     // Step 5: Get migration status and stats
     const status = await getMigrationStatus()
-    const client = getRedisClient()
-    
-    // Get connection count from the connections set instead of using dbSize (which doesn't exist)
-    let keyCount = 0
-    try {
-      const connectionsCount = await (client as any).scard("connections")
-      keyCount = connectionsCount || 0
-    } catch (e) {
-      console.warn("[v0] Failed to count keys, using 0")
-      keyCount = 0
-    }
+    const connectionCounts = await getConnectionCountDiagnostics()
+    const keyCount = connectionCounts.connection_hash_count
 
     logs.push(`Database Statistics:`)
     logs.push(`  - Schema Version: ${status.currentVersion}`)
     logs.push(`  - Stored Connections: ${keyCount}`)
+    logs.push(`  - Connection Hash Count: ${connectionCounts.connection_hash_count}`)
+    logs.push(`  - Legacy Connection Set Count: ${connectionCounts.legacy_connection_set_count}`)
     logs.push(`  - Database Type: Redis`)
     logs.push(`  - Indexes: Created`)
     logs.push(`  - TTL Policies: Configured`)
@@ -165,6 +158,8 @@ export async function POST(request: NextRequest) {
         },
         stats: {
           total_keys: keyCount,
+          connection_hash_count: connectionCounts.connection_hash_count,
+          legacy_connection_set_count: connectionCounts.legacy_connection_set_count,
           connected: true,
         },
         logs,
