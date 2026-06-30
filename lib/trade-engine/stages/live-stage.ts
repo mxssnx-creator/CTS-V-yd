@@ -3097,6 +3097,9 @@ export async function executeLivePosition(
     // errors operators saw: fake local positions, repeated protection-order
     // failures, and confusing "position not exist" exchange responses.
     let entryOrderId = orderResult?.orderId || orderResult?.id
+    console.log(
+      `${LOG_PREFIX} [Order Check] success=${orderResult?.success}, orderId=${entryOrderId}, error=${orderResult?.error}`,
+    )
     if (!orderResult?.success || !entryOrderId) {
       const reason =
         orderResult?.error ||
