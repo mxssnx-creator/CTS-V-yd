@@ -1050,7 +1050,7 @@ async function sweepOrphanProtectionOrders(
   try {
     const raw = (await withTimeout(
       connector.getOpenOrders(symbol) as Promise<any>,
-      5000,
+      10000,
       `sweepOrphan.getOpenOrders(${symbol})`,
     )) as any[] | undefined
     orders = Array.isArray(raw) ? raw : []
@@ -1437,11 +1437,11 @@ async function placeProtectionOrder(
 async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
   if (!connector || typeof connector.getOpenOrders !== "function") return null
   try {
-    // 5 s upper bound — same envelope as other reconcile-side venue calls.
-    // On timeout we degrade gracefully to drift-only reconciliation.
+    // 10 s upper bound — production increased from 5s to handle exchange network
+    // latency. On timeout we degrade gracefully to drift-only reconciliation.
     const orders = (await withTimeout(
       connector.getOpenOrders() as Promise<any>,
-      5000,
+      10000,
       "getOpenOrders(reconcile-tick)",
     )) as any[] | undefined
     if (!Array.isArray(orders)) return null
@@ -3171,8 +3171,26 @@ export async function executeLivePosition(
       // Check if we successfully retried and got an order ID
       const retryOrderId = orderResult?.orderId || orderResult?.id
       if (!retryOrderId || !orderResult?.success) {
-        // Still no order - reject the position
-        await savePosition(livePosition)
+        // Still no order - reject the position and clean up orphaned position record
+        livePosition.status = "rejected"
+        livePosition.statusReason = String(reason)
+        pushStep(livePosition, "place_order", false, livePosition.statusReason)
+        
+        // Clean up: Delete this rejected position from Redis to prevent orphaned
+        // position accumulation. The next cycle can re-attempt if needed.
+        try {
+          const { deletePosition } = await import("@/lib/redis-db")
+          await deletePosition(livePosition.id)
+          console.warn(
+            `${LOG_PREFIX} [Cleanup] Deleted orphaned live position ${livePosition.id} after 101400 retry failure`,
+          )
+        } catch (err) {
+          console.warn(
+            `${LOG_PREFIX} [Cleanup] Failed to delete position ${livePosition.id}:`,
+            err instanceof Error ? err.message : String(err),
+          )
+        }
+        
         await incrementMetric(connectionId, "live_orders_failed_count")
         await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "failed")
         await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})

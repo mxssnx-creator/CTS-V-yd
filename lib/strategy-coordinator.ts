@@ -2498,11 +2498,12 @@ export class StrategyCoordinator {
       // Dev: 150 per symbol keeps the pipeline fed without the memory spike
       // that 300/sym caused (300 × ~2 KB entries × 2 variants = ~1.2 MB/sym
       // in-flight; at 1 sym the cycle footprint drops from ~600 KB to ~300 KB).
-      // Prod: 50 unchanged (serverless — each invocation is short-lived).
+      // Prod: 200 (increased from 50 for production trading — sufficient for
+      // healthy strategy generation without OOM at 3.5GB heap in production).
       const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (
         process.env.NODE_ENV === "development"
           ? Math.max(150, _devSyms * 150)
-          : 50
+          : 200
       )
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
