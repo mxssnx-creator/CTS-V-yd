@@ -3102,60 +3102,101 @@ export async function executeLivePosition(
         orderResult?.error ||
         orderResult?.message ||
         (orderResult?.success ? "Exchange accepted entry but returned no orderId" : "Exchange entry order was rejected")
-      livePosition.status = "rejected"
-      livePosition.statusReason = String(reason)
-      pushStep(livePosition, "place_order", false, livePosition.statusReason)
       
-      // ── 101400 Minimum Order Amount Error Correction ────────────────────
-      // When BingX rejects with code=101400, extract the minimum from the
-      // error message and save it to Redis. Next cycle's volume calculator
-      // will respect this minimum, eliminating repeated 101400 errors.
-      if (isMinOrderSizeError(reason)) {
+      // ── 101400 Minimum Order Amount Error Correction with Same-Cycle Retry ─
+      // When BingX rejects with code=101400, extract the minimum from the error
+      // message and retry IMMEDIATELY with corrected volume in THIS cycle.
+      // This prevents wasting cycles on repeated sub-minimum rejections.
+      let retryWasAttempted = false
+      if (isMinOrderSizeError(reason) && placeAttempt < 3) {
         const minQty = extractMinOrderQty(reason)
-        if (minQty && minQty > 0) {
+        if (minQty && minQty > 0 && minQty > computedVolume) {
+          retryWasAttempted = true
           try {
             const { setSettings } = await import("@/lib/redis-db")
+            
+            // Save the corrected minimum for future cycles
             await setSettings(`trading_pair:${realPosition.symbol}`, {
               min_order_size: minQty,
               updated_at: new Date().toISOString(),
               source: "101400_error_extraction",
             })
+            
             console.warn(
-              `${LOG_PREFIX} [101400 Correction] Saved min_order_size=${minQty} for ${realPosition.symbol} (was ${computedVolume})`,
+              `${LOG_PREFIX} [101400 Correction] Detected minimum ${minQty} > current ${computedVolume.toFixed(8)} for ${realPosition.symbol}; retrying in same cycle`,
             )
+            
+            // Retry immediately with corrected quantity
+            const retryOrderResult = await exchangeConnector.placeOrder(
+              realPosition.symbol,
+              exchangeSide,
+              minQty,
+              undefined,
+              "market",
+              "IOC",
+              { leverage: livePosition.leverage },
+            )
+            
+            if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {
+              console.log(
+                `${LOG_PREFIX} [101400 Retry] Successfully placed order with corrected volume ${minQty.toFixed(8)} for ${realPosition.symbol}`,
+              )
+              // Continue with the corrected order
+              Object.assign(orderResult, retryOrderResult)
+              computedVolume = minQty  // Update for subsequent logging
+              retryWasAttempted = false  // Signal success
+            } else {
+              // Retry also failed
+              console.warn(
+                `${LOG_PREFIX} [101400 Retry] Retry with ${minQty.toFixed(8)} also failed:`,
+                retryOrderResult?.error || retryOrderResult?.message || "unknown",
+              )
+            }
           } catch (err) {
             console.warn(
-              `${LOG_PREFIX} [101400 Correction] Failed to save min_order_size:`,
+              `${LOG_PREFIX} [101400 Correction] Retry attempt failed:`,
               err instanceof Error ? err.message : String(err),
             )
           }
         }
       }
       
-      await savePosition(livePosition)
-      await incrementMetric(connectionId, "live_orders_failed_count")
-      await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "failed")
-      await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
-      await logProgressionEvent(connectionId, "live_trading", "error", `Entry order rejected for ${realPosition.symbol}`, {
-        symbol: realPosition.symbol,
-        direction: realPosition.direction,
-        side: exchangeSide,
-        quantity: computedVolume,
-        price: currentPrice,
-        leverage: livePosition.leverage,
-        error: livePosition.statusReason,
-        attempts: placeAttempt,
-      })
-      await logLiveOrderFinal(orderTrace, {
-        status: "rejected",
-        livePositionId: livePosition.id,
-        reason: livePosition.statusReason,
-        extra: {
-          orderResult,
+      // If no retry was attempted, or retry failed, mark as rejected
+      if (retryWasAttempted) {
+        livePosition.status = "rejected"
+        livePosition.statusReason = String(reason)
+        pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      }
+      
+      // Check if we successfully retried and got an order ID
+      const retryOrderId = orderResult?.orderId || orderResult?.id
+      if (!retryOrderId || !orderResult?.success) {
+        // Still no order - reject the position
+        await savePosition(livePosition)
+        await incrementMetric(connectionId, "live_orders_failed_count")
+        await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "failed")
+        await releaseLock(connectionId, realPosition.symbol, realPosition.direction + _lockDirSuffix).catch(() => {})
+        await logProgressionEvent(connectionId, "live_trading", "error", `Entry order rejected for ${realPosition.symbol}`, {
+          symbol: realPosition.symbol,
+          direction: realPosition.direction,
+          side: exchangeSide,
+          quantity: computedVolume,
+          price: currentPrice,
+          leverage: livePosition.leverage,
+          error: livePosition.statusReason,
           attempts: placeAttempt,
-        },
-      })
-      return livePosition
+        })
+        await logLiveOrderFinal(orderTrace, {
+          status: "rejected",
+          livePositionId: livePosition.id,
+          reason: livePosition.statusReason,
+          extra: {
+            orderResult,
+            attempts: placeAttempt,
+          },
+        })
+        return livePosition
+      }
     }
 
     livePosition.orderId = String(entryOrderId)
@@ -6367,7 +6408,7 @@ export async function syncLiveFromPseudo(
   exchangeConnector: any,
 ): Promise<void> {
   try {
-    // ── System tracking validation ──
+    // ─��� System tracking validation ──
     // Only sync positions created by this system. Skip foreign/manual orders.
     const trackingId = String(pseudoPos?.system_tracking_id || "").trim()
     if (!trackingId.startsWith("sys-") || trackingId.length <= 10) {
