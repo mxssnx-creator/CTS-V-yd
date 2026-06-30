@@ -2498,12 +2498,12 @@ export class StrategyCoordinator {
       // Dev: 150 per symbol keeps the pipeline fed without the memory spike
       // that 300/sym caused (300 × ~2 KB entries × 2 variants = ~1.2 MB/sym
       // in-flight; at 1 sym the cycle footprint drops from ~600 KB to ~300 KB).
-      // Prod: 2000 (system generates up to ~1200 Main sets per cycle; ceiling
+      // Prod: 5000 (system generates up to ~2000+ Main sets per cycle; ceiling
       // ensures no truncation while memory stays bounded at ~3.5GB production heap).
       const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (
         process.env.NODE_ENV === "development"
           ? Math.max(150, _devSyms * 150)
-          : 2000
+          : 5000
       )
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
@@ -3232,7 +3232,7 @@ export class StrategyCoordinator {
         continue
       }
 
-      // ── 3. PF/DDT gate ────────────────────────����──────────────────────────
+      // ── 3. PF/DDT gate ─────────────────��──────����──────────────────────────
       const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                      s.avgDrawdownTime  <= metrics.maxDrawdownTime
       if (passes) {
@@ -3480,7 +3480,7 @@ export class StrategyCoordinator {
     const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (
       process.env.NODE_ENV === "development"
         ? Math.max(200, _devSymsReal * 60)
-        : 2000  // Production: increased from 1000 to handle high diversity without truncation
+        : 5000  // Production: no truncation; system generates 2000+, all pass through
     )
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
