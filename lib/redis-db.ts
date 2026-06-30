@@ -2147,6 +2147,52 @@ export async function getAllConnections(): Promise<any[]> {
   return __connInflight
 }
 
+
+export interface ConnectionCountDiagnostics {
+  connection_hash_count: number
+  legacy_connection_set_count: number
+}
+
+export async function getConnectionCountDiagnostics(): Promise<ConnectionCountDiagnostics> {
+  await initRedis()
+  const client = getClient()
+  const [connections, legacyCount] = await Promise.all([
+    getAllConnections(),
+    client.scard("connections").catch((error: unknown) => {
+      console.warn(
+        "[v0] [redis-db] Failed to count legacy connections set",
+        error instanceof Error ? error.message : error,
+      )
+      return 0
+    }),
+  ])
+
+  return {
+    connection_hash_count: connections.length,
+    legacy_connection_set_count: Number(legacyCount) || 0,
+  }
+}
+
+export async function reconcileLegacyConnectionsSetFromHashes(): Promise<ConnectionCountDiagnostics & { repaired: boolean }> {
+  await initRedis()
+  const client = getClient()
+  const connections = await getAllConnections()
+  const ids = connections
+    .map((connection) => String(connection?.id ?? "").trim())
+    .filter((id): id is string => id.length > 0)
+
+  await client.del("connections")
+  if (ids.length > 0) {
+    await client.sadd("connections", ...ids)
+  }
+
+  return {
+    connection_hash_count: connections.length,
+    legacy_connection_set_count: ids.length,
+    repaired: true,
+  }
+}
+
 export async function saveConnection(connection: any): Promise<void> {
   await initRedis()
   const client = getClient()
@@ -2161,14 +2207,20 @@ export async function saveConnection(connection: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
   
-  await client.hset(`connection:${id}`, data)
+  await Promise.all([
+    client.hset(`connection:${id}`, data),
+    client.sadd("connections", id),
+  ])
   invalidateConnectionsCache()
 }
 
 export async function deleteConnection(id: string): Promise<void> {
   await initRedis()
   const client = getClient()
-  await client.del(`connection:${id}`)
+  await Promise.all([
+    client.del(`connection:${id}`),
+    client.srem("connections", id),
+  ])
   invalidateConnectionsCache()
 }
 
