@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient, getRedisBackend } from "@/lib/redis-db"
-import { initRedis, getConnectionCountDiagnostics } from "@/lib/redis-db"
+import { initRedis, getRedisBackend, getConnectionCountDiagnostics } from "@/lib/redis-db"
+
 import { getMigrationStatus } from "@/lib/redis-migrations"
 
 export const dynamic = "force-dynamic"

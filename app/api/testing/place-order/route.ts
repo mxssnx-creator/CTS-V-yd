@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors/factory"
+import { getLiveOrderSafetyFailure } from "@/lib/live-order-safety"
 import type { ExchangeConnection } from "@/lib/types"
 
 export const dynamic = "force-dynamic"
@@ -39,11 +40,34 @@ export async function POST(req: NextRequest) {
       contract_type: connData.contract_type || "",
     } as any as ExchangeConnection
 
-    console.log(`[PlaceOrder] Placing ${side} order for ${symbol} x${leverage} with ${quantity} coins`)
+    const sideKey = String(side).trim().toLowerCase()
+    const direction: "long" | "short" = sideKey === "short" || sideKey === "sell" ? "short" : "long"
+    const exchangeSide: "buy" | "sell" = direction === "long" ? "buy" : "sell"
+    const symbolKey = String(symbol).trim().toUpperCase()
 
-    // Choose connector: prefer simulated when FORCE_SIMULATED=1 or missing API keys
+    console.log(`[PlaceOrder] Placing ${direction} (${exchangeSide}) order for ${symbolKey} x${leverage} with ${quantity} coins`)
+
+    // Choose connector: prefer simulated when FORCE_SIMULATED=1 or missing API keys.
+    // Real exchange order placement is intentionally blocked unless both a
+    // server-side enable flag and an explicit per-request confirmation are present.
     let connector: any = null
     const forceSim = process.env.FORCE_SIMULATED === "1"
+    const willUseRealExchange = !forceSim && !!connection.api_key && !!connection.api_secret
+    const orderMode = willUseRealExchange ? "live" : "simulated"
+    if (willUseRealExchange) {
+      const safetyFailure = getLiveOrderSafetyFailure(body)
+      if (safetyFailure) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: safetyFailure,
+            mode: "blocked_live_order_safety",
+          },
+          { status: 403 },
+        )
+      }
+    }
+
     if (forceSim || !connection.api_key || !connection.api_secret) {
       try {
         const { SimulatedConnector } = await import("@/lib/exchange-connectors/simulated-connector")
@@ -69,7 +93,7 @@ export async function POST(req: NextRequest) {
     if (leverage && leverage > 1 && typeof connector?.setLeverage === "function") {
       console.log(`[PlaceOrder] Setting leverage to ${leverage}x`)
       try {
-        const leverageResult = await connector.setLeverage(symbol, leverage)
+        const leverageResult = await connector.setLeverage(symbolKey, leverage)
         console.log(`[PlaceOrder] Leverage set: ${JSON.stringify(leverageResult)}`)
       } catch (err) {
         console.log(`[PlaceOrder] Could not set leverage (may not be a perpetual market):`, err instanceof Error ? err.message : String(err))
@@ -77,8 +101,8 @@ export async function POST(req: NextRequest) {
     }
 
     // Place market order with minimal volume
-    console.log(`[PlaceOrder] Placing market order: ${side} ${quantity} ${symbol} with leverage ${leverage}x`)
-    const result = await connector.placeOrder(symbol, side, quantity, 0, "market")
+    console.log(`[PlaceOrder] Placing market order: ${exchangeSide} ${quantity} ${symbolKey} with leverage ${leverage}x`)
+    const result = await connector.placeOrder(symbolKey, exchangeSide, quantity, 0, "market")
 
     console.log(`[PlaceOrder] Order result:`, result)
 
@@ -92,28 +116,43 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // Persist a live position record and update progression counters so
-    // the dashboard reflects this test order immediately. Treat the
-    // order as filled for testing purposes if no explicit fill info exists.
+    // Persist real exchange results to the live counters. Simulated fallback
+    // orders must not inflate live order/position counts because that makes
+    // dashboard relations and percentages look like real exchange execution.
     try {
-      const { getRedisClient, saveMarketData, savePosition, getMarketData } = await import("@/lib/redis-db")
+      const { getRedisClient, savePosition, getMarketData } = await import("@/lib/redis-db")
+      if (!willUseRealExchange) {
+        await (getRedisClient() as any).hincrby(`progression:${connectionId}`, "live_orders_simulated_count", 1)
+        return NextResponse.json({
+          success: true,
+          mode: orderMode,
+          orderId: (result as any)?.orderId || (result as any)?.order_id || "N/A",
+          symbol: symbolKey,
+          side: exchangeSide,
+          direction,
+          quantity,
+          leverage,
+          timestamp: Date.now(),
+          details: (result as any)?.details || result,
+        })
+      }
       const client = getRedisClient()
       // Determine fill price: prefer exchange-provided, else market data
       let fillPrice = (result as any)?.filledPrice || (result as any)?.avgPrice || 0
       if (!fillPrice || fillPrice <= 0) {
-        const md = await getMarketData(symbol, "1m").catch(() => null)
+        const md = await getMarketData(symbolKey, "1m").catch(() => null)
         const latest = md && (md.latest || (Array.isArray(md) ? md[md.length - 1] : null))
         fillPrice = latest ? parseFloat(String(((latest.close ?? latest[4] ?? latest.price) || 0))) || 0 : fillPrice
       }
 
       const execQty = Number(quantity) || Number((result as any)?.filledQty) || 0
-      const liveId = `live:${connectionId}:${symbol}:${side}:${Date.now()}:${Math.random().toString(36).slice(2,8)}`
+      const liveId = `live:${connectionId}:${symbolKey}:${direction}:${Date.now()}:${Math.random().toString(36).slice(2,8)}`
       const livePos: any = {
         id: liveId,
         connectionId,
-        symbol,
-        side: side === "buy" ? "long" : "short",
-        direction: side === "buy" ? "long" : "short",
+        symbol: symbolKey,
+        side: direction,
+        direction,
         entryPrice: fillPrice || 0,
         executedQuantity: execQty,
         remainingQuantity: 0,
@@ -150,10 +189,10 @@ export async function POST(req: NextRequest) {
         }
         // Update per-symbol orders map
         const ordersBySymbolKey = `live_orders_by_symbol:${connectionId}`
-        const existingRaw = await client.hget(ordersBySymbolKey, symbol).catch(() => null)
-        let existing = existingRaw ? JSON.parse(String(existingRaw)) : { symbol, side, count: 0 }
-        existing.count = (existing.count || 0) + 1
-        await client.hset(ordersBySymbolKey, symbol, JSON.stringify(existing))
+        await (client as any).hincrby(ordersBySymbolKey, `${symbolKey}:${direction}:placed`, 1)
+        if (execQty > 0) {
+          await (client as any).hincrby(ordersBySymbolKey, `${symbolKey}:${direction}:filled`, 1)
+        }
       } catch (cErr) {
         console.warn("[PlaceOrder] Failed to update progression counters:", cErr)
       }
@@ -163,9 +202,11 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       success: true,
+      mode: orderMode,
       orderId: (result as any)?.orderId || (result as any)?.order_id || "N/A",
-      symbol,
-      side,
+      symbol: symbolKey,
+      side: exchangeSide,
+      direction,
       quantity,
       leverage,
       timestamp: Date.now(),

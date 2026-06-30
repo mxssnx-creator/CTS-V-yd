@@ -25,6 +25,11 @@ import { QuickstartConnectionControls } from "./quickstart-connection-controls"
 import { QuickstartOptionsBar } from "./quickstart-options-bar"
 import { useExchange } from "@/lib/exchange-context"
 
+const toBooleanFlag = (value: unknown): boolean =>
+  value === true || value === 1 || value === "1" || value === "true" || value === "yes" || value === "on"
+const liveTradeUiFlag = (conn: any): boolean =>
+  toBooleanFlag(conn?.live_trade_requested) || toBooleanFlag(conn?.is_live_trade)
+
 // ─── types ────────────────────────────────────────────────────────────────────
 
 interface LogEntry {
@@ -821,7 +826,7 @@ export function QuickstartSection() {
       addLog(`Connected to ${conn.exchange?.toUpperCase() || "exchange"}`, "success")
       setActiveConnectionId(conn.id)
       // Seed live state from whatever the connection already says
-      setLiveTradeActive(conn.is_live_trade === "1" || conn.is_live_trade === true)
+      setLiveTradeActive(liveTradeUiFlag(conn))
 
       const clampedCount = Math.max(1, Math.min(32, symbolCount))
       addLog(
@@ -942,7 +947,7 @@ export function QuickstartSection() {
       const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
       const conn = conns.find(c => c.id === id)
       if (conn) {
-        setLiveTradeActive(conn.is_live_trade === "1" || conn.is_live_trade === true)
+        setLiveTradeActive(liveTradeUiFlag(conn))
       }
     } catch { /* non-critical */ }
   }, [activeConnectionId, connectionId])
@@ -969,12 +974,16 @@ export function QuickstartSection() {
         addLog(`Live toggle failed: ${body?.error || res.statusText}${hint}`, "error")
         return
       }
-      setLiveTradeActive(nextState)
+      const requestedState = typeof body?.live_trade_requested === "boolean" ? body.live_trade_requested : nextState
+      const effectiveState = typeof body?.is_live_trade === "boolean" ? body.is_live_trade : requestedState
+      setLiveTradeActive(requestedState)
       addLog(
-        nextState
-          ? "LIVE exchange trading ENABLED — real orders will be placed"
+        requestedState
+          ? (effectiveState
+              ? "LIVE exchange trading ENABLED — real orders can be placed when strategy gates pass"
+              : "LIVE exchange trading REQUESTED — blocked until API credentials are configured")
           : "LIVE exchange trading disabled",
-        nextState ? "success" : "info",
+        requestedState ? (effectiveState ? "success" : "warning") : "info",
       )
       // Refresh stats immediately so the Live counter reflects the new engine
       setTimeout(() => fetchStats(true), 1000)

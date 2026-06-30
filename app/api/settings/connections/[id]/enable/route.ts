@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { initRedis, getConnection, updateConnection } from "@/lib/redis-db"
+import { initRedis, getConnection, updateConnection, getRedisClient } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
@@ -113,6 +113,21 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             isTruthyFlag((updatedConnection as any).is_testnet) ||
             isTruthyFlag((updatedConnection as any).demo_mode))
         if (canRun) {
+          const client = getRedisClient()
+          const globalState: Record<string, string> = await client
+            .hgetall("trade_engine:global")
+            .catch(() => ({} as Record<string, string>)) || {}
+
+          await client.hset("trade_engine:global", {
+            ...globalState,
+            status: "running",
+            desired_status: "running",
+            operator_intent: "running",
+            coordinator_ready: "true",
+            started_at: globalState.started_at || new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+
           await coordinator.startMissingEngines([updatedConnection])
         }
       } else {

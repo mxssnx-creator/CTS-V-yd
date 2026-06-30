@@ -5,6 +5,97 @@ const repo = path.resolve(__dirname, "../..")
 const read = (file: string) => fs.readFileSync(path.join(repo, file), "utf8")
 
 describe("requested regression guardrails", () => {
+
+  test("live order test endpoints require explicit server and request safety gates", () => {
+    const safety = read("lib/live-order-safety.ts")
+    const placeOrder = read("app/api/testing/place-order/route.ts")
+    const liveOrdersTest = read("app/api/test/live-orders-test/route.ts")
+
+    expect(safety).toContain('process.env.ALLOW_LIVE_ORDER_PLACEMENT === "1"')
+    expect(safety).toContain('confirmLiveOrderPlacement === true')
+    expect(safety).toContain('I understand this places real exchange orders')
+    expect(placeOrder).toContain('const willUseRealExchange = !forceSim && !!connection.api_key && !!connection.api_secret')
+    expect(placeOrder).toContain('getLiveOrderSafetyFailure(body)')
+    expect(placeOrder).toContain('mode: "blocked_live_order_safety"')
+    expect(placeOrder).toContain('const orderMode = willUseRealExchange ? "live" : "simulated"')
+    expect(placeOrder).toContain('"live_orders_simulated_count"')
+    expect(placeOrder).toContain('const direction: "long" | "short" = sideKey === "short" || sideKey === "sell" ? "short" : "long"')
+    expect(placeOrder).toContain('const exchangeSide: "buy" | "sell" = direction === "long" ? "buy" : "sell"')
+    expect(placeOrder).toContain('`${symbolKey}:${direction}:placed`')
+    expect(placeOrder).toContain('`${symbolKey}:${direction}:filled`')
+    expect(placeOrder).not.toContain('JSON.stringify(existing)')
+    expect(placeOrder).not.toContain("symbol,\n          side,")
+    expect(liveOrdersTest).toContain('getLiveOrderSafetyFailure(body)')
+    expect(liveOrdersTest).toContain('mode: "blocked_live_order_safety"')
+  })
+
+  test("live order statistics keep long and short buckets independent", () => {
+    const liveStage = read("lib/trade-engine/stages/live-stage.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+
+    expect(liveStage).toContain('const sideKey = String(side || "").trim().toLowerCase()')
+    expect(liveStage).toContain('sideKey.includes("short") || sideKey === "sell"')
+    expect(liveStage).toContain('const symbolKey = String(symbol || "").trim().toUpperCase()')
+    expect(liveStage).toContain('const field = `${symbolKey}:${dir}:${metric}`')
+
+    expect(statsRoute).toContain("Legacy/testing route compatibility")
+    expect(statsRoute).toContain('rawSide.includes("short") || rawSide === "sell"')
+    expect(statsRoute).toContain("const legacyCount = n(parsed?.count ?? 0)")
+    expect(statsRoute).toContain("parsed?.filled ?? parsed?.ordersFilled ?? legacyCount")
+    expect(statsRoute).toContain("entry[direction][kind] += value")
+    expect(statsRoute).not.toContain("entry[direction][kind] = value")
+  })
+
+  test("progression strategy totals are pipeline-aware and do not sum cascade stages", () => {
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+
+    expect(statsRoute).toContain("Pipeline-aware total: Base → Main → Real → Live is a cascade")
+    expect(statsRoute).toContain("total: stratTotal")
+    expect(statsRoute).not.toContain("total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0) + (stratCounts.live || 0)")
+    expect(statsRoute).not.toContain("full pipeline throughput across all stages")
+  })
+
+
+  test("live-trade UI uses requested intent so sliders do not flip off while blocked", () => {
+    const engineStates = read("app/api/connections/[id]/engine-states/route.ts")
+    const activeCard = read("components/dashboard/active-connection-card.tsx")
+    const optionsBar = read("components/dashboard/quickstart-options-bar.tsx")
+    const quickstart = read("components/dashboard/quickstart-section.tsx")
+
+    expect(engineStates).toContain("const liveRequested = toBoolean((connection as any).live_trade_requested)")
+    expect(engineStates).toContain("const flagLive    = liveRequested || liveEffective")
+    expect(engineStates).toContain("live: buildModeState(flagLive, liveEffective)")
+    expect(activeCard).toContain("const liveTradeUiFlag")
+    expect(activeCard).toContain("toBoolean(details?.live_trade_requested) || toBoolean(details?.is_live_trade)")
+    expect(activeCard).toContain("const requestedState = typeof data.live_trade_requested === \"boolean\" ? data.live_trade_requested : newState")
+    expect(optionsBar).toContain("const liveRequested = toBooleanFlag(conn.live_trade_requested)")
+    expect(optionsBar).toContain("setControlOrders(liveRequested || liveEffective)")
+    expect(quickstart).toContain("const liveTradeUiFlag = (conn: any): boolean")
+    expect(quickstart).toContain("setLiveTradeActive(liveTradeUiFlag(conn))")
+  })
+
+
+  test("live-trade enable updates global operator intent to running", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+    const intentBlock = source.slice(
+      source.indexOf('await getRedisClient().hset("trade_engine:global"'),
+      source.indexOf('}).catch((stateErr: unknown)', source.indexOf('await getRedisClient().hset("trade_engine:global"')),
+    )
+
+    expect(intentBlock).toContain('status: "running"')
+    expect(intentBlock).toContain('desired_status: "running"')
+    expect(intentBlock).toContain('operator_intent: "running"')
+    expect(intentBlock).toContain('mode: hasCredentials ? "live" : "live_requested"')
+  })
+
+  test("live-trade queued starts use settings namespace consumed by coordinator", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+
+    expect(source).toContain('setSettings("engine_coordinator:refresh_requested"')
+    expect(source).not.toContain('hset("engine_coordinator:refresh_requested"')
+    expect(source).toContain('engineStatus = "queued"')
+  })
+
   test("live-trade enable preserves requested state when credentials are missing", () => {
     const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
 
@@ -355,6 +446,8 @@ describe("requested regression guardrails", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
 
+    expect(instrumentation).toContain('process.env.NEXT_RUNTIME === "edge"')
+    expect(instrumentation).not.toContain('process.env.NEXT_RUNTIME !== "nodejs"')
     expect(instrumentation).toContain('ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
     expect(instrumentation).toContain("trade-engine auto-start skipped")
     expect(instrumentation).toContain('ENABLE_IN_PROCESS_CONTINUITY === "1"')
@@ -392,9 +485,9 @@ describe("requested regression guardrails", () => {
     const autoStart = read("lib/trade-engine-auto-start.ts")
 
     expect(autoStart).toContain("export async function runTradeEngineHealingSweep")
-    expect(autoStart).toContain("cron callers must await this function directly")
-    expect(cron).toContain("runTradeEngineHealingSweep(true)")
-    expect(cron).toContain("await initializeTradeEngineAutoStart()")
+    expect(autoStart).toContain("Cron/serverless routes must call this directly and await it")
+    expect(cron).toContain('runCronTask("auto-start-healing-sweep", () => runTradeEngineHealingSweep({ isStartup: true }))')
+    expect(cron).not.toContain("initializeTradeEngineAutoStart")
   })
 
   test("status route does not report stale Redis running intent as local engine progress", () => {
@@ -438,6 +531,23 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Connection enabled; start queued for coordinator worker")
     expect(source).toContain("this UI worker is not opted in for local engine loops")
     expect(source).toContain('engineStatus = "queued"')
+  })
+
+  test("connection enable paths keep global coordinator intent stable when engines can run", () => {
+    const enableRoute = read("app/api/settings/connections/[id]/enable/route.ts")
+    const dashboardRoute = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
+
+    expect(enableRoute).toContain('hgetall("trade_engine:global")')
+    expect(enableRoute).toContain('status: "running"')
+    expect(enableRoute).toContain('desired_status: "running"')
+    expect(enableRoute).toContain('operator_intent: "running"')
+    expect(enableRoute).toContain('coordinator_ready: "true"')
+    expect(enableRoute.indexOf('operator_intent: "running"')).toBeLessThan(enableRoute.indexOf("await coordinator.startMissingEngines"))
+
+    expect(dashboardRoute).toContain("const preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain("desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain("operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain("Only /api/trade-engine/stop owns global shutdown")
   })
 
   test("dashboard detailed logs header action scrolls within the log dialog", () => {

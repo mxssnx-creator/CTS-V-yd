@@ -15,6 +15,7 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  serverExternalPackages: ["redis", "@redis/client"],
   // ── Tier-3 perf: prod-only console removal ───────────────────────
   // Strips `console.log` / `console.debug` / `console.info` from
   // production client + server bundles, keeping `console.error` and
@@ -33,10 +34,8 @@ const nextConfig = {
     serverActions: {
       allowedOrigins: ["*"],
     },
-    // Enable instrumentation hook for deterministic server-side boot sequence
-    // (migrations, global state initialization, orphan cleanup) on every
-    // process start. Critical for production stability.
-    instrumentationHook: true,
+    // instrumentation.ts is auto-discovered by Next.js and remains the
+    // deterministic server-side boot sequence entry point.
   },
   // Production-specific headers for performance
   async headers() {
@@ -69,6 +68,26 @@ const nextConfig = {
   },
   webpack: (config, { isServer, nextRuntime, webpack }) => {
     config.resolve = config.resolve || {}
+    config.resolve.alias = {
+      ...(config.resolve.alias || {}),
+      diagnostics_channel: false,
+      "node:diagnostics_channel": false,
+      net: false,
+      "node:net": false,
+      tls: false,
+      "node:tls": false,
+      dns: false,
+      "dns/promises": false,
+      "node:dns": false,
+      "node:dns/promises": false,
+      assert: false,
+      "node:assert": false,
+      perf_hooks: false,
+      "node:perf_hooks": false,
+      events: false,
+      "node:events": false,
+      "@node-rs/xxhash": false,
+    }
     config.plugins = config.plugins || []
 
     // Strip the `node:` URI scheme so Webpack 5 can resolve Node built-ins
@@ -86,6 +105,8 @@ const nextConfig = {
         crypto: false,
         stream: false,
         buffer: false,
+        diagnostics_channel: false,
+        "@node-rs/xxhash": false,
       }
     }
 

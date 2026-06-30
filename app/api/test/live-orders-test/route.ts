@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors/factory"
 import { getVenueMinQty } from "@/lib/exchange-min-qty"
+import { getLiveOrderSafetyFailure } from "@/lib/live-order-safety"
 import type { ExchangeConnection } from "@/lib/types"
 
 const LOG_PREFIX = "[v0] [LiveOrdersTest]"
@@ -148,6 +149,18 @@ export async function POST(req: NextRequest) {
     await initRedis()
     const body = await req.json()
     const { connectionId } = body
+
+    const safetyFailure = getLiveOrderSafetyFailure(body)
+    if (safetyFailure) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: safetyFailure,
+          mode: "blocked_live_order_safety",
+        },
+        { status: 403 },
+      )
+    }
 
     if (!connectionId) {
       return NextResponse.json(
