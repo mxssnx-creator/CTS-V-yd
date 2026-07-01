@@ -657,7 +657,14 @@ export class EngineProgressManager {
 // Global Manager Registry
 // ============================================
 
-const managerRegistry = new Map<string, EngineProgressManager>()
+const g = globalThis as unknown as {
+  __engineProgressManagers?: Map<string, EngineProgressManager>
+}
+
+// Keep managers process-singleton across module reloads (for example Next.js HMR).
+// This reduces same-process stale manager duplication while Redis persistence is
+// migrated to hash/delta updates for cross-worker overwrite safety.
+const managerRegistry = g.__engineProgressManagers ??= new Map<string, EngineProgressManager>()
 
 export function getProgressManager(connectionId: string): EngineProgressManager {
   if (!managerRegistry.has(connectionId)) {
