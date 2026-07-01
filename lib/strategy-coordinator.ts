@@ -1501,6 +1501,25 @@ export class StrategyCoordinator {
     await this.memoryCircuitBreaker(symbol)
 
     try {
+      // ── Check for unchanged position state (skip redundant calculations) ──
+      // Early exit if no new positions opened/closed — prevents recalculating
+      // P&F/DDT every cycle when market data hasn't produced new entries.
+      const posCtx: PositionContext = sharedContext
+        ?? (isPrehistoric
+          ? this.neutralPositionContext()
+          : await this.getPositionContext())
+      
+      const posFingerprint = `${posCtx.openPositions.length}|${posCtx.closedPositions.length}`
+      const prevFingerprint = (this as any)._lastPosFingerprint?.[symbol]
+      if (prevFingerprint === posFingerprint && !isPrehistoric && indications.length === (this as any)._lastIndicationCount?.[symbol]) {
+        console.log(`[v0] [StrategyCoordinator] ${symbol}: unchanged position/indication state, skipping calculations`)
+        return results
+      }
+      if (!(this as any)._lastPosFingerprint) (this as any)._lastPosFingerprint = {}
+      if (!(this as any)._lastIndicationCount) (this as any)._lastIndicationCount = {}
+      ;(this as any)._lastPosFingerprint[symbol] = posFingerprint
+      ;(this as any)._lastIndicationCount[symbol] = indications.length
+
       // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
       await Promise.all([
         this.loadAppPFThresholds(),
@@ -1549,7 +1568,27 @@ export class StrategyCoordinator {
       // additional related variants flow uniformly through this filter).
       // CoordIndex.validRealKeys is populated here; Real tuner writes sizeDelta
       // / tunedAvgPF onto each record for O(1) access at Live dispatch.
-      const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets, coordIndex)
+      // OPTIMIZATION: Skip Real evaluation if no Main sets and no active positions
+      // to evaluate (avoids P&F/DDT recalculation on idle cycles).
+      let realSets: StrategySet[] = []
+      let realResult: StrategyEvaluation
+      if (mainSets.length > 0 || posCtx.openPositions.length > 0) {
+        const realEval = await this.evaluateRealSets(symbol, mainSets, coordIndex)
+        realSets = realEval.sets
+        realResult = realEval.result
+      } else {
+        realResult = {
+          stage: "real",
+          symbol,
+          timestamp: new Date().toISOString(),
+          message: "real: skipped (no main sets, no open positions)",
+          created_sets: 0,
+          passed_sets: 0,
+          rejected_sets: 0,
+          avgProfitFactor: 0,
+          avgDrawdownTime: 0,
+        }
+      }
       results.push(realResult)
 
       // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode).
@@ -1765,7 +1804,8 @@ export class StrategyCoordinator {
         // the UI settings dialog and change infrequently during a session.
         // Previously 30s caused 67 hgetall calls/min at 10 symbols. At 5 min
         // this drops to 2 calls/min, 97% reduction in Redis I/O for this path.
-        const SETTINGS_CACHE_TTL_MS = 5 * 60 * 1000
+        // AGGRESSIVE CACHE: 10 minutes for settings (operator changes infrequently)
+      const SETTINGS_CACHE_TTL_MS = 10 * 60 * 1000
         const cachedAge = Date.now() - this._prevPosMinCountAt
         const winAge = Date.now() - this._prevPosWindowAt
         if (
@@ -2097,7 +2137,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 2: MAIN ──────────────────────���─────────────────────────────────���──
+  // ─── STAGE 2: MAIN ──────────────────────���─────────────────────────────────�����──
 
   /**
    * Validate BASE Sets (avgPF >= 1.2, avgConf >= 0.5, DDT <= 24h) AND create
@@ -3232,7 +3272,7 @@ export class StrategyCoordinator {
         continue
       }
 
-      // ── 3. PF/DDT gate ─────────────────��──────����──────────────────────────
+      // ── 3. PF/DDT gate ─────────────────����──────����──────────────────────────
       const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                      s.avgDrawdownTime  <= metrics.maxDrawdownTime
       if (passes) {
@@ -3376,7 +3416,7 @@ export class StrategyCoordinator {
     //
     // Bootstrap fallback: on fresh sessions every indication produces symmetric
     // long+short pairs (same prev/last/cont/outcome context, just different direction)
-    // → every bucket is L=1,S=1 → all cancelled → netted=[]. When this happens and
+    // → every bucket is L=1,S=1 → all cancelled ��� netted=[]. When this happens and
     // there are no axis sets either, keep the top-PF set per direction so the live
     // pipeline can start building position history. Future cycles will develop
     // asymmetric signals and netting will work as intended.
@@ -3824,7 +3864,7 @@ export class StrategyCoordinator {
       //
       // Pre-compute the axis POSITION accumulation sum so the stats route
       // never needs extra round-trips on every dashboard refresh.
-      // Source: axis_pos_acc:{conn} — the hash bumpAxisPosAccumulation writes
+      // Source: axis_pos_acc:{conn} ��� the hash bumpAxisPosAccumulation writes
       // to in the Real tuner loop above. Each field is parentSetKey|axisKey and
       // the value is the cumulative entryCount (= baseEC + min(cont,liveCont))
       // across all cycles — exactly the "Accumulated" perspective the operator
@@ -4153,7 +4193,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────�����───��─────��─────��──────���───────��
+  // ─── STAGE 4: LIVE ─────────����─���────────��─────�����───��─────��─────��──────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -5477,7 +5517,7 @@ export class StrategyCoordinator {
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
               //   �� per-axis Pos-acc ledger has a non-zero delta to record
-              // ── Axis-Set LRU cache ────────��──�����─────────────────────���───��─
+              // ── Axis-Set LRU cache ─────���──��──�����─────────────────────���───��─
               // Axis Set objects are now pure value objects (the Real-stage tuner
               // writes sizeDelta onto the CoordRecord instead of mutating entries).
               // They can be safely reused across cycles without cloning.
