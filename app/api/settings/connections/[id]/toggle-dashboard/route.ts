@@ -328,7 +328,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          await coordinator.stopEngine(resolvedId)
+          await coordinator.stopEngine(resolvedId, { operatorRequested: true })
           console.log(`[v0] [Toggle] ✓ Engine stopped directly for ${connection.name}`)
           await logProgressionEvent(resolvedId, "engine_stopped_direct", "info", "Main Trade Engine stopped directly from disable", {
             connectionId: resolvedId,

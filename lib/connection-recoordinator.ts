@@ -318,7 +318,7 @@ export async function recoordinateAfterSettingsChange(
       console.log(
         `[v0] [${opts.logTag}] Recoordinate: stopping engine for ${id} (was running, no longer should)`,
       )
-      await coordinator.stopEngine(id)
+      await coordinator.stopEngine(id, { operatorRequested: true })
     } else if (shouldRun && isRunning) {
       // Should run and is — the hot-reload path inside
       // `applyPendingChangesNow` already handled the change. Nothing
