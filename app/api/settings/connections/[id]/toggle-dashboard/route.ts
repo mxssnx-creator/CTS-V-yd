@@ -257,7 +257,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
             })
             engineStatus = "queued"
-            console.log(
+            console.warn(
               `[v0] [Toggle] Engine start queued for ${connection.name}; this UI worker is not opted in for local engine loops`,
             )
           }

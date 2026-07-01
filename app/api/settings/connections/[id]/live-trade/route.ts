@@ -193,7 +193,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
             engineStatus = "queued"
             engineStartedNow = false
-            console.log(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
+            console.warn(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
           }
         } catch (err) {
           console.error(`[v0] [LiveTrade] Failed to start engine for ${connName}:`, err)

@@ -150,7 +150,7 @@ export class GlobalTradeEngineCoordinator {
       this.isPaused = status === "paused"
       this.isGloballyRunning = enabled && Array.from(this.engineManagers.values()).some((manager) => manager.isEngineRunning)
       if (!enabled) {
-        console.log(
+        console.warn(
           `[v0] [Coordinator] ${context} skipped — global coordinator is not enabled (status="${status || "empty"}")`,
         )
       }
@@ -206,7 +206,7 @@ export class GlobalTradeEngineCoordinator {
       process.env.CF_PAGES === "1"
 
     if (!inProcessStartAllowed && runningUnderProdStart) {
-      console.log(
+      console.warn(
         `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped in production UI worker; ` +
           `set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engine loops in-process`,
       )
@@ -223,7 +223,7 @@ export class GlobalTradeEngineCoordinator {
 
     // Step 1: Check if already starting
     if (this.startingEngines.has(connectionId)) {
-      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
+      console.warn(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
       return false
     }
 
@@ -245,7 +245,7 @@ export class GlobalTradeEngineCoordinator {
         const remoteHeartbeatFresh =
           Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
         if (remoteHeartbeatFresh) {
-          console.log(
+          console.warn(
             `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker with a fresh heartbeat; not clearing distributed running flag`,
           )
           return true
@@ -260,7 +260,7 @@ export class GlobalTradeEngineCoordinator {
         await client.del(`engine_is_running:${connectionId}`).catch(() => 0)
       }
     } catch (e) {
-      console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
+      console.warn(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
     }
 
     // Step 3: Add to lock set
@@ -1433,7 +1433,7 @@ export class GlobalTradeEngineCoordinator {
           const requestTime = new Date(refreshRequest.timestamp).getTime()
           const now = Date.now()
           if (now - requestTime < 30000) {
-            console.log(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
+            console.warn(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
             await setSettings("engine_coordinator:refresh_requested", {
               timestamp: null,
               connectionId: null,
