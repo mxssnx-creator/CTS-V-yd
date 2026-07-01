@@ -208,8 +208,7 @@ export class GlobalTradeEngineCoordinator {
 
     if (!inProcessStartAllowed && runningUnderProdStart) {
       console.warn(
-        `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped in production UI worker; ` +
-          `set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engine loops in-process`,
+        `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed`,
       )
       return false
     }
@@ -1514,33 +1513,6 @@ export class GlobalTradeEngineCoordinator {
     this.healthCheckTimer = setInterval(async () => {
       try {
         // -- 1. Refresh-request handling ----------------------------------
-        const refreshRequests: Array<{ key: string; value: any }> = []
-        const legacyRefreshRequest = await getSettings("engine_coordinator:refresh_requested")
-        if (legacyRefreshRequest && legacyRefreshRequest.timestamp) {
-          refreshRequests.push({ key: "engine_coordinator:refresh_requested", value: legacyRefreshRequest })
-        }
-        try {
-          const { getRedisClient } = await import("@/lib/redis-db")
-          const client = getRedisClient()
-          const queueKeys = await client.keys("settings:engine_coordinator:refresh_requested:*").catch(() => [])
-          for (const rawKey of queueKeys) {
-            const settingsKey = rawKey.replace(/^settings:/, "")
-            const value = await getSettings(settingsKey)
-            if (value && value.timestamp) refreshRequests.push({ key: settingsKey, value })
-          }
-        } catch {
-          // Legacy single-slot request still works if key scanning is unavailable.
-        }
-
-        const refreshNow = Date.now()
-        const freshRequests = refreshRequests.filter(({ value }) => {
-          const requestTime = new Date(value.timestamp).getTime()
-          return Number.isFinite(requestTime) && refreshNow - requestTime < 30000
-        })
-        if (freshRequests.length > 0) {
-          for (const { key, value } of freshRequests) {
-            console.log(`[v0] [Coordinator] Refresh requested for ${value.connectionId}: ${value.action}`)
-            await setSettings(key, {
         const refreshRequests = await getQueuedEngineRefreshRequests()
         if (refreshRequests.length > 0) {
           const { getConnection } = await import("@/lib/redis-db")
@@ -1578,17 +1550,7 @@ export class GlobalTradeEngineCoordinator {
             } else {
               await this.refreshEngines()
             }
-          if (now - requestTime < 30000) {
-            console.warn(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
-            await setSettings("engine_coordinator:refresh_requested", {
-              timestamp: null,
-              connectionId: null,
-              action: null,
-              processed_at: new Date().toISOString(),
-              processed_state_switch_version: value.state_switch_version || null,
-            })
           }
-          await this.refreshEngines()
         }
 
         // -- 2. Per-engine stall watchdog (in-place re-arm) ---------------
