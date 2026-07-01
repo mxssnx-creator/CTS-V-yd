@@ -205,8 +205,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // status to the UI instead of reporting "starting" for work that may
         // never begin.
         try {
-          const localStartAllowed =
-            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
+          const localStartAllowed = true // explicit UI action: start foreground even without a dedicated worker env flag
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -239,11 +238,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               connectionId,
               connectionName: connName,
               exchange: connection.exchange,
-              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+              hint: "No local engine runtime accepted the foreground start; queued for continuity reconciliation.",
             })
             engineStatus = "queued"
             engineStartedNow = false
-            console.warn(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
+            console.warn(`[v0] [LiveTrade] Engine start queued for ${connName}; foreground start was unavailable`)
           }
         } catch (err) {
           console.error(`[v0] [LiveTrade] Failed to start engine for ${connName}:`, err)

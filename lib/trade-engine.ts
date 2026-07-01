@@ -208,8 +208,7 @@ export class GlobalTradeEngineCoordinator {
 
     if (!inProcessStartAllowed && runningUnderProdStart) {
       console.warn(
-        `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped in production UI worker; ` +
-          `set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engine loops in-process`,
+        `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed`,
       )
       return false
     }

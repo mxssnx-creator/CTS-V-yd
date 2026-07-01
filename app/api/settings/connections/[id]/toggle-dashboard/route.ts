@@ -251,8 +251,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // request handler and starve subsequent status/UI requests.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          const localStartAllowed =
-            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
+          const localStartAllowed = true // explicit UI action: start foreground even without a dedicated worker env flag
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -291,14 +290,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               connectionId: resolvedId,
               connectionName: connection.name,
               exchange: connection.exchange,
-              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+              hint: "No local engine runtime accepted the foreground start; queued for continuity reconciliation.",
             })
             const queuedGlobalState = await toggleClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) as Record<string, string>
             const workerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(queuedGlobalState)
             engineWarning = workerDiagnostic.error
             engineStatus = "queued"
             console.warn(
-              `[v0] [Toggle] Engine start queued for ${connection.name}; this UI worker is not opted in for local engine loops`,
+              `[v0] [Toggle] Engine start queued for ${connection.name}; foreground start was unavailable`,
             )
           }
         } catch (engineStartError) {

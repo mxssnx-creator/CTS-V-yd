@@ -24,6 +24,7 @@ type HealingSweepOptions = {
 type HealingSweepResult = {
   startedCount: number
   eligibleCount: number
+  queuedRefreshProcessedCount?: number
   skipped?: string
   error?: string
 }
@@ -56,6 +57,54 @@ function shouldArmInProcessMonitor(): boolean {
   // after the request completes and can add avoidable UI latency.
   if (process.env.VERCEL === "1" || process.env.NEXT_RUNTIME === "edge") return false
   return process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || process.env.ENABLE_IN_PROCESS_CONTINUITY === "1"
+}
+
+async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnType<typeof loadTradeEngineCoordinator>>): Promise<number> {
+  const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest } = await import("./engine-refresh-queue")
+  const { getConnection } = await loadRedisDb()
+
+  const refreshRequests = await getQueuedEngineRefreshRequests()
+  let processed = 0
+
+  for (const { request } of refreshRequests) {
+    const requestTime = new Date(request.timestamp).getTime()
+    if (!Number.isFinite(requestTime) || Date.now() - requestTime >= 120_000) {
+      console.log(`[v0] [AutoStart] Dropping expired refresh request for ${request.connectionId}`)
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
+      continue
+    }
+
+    const connection = await getConnection(request.connectionId)
+    const currentVersion = String(connection?.state_switch_version ?? 0)
+    const requestedVersion = String(request.state_switch_version ?? "")
+    if (!connection || currentVersion !== requestedVersion) {
+      console.log(
+        `[v0] [AutoStart] Ignoring stale refresh request for ${request.connectionId}: ` +
+          `requested state_switch_version=${requestedVersion}, current=${currentVersion}`,
+      )
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
+      continue
+    }
+
+    console.log(
+      `[v0] [AutoStart] Processing queued refresh request for ${request.connectionId}: ${request.action} ` +
+        `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
+    )
+    await clearEngineRefreshRequest(request.connectionId)
+    processed++
+
+    if (request.action === "stop") {
+      await coordinator.stopEngine(request.connectionId, { operatorRequested: true })
+    } else if (request.action === "start") {
+      await coordinator.startMissingEngines([connection])
+    } else {
+      await coordinator.refreshEngines()
+    }
+  }
+
+  return processed
 }
 
 /**
@@ -168,6 +217,7 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
     await loadSettingsAsync().catch(() => {})
 
     const coordinator = await loadTradeEngineCoordinator()
+    const queuedRefreshProcessedCount = await processQueuedEngineRefreshRequests(coordinator)
     const startedCount = await coordinator.startMissingEngines(eligibleConnections)
 
     const activeEngineCount = typeof coordinator.getActiveEngineCount === "function" ? coordinator.getActiveEngineCount() : 0
@@ -182,7 +232,7 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       )
     }
 
-    return { startedCount, eligibleCount: eligibleConnections.length }
+    return { startedCount, eligibleCount: eligibleConnections.length, queuedRefreshProcessedCount }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (message.includes("Redis credentials")) {
