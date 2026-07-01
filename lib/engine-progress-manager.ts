@@ -332,16 +332,23 @@ export class EngineProgressManager {
       this.state.symbols[symbol] = this.createSymbolProgress(symbol)
     }
     const sp = this.state.symbols[symbol]
+    const wasConnected = sp.wsConnected
+    const messageDelta = Math.max(0, messages - sp.wsMessagesReceived)
+    const errorDelta = Math.max(0, errors - sp.wsErrors)
+
+    this.state.wsMessagesTotal += messageDelta
+    this.state.wsErrorsTotal += errorDelta
+    if (connected && !wasConnected) {
+      this.state.wsSymbolsConnected++
+    } else if (!connected && wasConnected) {
+      this.state.wsSymbolsConnected = Math.max(0, this.state.wsSymbolsConnected - 1)
+    }
+
     sp.wsConnected = connected
     sp.wsMessagesReceived = messages
     sp.wsErrors = errors
     sp.wsLastUpdate = new Date().toISOString()
 
-    this.state.wsMessagesTotal += messages
-    this.state.wsErrorsTotal += errors
-    if (connected) {
-      this.state.wsSymbolsConnected++
-    }
     this.state.wsLastUpdate = new Date().toISOString()
     await this.saveState()
   }
