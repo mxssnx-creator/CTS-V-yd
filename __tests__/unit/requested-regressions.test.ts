@@ -431,6 +431,12 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("private static readonly _AXIS_LRU_MAX = (() =>")
   })
 
+  test("coordinator startEngine allows production in-process starts by default", () => {
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain("Production must allow in-process starts from the coordinator")
+    expect(source).toContain("Duplicate starts")
+    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
   test("coordinator startEngine allows explicit foreground UI starts", () => {
     const source = read("lib/trade-engine.ts")
 
@@ -456,17 +462,31 @@ describe("requested regression guardrails", () => {
     expect(existingBlock).not.toContain("!hasLiveTrade")
   })
 
-  test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
+  test("production web boot enables in-process starts and continuity by default", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
 
     expect(instrumentation).toContain('process.env.NEXT_RUNTIME === "edge"')
     expect(instrumentation).not.toContain('process.env.NEXT_RUNTIME !== "nodejs"')
-    expect(instrumentation).toContain('ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(instrumentation).toContain("trade-engine auto-start skipped")
-    expect(instrumentation).toContain('ENABLE_IN_PROCESS_CONTINUITY === "1"')
-    expect(continuityRunner).toContain('ENABLE_IN_PROCESS_CONTINUITY !== "1"')
-    expect(continuityRunner).toContain("web/UI process")
+    expect(instrumentation).toContain('DISABLE_TRADE_ENGINE_AUTOSTART !== "1"')
+    expect(instrumentation).toContain('DISABLE_IN_PROCESS_CONTINUITY !== "1"')
+    expect(continuityRunner).toContain('DISABLE_IN_PROCESS_CONTINUITY === "1"')
+    expect(continuityRunner).toContain("Long-lived Node production/dev processes should keep continuity alive")
+  })
+
+  test("indication snapshots do not double-count legacy production fields", () => {
+    const detailedTracking = read("lib/detailed-tracking.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+    const migrations = read("lib/redis-migrations.ts")
+
+    expect(detailedTracking).toContain("const byType = aggregateWindowByType(active)")
+    expect(detailedTracking).not.toContain("const aggregateWindowByType = (hash: Record<string, string>): Record<string, number> =>")
+    expect(statsRoute).toContain("function aggregateIndicationSnapshot")
+    expect(statsRoute).toContain("ignore the plain field so mixed deploys do not double")
+    expect(migrations).toContain('name: "063-reset-legacy-indication-snapshots"')
+    expect(migrations).toContain('"indications_active:*"')
+    expect(migrations).toContain('"indications_window:*:last5"')
+    expect(migrations).toContain("do NOT touch cumulative progression counters")
   })
 
   test("server continuity cron awaits direct healing sweep instead of relying on auto-start timers", () => {

@@ -197,6 +197,10 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
   async startEngine(connectionId: string, config: EngineConfig, _options: StartEngineOptions = {}): Promise<boolean> {
+    // Production must allow in-process starts from the coordinator so explicit
+    // UI/API actions, auto-start healing sweeps, and continuity ticks all work
+    // without requiring a separate dedicated worker env flag. Duplicate starts
+    // are still guarded below by in-process and Redis startup locks.
     const inProcessStartAllowed =
       process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" ||
       (config as any)?.allowInProcessStart === true

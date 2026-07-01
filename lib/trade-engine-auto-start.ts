@@ -52,11 +52,60 @@ function getGlobalOperatorIntent(state: Record<string, string> | null | undefine
 }
 
 function shouldArmInProcessMonitor(): boolean {
-  // Timers are useful for long-lived dedicated workers. Hosted/serverless web
-  // processes should rely on the cron route because intervals are not durable
-  // after the request completes and can add avoidable UI latency.
+  // Long-lived Node production/dev processes can own in-process engine starts by
+  // default. Serverless/edge deployments still rely on the awaited healing sweep
+  // and deployment cron because timers are not durable after responses return.
+  if (process.env.DISABLE_TRADE_ENGINE_AUTOSTART === "1") return false
   if (process.env.VERCEL === "1" || process.env.NEXT_RUNTIME === "edge") return false
-  return process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || process.env.ENABLE_IN_PROCESS_CONTINUITY === "1"
+  return true
+}
+
+async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnType<typeof loadTradeEngineCoordinator>>): Promise<number> {
+  const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest } = await import("./engine-refresh-queue")
+  const { getConnection } = await loadRedisDb()
+
+  const refreshRequests = await getQueuedEngineRefreshRequests()
+  let processed = 0
+
+  for (const { request } of refreshRequests) {
+    const requestTime = new Date(request.timestamp).getTime()
+    if (!Number.isFinite(requestTime) || Date.now() - requestTime >= 120_000) {
+      console.log(`[v0] [AutoStart] Dropping expired refresh request for ${request.connectionId}`)
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
+      continue
+    }
+
+    const connection = await getConnection(request.connectionId)
+    const currentVersion = String(connection?.state_switch_version ?? 0)
+    const requestedVersion = String(request.state_switch_version ?? "")
+    if (!connection || currentVersion !== requestedVersion) {
+      console.log(
+        `[v0] [AutoStart] Ignoring stale refresh request for ${request.connectionId}: ` +
+          `requested state_switch_version=${requestedVersion}, current=${currentVersion}`,
+      )
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
+      continue
+    }
+
+    console.log(
+      `[v0] [AutoStart] Processing queued refresh request for ${request.connectionId}: ${request.action} ` +
+        `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
+    )
+    await clearEngineRefreshRequest(request.connectionId)
+    processed++
+
+    if (request.action === "stop") {
+      await coordinator.stopEngine(request.connectionId, { operatorRequested: true })
+    } else if (request.action === "start") {
+      await coordinator.startMissingEngines([connection])
+    } else {
+      await coordinator.refreshEngines()
+    }
+  }
+
+  return processed
 }
 
 async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnType<typeof loadTradeEngineCoordinator>>): Promise<number> {

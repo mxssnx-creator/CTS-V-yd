@@ -3361,6 +3361,35 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "61")
     },
   },
+  {
+    version: 63,
+    name: "063-reset-legacy-indication-snapshots",
+    up: async (client: any) => {
+      // Old production builds wrote mixed indication snapshot shapes:
+      //   direction=123                (legacy plain cumulative-ish field)
+      //   BTCUSDT:direction=1         (current per-symbol current-cycle field)
+      // Window readers now prefer scoped fields, but hosted Redis instances can
+      // retain stale legacy fields for days. Clear only short-lived snapshot
+      // hashes so the next engine/cron tick rebuilds truthful current values;
+      // do NOT touch cumulative progression counters or historical stats.
+      const patterns = [
+        "indications_active:*",
+        "indications_window:*:last5",
+        "indications_window:*:last60min",
+      ]
+      let deleted = 0
+      for (const pattern of patterns) {
+        const keys = ((await client.keys(pattern).catch(() => [])) || []) as string[]
+        if (keys.length === 0) continue
+        await client.del(...keys).catch(() => 0)
+        deleted += keys.length
+      }
+      console.log(`[v0] Migration 063: reset ${deleted} legacy/stale indication snapshot key(s)`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "62")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

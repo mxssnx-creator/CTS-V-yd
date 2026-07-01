@@ -10,7 +10,7 @@
  * Vercel/serverless note: serverless functions cannot guarantee durable
  * in-process timers after the request returns. On Vercel the repo's
  * `vercel.json` crons are the durable production fallback. Set
- * ENABLE_IN_PROCESS_CONTINUITY=1 to force this runner in a dedicated worker.
+ * DISABLE_IN_PROCESS_CONTINUITY=1 to opt out in long-lived Node deployments.
  */
 
 type ContinuityGlobal = typeof globalThis & {
@@ -36,10 +36,10 @@ function parseInterval(name: string, fallback: number, min: number, max: number)
 }
 
 function shouldSkipInProcessTimers(): boolean {
-  // Heavy in-process timers are safe only in a dedicated worker. In the Next.js
-  // web/UI process they can monopolize the event loop and make health/UI routes
-  // time out while an active BingX engine is warming up.
-  if (process.env.ENABLE_IN_PROCESS_CONTINUITY !== "1") return true
+  // Long-lived Node production/dev processes should keep continuity alive by
+  // default. Serverless/edge deployments still use deployment cron because
+  // in-process timers are not durable after responses return.
+  if (process.env.DISABLE_IN_PROCESS_CONTINUITY === "1") return true
   return process.env.VERCEL === "1" || process.env.NEXT_RUNTIME === "edge"
 }
 
