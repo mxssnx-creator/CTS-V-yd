@@ -6,6 +6,7 @@ import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 import { nextStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
@@ -94,6 +95,15 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     // Write the flag — this is what the running engine's live-stage checks.
     const staleLiveTradeBlockReason = String((connection as any).live_trade_blocked_reason || "").trim()
+    const stateSwitchVersion = String(Date.now())
+    const liveTradeChangedAt = new Date().toISOString()
+    const previousValues = {
+      is_live_trade: connection.is_live_trade,
+      live_trade_requested: (connection as any).live_trade_requested,
+      state_switch_version: (connection as any).state_switch_version,
+      live_trade_changed_at: (connection as any).live_trade_changed_at,
+    }
+
     const stateSwitchVersion = nextStateSwitchVersion(connection)
     const updatedConnection = {
       ...connection,
@@ -108,6 +118,40 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           }
         : { live_trade_requested: "0" }),
       state_switch_version: stateSwitchVersion,
+      live_trade_changed_at: liveTradeChangedAt,
+      updated_at: liveTradeChangedAt,
+    }
+    await updateConnection(connectionId, updatedConnection)
+
+    const newValues = {
+      is_live_trade: updatedConnection.is_live_trade,
+      live_trade_requested: updatedConnection.live_trade_requested,
+      state_switch_version: stateSwitchVersion,
+      live_trade_changed_at: liveTradeChangedAt,
+    }
+    await notifySettingsChanged(
+      connectionId,
+      ["is_live_trade", "live_trade_requested"],
+      previousValues,
+      newValues,
+    )
+
+    const coordinator = getGlobalTradeEngineCoordinator()
+    // Best-effort local fast-path only. Remote workers converge via the durable
+    // settings_change/settings:dirty event written by notifySettingsChanged above.
+    await coordinator.applyPendingChangesNow(connectionId).catch((applyErr: unknown) => {
+      console.warn(
+        "[v0] [LiveTrade] Local applyPendingChangesNow failed:",
+        applyErr instanceof Error ? applyErr.message : applyErr,
+      )
+    })
+
+    await ProgressionStateManager.recoordinateForActualOne(connectionId).catch((progressionErr: unknown) => {
+      console.warn(
+        "[v0] [LiveTrade] Progression recoordination failed after live-trade dirty signal:",
+        progressionErr instanceof Error ? progressionErr.message : progressionErr,
+      )
+    })
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
@@ -155,7 +199,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       )
     })
 
-    const coordinator = getGlobalTradeEngineCoordinator()
     let engineStatus: "running" | "starting" | "queued" | "stopped" | "error" = "stopped"
     let engineStartedNow = false
 
