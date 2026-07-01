@@ -19,9 +19,10 @@ export function getConnectionState(conn: any): ConnectionState {
   
   return {
     main_assigned: toBoolean(conn.is_assigned) || toBoolean(conn.is_active_inserted),
-    // main_enabled: true when either is_enabled_dashboard or is_active_inserted is set.
-    // Migrations seed is_active_inserted without is_enabled_dashboard; OR keeps them equivalent.
-    main_enabled: toBoolean(conn.is_enabled_dashboard) || toBoolean(conn.is_active_inserted),
+    // main_enabled is the processing switch only. Assignment/visibility is
+    // tracked separately by main_assigned so disabled-but-visible cards do not
+    // accidentally qualify for engine processing.
+    main_enabled: toBoolean(conn.is_enabled_dashboard),
     is_inserted: toBoolean(conn.is_inserted),
     is_enabled_dashboard: toBoolean(conn.is_enabled_dashboard),
   }
@@ -91,9 +92,9 @@ export function isConnectionReadyForEngine(conn: any): boolean {
   const toBoolean = (val: any) => val === true || val === 1 || val === "1" || val === "true"
   
   return (
-    toBoolean(conn.is_assigned) &&
-    // Use OR: either flag being set means the connection is active/ready
-    (toBoolean(conn.is_enabled_dashboard) || toBoolean(conn.is_active_inserted)) &&
+    (toBoolean(conn.is_assigned) || toBoolean(conn.is_active_inserted) || toBoolean(conn.is_dashboard_inserted)) &&
+    // Processing is controlled exclusively by the dashboard toggle.
+    toBoolean(conn.is_enabled_dashboard) &&
     !!conn.exchange &&
     !!conn.api_type
   )

@@ -217,6 +217,29 @@ export class GlobalTradeEngineCoordinator {
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
 
+    // A queued start can race with a later dashboard disable/settings change in
+    // production. Re-read the per-connection operator intent immediately before
+    // acquiring locks so stale queued starts cannot resurrect a disabled
+    // connection or start processing with stale assignment flags.
+    try {
+      const { initRedis, getConnection } = await import("@/lib/redis-db")
+      const { isConnectionReadyForEngine } = await import("@/lib/connection-state-helpers")
+      await initRedis()
+      const currentConnection = await getConnection(connectionId)
+      if (!currentConnection || !isConnectionReadyForEngine(currentConnection)) {
+        console.log(
+          `[v0] [Coordinator] startEngine(${connectionId}) skipped — connection is no longer assigned/enabled`,
+        )
+        return false
+      }
+    } catch (intentErr) {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) could not verify current connection intent; refusing stale start:`,
+        intentErr instanceof Error ? intentErr.message : String(intentErr),
+      )
+      return false
+    }
+
     if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
       return false
     }
@@ -1428,20 +1451,41 @@ export class GlobalTradeEngineCoordinator {
     this.healthCheckTimer = setInterval(async () => {
       try {
         // -- 1. Refresh-request handling ----------------------------------
-        const refreshRequest = await getSettings("engine_coordinator:refresh_requested")
-        if (refreshRequest && refreshRequest.timestamp) {
-          const requestTime = new Date(refreshRequest.timestamp).getTime()
-          const now = Date.now()
-          if (now - requestTime < 30000) {
-            console.log(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
-            await setSettings("engine_coordinator:refresh_requested", {
+        const refreshRequests: Array<{ key: string; value: any }> = []
+        const legacyRefreshRequest = await getSettings("engine_coordinator:refresh_requested")
+        if (legacyRefreshRequest && legacyRefreshRequest.timestamp) {
+          refreshRequests.push({ key: "engine_coordinator:refresh_requested", value: legacyRefreshRequest })
+        }
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          const queueKeys = await client.keys("settings:engine_coordinator:refresh_requested:*").catch(() => [])
+          for (const rawKey of queueKeys) {
+            const settingsKey = rawKey.replace(/^settings:/, "")
+            const value = await getSettings(settingsKey)
+            if (value && value.timestamp) refreshRequests.push({ key: settingsKey, value })
+          }
+        } catch {
+          // Legacy single-slot request still works if key scanning is unavailable.
+        }
+
+        const refreshNow = Date.now()
+        const freshRequests = refreshRequests.filter(({ value }) => {
+          const requestTime = new Date(value.timestamp).getTime()
+          return Number.isFinite(requestTime) && refreshNow - requestTime < 30000
+        })
+        if (freshRequests.length > 0) {
+          for (const { key, value } of freshRequests) {
+            console.log(`[v0] [Coordinator] Refresh requested for ${value.connectionId}: ${value.action}`)
+            await setSettings(key, {
               timestamp: null,
               connectionId: null,
               action: null,
               processed_at: new Date().toISOString(),
+              processed_state_switch_version: value.state_switch_version || null,
             })
-            await this.refreshEngines()
           }
+          await this.refreshEngines()
         }
 
         // -- 2. Per-engine stall watchdog (in-place re-arm) ---------------

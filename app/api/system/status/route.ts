@@ -7,6 +7,8 @@ import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
 import { ConnectionCoordinator } from "@/lib/connection-coordinator"
 import { BatchProcessor } from "@/lib/batch-processor"
+import { isTruthyFlag } from "@/lib/boolean-utils"
+import { isConnectionReadyForEngine } from "@/lib/connection-state-helpers"
 
 export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
@@ -14,9 +16,15 @@ export async function GET(request: NextRequest) {
     const coordinator = ConnectionCoordinator.getInstance()
     const batchProcessor = BatchProcessor.getInstance()
 
+    // Production route workers can be cold-started independently from the
+    // browser/dev boot path. Hydrate the coordinator from Redis before reading
+    // its in-memory maps; otherwise production health/status reports zero
+    // connections even though Redis has been migrated and seeded correctly.
+    await coordinator.initializeConnections()
+
     // Get system-wide statistics
     const allConnections = coordinator.getAllConnections()
-    const activeConnections = allConnections.filter((c) => c.is_enabled && c.is_active)
+    const activeConnections = allConnections.filter((c) => isConnectionReadyForEngine(c))
     const allHealth = coordinator.getAllConnectionsHealth()
     const allMetrics = coordinator.getAllConnectionsMetrics()
 
@@ -60,8 +68,8 @@ export async function GET(request: NextRequest) {
       connections: {
         total: allConnections.length,
         active: activeConnections.length,
-        enabled: allConnections.filter((c) => c.is_enabled).length,
-        disabled: allConnections.filter((c) => !c.is_enabled).length,
+        enabled: allConnections.filter((c) => isTruthyFlag(c.is_enabled_dashboard)).length,
+        disabled: allConnections.filter((c) => !isTruthyFlag(c.is_enabled_dashboard)).length,
         byExchange,
         byApiType,
       },

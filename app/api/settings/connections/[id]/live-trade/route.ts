@@ -6,6 +6,8 @@ import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 /**
  * POST /api/settings/connections/[id]/live-trade
@@ -107,6 +109,37 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
+    await notifySettingsChanged(
+      connectionId,
+      ["is_live_trade", "live_trade_requested"],
+      {
+        is_live_trade: connection.is_live_trade,
+        live_trade_requested: connection.live_trade_requested,
+      },
+      {
+        is_live_trade: updatedConnection.is_live_trade,
+        live_trade_requested: updatedConnection.live_trade_requested,
+      },
+    ).catch((settingsErr) => {
+      console.warn(
+        `[v0] [LiveTrade] Settings-change signal failed for ${connectionId}:`,
+        settingsErr instanceof Error ? settingsErr.message : String(settingsErr),
+      )
+    })
+
+    // Live-trade mode changes alter the processing fingerprint used by
+    // progression/coordinator stats. Re-coordinate immediately so the UI does
+    // not keep showing a progression born for the previous live/sim mode, and
+    // poke any local running manager to re-read the flag without waiting for a
+    // polling tick.
+    await ProgressionStateManager.recoordinateForActualOne(connectionId, isLiveTrade ? "live" : "main").catch((recoordErr) => {
+      console.warn(
+        `[v0] [LiveTrade] Progression re-coordination failed for ${connectionId}:`,
+        recoordErr instanceof Error ? recoordErr.message : String(recoordErr),
+      )
+    })
+    getGlobalTradeEngineCoordinator().applyPendingChangesNow(connectionId).catch(() => undefined)
+
     if (staleLiveTradeBlockReason) {
       const clearReason = isLiveTrade
         ? "Live Trading enabled after credential validation; cleared stale block so exchange orders can proceed."
@@ -179,12 +212,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engineStartedNow = started
             console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
           } else {
-            await setSettings("engine_coordinator:refresh_requested", {
+            const refreshPayload = {
               timestamp: new Date().toISOString(),
               connectionId,
               action: "start",
               reason: "live_trade_enable",
-            })
+            }
+            await Promise.all([
+              setSettings("engine_coordinator:refresh_requested", refreshPayload),
+              setSettings(`engine_coordinator:refresh_requested:${connectionId}`, refreshPayload),
+            ])
             await logProgressionEvent(connectionId, "engine_start_queued", "info", "Live Trade enabled; start queued for coordinator worker", {
               connectionId,
               connectionName: connName,

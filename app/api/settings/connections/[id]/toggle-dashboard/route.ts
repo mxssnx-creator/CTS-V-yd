@@ -11,6 +11,20 @@ import { loadSettingsAsync } from "@/lib/settings-storage"
 // When enabling, also triggers engine start for this connection
 export const dynamic = "force-dynamic"
 export const maxDuration = 15
+
+async function queueCoordinatorRefresh(connectionId: string, action: "start" | "stop", reason: string, stateSwitchVersion?: string) {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    connectionId,
+    action,
+    reason,
+    state_switch_version: stateSwitchVersion || null,
+  }
+  await Promise.all([
+    setSettings("engine_coordinator:refresh_requested", payload),
+    setSettings(`engine_coordinator:refresh_requested:${connectionId}`, payload),
+  ])
+}
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -143,9 +157,24 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       }
     }
 
-    // Save connection state only if state changed
+    // Save connection state only if state changed. Stamp a per-connection
+    // switch generation so status/progression readers and coordinator workers
+    // can distinguish this operator intent from stale queued start/stop work.
+    let stateSwitchVersion: string | undefined
     if (needsUpdate && updatedConnection) {
+      stateSwitchVersion = `${Date.now()}`
+      updatedConnection = {
+        ...updatedConnection,
+        state_switch_version: stateSwitchVersion,
+        state_switch_action: enableMain ? "enable" : "disable",
+        state_switch_at: new Date().toISOString(),
+      }
       await updateConnection(resolvedId, updatedConnection)
+      await setSettings(`connection_state_switch:${resolvedId}`, {
+        version: stateSwitchVersion,
+        action: enableMain ? "enable" : "disable",
+        updated_at: updatedConnection.state_switch_at,
+      }).catch(() => undefined)
       console.log(`[v0] [Toggle] Updated ${connection.name} (resolved id: ${resolvedId})`)
     }
 
@@ -244,12 +273,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
             engineStatus = "started"
           } else {
-            await setSettings("engine_coordinator:refresh_requested", {
-              timestamp: new Date().toISOString(),
-              connectionId: resolvedId,
-              action: "start",
-              reason: "dashboard_toggle_enable",
-            })
+            await queueCoordinatorRefresh(resolvedId, "start", "dashboard_toggle_enable", stateSwitchVersion)
             await logProgressionEvent(resolvedId, "engine_start_queued", "info", "Connection enabled; start queued for coordinator worker", {
               connectionId: resolvedId,
               connectionName: connection.name,
@@ -264,11 +288,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         } catch (engineStartError) {
           console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
           // Still set the flag as fallback - coordinator may pick it up
-          await setSettings("engine_coordinator:refresh_requested", {
-            timestamp: new Date().toISOString(),
-            connectionId: resolvedId,
-            action: "start",
-          })
+          await queueCoordinatorRefresh(resolvedId, "start", "dashboard_toggle_enable_fallback", stateSwitchVersion)
           engineStatus = "queued"
         }
           
@@ -337,11 +357,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         } catch (engineStopError) {
           console.warn(`[v0] [Toggle] Failed to stop engine directly:`, engineStopError)
           // Fallback refresh request so coordinator picks up desired stop state
-          await setSettings("engine_coordinator:refresh_requested", {
-            timestamp: new Date().toISOString(),
-            connectionId: resolvedId,
-            action: "stop",
-          })
+          await queueCoordinatorRefresh(resolvedId, "stop", "dashboard_toggle_disable_fallback", stateSwitchVersion)
           await logProgressionEvent(resolvedId, "engine_stop_fallback_requested", "warning", "Direct stop failed; coordinator refresh requested", {
             connectionId: resolvedId,
             error: engineStopError instanceof Error ? engineStopError.message : String(engineStopError),
