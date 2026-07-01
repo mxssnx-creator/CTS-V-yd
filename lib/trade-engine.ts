@@ -398,24 +398,17 @@ export class GlobalTradeEngineCoordinator {
       // (`if (!this.isGloballyRunning) return`) and never recovers stalls.
       this.isGloballyRunning = true
 
-      // ── Mark connection as active-inserted now that engine is live ────
-      // is_active_inserted controls the "Active Connections" panel on the
-      // dashboard. The migration seeds it as "0" (operator hasn't inserted
-      // it yet). Flip it to "1" on first successful engine start so the
-      // dashboard card moves into the Active panel automatically — the
-      // operator pressed Start, which is the explicit activation event.
-      // Idempotent: repeated starts on an already-active connection are safe.
+      // ── Mark connection as assigned now that engine is live ───────────
+      // is_active_inserted/is_assigned control Main Connections visibility.
+      // Do NOT set is_enabled_dashboard here: that flag is the explicit
+      // processing switch and must not be backfilled by engine-start paths.
       try {
         // Use updateConnection (not raw hset) so the getAllConnections()
-        // 2-second in-memory cache is invalidated immediately. Without this,
-        // the connections API can serve stale is_enabled_dashboard="0" for up
-        // to 2 seconds after the engine starts, causing "Enabled dashboard: none"
-        // in every dashboard poll that hits within that window.
+        // 2-second in-memory cache is invalidated immediately.
         const { updateConnection: _uc } = await import("@/lib/redis-db")
         await _uc(connectionId, {
-          is_active_inserted:   "1",
-          is_active:            "1",
-          is_enabled_dashboard: "1",
+          is_active_inserted: "1",
+          is_assigned: "1",
         })
       } catch { /* non-critical — dashboard can lag */ }
       return true
@@ -1019,18 +1012,18 @@ export class GlobalTradeEngineCoordinator {
             }
             started++
 
-            // Mirror the enabled/inserted flags that toggle-dashboard writes so
-            // the connections API + system-stats-v3 show correct counts even
-            // when this code path (auto-restart after OOM) bypasses toggle-dashboard.
+            // Mirror only assignment/visibility. Do not set is_enabled_dashboard
+            // here: it is the explicit processing switch and legacy assigned rows
+            // must not be auto-enabled by engine-start paths.
             try {
               const { updateConnection } = await import("@/lib/redis-db")
               await updateConnection(connection.id, {
                 is_active_inserted: "1",
-                is_enabled_dashboard: "1",
+                is_assigned: "1",
               })
             } catch (flagErr) {
               console.warn(
-                `[v0] [Coordinator] Could not update is_active_inserted for ${connection.id}:`,
+                `[v0] [Coordinator] Could not update assignment flags for ${connection.id}:`,
                 flagErr instanceof Error ? flagErr.message : flagErr,
               )
             }
