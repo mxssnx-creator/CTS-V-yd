@@ -96,8 +96,9 @@ completeStartup()
 ## Environment Variables
 
 ### Production Stability
-- `ENABLE_TRADE_ENGINE_AUTOSTART=1`: Start auto-sync monitor on boot
-- `ENABLE_IN_PROCESS_CONTINUITY=1`: Start continuity runner on boot
+- Supported production topology: use a dedicated Node trade-engine worker. UI/API workers persist operator intent and report diagnostics, but must not run trade engines in-process.
+- `ENABLE_TRADE_ENGINE_AUTOSTART=1`: Required on exactly one dedicated worker/process so it owns trade-engine loops and writes the global worker heartbeat. Leave unset everywhere else.
+- `ENABLE_IN_PROCESS_CONTINUITY=1`: Set only on that same dedicated worker when in-process continuity timers are expected.
 - `NODE_ENV=production`: Production mode (enables deterministic boot logging)
 
 ### Dev Mode

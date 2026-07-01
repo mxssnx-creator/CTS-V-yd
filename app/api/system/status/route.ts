@@ -8,6 +8,12 @@ import { SystemLogger } from "@/lib/system-logger";
 import { ConnectionCoordinator } from "@/lib/connection-coordinator";
 import { BatchProcessor } from "@/lib/batch-processor";
 import { isTruthyFlag } from "@/lib/boolean-utils";
+import { type NextRequest, NextResponse } from "next/server"
+import { SystemLogger } from "@/lib/system-logger"
+import { ConnectionCoordinator } from "@/lib/connection-coordinator"
+import { BatchProcessor } from "@/lib/batch-processor"
+import { isTruthyFlag } from "@/lib/boolean-utils"
+import { buildMissingTradeEngineWorkerDiagnostic } from "@/lib/trade-engine-worker-heartbeat"
 
 const HEARTBEAT_FRESH_MS = 90_000;
 
@@ -71,6 +77,14 @@ export async function GET(request: NextRequest) {
     } catch (error) {
       databaseInfo.error = "Redis info unavailable";
     }
+
+    let tradeEngineGlobal: Record<string, string> = {}
+    try {
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      tradeEngineGlobal = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+    } catch {}
+    const tradeEngineWorkerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(tradeEngineGlobal)
 
     // Group by exchange
     const byExchange: Record<string, number> = {};
@@ -167,6 +181,7 @@ export async function GET(request: NextRequest) {
           : configuredConnections.length > 0
             ? "degraded"
             : "degraded",
+      status: tradeEngineWorkerDiagnostic.missingFreshWorkerHeartbeat ? "degraded" : (activeConnections.length > 0 ? "healthy" : "degraded"),
       database: databaseInfo,
       connectionInventory: {
         total: allConnections.length,
@@ -256,6 +271,10 @@ export async function GET(request: NextRequest) {
           "pionex",
           "orangex",
         ],
+      },
+      tradeEngine: {
+        status: tradeEngineWorkerDiagnostic.operatorIntent,
+        worker: tradeEngineWorkerDiagnostic,
       },
       features: {
         rateLimiting: "enabled",
