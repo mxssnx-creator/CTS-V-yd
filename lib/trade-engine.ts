@@ -627,12 +627,46 @@ export class GlobalTradeEngineCoordinator {
     }
     this.escalatingEngines.add(connectionId)
     try {
-      // Pre-emptively break the progression lock so the restart can
-      // acquire a fresh slot without waiting for the TTL.
+      const localManager = this.engineManagers.get(connectionId)
+      const hasLocalRunningManager = localManager?.isEngineRunning === true
+
+      if (hasLocalRunningManager) {
+        // Local owners stop normally so the manager releases its own
+        // progression lock. Do not force-break a lock we can release cleanly.
+        try {
+          await this.stopEngine(connectionId)
+        } catch (stopErr) {
+          console.warn(
+            `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
+            stopErr instanceof Error ? stopErr.message : String(stopErr),
+          )
+        }
+        try {
+          await this.startEngineFromConnectionConfig(connectionId)
+        } catch (startErr) {
+          console.error(
+            `[v0] [Coordinator] restartEngine start failed for ${connectionId}:`,
+            startErr instanceof Error ? startErr.message : String(startErr),
+          )
+        }
+        return
+      }
+
+      const remoteOwnerFresh = await this.markRemoteRestartRequestIfFresh(connectionId)
+      if (remoteOwnerFresh) {
+        console.log(
+          `[v0] [Coordinator] restartEngine(${connectionId}) deferred — remote owner has fresh heartbeat; restart request marker written`,
+        )
+        return
+      }
+
+      // No local manager and no fresh remote heartbeat: treat the distributed
+      // owner as stale, break the abandoned lock, and let this worker start.
       try {
         await forceBreakProgressionLock(connectionId)
       } catch { /* TTL will reclaim */ }
       try {
+        await this.startEngineFromConnectionConfig(connectionId)
         await this.stopEngineUnlocked(connectionId)
       } catch (stopErr) {
         console.warn(
@@ -650,6 +684,51 @@ export class GlobalTradeEngineCoordinator {
       }
     } finally {
       this.escalatingEngines.delete(connectionId)
+    }
+  }
+
+  /**
+   * For cross-process restart requests, never break a fresh remote owner.
+   * Instead, persist durable restart/settings-change markers that the owning
+   * worker's settings watcher can consume. Returns true when a fresh remote
+   * heartbeat was found and the restart was therefore deferred.
+   */
+  private async markRemoteRestartRequestIfFresh(connectionId: string): Promise<boolean> {
+    try {
+      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
+      await initRedis().catch(() => undefined)
+      const client = getRedisClient()
+      const remoteState = (await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))) || {}
+      const remoteHeartbeat =
+        Number((remoteState as any).last_processor_heartbeat) ||
+        Number((remoteState as any).last_heartbeat_at) ||
+        ((remoteState as any).last_heartbeat_iso ? new Date((remoteState as any).last_heartbeat_iso).getTime() : 0)
+      const remoteHeartbeatFresh =
+        Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
+      if (!remoteHeartbeatFresh) return false
+
+      const nowIso = new Date().toISOString()
+      await Promise.all([
+        client.hset(`trade_engine_state:${connectionId}`, {
+          restart_required: "1",
+          restart_request: "1",
+          restart_reason: "restart_requested_by_non_owner",
+          restart_requested_at: nowIso,
+          settings_change_marker: nowIso,
+        }).catch(() => 0),
+        client.hset(`progression:${connectionId}`, {
+          restart_request: "1",
+          restart_requested_at: nowIso,
+          settings_change_marker: nowIso,
+        }).catch(() => 0),
+      ])
+      return true
+    } catch (err) {
+      console.warn(
+        `[v0] [Coordinator] Could not inspect remote restart owner for ${connectionId}; treating owner as stale:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return false
     }
   }
 
