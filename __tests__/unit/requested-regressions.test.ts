@@ -517,6 +517,38 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("not clearing distributed running flag")
   })
 
+
+  test("restart from non-owner preserves fresh remote progression lock", () => {
+    const source = read("lib/trade-engine.ts")
+    const restartBlock = source.slice(
+      source.indexOf("async restartEngine(connectionId: string): Promise<void>"),
+      source.indexOf("private async markRemoteRestartRequestIfFresh"),
+    )
+
+    expect(restartBlock).toContain("hasLocalRunningManager")
+    expect(restartBlock).toContain("stop normally so the manager releases its own")
+    expect(restartBlock).toContain("markRemoteRestartRequestIfFresh(connectionId)")
+    expect(restartBlock).toContain("remote owner has fresh heartbeat")
+    expect(restartBlock).toContain("treat the distributed")
+    expect(restartBlock).toContain("forceBreakProgressionLock(connectionId)")
+    expect(restartBlock.indexOf("markRemoteRestartRequestIfFresh(connectionId)")).toBeLessThan(
+      restartBlock.indexOf("forceBreakProgressionLock(connectionId)"),
+    )
+  })
+
+  test("fresh remote restart marker path does not force-break progression lock", () => {
+    const source = read("lib/trade-engine.ts")
+    const markerBlock = source.slice(
+      source.indexOf("private async markRemoteRestartRequestIfFresh"),
+      source.indexOf("async applyPendingChangesNow"),
+    )
+
+    expect(markerBlock).toContain("Date.now() - remoteHeartbeat < 90_000")
+    expect(markerBlock).toContain("restart_request")
+    expect(markerBlock).toContain("settings_change_marker")
+    expect(markerBlock).not.toContain("forceBreakProgressionLock")
+  })
+
   test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
     const source = read("lib/connection-recoordinator.ts")
 

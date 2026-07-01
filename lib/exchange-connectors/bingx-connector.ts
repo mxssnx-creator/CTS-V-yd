@@ -114,6 +114,16 @@ export class BingXConnector extends BaseExchangeConnector {
 
   private async initializeSDKClient(credentials: ExchangeCredentials): Promise<void> {
     const BingXModule = await loadOptionalBingXModule()
+    try {
+      // Dynamically load SDK through an opaque import so Next does not bundle
+      // optional NestJS peer dependencies from bingx-api into app startup.
+      const importBingX = new Function("return import('bingx-api')") as () => Promise<typeof import("bingx-api")>
+      const BingXModule = await importBingX()
+      
+      // Try multiple export patterns used by bingx-api
+      const BingXClient = (BingXModule as any).BingxApiClient 
+        || (BingXModule as any).default 
+        || (BingXModule as any)
       
     // Try multiple export patterns used by bingx-api
     const BingXClient = (BingXModule as any).BingxApiClient
