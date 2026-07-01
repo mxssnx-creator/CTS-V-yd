@@ -2,6 +2,7 @@ import { NextResponse } from "next/server"
 import { getRedisClient, initRedis, getActiveConnectionsForEngine } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { buildMissingTradeEngineWorkerDiagnostic, readTradeEngineWorkerHeartbeat } from "@/lib/trade-engine-worker-heartbeat"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -57,9 +58,11 @@ export async function GET() {
     const operatorIntent = engineHash.operator_intent || engineHash.desired_status || engineHash.status || "stopped"
     const isGloballyRunning = operatorIntent === "running"
     const isGloballyPaused  = operatorIntent === "paused"
-    const globalHeartbeatAt = Number(engineHash.last_heartbeat_at || 0)
-    const hasFreshGlobalHeartbeat =
-      Number.isFinite(globalHeartbeatAt) && globalHeartbeatAt > 0 && Date.now() - globalHeartbeatAt < 90_000
+    // Reads trade_engine:global.last_heartbeat_at via the shared worker heartbeat helper.
+    const workerHeartbeat = readTradeEngineWorkerHeartbeat(engineHash)
+    const globalHeartbeatAt = workerHeartbeat.lastHeartbeatAt || 0
+    const hasFreshGlobalHeartbeat = workerHeartbeat.fresh
+    const workerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(engineHash)
 
     
     // Also check in-memory coordinator state
@@ -130,8 +133,11 @@ export async function GET() {
         connections: [],
         summary: { total: 0, running: 0, stopped: 0, totalTrades: 0, totalPositions: 0, errors: 0 },
         analysis,
+        diagnostics: {
+          worker: workerDiagnostic,
+        },
         requirements: {
-          message: "No connections eligible for processing",
+          message: workerDiagnostic.error || "No connections eligible for processing",
           needed: [
             analysis.withCredentials === 0 ? "Add API credentials to a connection" : null,
             analysis.inActivePanel === 0 ? "Add a connection to the Active panel" : null,
@@ -236,10 +242,12 @@ export async function GET() {
       lastHeartbeatAt: globalHeartbeatAt || null,
       diagnostics: {
         rootCause:
-          isGloballyRunning && activeEngineCount === 0
+          workerDiagnostic.error ||
+          (isGloballyRunning && activeEngineCount === 0
             ? "Global Redis operator intent is running, but no local manager or fresh distributed processor heartbeat is attached. In production this means the UI worker only has operator intent; a dedicated opted-in engine worker/cron heartbeat is not actually running."
-            : null,
-        requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 (and ENABLE_IN_PROCESS_CONTINUITY=1 for in-process timers) on exactly one dedicated worker/process",
+            : null),
+        worker: workerDiagnostic,
+        requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 on exactly one dedicated worker/process; add ENABLE_IN_PROCESS_CONTINUITY=1 on that same process only when in-process continuity timers are expected",
       },
       connections: connectionStatuses,
       summary,

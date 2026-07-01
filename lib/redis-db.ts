@@ -3044,6 +3044,8 @@ export function getConnectionStates(connection: any): {
         isEnabledFlag(connection.is_active_inserted) ||
         isEnabledFlag(connection.is_dashboard_inserted)) &&
       isEnabledFlag(connection.is_enabled_dashboard),
+    main_assigned: isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned),
+    is_active: isEnabledFlag(connection.is_active_inserted) && isEnabledFlag(connection.is_enabled_dashboard),
   }
 }
 
@@ -3057,6 +3059,15 @@ export function isConnectionAssignedToMain(connection: any): boolean {
 
 export function isConnectionMainEnabled(connection: any): boolean {
   return isConnectionAssignedToMain(connection) && isEnabledFlag(connection.is_enabled_dashboard)
+  return isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned)
+}
+
+export function isConnectionProcessingEnabled(connection: any): boolean {
+  return isEnabledFlag(connection.is_enabled_dashboard)
+}
+
+export function isConnectionMainEnabled(connection: any): boolean {
+  return isConnectionProcessingEnabled(connection)
 }
 
 export function isConnectionBaseEnabled(connection: any): boolean {
@@ -3670,6 +3681,17 @@ export async function getAssignedAndEnabledConnections(): Promise<any[]> {
     // to Main Connections and the dashboard processing toggle is enabled. Base
     // Settings flags and active-panel visibility alone are not enable signals.
     return isConnectionMainEnabled(conn)
+    // A connection is eligible for engine processing only when it is both:
+    // 1. Assigned/inserted into the Main Connections panel, and
+    // 2. Explicitly enabled via the dashboard processing switch.
+    // Base is_enabled/enabled and is_active_inserted/is_assigned are not
+    // processing switches and must not cause auto-start by themselves.
+    const isAssigned =
+      isEnabledFlag(conn.is_active_inserted) ||
+      isEnabledFlag(conn.is_assigned) ||
+      isEnabledFlag(conn.is_dashboard_inserted)
+    const isEnabled = isEnabledFlag(conn.is_enabled_dashboard)
+    return isAssigned && isEnabled
   })
 }
 
