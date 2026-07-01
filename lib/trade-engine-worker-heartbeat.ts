@@ -37,11 +37,15 @@ export function buildMissingTradeEngineWorkerDiagnostic(
     missingFreshWorkerHeartbeat,
     operatorIntent,
     heartbeat,
-    error: missingFreshWorkerHeartbeat
-      ? "trade_engine:global.status is running, but no fresh trade-engine worker heartbeat exists. Run exactly one dedicated Node worker with ENABLE_TRADE_ENGINE_AUTOSTART=1; add ENABLE_IN_PROCESS_CONTINUITY=1 only if in-process timers are expected."
+    // Missing heartbeat is diagnostic information, not a user-facing error.
+    // Explicit UI/API actions can start an engine foreground with allowInProcessStart,
+    // while cron/serverless continuity drains queued work when no local runtime is alive.
+    error: null,
+    warning: missingFreshWorkerHeartbeat
+      ? "No fresh trade-engine worker heartbeat is attached yet. The next explicit UI action or continuity sweep will reconcile engine runtime."
       : null,
     requiredTopology:
-      "Dedicated worker topology: exactly one Node process owns trade engine loops with ENABLE_TRADE_ENGINE_AUTOSTART=1. UI/API workers must not run engines in-process unless they are that dedicated worker.",
+      "A dedicated engine worker is optional for always-on processing; explicit UI actions and continuity sweeps can reconcile engine runtime when no worker heartbeat exists.",
   }
 }
 

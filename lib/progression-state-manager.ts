@@ -1009,11 +1009,8 @@ return {
       const storedSymbolCount = parseInt(existing.symbol_count || "0", 10)
       const storedHash = existing.active_symbols_hash || ""
       const storedSymbols = storedHash
-        ? storedHash.split("|").map((s) => s.trim()).filter(Boolean)
+        ? storedHash.split("|").map((symbol: string) => symbol.trim()).filter(Boolean)
         : []
-        .split("|")
-        .map((symbol) => symbol.trim())
-        .filter(Boolean)
       const storedSymbolSet = new Set(storedSymbols)
       const missingSymbols = currentSymbols.filter((symbol) => !storedSymbolSet.has(symbol))
       const additiveSymbolOnlyChange =
@@ -1058,10 +1055,6 @@ return {
           .hset(`settings:trade_engine_state:${connectionId}`, {
             config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
             config_set_symbols_processed: String(Math.min(Math.max(0, actualProcessedCount || 0), liveSymbolCount)),
-        await client
-          .hset(`settings:trade_engine_state:${connectionId}`, {
-            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
-            config_set_symbols_processed: String(Math.max(0, storedSymbolCount)),
           })
           .catch(() => {})
 
@@ -1076,7 +1069,6 @@ return {
       // Only compare fingerprints when a stored snapshot exists (empty stored
       // fingerprint = first ever start, not yet solidified — not a mismatch).
       const settingsMismatch = storedFingerprint !== "" && storedFingerprint !== liveFingerprint
-      const storedSymbolSet = new Set(storedSymbols)
       const missingPrehistoricSymbols = currentSymbols.filter((symbol) => !storedSymbolSet.has(symbol))
       const additiveSymbolChange =
         symbolMismatch &&

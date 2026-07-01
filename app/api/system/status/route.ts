@@ -3,11 +3,6 @@
  * Returns comprehensive system status including connection, rate limiting, and API health
  */
 
-import { type NextRequest, NextResponse } from "next/server";
-import { SystemLogger } from "@/lib/system-logger";
-import { ConnectionCoordinator } from "@/lib/connection-coordinator";
-import { BatchProcessor } from "@/lib/batch-processor";
-import { isTruthyFlag } from "@/lib/boolean-utils";
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
 import { ConnectionCoordinator } from "@/lib/connection-coordinator"
@@ -38,12 +33,6 @@ export async function GET(request: NextRequest) {
     // browser/dev boot path. Hydrate the coordinator from Redis before reading
     // its in-memory maps; otherwise production health/status reports zero
     // connections even though Redis has been migrated and seeded correctly.
-    await coordinator.initializeConnections();
-
-    // Production route workers can be cold-started independently from the
-    // browser/dev boot path. Hydrate the coordinator from Redis before reading
-    // its in-memory maps; otherwise production health/status reports zero
-    // connections even though Redis has been migrated and seeded correctly.
     await coordinator.initializeConnections()
 
     // Get system-wide statistics
@@ -51,12 +40,6 @@ export async function GET(request: NextRequest) {
     const activeConnections = allConnections.filter((c) => isConnectionReadyForEngine(c))
     const allHealth = coordinator.getAllConnectionsHealth()
     const allMetrics = coordinator.getAllConnectionsMetrics()
-    const allConnections = coordinator.getAllConnections();
-    const activeConnections = allConnections.filter(
-      (c) => isTruthyFlag(c.is_enabled) && isTruthyFlag(c.is_active),
-    );
-    const allHealth = coordinator.getAllConnectionsHealth();
-    const allMetrics = coordinator.getAllConnectionsMetrics();
 
     // Get database and runtime heartbeat info from Redis
     let databaseInfo: any = { status: "available", type: "redis" };
@@ -186,12 +169,6 @@ export async function GET(request: NextRequest) {
 
     const systemStatus = {
       timestamp: new Date().toISOString(),
-      status:
-        runningEngineConnections.length > 0
-          ? "healthy"
-          : configuredConnections.length > 0
-            ? "degraded"
-            : "degraded",
       status: tradeEngineWorkerDiagnostic.missingFreshWorkerHeartbeat ? "degraded" : (activeConnections.length > 0 ? "healthy" : "degraded"),
       database: databaseInfo,
       connectionInventory: {
@@ -229,10 +206,6 @@ export async function GET(request: NextRequest) {
         active: activeConnections.length,
         enabled: allConnections.filter((c) => isTruthyFlag(c.is_enabled_dashboard)).length,
         disabled: allConnections.filter((c) => !isTruthyFlag(c.is_enabled_dashboard)).length,
-        enabled: allConnections.filter((c) => isTruthyFlag(c.is_enabled))
-          .length,
-        disabled: allConnections.filter((c) => !isTruthyFlag(c.is_enabled))
-          .length,
         byExchange,
         byApiType,
       },

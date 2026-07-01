@@ -790,6 +790,7 @@ export class IndicationProcessor {
           direction: 0,
           move: 0,
           active: 0,
+          active_advanced: 0,
           optimal: 0,
           auto: 0,
         }
@@ -801,12 +802,24 @@ export class IndicationProcessor {
           await _ir()
           const _client = _gc()
           const activeKey = `indications_active:${this.connectionId}`
+          const w5Key = `indications_window:${this.connectionId}:last5`
+          const w60Key = `indications_window:${this.connectionId}:last60min`
           const fields: Record<string, string> = {}
           for (const [type, cnt] of Object.entries(typeCounts)) {
             fields[`${symbol}:${type}`] = String(cnt)
           }
-          await _client.hset(activeKey, fields)
-          await _client.expire(activeKey, 600)
+          const pipe = _client.multi()
+          pipe.hset(activeKey, fields)
+          pipe.expire(activeKey, 600)
+          // Keep windowed stats idempotent and per-symbol for all raw
+          // indication types, including Auto. Without these writes, the
+          // detailed tracking endpoint falls back to cumulative counters and
+          // shows inflated/identical "last 5" numbers in production.
+          pipe.hset(w5Key, fields)
+          pipe.expire(w5Key, 300)
+          pipe.hset(w60Key, fields)
+          pipe.expire(w60Key, 4200)
+          await pipe.exec()
         } catch { /* non-critical — falls back to cumulative indCounts */ }
       }
 

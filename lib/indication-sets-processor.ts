@@ -130,9 +130,9 @@ export class IndicationSetsProcessor {
   // Dev mode uses a minimal range grid so the 4-GB v0 sandbox VM can run the
   // full indication → strategy → live pipeline without OOM.
   //   Full grid: 29 ranges × 3 dd × 2 lp × 3 fm = 522 keys/type/symbol
-  //              × 4 types × 3 symbols = 6,264 keys/cycle → accumulates fast
+  //              × 5 types × 3 symbols = 7,830 keys/cycle → accumulates fast
   //   Dev  grid:  3 ranges × 2 dd × 1 lp × 2 fm = 12  keys/type/symbol
-  //              × 4 types × 3 symbols = 144 keys/cycle — easily evictable
+  //              × 5 types × 3 symbols = 180 keys/cycle — easily evictable
   private readonly _isDev = process.env.NODE_ENV === "development"
   private directionMoveRanges: number[] = this._isDev
     ? [5, 15, 25]                                        // 3 representative dev ranges
@@ -145,6 +145,9 @@ export class IndicationSetsProcessor {
   private factorMultipliers: number[] = this._isDev ? [0.9, 1.1]        : [0.9, 1.0, 1.1]
   private activeThresholds: number[] = this._isDev ? [0.5, 2.5]         : [0.5, 1.0, 1.5, 2.0, 2.5]
   private activeTimeRatios: number[] = this._isDev ? [1.0]              : [0.5, 1.0]
+  private activeAdvancedActivityRatios: number[] = this._isDev ? [1.0, 2.0] : [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  private activeAdvancedMinPositions = 3
+  private activeAdvancedContinuationRatio = 0.6
   private shortPriceHistoryWarnings: Set<string> = new Set()
   private outcomeHorizonCandles = 12
   private outcomeTakeProfitPct = 0.01
@@ -197,6 +200,19 @@ export class IndicationSetsProcessor {
         this.factorMultipliers = this.parseNumericList(settings.indicationFactorMultipliers, this.factorMultipliers)
         this.activeThresholds = this.parseNumericList(settings.activeThresholds, this.activeThresholds)
         this.activeTimeRatios = this.parseNumericList(settings.activeTimeRatios, this.activeTimeRatios)
+        const activeAdvanced = settings.active_advanced || settings.activeAdvanced || {}
+        this.activeAdvancedActivityRatios = this.parseRangeObject(
+          activeAdvanced.activity_ratios || settings.activeAdvancedActivityRatios,
+          this.activeAdvancedActivityRatios,
+        )
+        this.activeAdvancedMinPositions = Math.max(
+          2,
+          Math.round(this.parsePositiveNumber(activeAdvanced.min_positions ?? settings.activeAdvancedMinPositions, this.activeAdvancedMinPositions)),
+        )
+        this.activeAdvancedContinuationRatio = Math.max(
+          0,
+          Math.min(1, this.parsePositiveNumber(activeAdvanced.continuation_ratio ?? settings.activeAdvancedContinuationRatio, this.activeAdvancedContinuationRatio)),
+        )
         this.outcomeHorizonCandles = this.parsePositiveNumber(settings.indicationOutcomeHorizonCandles, this.outcomeHorizonCandles)
         this.outcomeTakeProfitPct = this.parsePositiveNumber(settings.indicationOutcomeTakeProfitPct, this.outcomeTakeProfitPct)
         this.outcomeStopLossPct = this.parsePositiveNumber(settings.indicationOutcomeStopLossPct, this.outcomeStopLossPct)
@@ -216,6 +232,7 @@ export class IndicationSetsProcessor {
         if (setsConfig.direction) this.limits.direction = Number(setsConfig.direction)
         if (setsConfig.move) this.limits.move = Number(setsConfig.move)
         if (setsConfig.active) this.limits.active = Number(setsConfig.active)
+        if (setsConfig.active_advanced) this.limits.active_advanced = Number(setsConfig.active_advanced)
         if (setsConfig.optimal) this.limits.optimal = Number(setsConfig.optimal)
       }
     } catch (error) {
@@ -300,6 +317,13 @@ export class IndicationSetsProcessor {
     }
     return fallback
   }
+
+  private parseRangeObject(raw: any, fallback: number[]): number[] {
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      return this.parseRangeSettings(raw.from, raw.to, raw.step, fallback)
+    }
+    return this.parseNumericList(raw, fallback)
+  }
   
   /** Get position limits */
   getPositionLimits(): PositionLimits {
@@ -333,7 +357,7 @@ export class IndicationSetsProcessor {
       this.normalizePriceHistory(marketData)
       await this.warnIfPriceHistoryTooShort(symbol, marketData)
 
-      // Process all 4 main types in parallel with independent logic.
+      // Process all 5 set-backed types in parallel with independent logic.
       // Use per-type isolation so an Optimal/Auto calculation failure never
       // aborts Direction/Move/Active for the same symbol and never crashes the
       // whole progression cycle.
@@ -353,10 +377,11 @@ export class IndicationSetsProcessor {
           return { type, total: 0, qualified: 0, configs: 0, error: true }
         }
       }
-      const [directionResults, moveResults, activeResults, optimalResults] = await Promise.all([
+      const [directionResults, moveResults, activeResults, activeAdvancedResults, optimalResults] = await Promise.all([
         runType("direction", () => this.processDirectionSet(symbol, marketData)),
         runType("move", () => this.processMoveSet(symbol, marketData)),
         runType("active", () => this.processActiveSet(symbol, marketData)),
+        runType("active_advanced", () => this.processActiveAdvancedSet(symbol, marketData)),
         runType("optimal", () => this.processOptimalSet(symbol, marketData)),
       ])
 
@@ -377,6 +402,7 @@ export class IndicationSetsProcessor {
         (directionResults?.qualified || 0) +
         (moveResults?.qualified || 0) +
         (activeResults?.qualified || 0) +
+        (activeAdvancedResults?.qualified || 0) +
         (optimalResults?.qualified || 0)
 
       // ── ACTIVE-VALID indication snapshot (per cycle, per (symbol, type)) ──
@@ -386,28 +412,24 @@ export class IndicationSetsProcessor {
       // single hash field per (symbol, type) on every cycle so the most
       // recent qualified count for that pair is always the one read.
       //
-      //   indications_active:{connectionId} → hash
+      //   indication_sets_active:{connectionId} → hash
       //     fields: "{symbol}:direction", "{symbol}:move", "{symbol}:active",
       //             "{symbol}:active_advanced", "{symbol}:optimal"
       //
-      // The stats API hgetalls this hash and aggregates by type — fields are
+      // Detailed set tracking hgetalls this hash and aggregates by type — fields are
       // O(symbols × types) total which is small (≤ 5 × 5 = 25 fields). TTL
       // is short so a stopped engine doesn't leave stale "active" rows
       // forever; the next cycle naturally refreshes them.
       try {
         const { getRedisClient: _getRedis } = await import("@/lib/redis-db")
         const client = _getRedis()
-        const activeKey = `indications_active:${this.connectionId}`
+        const activeKey = `indication_sets_active:${this.connectionId}`
         await client.hset(activeKey, {
           [`${symbol}:direction`]:       String(directionResults?.qualified ?? 0),
           [`${symbol}:move`]:            String(moveResults?.qualified      ?? 0),
           [`${symbol}:active`]:          String(activeResults?.qualified    ?? 0),
+          [`${symbol}:active_advanced`]: String(activeAdvancedResults?.qualified ?? 0),
           [`${symbol}:optimal`]:         String(optimalResults?.qualified   ?? 0),
-          // active_advanced is tracked in DEFAULT_LIMITS and the active hash schema
-          // but the processor has no separate processActiveAdvancedSet — write 0 so
-          // the reader always sees all expected type fields, preventing stale values
-          // from a previous hotter cycle from persisting for this symbol.
-          [`${symbol}:active_advanced`]: "0",
         })
         await client.expire(activeKey, 600) // 10 min — engine refreshes each cycle
 
@@ -420,36 +442,38 @@ export class IndicationSetsProcessor {
         // with every retry/overlap instead of reflecting the current window.
         // Per-symbol HSET keeps sibling symbols independent and idempotent.
         const progKey    = `progression:${this.connectionId}`
-        const w5Key      = `indications_window:${this.connectionId}:last5`
-        const w60Key     = `indications_window:${this.connectionId}:last60min`
+        const w5Key      = `indication_sets_window:${this.connectionId}:last5`
+        const w60Key     = `indication_sets_window:${this.connectionId}:last60min`
         const dirQ  = directionResults?.qualified  ?? 0
         const moveQ = moveResults?.qualified       ?? 0
         const actQ  = activeResults?.qualified     ?? 0
+        const advQ  = activeAdvancedResults?.qualified ?? 0
         const optQ  = optimalResults?.qualified    ?? 0
         const pipe = client.multi()
         pipe.hset(w5Key, {
           [`${symbol}:direction`]: String(dirQ),
           [`${symbol}:move`]: String(moveQ),
           [`${symbol}:active`]: String(actQ),
+          [`${symbol}:active_advanced`]: String(advQ),
           [`${symbol}:optimal`]: String(optQ),
-          [`${symbol}:active_advanced`]: "0",
         })
         pipe.expire(w5Key,   300) // 5 min rolling window
         pipe.hset(w60Key, {
           [`${symbol}:direction`]: String(dirQ),
           [`${symbol}:move`]: String(moveQ),
           [`${symbol}:active`]: String(actQ),
+          [`${symbol}:active_advanced`]: String(advQ),
           [`${symbol}:optimal`]: String(optQ),
-          [`${symbol}:active_advanced`]: "0",
         })
         pipe.expire(w60Key,  4200) // 70 min rolling window
-        if (dirQ > 0 || moveQ > 0 || actQ > 0 || optQ > 0) {
+        if (dirQ > 0 || moveQ > 0 || actQ > 0 || advQ > 0 || optQ > 0) {
           // Total indication Sets active this cycle: configs that qualified across
           // all types. Stored as a progression field so getIndicationTracking has
           // a non-zero totalIndicationSets without a separate keys() scan.
           const totalSetsThisCycle = (directionResults?.configs ?? dirQ) +
                                      (moveResults?.configs      ?? moveQ) +
                                      (activeResults?.configs    ?? actQ) +
+                                     (activeAdvancedResults?.configs ?? advQ) +
                                      (optimalResults?.configs   ?? optQ)
           if (totalSetsThisCycle > 0) {
             pipe.hincrby(progKey, "indication_sets_total", totalSetsThisCycle)
@@ -460,13 +484,14 @@ export class IndicationSetsProcessor {
 
       if (totalQualified > 0) {
         console.log(
-          `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
+          `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} ActiveAdvanced=${activeAdvancedResults?.qualified}/${activeAdvancedResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
         )
 
         await logProgressionEvent(this.connectionId, "indications_sets", "info", `All indication types processed for ${symbol}`, {
           direction: directionResults,
           move: moveResults,
           active: activeResults,
+          active_advanced: activeAdvancedResults,
           optimal: optimalResults,
           duration,
         })
@@ -629,6 +654,48 @@ export class IndicationSetsProcessor {
     }
 
     return { type: "active", total, qualified, configs: pendingWrites.length }
+  }
+
+  /**
+   * Process Active Advanced Indication Set.
+   *
+   * This is intentionally independent from the normal Active Set. It looks for
+   * a minimum number of same-direction recent moves and a configurable
+   * continuation ratio, then persists its own `active_advanced` set keys and
+   * contributes separately to active/windowed stats.
+   */
+  private async processActiveAdvancedSet(symbol: string, marketData: any): Promise<any> {
+    const activityRatios = this.activeAdvancedActivityRatios
+    const minPositions = this.activeAdvancedMinPositions
+    const continuationRatio = this.activeAdvancedContinuationRatio
+    const factorMultipliers = this.factorMultipliers
+    let qualified = 0
+    let total = 0
+    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+
+    for (const activityRatio of activityRatios) {
+      for (const factorMultiplier of factorMultipliers) {
+        const config = { activityRatio, minPositions, continuationRatio, factorMultiplier }
+        const indication = this.calculateActiveAdvancedIndication(marketData, config)
+        if (!indication) continue
+
+        total++
+        const direction = indication.metadata?.direction === "short" ? "short" : "long"
+        indication.direction = direction
+        const setKey = `indication_set:${this.connectionId}:${symbol}:active_advanced:ar${activityRatio}:min${minPositions}:cr${continuationRatio}:f${factorMultiplier}`
+
+        if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
+          qualified++
+          pendingWrites.push({ setKey, indication, config })
+        }
+      }
+    }
+
+    if (pendingWrites.length > 0) {
+      await this.batchSaveIndications(pendingWrites, "active_advanced")
+    }
+
+    return { type: "active_advanced", total, qualified, configs: pendingWrites.length }
   }
 
   /**
@@ -1136,6 +1203,63 @@ export class IndicationSetsProcessor {
     }
 
     return null
+  }
+
+  private calculateActiveAdvancedIndication(
+    marketData: any,
+    config: {
+      activityRatio: number
+      minPositions: number
+      continuationRatio: number
+      factorMultiplier: number
+    },
+  ): any {
+    const { activityRatio, minPositions, continuationRatio, factorMultiplier } = config
+    const window = Math.max(minPositions + 2, 8)
+    const prices = this.getPriceHistory(marketData, window)
+    if (!prices || prices.length < minPositions + 1) return null
+
+    const moves: number[] = []
+    for (let i = 1; i < prices.length; i++) {
+      const prev = prices[i - 1]
+      const curr = prices[i]
+      if (!Number.isFinite(prev) || !Number.isFinite(curr) || prev <= 0) continue
+      moves.push((curr - prev) / prev)
+    }
+    if (moves.length < minPositions) return null
+
+    const longMoves = moves.filter((m) => m > 0)
+    const shortMoves = moves.filter((m) => m < 0)
+    const direction = longMoves.length >= shortMoves.length ? "long" : "short"
+    const alignedMoves = direction === "long" ? longMoves : shortMoves
+    if (alignedMoves.length < minPositions) return null
+
+    const continuity = alignedMoves.length / moves.length
+    if (continuity < continuationRatio) return null
+
+    const avgMagnitudePct =
+      (alignedMoves.reduce((sum, m) => sum + Math.abs(m), 0) / Math.max(1, alignedMoves.length)) * 100
+    if (avgMagnitudePct < activityRatio) return null
+
+    const volatility = this.calculateVolatility(prices)
+    const signalScore = 1.0 + ((avgMagnitudePct / Math.max(activityRatio, 0.1)) * continuity + volatility) * factorMultiplier
+
+    return {
+      profitFactor: 0,
+      signalScore,
+      rawSignalStrength: signalScore,
+      confidence: Math.min(1.0, 0.45 + continuity * 0.35 + Math.min(0.2, avgMagnitudePct / 20)),
+      metadata: {
+        direction,
+        activityRatio,
+        minPositions,
+        continuationRatio,
+        factorMultiplier,
+        continuity,
+        avgMagnitudePct,
+        volatility,
+      },
+    }
   }
 
   private calculateOptimalIndication(marketData: any, range: number, factorMultiplier: number): any {

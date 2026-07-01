@@ -162,16 +162,14 @@ export class StrategySetsProcessor {
         (a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0)
       )
       const selectedTotal = sortedIndications.length
-      const sortedIndications = [...indications]
-        .sort((a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
-        .slice(0, candidateLimit)
+      const selectedIndications = sortedIndications.slice(0, candidateLimit)
 
       // Process all 4 strategy types in parallel with independent logic
       const [baseResults, mainResults, realResults, liveResults] = await Promise.all([
-        this.processBaseStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
-        this.processMainStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
-        this.processRealStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
-        this.processLiveStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
+        this.processBaseStrategySet(symbol, selectedIndications, rawTotal, selectedTotal),
+        this.processMainStrategySet(symbol, selectedIndications, rawTotal, selectedTotal),
+        this.processRealStrategySet(symbol, selectedIndications, rawTotal, selectedTotal),
+        this.processLiveStrategySet(symbol, selectedIndications, rawTotal, selectedTotal),
       ])
 
       const duration = Date.now() - startTime

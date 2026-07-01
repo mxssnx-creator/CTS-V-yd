@@ -97,6 +97,17 @@ describe("requested regression guardrails", () => {
     expect(source).toContain('engineStatus = "queued"')
   })
 
+  test("production healing sweep drains queued engine refresh requests", () => {
+    const source = read("lib/trade-engine-auto-start.ts")
+
+    expect(source).toContain("processQueuedEngineRefreshRequests")
+    expect(source).toContain("getQueuedEngineRefreshRequests")
+    expect(source).toContain("currentVersion !== requestedVersion")
+    expect(source).toContain("await coordinator.stopEngine(request.connectionId, { operatorRequested: true })")
+    expect(source).toContain("await coordinator.startMissingEngines([connection])")
+    expect(source).toContain("queuedRefreshProcessedCount")
+  })
+
   test("live-trade enable preserves requested state when credentials are missing", () => {
     const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
 
@@ -182,8 +193,8 @@ describe("requested regression guardrails", () => {
     expect(startBranch).toContain('status: "running"')
     expect(startBranch).toContain('coordinator_ready: "true"')
     expect(startBranch).toContain("const started = await coordinator.startEngine")
-    expect(startBranch).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(startBranch).toContain('engineStatus = "queued"')
+    expect(startBranch).toContain('const localStartAllowed = true')
+    expect(startBranch).toContain('allowInProcessStart: true')
     expect(startBranch).not.toContain("setImmediate")
   })
 
@@ -218,9 +229,9 @@ describe("requested regression guardrails", () => {
 
     expect(source).toContain('export const runtime = "nodejs"')
     expect(source).toContain("const started = await coordinator.startEngine")
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(source).toContain('const localStartAllowed = true')
     expect(source).toContain('reason: "live_trade_enable"')
-    expect(source).toContain("Engine start queued for")
+    expect(source).toContain('allowInProcessStart: true')
     expect(source).toContain('live_trade_requested: "1"')
     expect(source).toContain('mode: hasCredentials ? "live" : "live_requested"')
     expect(source).not.toContain("setImmediate")
@@ -420,12 +431,12 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("private static readonly _AXIS_LRU_MAX = (() =>")
   })
 
-  test("coordinator startEngine is guarded in production UI workers", () => {
+  test("coordinator startEngine allows production in-process starts by default", () => {
     const source = read("lib/trade-engine.ts")
 
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(source).toContain('process.env.npm_lifecycle_event === "start"')
-    expect(source).toContain('startEngine(${connectionId}) queued/skipped in production UI worker')
+    expect(source).toContain("Production must allow in-process starts from the coordinator")
+    expect(source).toContain("Duplicate starts")
+    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {
@@ -445,17 +456,54 @@ describe("requested regression guardrails", () => {
     expect(existingBlock).not.toContain("!hasLiveTrade")
   })
 
-  test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
+  test("production web boot enables in-process starts and continuity by default", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
 
     expect(instrumentation).toContain('process.env.NEXT_RUNTIME === "edge"')
     expect(instrumentation).not.toContain('process.env.NEXT_RUNTIME !== "nodejs"')
-    expect(instrumentation).toContain('ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(instrumentation).toContain("trade-engine auto-start skipped")
-    expect(instrumentation).toContain('ENABLE_IN_PROCESS_CONTINUITY === "1"')
-    expect(continuityRunner).toContain('ENABLE_IN_PROCESS_CONTINUITY !== "1"')
-    expect(continuityRunner).toContain("web/UI process")
+    expect(instrumentation).toContain('DISABLE_TRADE_ENGINE_AUTOSTART !== "1"')
+    expect(instrumentation).toContain('DISABLE_IN_PROCESS_CONTINUITY !== "1"')
+    expect(continuityRunner).toContain('DISABLE_IN_PROCESS_CONTINUITY === "1"')
+    expect(continuityRunner).toContain("Long-lived Node production/dev processes should keep continuity alive")
+  })
+
+  test("indication snapshots do not double-count legacy production fields", () => {
+    const detailedTracking = read("lib/detailed-tracking.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+    const migrations = read("lib/redis-migrations.ts")
+
+    expect(detailedTracking).toContain("const byType = aggregateWindowByType(active)")
+    expect(detailedTracking).toContain("indication_sets_active")
+    expect(detailedTracking).toContain("indication_sets_window")
+    expect(detailedTracking).toContain("Do not read the raw indications_active")
+    expect(detailedTracking).toContain("last5ByType[t] = v5")
+    expect(detailedTracking).toContain("const totalIndicationSets = totalActive || last5Total || 0")
+    expect(detailedTracking).not.toContain("const aggregateWindowByType = (hash: Record<string, string>): Record<string, number> =>")
+    expect(statsRoute).toContain("function aggregateIndicationSnapshot")
+    expect(statsRoute).toContain("ignore the plain field so mixed deploys do not double")
+    expect(migrations).toContain('name: "063-reset-legacy-indication-snapshots"')
+    expect(migrations).toContain('name: "064-split-raw-and-set-indication-snapshots"')
+    expect(migrations).toContain('"indications_active:*"')
+    expect(migrations).toContain('"indications_window:*:last5"')
+    expect(migrations).toContain("do NOT touch cumulative progression counters")
+  })
+
+  test("indication processing keeps every type independent and windowed", () => {
+    const setProcessor = read("lib/indication-sets-processor.ts")
+    const rawProcessor = read("lib/trade-engine/indication-processor-fixed.ts")
+
+    expect(setProcessor).toContain('runType("active_advanced", () => this.processActiveAdvancedSet(symbol, marketData))')
+    expect(setProcessor).toContain("private async processActiveAdvancedSet")
+    expect(setProcessor).toContain('await this.batchSaveIndications(pendingWrites, "active_advanced")')
+    expect(setProcessor).toContain('active_advanced: activeAdvancedResults')
+    expect(setProcessor).toContain('`${symbol}:active_advanced`]: String(advQ)')
+    expect(setProcessor).toContain('const activeKey = `indication_sets_active:${this.connectionId}`')
+    expect(setProcessor).toContain('const w5Key      = `indication_sets_window:${this.connectionId}:last5`')
+    expect(rawProcessor).toContain("active_advanced: 0")
+    expect(rawProcessor).toContain('const w5Key = `indications_window:${this.connectionId}:last5`')
+    expect(rawProcessor).toContain("pipe.hset(w5Key, fields)")
+    expect(rawProcessor).toContain("pipe.hset(w60Key, fields)")
   })
 
   test("server continuity cron awaits direct healing sweep instead of relying on auto-start timers", () => {
@@ -503,8 +551,8 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("workerAttached: hasLocalEngineRuntime")
     expect(source).toContain("distributedHeartbeatFresh: hasFreshDistributedHeartbeat")
     expect(source).toContain("distributedEngineCount")
-    expect(source).toContain("no local manager or fresh distributed processor heartbeat is attached")
-    expect(source).toContain("ENABLE_TRADE_ENGINE_AUTOSTART=1")
+    expect(source).toContain("No local engine runtime is attached yet; explicit UI actions and continuity sweeps will reconcile queued engine work.")
+    expect(source).toContain("Optional for always-on processing")
     expect(source).toContain("operatorStatus: operatorIntent")
     expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
   })
@@ -558,14 +606,13 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("settings apply on next explicit Start or dedicated worker tick")
   })
 
-  test("dashboard enable queues engine start instead of blocking an unopted production UI worker", () => {
+  test("dashboard enable starts from explicit UI action without requiring worker env", () => {
     const source = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
 
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
-    expect(source).toContain("Connection enabled; start queued for coordinator worker")
-    expect(source).toContain("this UI worker is not opted in for local engine loops")
-    expect(source).toContain('engineStatus = "queued"')
+    expect(source).toContain('const localStartAllowed = true')
+    expect(source).toContain('allowInProcessStart: true')
+    expect(source).toContain('const started = await coordinator.startEngine')
+    expect(source).toContain('engineStatus = "started"')
   })
 
   test("connection enable paths keep global coordinator intent stable when engines can run", () => {

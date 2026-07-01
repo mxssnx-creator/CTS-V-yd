@@ -8,9 +8,7 @@ import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
-import { notifySettingsChanged } from "@/lib/settings-coordinator"
 import { nextStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
-import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 /**
  * POST /api/settings/connections/[id]/live-trade
@@ -97,7 +95,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     // Write the flag — this is what the running engine's live-stage checks.
     const staleLiveTradeBlockReason = String((connection as any).live_trade_blocked_reason || "").trim()
-    const stateSwitchVersion = String(Date.now())
+    const stateSwitchVersion = nextStateSwitchVersion(connection)
     const liveTradeChangedAt = new Date().toISOString()
     const previousValues = {
       is_live_trade: connection.is_live_trade,
@@ -106,7 +104,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       live_trade_changed_at: (connection as any).live_trade_changed_at,
     }
 
-    const stateSwitchVersion = nextStateSwitchVersion(connection)
     const updatedConnection = {
       ...connection,
       api_key: apiKey,
@@ -136,12 +133,17 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       ["is_live_trade", "live_trade_requested"],
       previousValues,
       newValues,
-    )
+    ).catch((settingsErr: unknown) => {
+      console.warn(
+        `[v0] [LiveTrade] Settings-change signal failed for ${connectionId}:`,
+        settingsErr instanceof Error ? settingsErr.message : String(settingsErr),
+      )
+    })
 
     const coordinator = getGlobalTradeEngineCoordinator()
     // Best-effort local fast-path only. Remote workers converge via the durable
     // settings_change/settings:dirty event written by notifySettingsChanged above.
-    await coordinator.applyPendingChangesNow(connectionId).catch((applyErr: unknown) => {
+    await (coordinator.applyPendingChangesNow?.(connectionId) ?? Promise.resolve()).catch((applyErr: unknown) => {
       console.warn(
         "[v0] [LiveTrade] Local applyPendingChangesNow failed:",
         applyErr instanceof Error ? applyErr.message : applyErr,
@@ -154,39 +156,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         progressionErr instanceof Error ? progressionErr.message : progressionErr,
       )
     })
-      updated_at: new Date().toISOString(),
-    }
-    await updateConnection(connectionId, updatedConnection)
-    await notifySettingsChanged(
-      connectionId,
-      ["is_live_trade", "live_trade_requested"],
-      {
-        is_live_trade: connection.is_live_trade,
-        live_trade_requested: connection.live_trade_requested,
-      },
-      {
-        is_live_trade: updatedConnection.is_live_trade,
-        live_trade_requested: updatedConnection.live_trade_requested,
-      },
-    ).catch((settingsErr) => {
-      console.warn(
-        `[v0] [LiveTrade] Settings-change signal failed for ${connectionId}:`,
-        settingsErr instanceof Error ? settingsErr.message : String(settingsErr),
-      )
-    })
-
-    // Live-trade mode changes alter the processing fingerprint used by
-    // progression/coordinator stats. Re-coordinate immediately so the UI does
-    // not keep showing a progression born for the previous live/sim mode, and
-    // poke any local running manager to re-read the flag without waiting for a
-    // polling tick.
-    await ProgressionStateManager.recoordinateForActualOne(connectionId, isLiveTrade ? "live" : "main").catch((recoordErr) => {
-      console.warn(
-        `[v0] [LiveTrade] Progression re-coordination failed for ${connectionId}:`,
-        recoordErr instanceof Error ? recoordErr.message : String(recoordErr),
-      )
-    })
-    getGlobalTradeEngineCoordinator().applyPendingChangesNow(connectionId).catch(() => undefined)
 
     if (staleLiveTradeBlockReason) {
       const clearReason = isLiveTrade
@@ -236,8 +205,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // status to the UI instead of reporting "starting" for work that may
         // never begin.
         try {
-          const localStartAllowed =
-            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
+          const localStartAllowed = true // explicit UI action: start foreground even without a dedicated worker env flag
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -259,29 +227,22 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engineStartedNow = started
             console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
           } else {
-            const refreshPayload = {
-              timestamp: new Date().toISOString(),
             await queueEngineRefreshRequest({
+              timestamp: new Date().toISOString(),
               connectionId,
               action: "start",
               state_switch_version: stateSwitchVersion,
               reason: "live_trade_enable",
-            }
-            await Promise.all([
-              setSettings("engine_coordinator:refresh_requested", refreshPayload),
-              setSettings(`engine_coordinator:refresh_requested:${connectionId}`, refreshPayload),
-            ])
-              timestamp: new Date().toISOString(),
             })
             await logProgressionEvent(connectionId, "engine_start_queued", "info", "Live Trade enabled; start queued for coordinator worker", {
               connectionId,
               connectionName: connName,
               exchange: connection.exchange,
-              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+              hint: "No local engine runtime accepted the foreground start; queued for continuity reconciliation.",
             })
             engineStatus = "queued"
             engineStartedNow = false
-            console.warn(`[v0] [LiveTrade] Engine start queued for ${connName}; this UI worker is not opted in for local engine loops`)
+            console.warn(`[v0] [LiveTrade] Engine start queued for ${connName}; foreground start was unavailable`)
           }
         } catch (err) {
           console.error(`[v0] [LiveTrade] Failed to start engine for ${connName}:`, err)
