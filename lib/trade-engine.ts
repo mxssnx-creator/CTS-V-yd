@@ -291,8 +291,30 @@ export class GlobalTradeEngineCoordinator {
         selfOwnedIfAlive: localManagerAlive,
       })
       if (!acquired.acquired || !acquired.handle) {
+        const ownerHeartbeatFreshnessMs = 90_000
+        let ownerHeartbeatFresh = false
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          const ownerState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+          const ownerHeartbeat = Number((ownerState as any)?.last_processor_heartbeat || 0)
+          ownerHeartbeatFresh =
+            Number.isFinite(ownerHeartbeat) &&
+            ownerHeartbeat > 0 &&
+            Date.now() - ownerHeartbeat < ownerHeartbeatFreshnessMs
+        } catch {
+          ownerHeartbeatFresh = false
+        }
+
+        if (ownerHeartbeatFresh) {
+          console.warn(
+            `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}) with a fresh heartbeat; leaving owner state untouched.`,
+          )
+          return true
+        }
+
         console.warn(
-          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
+          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}) with a stale heartbeat. Requesting prior progress stop and retrying once.`,
         )
         try {
           const { getRedisClient } = await import("@/lib/redis-db")
@@ -309,10 +331,10 @@ export class GlobalTradeEngineCoordinator {
               stop_requested_at: new Date().toISOString(),
             }),
           ])
-        } catch { /* best-effort signal for the previous worker */ }
+        } catch { /* best-effort signal for the previous stale worker */ }
         try {
           await this.stopEngine(connectionId)
-        } catch { /* local worker may not own the previous engine */ }
+        } catch { /* local worker may not own the previous stale engine */ }
         try {
           await forceBreakProgressionLock(connectionId)
         } catch { /* TTL fallback */ }
