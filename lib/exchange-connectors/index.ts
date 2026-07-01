@@ -72,10 +72,10 @@ export async function createExchangeConnector(
       return new BybitConnector(credentials, "bybit")
     }
     case "bingx": {
-      // Use the wrapper for instant API responses with library adapter
-      // Falls back to REST automatically if library fails
-      const { BingXConnectorWrapper } = await import("./bingx-connector-wrapper")
-      return new BingXConnectorWrapper(credentials, true)
+      // Use official SDK client (bingx-api library) for instant order execution
+      // SDK handles connection pooling, signing, and timestamp sync automatically
+      // Falls back to manual REST if SDK initialization fails
+      return new BingXConnector(credentials, "bingx")
     }
     case "pionex": {
       const { PionexConnector } = await import("./pionex-connector")
