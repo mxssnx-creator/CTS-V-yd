@@ -6,6 +6,7 @@ import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { isTruthyFlag, parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
+import { currentStateSwitchVersion, nextStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 import { buildMissingTradeEngineWorkerDiagnostic } from "@/lib/trade-engine-worker-heartbeat"
 
 // POST toggle connection active status (inserted/enabled) - INDEPENDENT from Settings
@@ -83,20 +84,24 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     let updatedConnection: any
     let engineAction: "start" | "stop" | null = null
     
+    let stateSwitchVersion = currentStateSwitchVersion(connection)
     if (needsUpdate) {
       if (isRemoval) {
         // Remove from Main Connections completely - unassign
-        updatedConnection = buildMainConnectionRemoveUpdate(connection)
+        stateSwitchVersion = nextStateSwitchVersion(connection)
+        updatedConnection = { ...buildMainConnectionRemoveUpdate(connection), state_switch_version: stateSwitchVersion }
         engineAction = "stop"
         console.log(`[v0] [Toggle] REMOVING: main_assigned=false, main_enabled=false (complete unassignment)`)
       } else if (enableMain) {
         // Enable in Main Connections - use clean helper
-        updatedConnection = buildMainConnectionEnableUpdate(connection)
+        stateSwitchVersion = nextStateSwitchVersion(connection)
+        updatedConnection = { ...buildMainConnectionEnableUpdate(connection), state_switch_version: stateSwitchVersion }
         engineAction = "start"
         console.log(`[v0] [Toggle] ENABLING: main_assigned=true, main_enabled=true (engine will process)`)
       } else {
         // Disable in Main Connections - use clean helper  
-        updatedConnection = buildMainConnectionDisableUpdate(connection)
+        stateSwitchVersion = nextStateSwitchVersion(connection)
+        updatedConnection = { ...buildMainConnectionDisableUpdate(connection), state_switch_version: stateSwitchVersion }
         engineAction = "stop"
         console.log(`[v0] [Toggle] DISABLING: main_enabled=false (engine will stop)`)
       }
@@ -260,11 +265,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
             engineStatus = "started"
           } else {
-            await setSettings("engine_coordinator:refresh_requested", {
-              timestamp: new Date().toISOString(),
+            await queueEngineRefreshRequest({
               connectionId: resolvedId,
               action: "start",
+              state_switch_version: stateSwitchVersion,
               reason: "dashboard_toggle_enable",
+              timestamp: new Date().toISOString(),
             })
             await logProgressionEvent(resolvedId, "engine_start_queued", "info", "Connection enabled; start queued for coordinator worker", {
               connectionId: resolvedId,
@@ -283,10 +289,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         } catch (engineStartError) {
           console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
           // Still set the flag as fallback - coordinator may pick it up
-          await setSettings("engine_coordinator:refresh_requested", {
-            timestamp: new Date().toISOString(),
+          await queueEngineRefreshRequest({
             connectionId: resolvedId,
             action: "start",
+            state_switch_version: stateSwitchVersion,
+            reason: "dashboard_toggle_enable_fallback",
+            timestamp: new Date().toISOString(),
           })
           const fallbackClient = getRedisClient()
           const fallbackGlobalState = await fallbackClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) as Record<string, string>
@@ -360,10 +368,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         } catch (engineStopError) {
           console.warn(`[v0] [Toggle] Failed to stop engine directly:`, engineStopError)
           // Fallback refresh request so coordinator picks up desired stop state
-          await setSettings("engine_coordinator:refresh_requested", {
-            timestamp: new Date().toISOString(),
+          await queueEngineRefreshRequest({
             connectionId: resolvedId,
             action: "stop",
+            state_switch_version: stateSwitchVersion,
+            reason: "dashboard_toggle_stop_fallback",
+            timestamp: new Date().toISOString(),
           })
           await logProgressionEvent(resolvedId, "engine_stop_fallback_requested", "warning", "Direct stop failed; coordinator refresh requested", {
             connectionId: resolvedId,

@@ -50,6 +50,7 @@ import {
   forceBreakProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
+import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests } from "./engine-refresh-queue"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -1513,10 +1514,43 @@ export class GlobalTradeEngineCoordinator {
     this.healthCheckTimer = setInterval(async () => {
       try {
         // -- 1. Refresh-request handling ----------------------------------
-        const refreshRequest = await getSettings("engine_coordinator:refresh_requested")
-        if (refreshRequest && refreshRequest.timestamp) {
-          const requestTime = new Date(refreshRequest.timestamp).getTime()
+        const refreshRequests = await getQueuedEngineRefreshRequests()
+        if (refreshRequests.length > 0) {
+          const { getConnection } = await import("@/lib/redis-db")
           const now = Date.now()
+
+          for (const { request } of refreshRequests) {
+            const requestTime = new Date(request.timestamp).getTime()
+            if (!Number.isFinite(requestTime) || now - requestTime >= 30000) {
+              console.log(`[v0] [Coordinator] Dropping expired refresh request for ${request.connectionId}`)
+              await clearEngineRefreshRequest(request.connectionId)
+              continue
+            }
+
+            const connection = await getConnection(request.connectionId)
+            const currentVersion = String(connection?.state_switch_version ?? 0)
+            const requestedVersion = String(request.state_switch_version ?? "")
+            if (!connection || currentVersion !== requestedVersion) {
+              console.log(
+                `[v0] [Coordinator] Ignoring stale refresh request for ${request.connectionId}: ` +
+                  `requested state_switch_version=${requestedVersion}, current=${currentVersion}`,
+              )
+              await clearEngineRefreshRequest(request.connectionId)
+              continue
+            }
+
+            console.log(
+              `[v0] [Coordinator] Refresh requested for ${request.connectionId}: ${request.action} ` +
+                `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
+            )
+            await clearEngineRefreshRequest(request.connectionId)
+            if (request.action === "stop") {
+              await this.stopEngine(request.connectionId, { operatorRequested: true })
+            } else if (request.action === "start") {
+              await this.startEngineFromConnectionConfig(request.connectionId)
+            } else {
+              await this.refreshEngines()
+            }
           if (now - requestTime < 30000) {
             console.warn(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
             await setSettings("engine_coordinator:refresh_requested", {

@@ -1,11 +1,12 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { initRedis, getConnection, updateConnection, persistNow, getRedisClient, setSettings } from "@/lib/redis-db"
+import { initRedis, getConnection, updateConnection, persistNow, getRedisClient } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { nextStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 /**
@@ -93,6 +94,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     // Write the flag — this is what the running engine's live-stage checks.
     const staleLiveTradeBlockReason = String((connection as any).live_trade_blocked_reason || "").trim()
+    const stateSwitchVersion = nextStateSwitchVersion(connection)
     const updatedConnection = {
       ...connection,
       api_key: apiKey,
@@ -105,6 +107,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             ...(hasCredentials ? { last_test_status: "success" } : {}),
           }
         : { live_trade_requested: "0" }),
+      state_switch_version: stateSwitchVersion,
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
@@ -194,11 +197,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engineStartedNow = started
             console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
           } else {
-            await setSettings("engine_coordinator:refresh_requested", {
-              timestamp: new Date().toISOString(),
+            await queueEngineRefreshRequest({
               connectionId,
               action: "start",
+              state_switch_version: stateSwitchVersion,
               reason: "live_trade_enable",
+              timestamp: new Date().toISOString(),
             })
             await logProgressionEvent(connectionId, "engine_start_queued", "info", "Live Trade enabled; start queued for coordinator worker", {
               connectionId,
