@@ -3318,6 +3318,49 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "60")
     },
   },
+  {
+    version: 62,
+    name: "062-separate-main-assignment-from-processing",
+    up: async (client: any) => {
+      await client.set("_schema_version", "62")
+      const truthy = (value: any) => value === true || value === 1 || value === "1" || value === "true"
+      const connections = await client.smembers("connections")
+      let backfilled = 0
+      let indexed = 0
+
+      await client.del("connections:main:enabled").catch(() => 0)
+
+      for (const connId of connections) {
+        const connData = await client.hgetall(`connection:${connId}`)
+        if (!connData || Object.keys(connData).length === 0) continue
+
+        const assigned = truthy(connData.is_active_inserted) || truthy(connData.is_assigned) || truthy(connData.is_dashboard_inserted)
+        const processingEnabled = truthy(connData.is_enabled_dashboard)
+        const hasLegacyActiveOnly = truthy(connData.is_active_inserted) && !processingEnabled
+
+        if (hasLegacyActiveOnly) {
+          await client.hset(`connection:${connId}`, {
+            is_assigned: "1",
+            is_enabled_dashboard: "0",
+            is_active: "0",
+            updated_at: new Date().toISOString(),
+          })
+          backfilled++
+        } else if (assigned && processingEnabled) {
+          await client.sadd("connections:main:enabled", connId)
+          indexed++
+        }
+      }
+
+      console.log(
+        `[v0] Migration 062: separated assignment from processing; ` +
+        `backfilled ${backfilled} legacy active-only row(s), indexed ${indexed} processing-enabled row(s)`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "61")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

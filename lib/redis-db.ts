@@ -3035,17 +3035,21 @@ export function getConnectionStates(connection: any): {
     base_enabled: isEnabledFlag(connection.is_enabled),
     base_inserted: isEnabledFlag(connection.is_inserted),
     main_enabled: isEnabledFlag(connection.is_enabled_dashboard),
-    main_assigned: isEnabledFlag(connection.is_active_inserted),
+    main_assigned: isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned),
     is_active: isEnabledFlag(connection.is_active_inserted) && isEnabledFlag(connection.is_enabled_dashboard),
   }
 }
 
 export function isConnectionAssignedToMain(connection: any): boolean {
-  return isEnabledFlag(connection.is_active_inserted)
+  return isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned)
+}
+
+export function isConnectionProcessingEnabled(connection: any): boolean {
+  return isEnabledFlag(connection.is_enabled_dashboard)
 }
 
 export function isConnectionMainEnabled(connection: any): boolean {
-  return isEnabledFlag(connection.is_enabled_dashboard)
+  return isConnectionProcessingEnabled(connection)
 }
 
 export function isConnectionBaseEnabled(connection: any): boolean {
@@ -3652,21 +3656,16 @@ export async function getEnabledConnections(): Promise<any[]> {
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
   return allConnections.filter(conn => {
-    // A connection is eligible for the engine when it is both:
-    // 1. Assigned/inserted into the active panel  
-    // 2. Enabled — either the base is_enabled flag OR the dashboard toggle
-    //    (is_enabled_dashboard). The dashboard toggle is what migration 021
-    //    and the quickstart route write, so checking it here means the engine
-    //    starts as soon as the user enables a connection via the UI or runs
-    //    quickstart — no extra Redis flag writes needed.
+    // A connection is eligible for engine processing only when it is both:
+    // 1. Assigned/inserted into the Main Connections panel, and
+    // 2. Explicitly enabled via the dashboard processing switch.
+    // Base is_enabled/enabled and is_active_inserted/is_assigned are not
+    // processing switches and must not cause auto-start by themselves.
     const isAssigned =
       isEnabledFlag(conn.is_active_inserted) ||
       isEnabledFlag(conn.is_assigned) ||
       isEnabledFlag(conn.is_dashboard_inserted)
-    const isEnabled =
-      isEnabledFlag(conn.is_enabled) ||
-      isEnabledFlag(conn.enabled) ||
-      isEnabledFlag(conn.is_enabled_dashboard)
+    const isEnabled = isEnabledFlag(conn.is_enabled_dashboard)
     return isAssigned && isEnabled
   })
 }
