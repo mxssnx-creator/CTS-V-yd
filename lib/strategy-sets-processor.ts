@@ -62,7 +62,12 @@ export interface StrategySet {
 
 export class StrategySetsProcessor {
   private connectionId: string
+  private settingsReady: Promise<void>
   private limits: StrategySetLimits = { ...DEFAULT_LIMITS }
+  private lastSettingsRefreshAt = 0
+  private settingsRefreshInFlight: Promise<void> | null = null
+  private readonly SETTINGS_REFRESH_INTERVAL_MS = 5_000
+  private settingsReady: Promise<void>
   /**
    * Per-type compaction config cache. Refreshed lazily by the underlying
    * `loadCompactionConfig` helper (5s TTL). Strategy pools use the
@@ -101,32 +106,49 @@ export class StrategySetsProcessor {
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
-    this.loadSettings()
+    this.settingsReady = this.loadSettings()
   }
 
   private async loadSettings(): Promise<void> {
     try {
       const settings = await getSettings("strategy_sets_config")
+      const nextLimits: StrategySetLimits = { ...DEFAULT_LIMITS }
+
       if (settings) {
         // Load independent limits per type
-        if (settings.base) this.limits.base = Number(settings.base)
-        if (settings.main) this.limits.main = Number(settings.main)
-        if (settings.real) this.limits.real = Number(settings.real)
-        if (settings.live) this.limits.live = Number(settings.live)
+        if (settings.base) nextLimits.base = Number(settings.base)
+        if (settings.main) nextLimits.main = Number(settings.main)
+        if (settings.real) nextLimits.real = Number(settings.real)
+        if (settings.live) nextLimits.live = Number(settings.live)
         // Fallback: legacy maxEntriesPerSet applies weighted by type.
         if (settings.maxEntriesPerSet && !settings.base) {
           const limit = Number(settings.maxEntriesPerSet)
-          this.limits = {
-            base: Math.max(300, Math.round(limit * 1.8)),
-            main: Math.max(120, Math.round(limit * 0.8)),
-            real: Math.max(60, Math.round(limit * 0.35)),
-            live: Math.max(120, limit),
-          }
+          nextLimits.base = Math.max(300, Math.round(limit * 1.8))
+          nextLimits.main = Math.max(120, Math.round(limit * 0.8))
+          nextLimits.real = Math.max(60, Math.round(limit * 0.35))
+          nextLimits.live = Math.max(120, limit)
         }
       }
+
+      this.limits = nextLimits
+      this.compactionCfgs = {}
+      this.lastSettingsRefreshAt = Date.now()
     } catch (error) {
       console.error("[v0] [StrategySets] Failed to load settings:", error)
     }
+  }
+
+  private async refreshSettingsIfNeeded(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastSettingsRefreshAt < this.SETTINGS_REFRESH_INTERVAL_MS) return
+
+    if (!this.settingsRefreshInFlight) {
+      this.settingsRefreshInFlight = this.loadSettings().finally(() => {
+        this.settingsRefreshInFlight = null
+      })
+    }
+
+    await this.settingsRefreshInFlight
   }
 
   /** Get the limit for a specific strategy type */
@@ -139,7 +161,11 @@ export class StrategySetsProcessor {
    */
   async processAllStrategySets(symbol: string, indications: any[]): Promise<void> {
     try {
+      await this.settingsReady
+
       const startTime = Date.now()
+
+      await this.refreshSettingsIfNeeded()
 
       // Sort indications by profitFactor descending so that the best-performing
       // signals are processed first across all strategy type pools.
@@ -290,6 +316,11 @@ export class StrategySetsProcessor {
   /**
    * Batch-save multiple qualifying strategies to the same set pool in
    * ONE read-merge-compact-write transaction.
+   * Batch-save all qualifying strategies for a type-specific pool in one
+   * staged read-merge-compact-write transaction. The strategy-set pipeline
+   * accumulates qualifying entries in memory while evaluating indications,
+   * then writes the staged batch once per strategy type to avoid repeated
+   * Redis I/O and read-modify-write races on the same key.
    */
   private async saveBatchToSet(
     setKey: string,
