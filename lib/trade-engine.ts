@@ -217,6 +217,29 @@ export class GlobalTradeEngineCoordinator {
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
 
+    // A queued start can race with a later dashboard disable/settings change in
+    // production. Re-read the per-connection operator intent immediately before
+    // acquiring locks so stale queued starts cannot resurrect a disabled
+    // connection or start processing with stale assignment flags.
+    try {
+      const { initRedis, getConnection } = await import("@/lib/redis-db")
+      const { isConnectionReadyForEngine } = await import("@/lib/connection-state-helpers")
+      await initRedis()
+      const currentConnection = await getConnection(connectionId)
+      if (!currentConnection || !isConnectionReadyForEngine(currentConnection)) {
+        console.log(
+          `[v0] [Coordinator] startEngine(${connectionId}) skipped — connection is no longer assigned/enabled`,
+        )
+        return false
+      }
+    } catch (intentErr) {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) could not verify current connection intent; refusing stale start:`,
+        intentErr instanceof Error ? intentErr.message : String(intentErr),
+      )
+      return false
+    }
+
     if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
       return false
     }
