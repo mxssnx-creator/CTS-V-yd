@@ -6,6 +6,7 @@ import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 /**
  * POST /api/settings/connections/[id]/live-trade
@@ -107,6 +108,20 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
+
+    // Live-trade mode changes alter the processing fingerprint used by
+    // progression/coordinator stats. Re-coordinate immediately so the UI does
+    // not keep showing a progression born for the previous live/sim mode, and
+    // poke any local running manager to re-read the flag without waiting for a
+    // polling tick.
+    await ProgressionStateManager.recoordinateForActualOne(connectionId, isLiveTrade ? "live" : "main").catch((recoordErr) => {
+      console.warn(
+        `[v0] [LiveTrade] Progression re-coordination failed for ${connectionId}:`,
+        recoordErr instanceof Error ? recoordErr.message : String(recoordErr),
+      )
+    })
+    getGlobalTradeEngineCoordinator().applyPendingChangesNow(connectionId).catch(() => undefined)
+
     if (staleLiveTradeBlockReason) {
       const clearReason = isLiveTrade
         ? "Live Trading enabled after credential validation; cleared stale block so exchange orders can proceed."

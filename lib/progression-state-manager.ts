@@ -1008,6 +1008,60 @@ return {
 
       const storedSymbolCount = parseInt(existing.symbol_count || "0", 10)
       const storedHash = existing.active_symbols_hash || ""
+      const storedSymbols = storedHash
+        .split("|")
+        .map((symbol) => symbol.trim())
+        .filter(Boolean)
+      const storedSymbolSet = new Set(storedSymbols)
+      const missingSymbols = currentSymbols.filter((symbol) => !storedSymbolSet.has(symbol))
+      const additiveSymbolOnlyChange =
+        storedSymbols.length > 0 &&
+        missingSymbols.length > 0 &&
+        storedSymbols.every((symbol) => currentSymbols.includes(symbol)) &&
+        storedFingerprint !== "" &&
+        storedFingerprint === liveFingerprint
+
+      if (additiveSymbolOnlyChange) {
+        // Additive symbol changes should not wipe an otherwise healthy
+        // progression. Preserve completed historic work for existing symbols
+        // and clear only the gates for symbols that are genuinely missing so
+        // the next prehistoric pass calculates the delta instead of replaying
+        // the whole connection.
+        await Promise.all([
+          client.del(`prehistoric:${connectionId}:done`).catch(() => {}),
+          client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}:verified`).catch(() => {}),
+          client.del(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => {}),
+          ...missingSymbols.map((symbol) =>
+            client.del(`prehistoric:${connectionId}:${symbol}:processed_intervals`).catch(() => {}),
+          ),
+        ])
+
+        await client.hset(key, {
+          symbol_count: String(liveSymbolCount),
+          active_symbols_hash: liveSymbolsHash,
+          started_for_settings_version: existing.started_for_settings_version || new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          engine_type: engineType || "main",
+          prehistoric_phase_active: "true",
+          missing_prehistoric_symbols: JSON.stringify(missingSymbols),
+          last_update: new Date().toISOString(),
+        }).catch(() => {})
+
+        await client
+          .hset(`settings:trade_engine_state:${connectionId}`, {
+            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
+            config_set_symbols_processed: String(Math.max(0, storedSymbolCount)),
+          })
+          .catch(() => {})
+
+        return {
+          changed: true,
+          reason: `symbols added (${missingSymbols.join(",")}) — preserving existing prehistoric progress`,
+          newEpoch: Number(existing.epoch || existing.started_at || 0) || undefined,
+        }
+      }
 
       const symbolMismatch = storedSymbolCount !== liveSymbolCount || storedHash !== liveSymbolsHash
       // Only compare fingerprints when a stored snapshot exists (empty stored

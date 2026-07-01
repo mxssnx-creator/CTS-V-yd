@@ -143,9 +143,23 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       }
     }
 
-    // Save connection state only if state changed
+    // Save connection state only if state changed. Stamp a per-connection
+    // switch generation so status/progression readers and coordinator workers
+    // can distinguish this operator intent from stale queued start/stop work.
     if (needsUpdate && updatedConnection) {
+      const stateSwitchVersion = `${Date.now()}`
+      updatedConnection = {
+        ...updatedConnection,
+        state_switch_version: stateSwitchVersion,
+        state_switch_action: enableMain ? "enable" : "disable",
+        state_switch_at: new Date().toISOString(),
+      }
       await updateConnection(resolvedId, updatedConnection)
+      await setSettings(`connection_state_switch:${resolvedId}`, {
+        version: stateSwitchVersion,
+        action: enableMain ? "enable" : "disable",
+        updated_at: updatedConnection.state_switch_at,
+      }).catch(() => undefined)
       console.log(`[v0] [Toggle] Updated ${connection.name} (resolved id: ${resolvedId})`)
     }
 
