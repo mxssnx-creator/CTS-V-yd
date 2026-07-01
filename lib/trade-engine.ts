@@ -102,6 +102,7 @@ export class GlobalTradeEngineCoordinator {
   private engineManagers: Map<string, TradeEngineManager> = new Map()
   private startingEngines = new Map<string, Promise<boolean>>()  // PHASE 1 FIX: Startup lock to prevent duplicate starts
   private stoppingEngines = new Set<string>()  // PHASE 2 FIX: Stop lock to prevent race conditions
+  private transitionQueues = new Map<string, Promise<unknown>>()
   private isGloballyRunning = false
   private isPaused = false
   private healthCheckTimer?: NodeJS.Timeout
@@ -116,6 +117,21 @@ export class GlobalTradeEngineCoordinator {
     totalCycles: 0,
     avgCycleDuration: 0,
     lastMetricsUpdate: new Date(),
+  }
+
+
+  private enqueueConnectionTransition<T>(
+    connectionId: string,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.transitionQueues.get(connectionId) ?? Promise.resolve()
+    const next = previous.then(action, action).finally(() => {
+      if (this.transitionQueues.get(connectionId) === next) {
+        this.transitionQueues.delete(connectionId)
+      }
+    })
+    this.transitionQueues.set(connectionId, next)
+    return next
   }
 
   constructor() {
@@ -170,6 +186,10 @@ export class GlobalTradeEngineCoordinator {
    * Initialize engine for a specific connection
    */
   async initializeEngine(connectionId: string, config: EngineConfig): Promise<TradeEngineManager> {
+    return this.enqueueConnectionTransition(connectionId, () => this.initializeEngineUnlocked(connectionId, config))
+  }
+
+  private async initializeEngineUnlocked(connectionId: string, config: EngineConfig): Promise<TradeEngineManager> {
     console.log(`[v0] Initializing TradeEngine for connection: ${connectionId}`)
 
     // Check if engine already exists
@@ -198,6 +218,10 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
   async startEngine(connectionId: string, config: EngineConfig): Promise<boolean> {
+    return this.enqueueConnectionTransition(connectionId, () => this.startEngineUnlocked(connectionId, config))
+  }
+
+  private async startEngineUnlocked(connectionId: string, config: EngineConfig): Promise<boolean> {
     const existingStart = this.startingEngines.get(connectionId)
     if (existingStart) {
       console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}; awaiting existing start request`)
@@ -343,6 +367,8 @@ export class GlobalTradeEngineCoordinator {
           ])
         } catch { /* best-effort signal for the previous stale worker */ }
         try {
+          await this.stopEngineUnlocked(connectionId)
+        } catch { /* local worker may not own the previous engine */ }
           await this.stopEngine(connectionId)
         } catch { /* local worker may not own the previous stale engine */ }
         try {
@@ -368,7 +394,7 @@ export class GlobalTradeEngineCoordinator {
       let manager = this.engineManagers.get(connectionId)
       if (!manager) {
         console.log(`[v0] Starting TradeEngine for connection: ${connectionId}`)
-        manager = await this.initializeEngine(connectionId, config)
+        manager = await this.initializeEngineUnlocked(connectionId, config)
       } else {
         console.log(`[v0] [STARTUP LOCK] Reusing existing engine manager for: ${connectionId}`)
       }
@@ -432,6 +458,11 @@ export class GlobalTradeEngineCoordinator {
    * Stop engine for a specific connection
    * PHASE 2 FIX: Added stop lock to prevent concurrent stop requests and race conditions
    */
+  async stopEngine(connectionId: string): Promise<void> {
+    return this.enqueueConnectionTransition(connectionId, () => this.stopEngineUnlocked(connectionId))
+  }
+
+  private async stopEngineUnlocked(connectionId: string): Promise<void> {
   async stopEngine(connectionId: string, options: StopEngineOptions = {}): Promise<void> {
     // Step 1: Check if already stopping
     if (this.stoppingEngines.has(connectionId)) {
@@ -581,6 +612,10 @@ export class GlobalTradeEngineCoordinator {
    * concurrent restarts for the same connection.
    */
   async restartEngine(connectionId: string): Promise<void> {
+    return this.enqueueConnectionTransition(connectionId, () => this.restartEngineUnlocked(connectionId))
+  }
+
+  private async restartEngineUnlocked(connectionId: string): Promise<void> {
     if (!(await this.isGlobalCoordinatorEnabled(`restartEngine(${connectionId})`))) {
       return
     }
@@ -598,7 +633,7 @@ export class GlobalTradeEngineCoordinator {
         await forceBreakProgressionLock(connectionId)
       } catch { /* TTL will reclaim */ }
       try {
-        await this.stopEngine(connectionId)
+        await this.stopEngineUnlocked(connectionId)
       } catch (stopErr) {
         console.warn(
           `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
@@ -606,7 +641,7 @@ export class GlobalTradeEngineCoordinator {
         )
       }
       try {
-        await this.startEngineFromConnectionConfig(connectionId)
+        await this.startEngineFromConnectionConfigUnlocked(connectionId)
       } catch (startErr) {
         console.error(
           `[v0] [Coordinator] restartEngine start failed for ${connectionId}:`,
@@ -627,6 +662,10 @@ export class GlobalTradeEngineCoordinator {
    * optimization, not a correctness one.
    */
   async applyPendingChangesNow(connectionId: string): Promise<void> {
+    return this.enqueueConnectionTransition(connectionId, () => this.applyPendingChangesNowUnlocked(connectionId))
+  }
+
+  private async applyPendingChangesNowUnlocked(connectionId: string): Promise<void> {
     const manager = this.engineManagers.get(connectionId)
     if (!manager || !manager.isEngineRunning) return
     try {
@@ -646,11 +685,13 @@ export class GlobalTradeEngineCoordinator {
    * live engine adopts the 15-symbol set without a full restart.
    */
   public invalidateSymbolsCacheForConnection(connectionId: string): void {
-    const manager = this.engineManagers.get(connectionId)
-    if (manager) {
-      manager.invalidateSymbolsCache()
-      console.log(`[v0] [Coordinator] invalidated symbol cache for ${connectionId}`)
-    }
+    void this.enqueueConnectionTransition(connectionId, async () => {
+      const manager = this.engineManagers.get(connectionId)
+      if (manager) {
+        manager.invalidateSymbolsCache()
+        console.log(`[v0] [Coordinator] invalidated symbol cache for ${connectionId}`)
+      }
+    })
   }
 
   /**
@@ -665,6 +706,10 @@ export class GlobalTradeEngineCoordinator {
    * watchdog will simply retry on the next pass.
    */
   private async startEngineFromConnectionConfig(connectionId: string): Promise<void> {
+    return this.enqueueConnectionTransition(connectionId, () => this.startEngineFromConnectionConfigUnlocked(connectionId))
+  }
+
+  private async startEngineFromConnectionConfigUnlocked(connectionId: string): Promise<void> {
     try {
       if (!(await this.isGlobalCoordinatorEnabled(`startEngineFromConnectionConfig(${connectionId})`))) {
         return
@@ -686,7 +731,7 @@ export class GlobalTradeEngineCoordinator {
         strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
         realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
       }
-      await this.startEngine(connectionId, config)
+      await this.startEngineUnlocked(connectionId, config)
     } catch (err) {
       console.warn(
         `[v0] [Coordinator] startEngineFromConnectionConfig failed for ${connectionId}:`,
@@ -700,6 +745,10 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 2 FIX: Ensures safe enable/disable by waiting for any ongoing state changes
    */
   async toggleEngine(connectionId: string, enabled: boolean, config?: EngineConfig): Promise<void> {
+    return this.enqueueConnectionTransition(connectionId, () => this.toggleEngineUnlocked(connectionId, enabled, config))
+  }
+
+  private async toggleEngineUnlocked(connectionId: string, enabled: boolean, config?: EngineConfig): Promise<void> {
     // Wait for any ongoing state changes to complete
     const maxWaits = 100 // 5 seconds max
     let waits = 0
@@ -719,12 +768,12 @@ export class GlobalTradeEngineCoordinator {
 
     if (enabled) {
       if (config) {
-        await this.startEngine(connectionId, config)
+        await this.startEngineUnlocked(connectionId, config)
       } else {
         console.warn(`[v0] [TOGGLE] Cannot start engine ${connectionId} - missing config`)
       }
     } else {
-      await this.stopEngine(connectionId)
+      await this.stopEngineUnlocked(connectionId)
     }
   }
 
@@ -1633,24 +1682,29 @@ export class GlobalTradeEngineCoordinator {
                 } catch {
                   /* TTL will reclaim */
                 }
-                // Stop + restart sequentially. The mutex above
-                // prevents this whole block from running concurrently
-                // for the same connection.
+                // Stop + restart as one queued transition. The mutex above
+                // prevents duplicate watchdog escalations, while the
+                // connection queue serializes this restart with dashboard
+                // start/stop/toggle requests for the same connection.
                 try {
-                  await this.stopEngine(connectionId)
-                } catch (stopErr) {
-                  console.warn(
-                    `[v0] [Watchdog] force stop threw for ${connectionId}:`,
-                    stopErr instanceof Error ? stopErr.message : String(stopErr),
-                  )
-                }
-                try {
-                  await this.startEngineFromConnectionConfig(connectionId)
-                } catch (startErr) {
-                  console.error(
-                    `[v0] [Watchdog] force restart failed for ${connectionId}:`,
-                    startErr instanceof Error ? startErr.message : String(startErr),
-                  )
+                  await this.enqueueConnectionTransition(connectionId, async () => {
+                    try {
+                      await this.stopEngineUnlocked(connectionId)
+                    } catch (stopErr) {
+                      console.warn(
+                        `[v0] [Watchdog] force stop threw for ${connectionId}:`,
+                        stopErr instanceof Error ? stopErr.message : String(stopErr),
+                      )
+                    }
+                    try {
+                      await this.startEngineFromConnectionConfigUnlocked(connectionId)
+                    } catch (startErr) {
+                      console.error(
+                        `[v0] [Watchdog] force restart failed for ${connectionId}:`,
+                        startErr instanceof Error ? startErr.message : String(startErr),
+                      )
+                    }
+                  })
                 } finally {
                   // Mutex MUST always be released, even on failure,
                   // so the next health-check tick can retry.
