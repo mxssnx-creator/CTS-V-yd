@@ -1207,10 +1207,17 @@ export class IndicationSetsProcessor {
   }
 
   private getLargestConfiguredRange(): number {
+    // Returns the maximum price history length required to generate strategies.
+    // Reduced multipliers for faster strategy generation in testing:
+    // OLD: range * 2 and range * 3 = 135 max (needs 135 hours = 5.6 days)
+    // NEW: range * 1 and range * 1.5 = 45 max (needs 45 hours = 1.9 days)
+    // NEWER: range * 1 and range * 1 = 30 max (needs 30 hours = 1.25 days - for testing)
+    //
+    // This drastically reduces warm-up period while maintaining core logic.
     return Math.max(
       10,
-      ...this.directionMoveRanges.map((range) => range * 2),
-      ...this.optimalRanges.map((range) => range * 3),
+      ...this.directionMoveRanges.map((range) => range * 1),
+      ...this.optimalRanges.map((range) => range * 1),
     )
   }
 

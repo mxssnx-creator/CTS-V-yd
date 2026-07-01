@@ -137,10 +137,10 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // Each value is calibrated to a ~2×p99 RTT of a typical BingX API call
 // (BingX p99 ≈ 120–250 ms); the gap gives one retry margin without
 // stalling the full sync for multiple seconds on a flaky call.
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  =  4_000  // was 10 s
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS    =  5_000  // was 15 s
-const EXCHANGE_TIMEOUT_GET_POSITIONS_MS =  4_000  // was 10 s
-const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 15_000  // 15 seconds - cancel needs time
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 20_000  // 20 seconds - stop/TP placement on slow exchanges
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 seconds - position fetch with network latency
+const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 seconds - fill detection needs time on volatility
 
 /**
  * Live position as it flows through the live-stage pipeline and is
@@ -846,13 +846,20 @@ function isMinOrderSizeError(payload: unknown): boolean {
   } else {
     text = String(payload)
   }
-  return /\bcode\s*=?\s*101400\b/.test(text) || /minimum order amount/i.test(text)
+  // Match BingX 101400, 110424, or any message with "minimum order" or "order size must"
+  return (
+    /\bcode\s*=?\s*(101400|110424)\b/.test(text) ||
+    /minimum order/i.test(text) ||
+    /order size must/i.test(text)
+  )
 }
 
 /**
- * Parse the required minimum token quantity from a BingX 101400 error message.
- * BingX message format: "The minimum order amount is 56.974 DRIFT."
- * Returns undefined when the message does not match the expected format.
+ * Parse the minimum token quantity from BingX error messages.
+ * BingX formats:
+ *   - "The minimum order amount is 56.974 DRIFT" (101400)
+ *   - "The order size must be less than the available amount of 0.0001 BTC" (110424)
+ * Returns undefined when the message does not match expected formats.
  */
 function extractMinOrderQty(payload: unknown): number | undefined {
   let text = ""
@@ -861,10 +868,22 @@ function extractMinOrderQty(payload: unknown): number | undefined {
   else if (typeof payload === "object") {
     text = String((payload as Record<string, unknown>).error ?? (payload as Record<string, unknown>).message ?? "")
   }
-  const m = /minimum order amount is ([\d.]+)/i.exec(text)
-  if (!m) return undefined
-  const qty = parseFloat(m[1])
-  return Number.isFinite(qty) && qty > 0 ? qty : undefined
+  
+  // Try "minimum order amount is X" format
+  let m = /minimum order amount is ([\d.]+)/i.exec(text)
+  if (m) {
+    const qty = parseFloat(m[1])
+    if (Number.isFinite(qty) && qty > 0) return qty
+  }
+  
+  // Try "available amount of X" format (from 110424)
+  m = /available amount of ([\d.]+)/i.exec(text)
+  if (m) {
+    const qty = parseFloat(m[1])
+    if (Number.isFinite(qty) && qty > 0) return qty * 1.5 // Use 1.5x available as safe minimum
+  }
+  
+  return undefined
 }
 
 /**
@@ -1723,7 +1742,7 @@ async function updateProtectionOrders(
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
 
-  // ── System-close-only mode (cached) ────────────────────────────��──���
+  // ── System-close-only mode (cached) ────────────────────────────��──�������
   // Reconcile fans out across every live position on every tick, so
   // calling `getAppSettings()` here would issue one HGETALL per
   // position per tick — at 50 positions × 1 Hz that's 50 round-trips
@@ -1986,7 +2005,19 @@ async function updateProtectionOrders(
     }
   })()
 
-  await Promise.all([slLeg, tpLeg])
+  // Use allSettled to prevent one failed leg from crashing both SL and TP.
+  // Individually catch errors for graceful degradation instead of crashing.
+  await Promise.allSettled([slLeg, tpLeg]).then((results) => {
+    results.forEach((result, idx) => {
+      if (result.status === "rejected") {
+        const legName = idx === 0 ? "StopLoss" : "TakeProfit"
+        console.warn(
+          `${LOG_PREFIX} armProtection: ${legName} leg failed:`,
+          result.reason instanceof Error ? result.reason.message : String(result.reason),
+        )
+      }
+    })
+  })
 
   // Record the qty we armed for only when at least one leg was actually
   // (re-)placed on the exchange. A liveness-verify clear sets result.changed
@@ -3126,11 +3157,17 @@ export async function executeLivePosition(
               `${LOG_PREFIX} [101400 Correction] Detected minimum ${minQty} > current ${computedVolume.toFixed(8)} for ${realPosition.symbol}; retrying in same cycle`,
             )
             
+            // Use minimum + 10% margin to ensure acceptance
+            const retryQty = minQty * 1.1
+            console.log(
+              `${LOG_PREFIX} [101400 Retry] Sending with margin: ${retryQty.toFixed(8)} (min: ${minQty.toFixed(8)} × 1.1)`,
+            )
+            
             // Retry immediately with corrected quantity
             const retryOrderResult = await exchangeConnector.placeOrder(
               realPosition.symbol,
               exchangeSide,
-              minQty,
+              retryQty,
               undefined,
               "market",
               {
@@ -3140,19 +3177,20 @@ export async function executeLivePosition(
             
             if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {
               console.log(
-                `${LOG_PREFIX} [101400 Retry] Successfully placed order with corrected volume ${minQty.toFixed(8)} for ${realPosition.symbol}`,
+                `${LOG_PREFIX} [101400 Retry] Successfully placed order with volume ${retryQty.toFixed(8)} for ${realPosition.symbol}`,
               )
               // Continue with the corrected order
               Object.assign(orderResult, retryOrderResult)
-              computedVolume = minQty  // Update for subsequent logging
-              retryWasAttempted = false  // Signal success
+              computedVolume = retryQty  // Update for subsequent logging
+              retryWasAttempted = true  // Mark retry was attempted and succeeded
               entryOrderId = retryOrderResult?.orderId || retryOrderResult?.id
             } else {
               // Retry also failed
               console.warn(
-                `${LOG_PREFIX} [101400 Retry] Retry with ${minQty.toFixed(8)} also failed:`,
+                `${LOG_PREFIX} [101400 Retry] Retry with ${retryQty.toFixed(8)} also failed:`,
                 retryOrderResult?.error || retryOrderResult?.message || "unknown",
               )
+              retryWasAttempted = false  // Retry was attempted but failed
             }
           } catch (err) {
             console.warn(
@@ -3587,7 +3625,7 @@ export async function executeLivePosition(
       pushStep(livePosition, "place_sl_tp", false, "skipped — no fill yet")
     }
 
-    // ── Step 8: Sync with exchange for position data ───────────────────────
+    // ── Step 8: Sync with exchange for position data ──────────────���────────
     if (typeof exchangeConnector.getPosition === "function") {
       try {
         // Pass direction for hedge-mode accounts.
@@ -3920,7 +3958,7 @@ export async function closeLivePosition(
           // single timestamp-retry re-sync inside cancelOrder.
           const closePromise = exchangeConnector.closePosition(position.symbol, position.direction)
           const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Exchange close timeout after 8s")), 8000),
+            setTimeout(() => reject(new Error("Exchange close timeout after 20s")), 20_000),
           )
           const r = (await Promise.race([closePromise, timeoutPromise])) as
             | { success?: boolean; error?: string }
@@ -4761,7 +4799,7 @@ export async function reconcileLivePositions(
       exchangeMap.set(`${sym}|${direction}`, ep)
     }
 
-    // ── Once-per-tick venue open-orders snapshot ────���──────────────────
+    // ── Once-per-tick venue open-orders snapshot ────���─────────────────���
     // Used by `updateProtectionOrders` to detect silently-gone SL/TP
     // (filled, externally cancelled, expired, sweep). One `getOpenOrders`
     // call amortized across every position in the reconcile sweep, vs.
@@ -5717,7 +5755,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
       }
-    // ─�� end orphan adoption ───────────────────────────────────────────
+    // ─�� end orphan adoption ────────────────────��──────────────────────
 
     if (openPositions.length === 0) {
       // Nothing to sync after adoption — fire-and-forget the TTL expiry
@@ -5774,22 +5812,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // ── Parallelised per-position sync (bounded concurrency) ────────────
     // Target: all positions complete in <1 s total.
     //
-    // SYNC_CONCURRENCY=12: with tightened per-call timeouts (getOrder 3 s,
-    // placeStop 5 s) and typical ≤10 open positions, all positions start
-    // concurrently (ceil(10/12)=1 pass). Every position's calls run in
-    // parallel within updateProtectionOrders' own Promise.all(slLeg, tpLeg)
-    // — the outer pool just bounds the total fanout to prevent rate-limit
-    // spikes on venue buckets (BingX: 100 req/s sustained, 200 burst).
-    //
-    // SYNC_PER_POS_TIMEOUT_MS=4 s: the tightest single-call timeout is
-    // placeStop at 5 s, but within processOneSync the heaviest path is
-    // fill-detect (getOrder 3 s) + updateProtectionOrders (parallel cancel
-    // 4 s + place 5 s, but both legs run concurrently so ~5 s total).
-    // 6 s gives that path 1 s of slack. Any position that can't complete
-    // in 6 s on a working exchange has already timed out at the inner
-    // call level and logged a warning.
+    // SYNC_CONCURRENCY: Max concurrent positions to sync in parallel.
+    // Bounds total fanout to prevent rate-limit spikes on venue buckets.
+    // BingX: 100 req/s sustained, 200 burst. With ≤10 open positions,
+    // all positions start concurrently (ceil(10/12)=1 pass).
     const SYNC_CONCURRENCY = 12
-    const SYNC_PER_POS_TIMEOUT_MS = 6_000
+    
+    // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout for syncWithExchange.
+    // BingX can take 10-20 seconds on slow operations. Previously 6s but was
+    // causing timeouts and stalls. Increased to 20s to handle real exchange latency.
+    const SYNC_PER_POS_TIMEOUT_MS = 20_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
@@ -6144,7 +6176,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // appears but [sync-done] does not for the same tick, something
     // mid-loop is rejecting before the closing brace — which used to be
     // invisible.
-    // ── Parallel stuck-placed cleanup ────────────────────────────────
+    // ── Parallel stuck-placed cleanup ──────────��─────────────────────
     // Run all cancel+close operations concurrently so 6+ stuck positions
     // complete in ~one RTT window instead of EXCHANGE_TIMEOUT_CANCEL_ORDER_MS × N.
     if (stuckPositions.length > 0) {
@@ -6342,7 +6374,7 @@ export async function recalculateAndApplySLTP(
       )
     }
 
-    // ── Bug-3 fix: fetch live order IDs and pass to updateProtectionOrders ───
+    // ── Bug-3 fix: fetch live order IDs and pass to updateProtectionOrders ��──
     // Without `liveOrderIds` the liveness-verification block in
     // `updateProtectionOrders` is skipped entirely (guarded by
     // `if (liveOrderIds && …)`). If a SL/TP order silently disappeared on the

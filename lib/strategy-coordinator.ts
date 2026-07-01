@@ -1518,6 +1518,24 @@ export class StrategyCoordinator {
           ? this.neutralPositionContext()
           : await this.getPositionContext())
 
+      // ── OPTIMIZATION: Skip processing if position state unchanged ──
+      // Check fingerprint of position counts to skip redundant calculations when
+      // no new positions have opened/closed. Prevents recalculating P&F/DDT every
+      // cycle when the market hasn't generated new entries.
+      const posFingerprint = `${posCtx.continuousCount}|${posCtx.lastPosCount}|${posCtx.prevPosCount}`
+      const prevFingerprint = (this as any)._lastPosFingerprint?.[symbol]
+      if (prevFingerprint === posFingerprint && !isPrehistoric) {
+        // Position state unchanged AND indication count stable
+        if (indications.length === (this as any)._lastIndicationCount?.[symbol]) {
+          console.log(`[v0] [StrategyCoordinator] ${symbol}: position+indication state unchanged, skipping cycle`)
+          return results // Early exit — no recalculation needed
+        }
+      }
+      if (!(this as any)._lastPosFingerprint) (this as any)._lastPosFingerprint = {}
+      if (!(this as any)._lastIndicationCount) (this as any)._lastIndicationCount = {}
+      ;(this as any)._lastPosFingerprint[symbol] = posFingerprint
+      ;(this as any)._lastIndicationCount[symbol] = indications.length
+
       // Refresh per-cycle trailing-matrix cache when this entry-point is
       // called standalone (the batch entry-point invalidates already).
       // `sharedContext` presence is the cheapest tell that we're inside
@@ -1765,7 +1783,8 @@ export class StrategyCoordinator {
         // the UI settings dialog and change infrequently during a session.
         // Previously 30s caused 67 hgetall calls/min at 10 symbols. At 5 min
         // this drops to 2 calls/min, 97% reduction in Redis I/O for this path.
-        const SETTINGS_CACHE_TTL_MS = 5 * 60 * 1000
+        // AGGRESSIVE CACHE: 10 minutes for settings (operator changes infrequently)
+      const SETTINGS_CACHE_TTL_MS = 10 * 60 * 1000
         const cachedAge = Date.now() - this._prevPosMinCountAt
         const winAge = Date.now() - this._prevPosWindowAt
         if (
@@ -2097,7 +2116,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 2: MAIN ──────────────────────���─────────────────────────────────���──
+  // ─── STAGE 2: MAIN ──────────────────────���─────────────────────────────────�����──
 
   /**
    * Validate BASE Sets (avgPF >= 1.2, avgConf >= 0.5, DDT <= 24h) AND create
@@ -2498,12 +2517,12 @@ export class StrategyCoordinator {
       // Dev: 150 per symbol keeps the pipeline fed without the memory spike
       // that 300/sym caused (300 × ~2 KB entries × 2 variants = ~1.2 MB/sym
       // in-flight; at 1 sym the cycle footprint drops from ~600 KB to ~300 KB).
-      // Prod: 2000 (system generates up to ~1200 Main sets per cycle; ceiling
+      // Prod: 5000 (system generates up to ~2000+ Main sets per cycle; ceiling
       // ensures no truncation while memory stays bounded at ~3.5GB production heap).
       const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (
         process.env.NODE_ENV === "development"
           ? Math.max(150, _devSyms * 150)
-          : 2000
+          : 5000
       )
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
@@ -3232,7 +3251,7 @@ export class StrategyCoordinator {
         continue
       }
 
-      // ── 3. PF/DDT gate ────────────────────────����──────────────────────────
+      // ── 3. PF/DDT gate ─────────────────����──────����──────────────────────────
       const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                      s.avgDrawdownTime  <= metrics.maxDrawdownTime
       if (passes) {
@@ -3376,7 +3395,7 @@ export class StrategyCoordinator {
     //
     // Bootstrap fallback: on fresh sessions every indication produces symmetric
     // long+short pairs (same prev/last/cont/outcome context, just different direction)
-    // → every bucket is L=1,S=1 → all cancelled → netted=[]. When this happens and
+    // → every bucket is L=1,S=1 → all cancelled ��� netted=[]. When this happens and
     // there are no axis sets either, keep the top-PF set per direction so the live
     // pipeline can start building position history. Future cycles will develop
     // asymmetric signals and netting will work as intended.
@@ -3480,7 +3499,7 @@ export class StrategyCoordinator {
     const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (
       process.env.NODE_ENV === "development"
         ? Math.max(200, _devSymsReal * 60)
-        : 2000  // Production: increased from 1000 to handle high diversity without truncation
+        : 5000  // Production: no truncation; system generates 2000+, all pass through
     )
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
@@ -3824,7 +3843,7 @@ export class StrategyCoordinator {
       //
       // Pre-compute the axis POSITION accumulation sum so the stats route
       // never needs extra round-trips on every dashboard refresh.
-      // Source: axis_pos_acc:{conn} — the hash bumpAxisPosAccumulation writes
+      // Source: axis_pos_acc:{conn} ��� the hash bumpAxisPosAccumulation writes
       // to in the Real tuner loop above. Each field is parentSetKey|axisKey and
       // the value is the cumulative entryCount (= baseEC + min(cont,liveCont))
       // across all cycles — exactly the "Accumulated" perspective the operator
@@ -4153,7 +4172,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────�����───��─────��─────��──────���───────��
+  // ─── STAGE 4: LIVE ─────────����─���────────��─────�����───��─────��─────��──────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -5477,7 +5496,7 @@ export class StrategyCoordinator {
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
               //   �� per-axis Pos-acc ledger has a non-zero delta to record
-              // ── Axis-Set LRU cache ────────��──�����─────────────────────���───��─
+              // ── Axis-Set LRU cache ─────���──��──�����─────────────────────���───��─
               // Axis Set objects are now pure value objects (the Real-stage tuner
               // writes sizeDelta onto the CoordRecord instead of mutating entries).
               // They can be safely reused across cycles without cloning.
