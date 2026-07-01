@@ -65,6 +65,7 @@ export interface StrategySet {
 export class StrategySetsProcessor {
   private connectionId: string
   private limits: StrategySetLimits = { ...DEFAULT_LIMITS }
+  private explicitLimitOverrides: Partial<Record<keyof StrategySetLimits, boolean>> = {}
   private settingsReady: Promise<void>
   /**
    * Per-type compaction config cache. Refreshed lazily by the underlying
@@ -95,7 +96,7 @@ export class StrategySetsProcessor {
     // Set-Compaction override is set — detected by the resolved floor
     // being the hard-coded 250 default.
     const finalCfg: CompactionConfig =
-      cfg.floor === 250 && legacyLimit > 250
+      this.explicitLimitOverrides[type] || (cfg.floor === 250 && legacyLimit > 250)
         ? { floor: legacyLimit, thresholdPct: cfg.thresholdPct }
         : cfg
     this.compactionCfgs[ckey] = finalCfg
@@ -112,10 +113,10 @@ export class StrategySetsProcessor {
       const settings = await getSettings("strategy_sets_config")
       if (settings) {
         // Load independent limits per type
-        if (settings.base) this.limits.base = Number(settings.base)
-        if (settings.main) this.limits.main = Number(settings.main)
-        if (settings.real) this.limits.real = Number(settings.real)
-        if (settings.live) this.limits.live = Number(settings.live)
+        if (settings.base) { this.limits.base = Number(settings.base); this.explicitLimitOverrides.base = true }
+        if (settings.main) { this.limits.main = Number(settings.main); this.explicitLimitOverrides.main = true }
+        if (settings.real) { this.limits.real = Number(settings.real); this.explicitLimitOverrides.real = true }
+        if (settings.live) { this.limits.live = Number(settings.live); this.explicitLimitOverrides.live = true }
         // Fallback: legacy maxEntriesPerSet applies weighted by type.
         if (settings.maxEntriesPerSet && !settings.base) {
           const limit = Number(settings.maxEntriesPerSet)
