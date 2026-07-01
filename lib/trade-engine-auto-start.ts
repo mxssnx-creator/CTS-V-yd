@@ -67,9 +67,9 @@ function shouldArmInProcessMonitor(): boolean {
  */
 export async function initializeTradeEngineAutoStart(): Promise<void> {
   if (autoStartInitialized) {
-    console.log("[v0] [Auto-Start] Already initialized, skipping")
+    console.warn("[v0] [Auto-Start] Already initialized, skipping")
     if (!autoStartTimer && shouldArmInProcessMonitor()) {
-      console.log("[v0] [Auto-Start] Monitor missing after init; restarting monitor")
+      console.warn("[v0] [Auto-Start] Monitor missing after init; restarting monitor")
       startConnectionMonitoring()
     }
     return
@@ -143,14 +143,14 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
 
     if (operatorIntent === "paused") {
       if (isStartup) {
-        console.log("[v0] [AutoStart] Startup sweep skipped: global coordinator is paused")
+        console.warn("[v0] [AutoStart] Startup sweep skipped: global coordinator is paused")
       }
       return { startedCount: 0, eligibleCount: 0, skipped: "paused" }
     }
 
     if (operatorIntent !== "running") {
       if (isStartup) {
-        console.log(
+        console.warn(
           `[v0] [AutoStart] Startup sweep skipped: global engine not running (intent="${operatorIntent || "empty"}"). ` +
             "Engine will start only when operator clicks Start.",
         )

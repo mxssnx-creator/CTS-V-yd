@@ -35,12 +35,20 @@ export async function GET() {
       return isBase
     })
     
-    const [globalState, marketDataKeys, prehistoricKeys, engineStateKeys] = await Promise.all([
+    const [globalState, refreshRequest, marketDataKeys, prehistoricKeys, engineStateKeys] = await Promise.all([
       client.hgetall("trade_engine:global").catch(() => ({})),
+      client.hgetall("settings:engine_coordinator:refresh_requested").catch(() => ({})),
       client.keys("market_data:*:1m").catch(() => []),
       client.keys("prehistoric:*").catch(() => []),
       client.keys("settings:trade_engine_state:*").catch(() => []),
     ])
+    const heartbeatRaw = String((globalState as Record<string, string>)?.last_heartbeat_at || "")
+    const heartbeatMs = Number(heartbeatRaw)
+    const lastHeartbeatAt =
+      Number.isFinite(heartbeatMs) && heartbeatMs > 0
+        ? new Date(heartbeatMs).toISOString()
+        : heartbeatRaw || null
+    const refreshTimestamp = String((refreshRequest as Record<string, string>)?.timestamp || "")
 
     const diagnostic = {
       timestamp: new Date().toISOString(),
@@ -55,6 +63,13 @@ export async function GET() {
       },
       runtime: {
         globalState,
+        coordinatorLifecycle: {
+          autoStartEnv: process.env.ENABLE_TRADE_ENGINE_AUTOSTART || "",
+          continuityEnv: process.env.ENABLE_IN_PROCESS_CONTINUITY || "",
+          activeWorkerId: (globalState as Record<string, string>)?.active_worker_id || null,
+          lastHeartbeatAt,
+          refreshRequested: Boolean(refreshTimestamp && refreshTimestamp !== "null"),
+        },
         dataCoverage: {
           marketDataKeys: marketDataKeys.length,
           prehistoricKeys: prehistoricKeys.length,

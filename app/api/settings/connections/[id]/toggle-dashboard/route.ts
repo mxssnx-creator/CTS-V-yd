@@ -276,7 +276,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             const workerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(queuedGlobalState)
             engineWarning = workerDiagnostic.error
             engineStatus = "queued"
-            console.log(
+            console.warn(
               `[v0] [Toggle] Engine start queued for ${connection.name}; this UI worker is not opted in for local engine loops`,
             )
           }
