@@ -63,6 +63,7 @@ export interface StrategySet {
 export class StrategySetsProcessor {
   private connectionId: string
   private limits: StrategySetLimits = { ...DEFAULT_LIMITS }
+  private settingsReady: Promise<void>
   /**
    * Per-type compaction config cache. Refreshed lazily by the underlying
    * `loadCompactionConfig` helper (5s TTL). Strategy pools use the
@@ -101,7 +102,7 @@ export class StrategySetsProcessor {
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
-    this.loadSettings()
+    this.settingsReady = this.loadSettings()
   }
 
   private async loadSettings(): Promise<void> {
@@ -139,6 +140,8 @@ export class StrategySetsProcessor {
    */
   async processAllStrategySets(symbol: string, indications: any[]): Promise<void> {
     try {
+      await this.settingsReady
+
       const startTime = Date.now()
 
       // Sort indications by profitFactor descending so that the best-performing
