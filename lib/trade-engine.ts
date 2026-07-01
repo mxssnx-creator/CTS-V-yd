@@ -222,6 +222,11 @@ export class GlobalTradeEngineCoordinator {
    */
   async startEngine(connectionId: string, config: EngineConfig, options: StartEngineOptions = {}): Promise<boolean> {
   async startEngine(connectionId: string, config: EngineConfig): Promise<boolean> {
+    const startDebugId = `${connectionId}:${Date.now().toString(36)}`
+    console.log(
+      `[v0] [ENGINE DEBUG] startEngine enter id=${startDebugId} connection=${connectionId} ` +
+        `existingManager=${this.engineManagers.has(connectionId)} starting=${this.startingEngines.has(connectionId)} stopping=${this.stoppingEngines.has(connectionId)}`,
+    )
     return this.enqueueConnectionTransition(connectionId, () => this.startEngineUnlocked(connectionId, config))
   }
 
@@ -261,6 +266,7 @@ export class GlobalTradeEngineCoordinator {
         `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped in production UI worker; ` +
           `set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engine loops in-process`,
       )
+      console.log(`[v0] [ENGINE DEBUG] startEngine skipped id=${startDebugId} reason=prod-ui-worker`)
       return false
     }
 
@@ -269,6 +275,7 @@ export class GlobalTradeEngineCoordinator {
     // distributed-lock recovery path and disrupt each other.
     if (this.startingEngines.has(connectionId)) {
       console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
+      console.log(`[v0] [ENGINE DEBUG] startEngine skipped id=${startDebugId} reason=local-start-mutex`)
       return false
     }
     this.startingEngines.add(connectionId)
@@ -281,8 +288,10 @@ export class GlobalTradeEngineCoordinator {
     this.ensureBackgroundTimers()
 
     if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
+      console.log(`[v0] [ENGINE DEBUG] startEngine skipped id=${startDebugId} reason=global-disabled`)
       return false
     }
+    console.log(`[v0] [ENGINE DEBUG] startEngine global-enabled id=${startDebugId}`)
 
     // Step 2: Check if already running (check in-memory manager first, then Redis hint)
     try {
@@ -291,10 +300,15 @@ export class GlobalTradeEngineCoordinator {
       const runningFlag = await client.get(`engine_is_running:${connectionId}`)
       const manager = this.engineManagers.get(connectionId)
       const managerRunning = !!manager?.isEngineRunning
+      console.log(
+        `[v0] [ENGINE DEBUG] startEngine running-check id=${startDebugId} ` +
+          `redisFlag=${runningFlag ?? "none"} managerRunning=${managerRunning}`,
+      )
 
       if (runningFlag === "true" || runningFlag === "1") {
         if (managerRunning) {
           console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
+          console.log(`[v0] [ENGINE DEBUG] startEngine skipped id=${startDebugId} reason=already-running-local`)
           if (options.markAssigned) {
             await this.markConnectionAssignedFromUserIntent(connectionId)
           }
@@ -307,6 +321,9 @@ export class GlobalTradeEngineCoordinator {
         if (remoteHeartbeatFresh) {
           console.log(
             `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker with a fresh heartbeat; not clearing distributed running flag`,
+          )
+          console.log(
+            `[v0] [ENGINE DEBUG] startEngine skipped id=${startDebugId} reason=fresh-remote-heartbeat heartbeatAgeMs=${Date.now() - remoteHeartbeat}`,
           )
           if (options.markAssigned) {
             await this.markConnectionAssignedFromUserIntent(connectionId)
@@ -346,6 +363,10 @@ export class GlobalTradeEngineCoordinator {
       let acquired = await acquireProgressionLock(connectionId, undefined, {
         selfOwnedIfAlive: localManagerAlive,
       })
+      console.log(
+        `[v0] [ENGINE DEBUG] startEngine lock-result id=${startDebugId} acquired=${acquired.acquired} ` +
+          `existingOwner=${acquired.existingOwner ?? "none"} healed=${acquired.healedStaleLock === true}`,
+      )
       if (!acquired.acquired || !acquired.handle) {
         const ownerHeartbeatFreshnessMs = 90_000
         let ownerHeartbeatFresh = false
@@ -371,6 +392,9 @@ export class GlobalTradeEngineCoordinator {
 
         console.warn(
           `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Leaving existing owner untouched.`,
+        )
+        console.log(`[v0] [ENGINE DEBUG] startEngine skipped id=${startDebugId} reason=lock-owned`)
+        return false
         )
         return false
           `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}) with a stale heartbeat. Requesting prior progress stop and retrying once.`,
@@ -426,10 +450,12 @@ export class GlobalTradeEngineCoordinator {
 
       // Step 5: Start the engine — pass the lock handle so it can
       // extend/release the slot and stamp the epoch.
+      console.log(`[v0] [ENGINE DEBUG] manager.start begin id=${startDebugId} epoch=${lockHandle.epoch}`)
       await manager.start(config, lockHandle)
       if (!manager.isEngineRunning) {
         throw new Error(`TradeEngine manager for ${connectionId} did not reach running state`)
       }
+      console.log(`[v0] [ENGINE DEBUG] manager.start complete id=${startDebugId} isRunning=${manager.isEngineRunning}`)
       // Manager now owns the lock; clear our local reference so the
       // finally-block doesn't try to break it on success.
       lockHandle = undefined
@@ -447,6 +473,10 @@ export class GlobalTradeEngineCoordinator {
       }
       return true
     } catch (err) {
+      console.warn(
+        `[v0] [ENGINE DEBUG] startEngine error id=${startDebugId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
       // On startup failure, release only the lock handle acquired by this
       // start attempt. Never force-break by connection id here; another owner
       // may have legitimately taken over after this attempt failed.
@@ -458,6 +488,11 @@ export class GlobalTradeEngineCoordinator {
         }
       }
       throw err
+    } finally {
+      // Step 6: Remove from lock set (always, even on error)
+      this.startingEngines.delete(connectionId)
+      console.log(`[v0] [STARTUP LOCK] Removed ${connectionId} from startup lock`)
+      console.log(`[v0] [ENGINE DEBUG] startEngine exit id=${startDebugId} starting=${this.startingEngines.has(connectionId)}`)
     }
   }
 
@@ -487,6 +522,11 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 2 FIX: Added stop lock to prevent concurrent stop requests and race conditions
    */
   async stopEngine(connectionId: string): Promise<void> {
+    const stopDebugId = `${connectionId}:${Date.now().toString(36)}`
+    console.log(
+      `[v0] [ENGINE DEBUG] stopEngine enter id=${stopDebugId} connection=${connectionId} ` +
+        `existingManager=${this.engineManagers.has(connectionId)} starting=${this.startingEngines.has(connectionId)} stopping=${this.stoppingEngines.has(connectionId)}`,
+    )
     return this.enqueueConnectionTransition(connectionId, () => this.stopEngineUnlocked(connectionId))
   }
 
@@ -495,6 +535,7 @@ export class GlobalTradeEngineCoordinator {
     // Step 1: Check if already stopping
     if (this.stoppingEngines.has(connectionId)) {
       console.log(`[v0] [STOP LOCK] Engine already stopping for ${connectionId}, skipping duplicate stop request`)
+      console.log(`[v0] [ENGINE DEBUG] stopEngine skipped id=${stopDebugId} reason=local-stop-mutex`)
       return
     }
 
@@ -514,6 +555,10 @@ export class GlobalTradeEngineCoordinator {
         const remoteHeartbeat = Number((remoteState as any)?.last_processor_heartbeat || 0)
         const remoteHeartbeatFresh =
           Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
+        console.log(
+          `[v0] [ENGINE DEBUG] stopEngine remote-check id=${stopDebugId} ` +
+            `heartbeat=${remoteHeartbeat || "none"} fresh=${remoteHeartbeatFresh}`,
+        )
         if (remoteHeartbeatFresh) {
           const stopPayload = {
             stop_requested: "1",
@@ -525,6 +570,11 @@ export class GlobalTradeEngineCoordinator {
             client.hset(`progression:${connectionId}`, stopPayload).catch(() => 0),
           ])
           console.log(`[v0] No local engine for ${connectionId}; remote owner has fresh heartbeat, wrote stop request without clearing runtime state`)
+          console.log(`[v0] [ENGINE DEBUG] stopEngine remote-stop-requested id=${stopDebugId}`)
+          return
+        }
+        console.log(`[v0] No in-memory engine found for connection: ${connectionId}; remote owner is stale/missing, running Redis cleanup`)
+        console.log(`[v0] [ENGINE DEBUG] stopEngine cleanup-stale id=${stopDebugId}`)
           return
         }
         console.log(`[v0] No in-memory engine found for connection: ${connectionId}; remote owner is stale/missing, running Redis cleanup`)
@@ -542,7 +592,9 @@ export class GlobalTradeEngineCoordinator {
         return
       }
 
+      console.log(`[v0] [ENGINE DEBUG] manager.stop begin id=${stopDebugId}`)
       await manager.stop()
+      console.log(`[v0] [ENGINE DEBUG] manager.stop complete id=${stopDebugId}`)
       this.engineManagers.delete(connectionId)
 
       await this.cleanupStoppedRuntimeState(connectionId)
@@ -552,6 +604,7 @@ export class GlobalTradeEngineCoordinator {
       // Step 3: Remove from stop lock set (always, even on error)
       this.stoppingEngines.delete(connectionId)
       console.log(`[v0] [STOP LOCK] Removed ${connectionId} from stop lock`)
+      console.log(`[v0] [ENGINE DEBUG] stopEngine exit id=${stopDebugId} stopping=${this.stoppingEngines.has(connectionId)}`)
     }
   }
 

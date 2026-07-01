@@ -220,6 +220,23 @@ export class StrategySetsProcessor {
       const mainResults = this.toStageResult("main", results.main, rawTotal, selectedTotal)
       const realResults = this.toStageResult("real", results.real, rawTotal, selectedTotal)
       const liveResults = this.toStageResult("live", results.live, rawTotal, selectedTotal)
+      )
+      const candidateLimit = Math.max(100, maxLimit * StrategySetsProcessor.MAX_INPUT_MULTIPLIER)
+      const sortedIndications = this.selectTopCandidates(indications, candidateLimit)
+
+      const results = this.evaluateStrategyPipeline(sortedIndications)
+      const rawTotal = indications.length
+      const selectedTotal = sortedIndications.length
+
+      await this.saveBatchToSet(`strategy_set:${this.connectionId}:${symbol}:base`, results.base.batch, "base")
+      await this.saveBatchToSet(`strategy_set:${this.connectionId}:${symbol}:main`, results.main.batch, "main")
+      await this.saveBatchToSet(`strategy_set:${this.connectionId}:${symbol}:real`, results.real.batch, "real")
+      await this.saveBatchToSet(`strategy_set:${this.connectionId}:${symbol}:live`, results.live.batch, "live")
+
+      const baseResults = this.toStageResult("base", results.base, rawTotal, selectedTotal)
+      const mainResults = this.toStageResult("main", results.main, rawTotal, selectedTotal)
+      const realResults = this.toStageResult("real", results.real, rawTotal, selectedTotal)
+      const liveResults = this.toStageResult("live", results.live, rawTotal, selectedTotal)
         this.limits.base,
         this.limits.main,
         this.limits.real,
@@ -356,6 +373,19 @@ export class StrategySetsProcessor {
       real: { total: 0, qualified: 0, batch: [] as StrategyBatch },
       live: { total: 0, qualified: 0, batch: [] as StrategyBatch },
     }
+      }
+    }
+
+    return heap.sort((a, b) => score(b) - score(a))
+  }
+
+  private evaluateStrategyPipeline(indications: any[]): Record<keyof StrategySetLimits, { total: number; qualified: number; batch: StrategyBatch }> {
+    const result = {
+      base: { total: 0, qualified: 0, batch: [] as StrategyBatch },
+      main: { total: 0, qualified: 0, batch: [] as StrategyBatch },
+      real: { total: 0, qualified: 0, batch: [] as StrategyBatch },
+      live: { total: 0, qualified: 0, batch: [] as StrategyBatch },
+    }
       // Base: broad intake (must be much higher volume than main/real)
       if (indication.confidence > 0.45 && indication.profitFactor > 0.9) {
         const strategy = {
@@ -417,6 +447,20 @@ export class StrategySetsProcessor {
         result.main.batch.push({ strategy, indicationType: indication.type })
       }
 
+      result.main.total++
+      if (confidence > 0.62 && profitFactor > 1.2) {
+        const strategy = {
+          profitFactor,
+          confidence,
+          metadata: { ...indication.metadata, strategyType: "main", riskLevel: "medium" },
+        }
+        result.main.qualified++
+        result.main.batch.push({ strategy, indicationType: indication.type })
+      }
+
+      result.real.total++
+      if (confidence > 0.78 && profitFactor > 1.45) {
+
       result.real.total++
       if (confidence > 0.78 && profitFactor > 1.45) {
     }
@@ -450,6 +494,9 @@ export class StrategySetsProcessor {
         result.real.qualified++
         result.real.batch.push({ strategy, indicationType: indication.type })
       }
+
+      result.live.total++
+      if (profitFactor >= 1.0) {
 
       result.live.total++
       if (profitFactor >= 1.0) {
