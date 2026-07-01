@@ -148,10 +148,9 @@ export async function POST(request: NextRequest) {
       console.warn("[v0] [Trade Engine] Coordinator worker startup warning:", engineStartError)
     }
 
-    // Sync is_enabled_dashboard + is_active_inserted flags for all connections whose
-    // engines are currently running. These flags may be stale ("0") if the engine was
-    // started by a path that bypassed toggle-dashboard (e.g. startMissingEngines on
-    // auto-restart). Without this sync the connections API always shows "Enabled: none".
+    // Sync only the panel-assignment flag for engines that are already running.
+    // Never backfill is_enabled_dashboard here: it is the explicit processing
+    // switch and legacy is_active_inserted=1 rows must not be auto-enabled.
     try {
       const { getAllConnections, updateConnection: updateConn } = await import("@/lib/redis-db")
       const runningIds: Set<string> = new Set()
@@ -170,12 +169,10 @@ export async function POST(request: NextRequest) {
         const allConns = await getAllConnections()
         for (const conn of allConns) {
           if (!runningIds.has(conn.id)) continue
-          const needsUpdate =
-            conn.is_enabled_dashboard !== "1" && conn.is_enabled_dashboard !== true ||
-            conn.is_active_inserted !== "1" && conn.is_active_inserted !== true
+          const needsUpdate = conn.is_active_inserted !== "1" && conn.is_active_inserted !== true
           if (needsUpdate) {
-            await updateConn(conn.id, { is_enabled_dashboard: "1", is_active_inserted: "1" })
-            console.log(`[v0] [Trade Engine] Synced is_enabled_dashboard=1 for running engine: ${conn.id}`)
+            await updateConn(conn.id, { is_active_inserted: "1", is_assigned: "1" })
+            console.log(`[v0] [Trade Engine] Synced assignment flags for running engine: ${conn.id}`)
           }
         }
       }
@@ -286,7 +283,7 @@ export async function POST(request: NextRequest) {
       const allConnections = await getAllConnections()
       for (const conn of allConnections) {
         // Only handle assigned main connections that are enabled
-        if (conn.is_assigned === "1" && conn.is_enabled_dashboard === "1" && conn.is_active === "1" && 
+        if (conn.is_assigned === "1" && conn.is_enabled_dashboard === "1" &&
             !resumedConnections.includes(conn.id)) {
           try {
             // Ensure live trade is enabled

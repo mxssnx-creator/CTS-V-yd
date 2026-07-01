@@ -67,9 +67,9 @@ function shouldArmInProcessMonitor(): boolean {
  */
 export async function initializeTradeEngineAutoStart(): Promise<void> {
   if (autoStartInitialized) {
-    console.log("[v0] [Auto-Start] Already initialized, skipping")
+    console.warn("[v0] [Auto-Start] Already initialized, skipping")
     if (!autoStartTimer && shouldArmInProcessMonitor()) {
-      console.log("[v0] [Auto-Start] Monitor missing after init; restarting monitor")
+      console.warn("[v0] [Auto-Start] Monitor missing after init; restarting monitor")
       startConnectionMonitoring()
     }
     return
@@ -131,9 +131,10 @@ export async function runTradeEngineHealingSweep(
 
 async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOptions): Promise<HealingSweepResult> {
   try {
-    const { initRedis, getRedisClient, getAllConnections } = await loadRedisDb()
+    const { initRedis, getRedisClient, getAssignedAndEnabledConnections } = await loadRedisDb()
     const { loadSettingsAsync } = await import("./settings-storage")
     const { isConnectionEligibleForEngine } = await import("./connection-state-utils")
+    const { writeTradeEngineWorkerHeartbeat } = await import("./trade-engine-worker-heartbeat")
 
     await initRedis()
     const client = getRedisClient()
@@ -142,14 +143,14 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
 
     if (operatorIntent === "paused") {
       if (isStartup) {
-        console.log("[v0] [AutoStart] Startup sweep skipped: global coordinator is paused")
+        console.warn("[v0] [AutoStart] Startup sweep skipped: global coordinator is paused")
       }
       return { startedCount: 0, eligibleCount: 0, skipped: "paused" }
     }
 
     if (operatorIntent !== "running") {
       if (isStartup) {
-        console.log(
+        console.warn(
           `[v0] [AutoStart] Startup sweep skipped: global engine not running (intent="${operatorIntent || "empty"}"). ` +
             "Engine will start only when operator clicks Start.",
         )
@@ -157,19 +158,23 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent || "not_running" }
     }
 
-    const connections = await getAllConnections()
-    if (!Array.isArray(connections)) {
-      console.warn("[v0] [AutoStart] Connections not array, skipping sweep")
+    const eligibleConnections = await getAssignedAndEnabledConnections()
+    if (!Array.isArray(eligibleConnections)) {
+      console.warn("[v0] [AutoStart] Eligible connections not array, skipping sweep")
       return { startedCount: 0, eligibleCount: 0, skipped: "connections_not_array" }
     }
-
-    const eligibleConnections = connections.filter((connection) => isConnectionEligibleForEngine(connection))
 
     // Best-effort warm load. Engines still read Redis settings while ticking.
     await loadSettingsAsync().catch(() => {})
 
     const coordinator = await loadTradeEngineCoordinator()
     const startedCount = await coordinator.startMissingEngines(eligibleConnections)
+
+    const activeEngineCount = typeof coordinator.getActiveEngineCount === "function" ? coordinator.getActiveEngineCount() : 0
+    if (coordinator.isRunning() || activeEngineCount > 0) {
+      await writeTradeEngineWorkerHeartbeat(client, `auto-start:${process.pid}`)
+    }
+
     if (startedCount > 0 || isStartup) {
       console.log(
         `[v0] [AutoStart] Healing sweep: ${startedCount} engines started ` +
