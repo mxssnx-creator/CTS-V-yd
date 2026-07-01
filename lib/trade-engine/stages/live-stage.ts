@@ -602,9 +602,6 @@ function resolveMaxHoldMs(connId: string): number {
   // few minutes), making positionsOpen stat nonsensical and consuming memory.
   // Cap at 2 minutes in non-production so positions roll quickly and the
   // open-book stays small. Real production runs use the configured value.
-  if (process.env.NODE_ENV !== "production") {
-    return 2 * 60 * 1000 // 2 minutes
-  }
   // Delegate to the centralised engine-timings snapshot rather than a
   // bespoke settings read. `maxPositionHoldMs` is the single source of
   // truth (Redis `settings:system`, default 4h, `0` disables). The sync
@@ -742,7 +739,7 @@ async function retry<T>(
 // stream of failed exchange API calls (~20/sec at observed cadence).
 //
 // Exponential backoff: each consecutive failure doubles the cooldown
-// (60s → 120s → 240s → 300s cap). This prevents the re-arm loop where
+// (60s ��� 120s → 240s → 300s cap). This prevents the re-arm loop where
 // a 60s cooldown expires, the next attempt fails again (same root cause),
 // and immediately re-arms for another 60s — making recovery appear stuck.
 // After the operator tops up, the next successful order resets the counter.
@@ -1224,7 +1221,7 @@ async function placeProtectionOrder(
   orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
 ): Promise<string | null> {
-  // ── Structured trace context ────────────────────────────────────────
+  // ── Structured trace context ──────────────────────���─────────────────
   // Every protection-order placement gets a single multi-field log line
   // before any exchange interaction, so when an operator reports "the
   // order didn't get created" we can immediately answer THREE questions
@@ -6017,7 +6014,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
 
-        // ── Delayed-fill SL/TP arming ────���────────────────────���───────
+        // ── Delayed-fill SL/TP arming ────����────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
         // and the position ended up `placed` with no protection orders.

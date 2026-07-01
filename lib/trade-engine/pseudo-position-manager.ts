@@ -856,7 +856,6 @@ export class PseudoPositionManager {
     symbol: string,
     opts: { maxOpenPerSymbol: number; minAgeMs?: number },
   ): Promise<{ closed: number; wins: number; losses: number }> {
-    if (process.env.NODE_ENV === "production") return { closed: 0, wins: 0, losses: 0 }
     try {
       const minAgeMs = Math.max(0, opts.minAgeMs ?? 0)
       const cap = Math.max(0, Math.floor(opts.maxOpenPerSymbol))

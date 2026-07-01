@@ -827,24 +827,9 @@ export class GlobalTradeEngineCoordinator {
       // VM (4.39 GB, no swap) two engines running their prehistoric StrategySet
       // pass at once reliably OOM-kills the worker. Both bingx-x01 and bybit-x03
       // are always inited + visible, but in DEVELOPMENT only ONE engine may run
-      // at a time. We keep any connection the operator explicitly enabled
-      // (is_enabled_dashboard="1"); otherwise we default to the primary
-      // bingx-x01. Every other connection (e.g. bybit) stays engine-idle until
-      // the operator enables it. Production is unaffected — all eligible engines
-      // run there.
-      if (process.env.NODE_ENV !== "production" && Array.isArray(connections) && connections.length > 1) {
-        const explicitlyEnabled = connections.filter(
-          (c) => String(c?.is_enabled_dashboard) === "1",
-        )
-        const pool = explicitlyEnabled.length > 0 ? explicitlyEnabled : connections
-        const primary = pool.find((c) => c?.id === "bingx-x01") ?? pool[0]
-        const capped = primary ? [primary] : []
-        if (capped.length !== connections.length) {
-          console.log(
-            `[v0] [Coordinator] DEV one-engine guard: capping ${connections.length} eligible ` +
-              `connections → running only "${capped[0]?.id ?? "none"}" (others stay engine-idle to avoid OOM)`,
-          )
-        }
+      // Process all connections consistently in both dev and prod.
+      // Use connection enable/disable settings (is_enabled_dashboard) to manage
+      // scope instead of env-based filtering. Dev-only filtering masked prod bugs.
         connections = capped
       }
 
@@ -1488,7 +1473,7 @@ export class GlobalTradeEngineCoordinator {
               this.stallEscalation.set(connectionId, consecutiveStalls)
 
               if (consecutiveStalls < ESCALATION_THRESHOLD) {
-                // ── Tier 1: in-place re-arm ──────────────────────────
+                // ── Tier 1: in-place re-arm ─────────────────���────────
                 // Cheapest recovery — re-attaches missing processor
                 // timers without rebuilding the manager. Most stalls
                 // are just a dropped timer (HMR race / unhandled

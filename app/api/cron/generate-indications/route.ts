@@ -358,7 +358,7 @@ async function generateIndicationsForConnection(
     const realGenerated = Math.max(0, Math.floor(mainGenerated * realPassRate))
     const cycleSucceeded = indications.length > 0
 
-    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ────────────
+    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ───��────────
     // market_data, all per-indication counters + latest hashes, progression
     // counters, cycle-completion accounting and final progression snapshot are
     // all queued into one multi()/exec() so N indication types + M counter
@@ -545,12 +545,9 @@ export async function GET() {
     // In DEV we process only the connection the operator explicitly enabled
     // (is_enabled_dashboard="1"), defaulting to the primary bingx-x01, so bybit
     // stays truly idle until enabled. Production processes every active connection.
-    if (process.env.NODE_ENV !== "production" && activeConnections.length > 1) {
-      const explicit = activeConnections.filter((c: any) => isTruthyFlag(c.is_enabled_dashboard))
-      const pool = explicit.length > 0 ? explicit : activeConnections
-      const primary = pool.find((c: any) => c.id === "bingx-x01") ?? pool[0]
-      if (primary) activeConnections = [primary]
-    }
+    // NOTE: Always process all active connections. Filtering to single connection
+    // in dev mode caused inconsistent behavior and masked bugs that only appeared in prod.
+    // For performance tuning, use connection enable/disable settings instead.
 
     if (activeConnections.length === 0) {
       return NextResponse.json({
