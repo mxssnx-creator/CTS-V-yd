@@ -66,7 +66,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
       const coordinator = getGlobalTradeEngineCoordinator()
       if (coordinator && coordinator.isEngineRunning(id)) {
         console.log(`[v0] [DELETE] Stopping engine for ${id} before archive`)
-        await coordinator.stopEngine(id)
+        await coordinator.stopEngine(id, { operatorRequested: true })
       }
     } catch (stopErr) {
       // Non-fatal: we still want to delete the record even if engine stop fails.
