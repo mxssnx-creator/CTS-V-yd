@@ -347,19 +347,20 @@ async function batchSavePositions(positions: LivePosition[]): Promise<void> {
   }
 }
 async function incrementMetric(connectionId: string, metric: string, delta: number = 1): Promise<void> {
-  const { getRedisClient } = await import("@/lib/redis-db")
-  const client = getRedisClient()
   try {
-    // Use hincrby for atomic counters; delta may be negative for decrements
-    if (typeof (client as any).hincrby === "function") {
-      await (client as any).hincrby(`progression:${connectionId}`, metric, delta)
-    } else {
-      // Fallback for adapters without hincrby: read-modify-write (best-effort)
-      const key = `progression:${connectionId}`
-      const hash = (await client.hgetall(key).catch(() => ({} as Record<string, string>))) || {}
-      const current = parseInt(String(hash[metric] || "0"), 10) || 0
-      await client.hset(key, { [metric]: String(current + delta) })
-    }
+    // Use validated wrapper to prevent stale metric writes
+    const { getCurrentEpoch } = await import("@/lib/trade-engine/progression-lock")
+    const { hincrbyProgression } = await import("@/lib/trade-engine/progression-writes")
+    
+    const currentEpoch = await getCurrentEpoch(connectionId)
+    if (!currentEpoch) return // No active lock, skip write (stale instance)
+    
+    // Use validated wrapper for epoch-safe increments
+    await hincrbyProgression(connectionId, metric, delta, {
+      connectionId,
+      epoch: currentEpoch,
+      logStaleRejects: false,
+    })
   } catch (err) {
     // metric failures should not throw the live pipeline
   }
@@ -2389,7 +2390,7 @@ export async function executeLivePosition(
     // This is the only writer of `live:lock:{conn}:{sym}:{dir}` on the
     // critical path, so the race window is closed at its source.
     if (isLiveTradeEnabled) {
-      // ── Variant-specific lock key ────────────────────────────────────────
+      // ── Variant-specific lock key ────────────────────────────────────��───
       // Block add-on orders MUST be able to proceed even when the default/
       // trailing position's lock is held (that lock means "default slot is
       // occupied — don't open a second default", not "all orders blocked").

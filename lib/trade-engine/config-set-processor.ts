@@ -35,6 +35,7 @@ export interface ProcessingResult {
 
 export class ConfigSetProcessor {
   private connectionId: string
+  private epoch: number
   private indicationManager: IndicationConfigManager
   private strategyManager: StrategyConfigManager
 
@@ -51,8 +52,9 @@ export class ConfigSetProcessor {
   // installs that haven't tuned the setting.
   private runtimeSetEntryCap: number = 250
 
-  constructor(connectionId: string) {
+  constructor(connectionId: string, epoch: number) {
     this.connectionId = connectionId
+    this.epoch = epoch
     this.indicationManager = new IndicationConfigManager(connectionId)
     this.strategyManager = new StrategyConfigManager(connectionId)
   }
@@ -695,6 +697,7 @@ export class ConfigSetProcessor {
         pfSource = "prehistoric_aggregate"
       }
       
+      const { hsetProgression } = await import("./progression-writes")
       const stageWrites: Promise<any>[] = []
       for (const stage of ["base", "main", "real"] as const) {
         const stageKey = `strategy_detail:${this.connectionId}:${stage}`
@@ -716,9 +719,12 @@ export class ConfigSetProcessor {
         // even if the per-stage detail hash is unreadable for any
         // reason. Stage-specific keys avoid clobbering the
         // realtime writer's own writes.
+        // Use validated wrapper to prevent stale writes
         stageWrites.push(
-          client.hset(`progression:${this.connectionId}`, {
-            [`strategy_${stage}_avg_profit_factor`]: pfStr,
+          hsetProgression(this.connectionId, `strategy_${stage}_avg_profit_factor`, pfStr, {
+            connectionId: this.connectionId,
+            epoch: this.epoch,
+            logStaleRejects: false,
           }),
         )
       }
