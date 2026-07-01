@@ -72,7 +72,7 @@ export async function register(): Promise<void> {
       console.error("[v0] [Instrumentation] auto-start init failed (continuing):", err instanceof Error ? err.message : err)
     }
   } else {
-    console.log("[v0] [Instrumentation] trade-engine auto-start skipped; set ENABLE_TRADE_ENGINE_AUTOSTART=1 in a dedicated worker to opt in")
+    console.warn("[v0] [Instrumentation] trade-engine auto-start skipped; set ENABLE_TRADE_ENGINE_AUTOSTART=1 in a dedicated worker to opt in")
   }
 
   if (process.env.ENABLE_IN_PROCESS_CONTINUITY === "1") {
@@ -83,7 +83,7 @@ export async function register(): Promise<void> {
       console.error("[v0] [Instrumentation] continuity runner failed (continuing):", err instanceof Error ? err.message : err)
     }
   } else {
-    console.log("[v0] [Instrumentation] in-process continuity skipped; use ENABLE_IN_PROCESS_CONTINUITY=1 only for a dedicated worker")
+    console.warn("[v0] [Instrumentation] in-process continuity skipped; use ENABLE_IN_PROCESS_CONTINUITY=1 only for a dedicated worker")
   }
 
   console.log("[v0] [Instrumentation] ✓ Server boot complete")

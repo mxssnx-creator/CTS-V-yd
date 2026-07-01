@@ -104,10 +104,18 @@ export async function GET() {
       }, { status: 500 })
     }
 
+    const activeConnections = connections.filter((c) => {
+      const assigned =
+        isEnabledFlag(c.is_assigned) ||
+        isEnabledFlag(c.is_active_inserted) ||
+        isEnabledFlag(c.is_dashboard_inserted)
+      return assigned && isEnabledFlag(c.is_enabled_dashboard)
+    })
     const activeConnections = connections.filter(
       (c) =>
-        (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_active)) &&
-        (isEnabledFlag(c.is_enabled_dashboard) || isEnabledFlag(c.is_enabled))
+        (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_assigned) || isEnabledFlag(c.is_dashboard_inserted)) &&
+        (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_assigned)) &&
+        isEnabledFlag(c.is_enabled_dashboard)
     )
 
     const engineStatuses = await Promise.all(
@@ -137,8 +145,16 @@ export async function GET() {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
-            isEnabled: isEnabledFlag(conn.is_enabled_dashboard) || isEnabledFlag(conn.is_enabled),
-            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_active),
+            assigned: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
+            processingEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isActive:
+              (isEnabledFlag(conn.is_assigned) ||
+                isEnabledFlag(conn.is_active_inserted) ||
+                isEnabledFlag(conn.is_dashboard_inserted)) && isEnabledFlag(conn.is_enabled_dashboard),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned),
             isLiveTrading: isEnabledFlag(conn.is_live_trade),
             isEngineRunning: isRunning,
             engineStatus,
@@ -149,8 +165,16 @@ export async function GET() {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
-            isEnabled: isEnabledFlag(conn.is_enabled_dashboard) || isEnabledFlag(conn.is_enabled),
-            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_active),
+            assigned: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
+            processingEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isActive:
+              (isEnabledFlag(conn.is_assigned) ||
+                isEnabledFlag(conn.is_active_inserted) ||
+                isEnabledFlag(conn.is_dashboard_inserted)) && isEnabledFlag(conn.is_enabled_dashboard),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned),
             isLiveTrading: isEnabledFlag(conn.is_live_trade),
             isEngineRunning: false,
             error: error instanceof Error ? error.message : "Unknown error",

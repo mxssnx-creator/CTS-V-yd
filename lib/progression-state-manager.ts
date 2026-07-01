@@ -1009,6 +1009,8 @@ return {
       const storedSymbolCount = parseInt(existing.symbol_count || "0", 10)
       const storedHash = existing.active_symbols_hash || ""
       const storedSymbols = storedHash
+        ? storedHash.split("|").map((s) => s.trim()).filter(Boolean)
+        : []
         .split("|")
         .map((symbol) => symbol.trim())
         .filter(Boolean)
@@ -1032,6 +1034,7 @@ return {
           client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
           client.del(`prehistoric_loaded:${connectionId}`).catch(() => {}),
           client.del(`prehistoric_loaded:${connectionId}:verified`).catch(() => {}),
+          client.del(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => {}),
           ...missingSymbols.map((symbol) =>
             client.del(`prehistoric:${connectionId}:${symbol}:processed_intervals`).catch(() => {}),
           ),
@@ -1055,6 +1058,10 @@ return {
           .hset(`settings:trade_engine_state:${connectionId}`, {
             config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
             config_set_symbols_processed: String(Math.min(Math.max(0, actualProcessedCount || 0), liveSymbolCount)),
+        await client
+          .hset(`settings:trade_engine_state:${connectionId}`, {
+            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
+            config_set_symbols_processed: String(Math.max(0, storedSymbolCount)),
           })
           .catch(() => {})
 
@@ -1069,7 +1076,88 @@ return {
       // Only compare fingerprints when a stored snapshot exists (empty stored
       // fingerprint = first ever start, not yet solidified — not a mismatch).
       const settingsMismatch = storedFingerprint !== "" && storedFingerprint !== liveFingerprint
+      const storedSymbolSet = new Set(storedSymbols)
+      const missingPrehistoricSymbols = currentSymbols.filter((symbol) => !storedSymbolSet.has(symbol))
+      const additiveSymbolChange =
+        symbolMismatch &&
+        !settingsMismatch &&
+        storedSymbols.length > 0 &&
+        liveSymbolCount > storedSymbols.length &&
+        storedSymbols.every((symbol) => currentSymbols.includes(symbol)) &&
+        missingPrehistoricSymbols.length === liveSymbolCount - storedSymbols.length
       const mismatch = symbolMismatch || settingsMismatch
+
+      if (additiveSymbolChange) {
+        const reason = `symbols added (stored=${storedSymbolCount} vs live=${liveSymbolCount})`
+        console.log(
+          `[v0] [Progression] Additive symbol re-coordination for ${connectionId}: ${reason}. ` +
+          `Keeping existing progress and re-opening prehistoric gates for new symbols only.`,
+        )
+
+        const progressionProcessedSet = `progression:${connectionId}:prehistoric_symbols_set`
+        const canonicalProcessedSet = `prehistoric:${connectionId}:symbols`
+        const [progressionProcessedCountRaw, canonicalProcessedCountRaw] = await Promise.all([
+          client.scard(progressionProcessedSet).catch(() => 0),
+          client.scard(canonicalProcessedSet).catch(() => 0),
+        ])
+        const progressionProcessedCount = Number(progressionProcessedCountRaw) || 0
+        const canonicalProcessedCount = Number(canonicalProcessedCountRaw) || 0
+        const actualProcessedCount = progressionProcessedCount > 0
+          ? progressionProcessedCount
+          : canonicalProcessedCount
+        const configSetSymbolsProcessed = Math.min(actualProcessedCount, liveSymbolCount)
+
+        await Promise.all([
+          client.del(`prehistoric:${connectionId}:done`).catch(() => {}),
+          client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}:verified`).catch(() => {}),
+          client.del(`prehistoric:progress:${connectionId}`).catch(() => {}),
+        ])
+
+        try {
+          const intervalKeys = missingPrehistoricSymbols.map((symbol) => `prehistoric:${connectionId}:${symbol}:processed_intervals`)
+          if (intervalKeys.length > 0) {
+            await client.del(...intervalKeys).catch(() => {})
+          }
+        } catch { /* non-critical */ }
+
+        await client.hset(key, {
+          symbol_count: String(liveSymbolCount),
+          active_symbols_hash: liveSymbolsHash,
+          started_for_settings_version: new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          engine_type: engineType || "main",
+          prehistoric_phase_active: configSetSymbolsProcessed < liveSymbolCount ? "true" : "false",
+          last_update: new Date().toISOString(),
+        }).catch(() => {})
+
+        await client.hset(`prehistoric:${connectionId}`, {
+          symbols_total: String(liveSymbolCount),
+          symbols_processed: String(configSetSymbolsProcessed),
+          is_complete: configSetSymbolsProcessed >= liveSymbolCount ? "1" : "0",
+          updated_at: new Date().toISOString(),
+        }).catch(() => {})
+
+        await client
+          .hset(`settings:trade_engine_state:${connectionId}`, {
+            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
+            config_set_symbols_processed: String(configSetSymbolsProcessed),
+            missing_prehistoric_symbols: JSON.stringify(missingPrehistoricSymbols),
+            prehistoric_data_loaded: configSetSymbolsProcessed >= liveSymbolCount ? "true" : "false",
+            updated_at: new Date().toISOString(),
+          })
+          .catch(() => {})
+
+        if (configSetSymbolsProcessed >= liveSymbolCount) {
+          await Promise.all([
+            client.set(`prehistoric:${connectionId}:done`, "1", { EX: 86400 } as any).catch(() => {}),
+            client.set(`prehistoric:${connectionId}:firstpass:done`, "1", { EX: 86400 } as any).catch(() => {}),
+          ])
+        }
+
+        return { changed: true, reason, newEpoch: Number(existing.epoch || "0") || undefined }
+      }
 
       if (mismatch) {
         const reason = symbolMismatch

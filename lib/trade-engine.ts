@@ -50,6 +50,7 @@ import {
   forceBreakProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
+import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests } from "./engine-refresh-queue"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -150,7 +151,7 @@ export class GlobalTradeEngineCoordinator {
       this.isPaused = status === "paused"
       this.isGloballyRunning = enabled && Array.from(this.engineManagers.values()).some((manager) => manager.isEngineRunning)
       if (!enabled) {
-        console.log(
+        console.warn(
           `[v0] [Coordinator] ${context} skipped — global coordinator is not enabled (status="${status || "empty"}")`,
         )
       }
@@ -206,7 +207,7 @@ export class GlobalTradeEngineCoordinator {
       process.env.CF_PAGES === "1"
 
     if (!inProcessStartAllowed && runningUnderProdStart) {
-      console.log(
+      console.warn(
         `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped in production UI worker; ` +
           `set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engine loops in-process`,
       )
@@ -246,7 +247,7 @@ export class GlobalTradeEngineCoordinator {
 
     // Step 1: Check if already starting
     if (this.startingEngines.has(connectionId)) {
-      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
+      console.warn(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
       return false
     }
 
@@ -268,7 +269,7 @@ export class GlobalTradeEngineCoordinator {
         const remoteHeartbeatFresh =
           Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
         if (remoteHeartbeatFresh) {
-          console.log(
+          console.warn(
             `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker with a fresh heartbeat; not clearing distributed running flag`,
           )
           return true
@@ -283,7 +284,7 @@ export class GlobalTradeEngineCoordinator {
         await client.del(`engine_is_running:${connectionId}`).catch(() => 0)
       }
     } catch (e) {
-      console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
+      console.warn(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
     }
 
     // Step 3: Add to lock set
@@ -311,8 +312,26 @@ export class GlobalTradeEngineCoordinator {
         selfOwnedIfAlive: localManagerAlive,
       })
       if (!acquired.acquired || !acquired.handle) {
+        const ownerHeartbeatFreshnessMs = 90_000
+        let ownerHeartbeatFresh = false
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          const ownerState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+          const ownerHeartbeat = Number((ownerState as any)?.last_processor_heartbeat || 0)
+          ownerHeartbeatFresh =
+            Number.isFinite(ownerHeartbeat) && ownerHeartbeat > 0 && Date.now() - ownerHeartbeat < ownerHeartbeatFreshnessMs
+        } catch { /* heartbeat read is best-effort */ }
+
+        if (ownerHeartbeatFresh) {
+          console.warn(
+            `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker (${acquired.existingOwner ?? "unknown"}) with a fresh heartbeat. Leaving existing owner untouched.`,
+          )
+          return true
+        }
+
         console.warn(
-          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
+          `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker (${acquired.existingOwner ?? "unknown"}) with a stale heartbeat. Requesting prior progress stop and retrying once.`,
         )
         try {
           const { getRedisClient } = await import("@/lib/redis-db")
@@ -347,6 +366,7 @@ export class GlobalTradeEngineCoordinator {
           return false
         }
       }
+      // Cannot start engine ${connectionId}: Leaving existing owner untouched; return false remains the retry-failure path above.
       lockHandle = acquired.handle
       console.log(
         `[v0] [STARTUP LOCK] Acquired progression lock for ${connectionId} (epoch=${lockHandle.epoch}${acquired.healedStaleLock ? ", healed stale" : ""})`,
@@ -379,24 +399,17 @@ export class GlobalTradeEngineCoordinator {
       // (`if (!this.isGloballyRunning) return`) and never recovers stalls.
       this.isGloballyRunning = true
 
-      // ── Mark connection as active-inserted now that engine is live ────
-      // is_active_inserted controls the "Active Connections" panel on the
-      // dashboard. The migration seeds it as "0" (operator hasn't inserted
-      // it yet). Flip it to "1" on first successful engine start so the
-      // dashboard card moves into the Active panel automatically — the
-      // operator pressed Start, which is the explicit activation event.
-      // Idempotent: repeated starts on an already-active connection are safe.
+      // ── Mark connection as assigned now that engine is live ───────────
+      // is_active_inserted/is_assigned control Main Connections visibility.
+      // Do NOT set is_enabled_dashboard here: that flag is the explicit
+      // processing switch and must not be backfilled by engine-start paths.
       try {
         // Use updateConnection (not raw hset) so the getAllConnections()
-        // 2-second in-memory cache is invalidated immediately. Without this,
-        // the connections API can serve stale is_enabled_dashboard="0" for up
-        // to 2 seconds after the engine starts, causing "Enabled dashboard: none"
-        // in every dashboard poll that hits within that window.
+        // 2-second in-memory cache is invalidated immediately.
         const { updateConnection: _uc } = await import("@/lib/redis-db")
         await _uc(connectionId, {
-          is_active_inserted:   "1",
-          is_active:            "1",
-          is_enabled_dashboard: "1",
+          is_active_inserted: "1",
+          is_assigned: "1",
         })
       } catch { /* non-critical — dashboard can lag */ }
       return true
@@ -544,13 +557,32 @@ export class GlobalTradeEngineCoordinator {
     }
     this.escalatingEngines.add(connectionId)
     try {
-      // Pre-emptively break the progression lock so the restart can
-      // acquire a fresh slot without waiting for the TTL.
+      const hasLocalRunningManager = this.engineManagers.get(connectionId)?.isEngineRunning === true
+      if (hasLocalRunningManager) {
+        // A local restart can stop normally so the manager releases its own
+        // lock/heartbeat before we acquire a replacement generation below.
+        try {
+          await this.stopEngine(connectionId)
+        } catch (stopErr) {
+          console.warn(
+            `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
+            stopErr instanceof Error ? stopErr.message : String(stopErr),
+          )
+        }
+      } else if (await this.markRemoteRestartRequestIfFresh(connectionId)) {
+        console.log(
+          `[v0] [Coordinator] restartEngine(${connectionId}) queued for remote owner has fresh heartbeat; treat the distributed owner as active`,
+        )
+        return
+      }
+
+      // Pre-emptively break the progression lock only after proving there is no
+      // local manager to stop normally and no remote owner with a fresh heartbeat.
       try {
         await forceBreakProgressionLock(connectionId)
       } catch { /* TTL will reclaim */ }
       try {
-        await this.stopEngine(connectionId)
+        if (!hasLocalRunningManager) await this.stopEngine(connectionId)
       } catch (stopErr) {
         console.warn(
           `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
@@ -567,6 +599,30 @@ export class GlobalTradeEngineCoordinator {
       }
     } finally {
       this.escalatingEngines.delete(connectionId)
+    }
+  }
+
+  private async markRemoteRestartRequestIfFresh(connectionId: string): Promise<boolean> {
+    try {
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      const remoteState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+      const remoteHeartbeat = Number((remoteState as any)?.last_processor_heartbeat || 0)
+      if (!(Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000)) {
+        return false
+      }
+      await client.hset(`trade_engine_state:${connectionId}`, {
+        restart_request: "1",
+        settings_change_marker: new Date().toISOString(),
+        restart_requested_at: new Date().toISOString(),
+      })
+      return true
+    } catch (error) {
+      console.warn(
+        `[v0] [Coordinator] remote restart marker failed for ${connectionId}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+      return false
     }
   }
 
@@ -893,8 +949,15 @@ export class GlobalTradeEngineCoordinator {
       // legitimately be (re-)started.
       this.pruneZombieManagers()
 
-      const { getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
+      const { getAssignedAndEnabledConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+
+      // Re-check against the canonical strict helper at the engine-start
+      // chokepoint so callers cannot accidentally use base `is_enabled` /
+      // legacy `enabled` as processing gates.
+      const strictlyEligibleIds = new Set((await getAssignedAndEnabledConnections()).map((c: any) => c.id))
+      connections = connections.filter((c: any) => strictlyEligibleIds.has(c.id))
+
       const enabledIds = new Set(connections.map(c => c.id))
       // Only count managers whose engine is actually running, not zombie Map entries from stale closures
       const runningIds = new Set(
@@ -957,18 +1020,18 @@ export class GlobalTradeEngineCoordinator {
             }
             started++
 
-            // Mirror the enabled/inserted flags that toggle-dashboard writes so
-            // the connections API + system-stats-v3 show correct counts even
-            // when this code path (auto-restart after OOM) bypasses toggle-dashboard.
+            // Mirror only assignment/visibility. Do not set is_enabled_dashboard
+            // here: it is the explicit processing switch and legacy assigned rows
+            // must not be auto-enabled by engine-start paths.
             try {
               const { updateConnection } = await import("@/lib/redis-db")
               await updateConnection(connection.id, {
                 is_active_inserted: "1",
-                is_enabled_dashboard: "1",
+                is_assigned: "1",
               })
             } catch (flagErr) {
               console.warn(
-                `[v0] [Coordinator] Could not update is_active_inserted for ${connection.id}:`,
+                `[v0] [Coordinator] Could not update assignment flags for ${connection.id}:`,
                 flagErr instanceof Error ? flagErr.message : flagErr,
               )
             }
@@ -1478,6 +1541,46 @@ export class GlobalTradeEngineCoordinator {
           for (const { key, value } of freshRequests) {
             console.log(`[v0] [Coordinator] Refresh requested for ${value.connectionId}: ${value.action}`)
             await setSettings(key, {
+        const refreshRequests = await getQueuedEngineRefreshRequests()
+        if (refreshRequests.length > 0) {
+          const { getConnection } = await import("@/lib/redis-db")
+          const now = Date.now()
+
+          for (const { request } of refreshRequests) {
+            const requestTime = new Date(request.timestamp).getTime()
+            if (!Number.isFinite(requestTime) || now - requestTime >= 30000) {
+              console.log(`[v0] [Coordinator] Dropping expired refresh request for ${request.connectionId}`)
+              await clearEngineRefreshRequest(request.connectionId)
+              continue
+            }
+
+            const connection = await getConnection(request.connectionId)
+            const currentVersion = String(connection?.state_switch_version ?? 0)
+            const requestedVersion = String(request.state_switch_version ?? "")
+            if (!connection || currentVersion !== requestedVersion) {
+              console.log(
+                `[v0] [Coordinator] Ignoring stale refresh request for ${request.connectionId}: ` +
+                  `requested state_switch_version=${requestedVersion}, current=${currentVersion}`,
+              )
+              await clearEngineRefreshRequest(request.connectionId)
+              continue
+            }
+
+            console.log(
+              `[v0] [Coordinator] Refresh requested for ${request.connectionId}: ${request.action} ` +
+                `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
+            )
+            await clearEngineRefreshRequest(request.connectionId)
+            if (request.action === "stop") {
+              await this.stopEngine(request.connectionId, { operatorRequested: true })
+            } else if (request.action === "start") {
+              await this.startEngineFromConnectionConfig(request.connectionId)
+            } else {
+              await this.refreshEngines()
+            }
+          if (now - requestTime < 30000) {
+            console.warn(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
+            await setSettings("engine_coordinator:refresh_requested", {
               timestamp: null,
               connectionId: null,
               action: null,
