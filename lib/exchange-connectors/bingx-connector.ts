@@ -2,9 +2,9 @@
 // in `next.config.mjs` (the runtime guard in `instrumentation.ts` makes
 // sure the stub is never executed at request time).
 import * as crypto from "crypto"
-// Official BingX SDK support is loaded at runtime when available. Keep this
-// file free of static SDK imports so Next.js does not bundle optional NestJS
-// peer dependencies required only by the SDK package.
+// Official BingX SDK for instant order execution with connection pooling
+// Note: SDK import is wrapped in try-catch during initialization
+import type { default as BingXClient } from "bingx-api"
 import {
   BaseExchangeConnector,
   type ExchangeCredentials,
@@ -13,15 +13,6 @@ import {
   type PlaceOrderOptions,
 } from "./base-connector"
 import { safeParseResponse } from "@/lib/safe-response-parser"
-
-async function loadOptionalBingXModule(): Promise<any> {
-  // Load the optional SDK without a statically analyzable import. The package
-  // pulls NestJS optional peers (class-validator, etc.) that are not needed for
-  // the manual REST fallback and can break Next dev/prod bundles when webpack
-  // tries to trace the dependency graph.
-  const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<any>
-  return dynamicImport("bingx-api")
-}
 
 /**
  * BingX Exchange Connector
@@ -102,8 +93,7 @@ export class BingXConnector extends BaseExchangeConnector {
     
     // Initialize the official BingX SDK client with connection pooling
     // SDK is dynamically loaded to avoid import issues in edge environments
-    this.initializeSDKClient(credentials).catch((err) => {
-      console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
+    this.initializeSDKClient(credentials).catch(() => {
       // Fall back to manual REST if SDK fails to initialize
       this.sdkClient = null
     })
@@ -113,29 +103,20 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   private async initializeSDKClient(credentials: ExchangeCredentials): Promise<void> {
-    const BingXModule = await loadOptionalBingXModule()
     try {
-      // Dynamically load SDK through an opaque import so Next does not bundle
-      // optional NestJS peer dependencies from bingx-api into app startup.
-      const importBingX = new Function("return import('bingx-api')") as () => Promise<typeof import("bingx-api")>
-      const BingXModule = await importBingX()
+      // Dynamically import SDK to avoid static edge environment issues
+      const BingXModule = await import("bingx-api")
       
       // Try multiple export patterns used by bingx-api
       const BingXClient = (BingXModule as any).BingxApiClient 
         || (BingXModule as any).default 
         || (BingXModule as any)
       
-    // Try multiple export patterns used by bingx-api
-    const BingXClient = (BingXModule as any).BingxApiClient
-      || (BingXModule as any).default
-      || (BingXModule as any)
+      if (!BingXClient || typeof BingXClient !== "function") {
+        console.warn("[BingX] SDK client not found or not a constructor")
+        return
+      }
 
-    if (!BingXClient || typeof BingXClient !== "function") {
-      console.warn("[BingX] SDK client not found or not a constructor")
-      return
-    }
-
-    try {
       // Initialize SDK client with configuration
       this.sdkClient = new BingXClient({
         apiKey: credentials.apiKey,
@@ -146,7 +127,7 @@ export class BingXConnector extends BaseExchangeConnector {
       
       console.log("[BingX] SDK client initialized (connection pooling + keep-alive enabled)")
     } catch (err) {
-      console.warn("[BingX] SDK client construction warning:", err instanceof Error ? err.message : String(err))
+      console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
       // Will fall back to manual REST
     }
   }
