@@ -140,9 +140,25 @@ export async function cleanupOrphanedProgress() {
       // Use client.get to match setRunningFlag which writes string values ("1"/"0")
       const runningFlag = await client.get(`engine_is_running:${conn.id}`)
 
-      // If marked as running but coordinator doesn't have it, clean up
+      // If marked as running but this coordinator doesn't have it, only clean
+      // it up after proving there is no fresh distributed owner. Production can
+      // boot multiple Node/API workers while a dedicated engine worker is still
+      // alive; clearing its `engine_is_running:*` flag from a non-owner worker
+      // is the exact race that makes the UI show phantom stops/restarts.
       if (runningFlag === "true" || runningFlag === "1") {
         if (!coordinator.isEngineRunning(conn.id)) {
+          const remoteState = await client.hgetall(`trade_engine_state:${conn.id}`).catch(() => ({} as Record<string, string>)) as Record<string, string>
+          const remoteHeartbeat = Number(remoteState?.last_processor_heartbeat || 0)
+          const remoteHeartbeatFresh =
+            Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
+
+          if (remoteHeartbeatFresh) {
+            console.log(
+              `[v0] [Startup] Preserving running flag for ${conn.id} — fresh distributed heartbeat present`,
+            )
+            continue
+          }
+
           console.log(`[v0] [Startup] Cleaning orphaned running flag for ${conn.id}`)
 
           // Clear orphaned flags using client.set to match setRunningFlag

@@ -558,6 +558,20 @@ describe("requested regression guardrails", () => {
     expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
   })
 
+
+  test("startup cleanup preserves fresh distributed engine owners", () => {
+    const source = read("lib/startup-coordinator.ts")
+    const cleanupBlock = source.slice(
+      source.indexOf("export async function cleanupOrphanedProgress"),
+      source.indexOf("export async function completeStartup"),
+    )
+
+    expect(cleanupBlock).toContain("fresh distributed heartbeat present")
+    expect(cleanupBlock).toContain("last_processor_heartbeat")
+    expect(cleanupBlock).toContain("Date.now() - remoteHeartbeat < 90_000")
+    expect(cleanupBlock.indexOf("remoteHeartbeatFresh")).toBeLessThan(cleanupBlock.indexOf("Cleaning orphaned running flag"))
+  })
+
   test("startup lock preserves a fresh remote engine owner instead of clearing its Redis flag", () => {
     const source = read("lib/trade-engine.ts")
 
