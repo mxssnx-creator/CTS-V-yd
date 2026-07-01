@@ -737,10 +737,12 @@ export class TradeEngineManager {
         console.warn("[v0] [Engine] ensureJustUniqueProgression failed, falling back to archive:", ensureErr)
         this.epoch = this.lockHandle?.epoch ?? Date.now()
         await ProgressionStateManager.archiveAndStartNewProgression(this.connectionId, this.epoch).catch(() => {})
-        await getRedisClient().hset(`progression:${this.connectionId}`, {
-          engine_started: "true",
-          last_update: new Date().toISOString(),
-        }).catch(() => {})
+        // Use validated wrapper to prevent stale writes
+        const { updateProgressionSnapshot } = await import("./progression-writes")
+        await updateProgressionSnapshot([
+          { field: "engine_started", value: "true", operation: "set" },
+          { field: "last_update", value: new Date().toISOString(), operation: "set" },
+        ], { connectionId: this.connectionId, epoch: this.epoch }).catch(() => {})
       }
 
       // Initialize engine state
@@ -796,28 +798,33 @@ export class TradeEngineManager {
         // entire progression becomes stale and UI will show incorrect counters.
         // Retry once before giving up.
         let snapWriteOk = false
+        const { updateProgressionSnapshot } = await import("./progression-writes")
+        const progMutations = [
+          { field: "symbol_count", value: String(symbolCount), operation: "set" as const },
+          { field: "active_symbols_hash", value: symbolsHash, operation: "set" as const },
+          { field: "started_for_settings_version", value: new Date().toISOString(), operation: "set" as const },
+          { field: "progress_settings_snapshot", value: JSON.stringify(settingsSnapshot), operation: "set" as const },
+          { field: "engine_type", value: config.engine_type || "main", operation: "set" as const },
+        ]
         try {
-          await redisClient.hset(`progression:${this.connectionId}`, {
-            symbol_count: String(symbolCount),
-            active_symbols_hash: symbolsHash,
-            started_for_settings_version: new Date().toISOString(),
-          progress_settings_snapshot: JSON.stringify(settingsSnapshot),
-          engine_type: config.engine_type || "main",
+          // Use validated wrapper for atomic snapshot
+          const result = await updateProgressionSnapshot(progMutations, {
+            connectionId: this.connectionId,
+            epoch: this.epoch,
+            logStaleRejects: false,
           })
-          snapWriteOk = true
+          snapWriteOk = result > 0
         } catch (err) {
           console.error("[v0] [Engine] First progression snapshot write failed, retrying:", err)
           try {
             // Retry once with exponential backoff
             await new Promise(r => setTimeout(r, 100))
-            await redisClient.hset(`progression:${this.connectionId}`, {
-              symbol_count: String(symbolCount),
-              active_symbols_hash: symbolsHash,
-              started_for_settings_version: new Date().toISOString(),
-              progress_settings_snapshot: JSON.stringify(settingsSnapshot),
-              engine_type: config.engine_type || "main",
+            const result = await updateProgressionSnapshot(progMutations, {
+              connectionId: this.connectionId,
+              epoch: this.epoch,
+              logStaleRejects: false,
             })
-            snapWriteOk = true
+            snapWriteOk = result > 0
           } catch (retryErr) {
             console.error("[v0] [Engine] Progression snapshot write FAILED after retry:", retryErr)
           }
@@ -1627,7 +1634,7 @@ export class TradeEngineManager {
       })
 
       // Initialize config sets and process prehistoric data through them
-      const configProcessor = new ConfigSetProcessor(this.connectionId)
+      const configProcessor = new ConfigSetProcessor(this.connectionId, this.epoch)
       const configInitResult = await configProcessor.initializeConfigSets()
       await logProgressionEvent(this.connectionId, "prehistoric_config_init", "info", "Config sets initialized", {
         indicationConfigs: configInitResult.indications,

@@ -301,23 +301,23 @@ export class RealtimeProcessor {
       // Surface the per-symbol pseudo-update counters so the dashboard
       // can verify Phase 2 is firing inside each shared-pipeline cycle.
       try {
-        const client = getRedisClient()
-        const progKey = `progression:${this.connectionId}`
+        const { getCurrentEpoch } = await import("./progression-lock")
+        const { hincrbyProgressionBatch, updateProgressionSnapshot } = await import("./progression-writes")
+        
+        const currentEpoch = await getCurrentEpoch(this.connectionId)
+        if (!currentEpoch) return positions.length // No active lock, skip metrics (stale instance)
+        
+        // Use validated wrappers for epoch-safe metrics
         await Promise.all([
-          client.hincrby(progKey, "pseudo_positions_updated_count", positions.length),
-          client.hincrby(progKey, "pseudo_positions_update_cycles", 1),
-          client.hset(progKey, {
-            pseudo_positions_last_update_at: new Date().toISOString(),
-            pseudo_positions_last_symbol: symbol,
-            // Dashboard back-compat: the stats route surfaces
-            // `pseudo_positions_last_count` as the `lastBatchSize`
-            // tile. Under the per-symbol shared pipeline each call IS
-            // a "batch" (one symbol's open positions), so we write the
-            // symbol's own count here. Operators reading the tile
-            // interpret it as "positions touched in the most recent cycle".
-            pseudo_positions_last_count: String(positions.length),
-          }),
-          client.expire(progKey, 7 * 24 * 60 * 60),
+          hincrbyProgressionBatch(this.connectionId, {
+            pseudo_positions_updated_count: positions.length,
+            pseudo_positions_update_cycles: 1,
+          }, { connectionId: this.connectionId, epoch: currentEpoch, logStaleRejects: false }),
+          updateProgressionSnapshot([
+            { field: "pseudo_positions_last_update_at", value: new Date().toISOString(), operation: "set" },
+            { field: "pseudo_positions_last_symbol", value: symbol, operation: "set" },
+            { field: "pseudo_positions_last_count", value: String(positions.length), operation: "set" },
+          ], { connectionId: this.connectionId, epoch: currentEpoch, logStaleRejects: false }),
         ])
       } catch {
         // Non-critical visibility metric — never break the pipeline.
