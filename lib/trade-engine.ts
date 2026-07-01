@@ -948,8 +948,15 @@ export class GlobalTradeEngineCoordinator {
       // legitimately be (re-)started.
       this.pruneZombieManagers()
 
-      const { getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
+      const { getAssignedAndEnabledConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+
+      // Re-check against the canonical strict helper at the engine-start
+      // chokepoint so callers cannot accidentally use base `is_enabled` /
+      // legacy `enabled` as processing gates.
+      const strictlyEligibleIds = new Set((await getAssignedAndEnabledConnections()).map((c: any) => c.id))
+      connections = connections.filter((c: any) => strictlyEligibleIds.has(c.id))
+
       const enabledIds = new Set(connections.map(c => c.id))
       // Only count managers whose engine is actually running, not zombie Map entries from stale closures
       const runningIds = new Set(

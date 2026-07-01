@@ -3283,6 +3283,13 @@ export async function getActiveConnectionsForEngine(): Promise<any[]> {
     if (key.includes(":settings") || key.includes(":state")) continue
     const data = await client.hgetall(key)
     if (data && Object.keys(data).length > 0) {
+      // Check if connection is assigned/visible in the Main/Active panel.
+      // Processing is gated separately by is_enabled_dashboard.
+      if (isEnabledFlag(data.is_active_inserted) || isEnabledFlag(data.is_assigned) || isEnabledFlag(data.is_dashboard_inserted)) {
+        connections.push({
+          id: key.replace("connection:", ""),
+          ...data,
+        })
       const connection = {
         id: key.replace("connection:", ""),
         ...data,
@@ -3677,6 +3684,13 @@ export async function getEnabledConnections(): Promise<any[]> {
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
   return allConnections.filter(conn => {
+    // A connection is eligible for engine processing only when it is both:
+    // 1. Assigned/visible in the Main/Active panel. Assignment remains based
+    //    on the assignment/visibility fields so cards do not disappear when
+    //    processing is disabled.
+    // 2. Processing-enabled via the dashboard toggle. Base `is_enabled` /
+    //    legacy `enabled` are settings-availability flags only and must not
+    //    start engine processing.
     // A connection is eligible for engine processing only when it is assigned
     // to Main Connections and the dashboard processing toggle is enabled. Base
     // Settings flags and active-panel visibility alone are not enable signals.

@@ -85,6 +85,11 @@ export function isConnectionWorking(connection: any): boolean {
 
 // ========== ENGINE ELIGIBILITY ==========
 export function isConnectionEligibleForEngine(connection: any): boolean {
+  // Engine processing requires assignment plus the dashboard processing toggle.
+  // Base `is_enabled` / legacy `enabled` are intentionally ignored here; they
+  // only describe base connection availability/settings visibility.
+  const isAssigned = isConnectionAssignedToMain(connection)
+  const processingEnabled = isConnectionDashboardEnabled(connection)
   // Connection must be assigned to the main panel and explicitly enabled for
   // dashboard processing. Active-panel visibility alone does not start engines.
 

@@ -131,7 +131,7 @@ export async function runTradeEngineHealingSweep(
 
 async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOptions): Promise<HealingSweepResult> {
   try {
-    const { initRedis, getRedisClient, getAllConnections } = await loadRedisDb()
+    const { initRedis, getRedisClient, getAssignedAndEnabledConnections } = await loadRedisDb()
     const { loadSettingsAsync } = await import("./settings-storage")
     const { isConnectionEligibleForEngine } = await import("./connection-state-utils")
     const { writeTradeEngineWorkerHeartbeat } = await import("./trade-engine-worker-heartbeat")
@@ -158,13 +158,11 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent || "not_running" }
     }
 
-    const connections = await getAllConnections()
-    if (!Array.isArray(connections)) {
-      console.warn("[v0] [AutoStart] Connections not array, skipping sweep")
+    const eligibleConnections = await getAssignedAndEnabledConnections()
+    if (!Array.isArray(eligibleConnections)) {
+      console.warn("[v0] [AutoStart] Eligible connections not array, skipping sweep")
       return { startedCount: 0, eligibleCount: 0, skipped: "connections_not_array" }
     }
-
-    const eligibleConnections = connections.filter((connection) => isConnectionEligibleForEngine(connection))
 
     // Best-effort warm load. Engines still read Redis settings while ticking.
     await loadSettingsAsync().catch(() => {})

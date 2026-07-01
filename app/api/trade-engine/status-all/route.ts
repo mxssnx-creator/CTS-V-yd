@@ -113,6 +113,7 @@ export async function GET() {
     })
     const activeConnections = connections.filter(
       (c) =>
+        (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_assigned) || isEnabledFlag(c.is_dashboard_inserted)) &&
         (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_assigned)) &&
         isEnabledFlag(c.is_enabled_dashboard)
     )
@@ -144,6 +145,10 @@ export async function GET() {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
+            assigned: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
+            processingEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
             isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
             isActive:
               (isEnabledFlag(conn.is_assigned) ||
@@ -160,6 +165,10 @@ export async function GET() {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
+            assigned: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
+            processingEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
+            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
             isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
             isActive:
               (isEnabledFlag(conn.is_assigned) ||
