@@ -436,23 +436,8 @@ describe("requested regression guardrails", () => {
 
     expect(source).toContain("Production must allow in-process starts from the coordinator")
     expect(source).toContain("Duplicate starts")
+    expect(source).not.toContain("runningUnderProdStart")
     expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
-    const source = read("lib/trade-engine.ts")
-
-    expect(source).toContain("Production must allow in-process starts from the coordinator")
-    expect(source).toContain("Duplicate starts")
-    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
-    const source = read("lib/trade-engine.ts")
-
-    expect(source).toContain("Production must allow in-process starts from the coordinator")
-    expect(source).toContain("Duplicate starts")
-    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
-  test("coordinator startEngine allows explicit foreground UI starts", () => {
-    const source = read("lib/trade-engine.ts")
-
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(source).toContain('(config as any)?.allowInProcessStart === true')
-    expect(source).toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {
@@ -568,7 +553,7 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("distributedHeartbeatFresh: hasFreshDistributedHeartbeat")
     expect(source).toContain("distributedEngineCount")
     expect(source).toContain("No local engine runtime is attached yet; explicit UI actions and continuity sweeps will reconcile queued engine work.")
-    expect(source).toContain("Optional for always-on processing")
+    expect(source).toContain("Optional for dedicated-worker deployments")
     expect(source).toContain("operatorStatus: operatorIntent")
     expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
   })
