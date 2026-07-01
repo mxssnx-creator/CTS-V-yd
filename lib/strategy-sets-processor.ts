@@ -1,7 +1,9 @@
 /**
- * Independent Strategy Sets Processor
- * Maintains separate 500-entry pools for each strategy calculation type
- * Each type evaluates independently with own set configurations
+ * Strategy Sets Processor
+ * Runs one logical intervaled strategy progression for each symbol.
+ * Evaluates candidates once, then persists Base → Main → Real → Live in order.
+ * Each stage can still use separate retention and compaction settings, but
+ * stages are not separate processing loops.
  */
 
 import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
