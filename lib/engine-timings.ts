@@ -138,6 +138,17 @@ export interface EngineTimings {
   neutralizeThresholdPct: number
   neutralizeMaxPerDirection: number
   neutralizeVolumeMode: "neutralize" | "rebalance" | "reduce"
+
+  // ── API & Exchange Operation Timeouts ──────────────────────────────────
+  // Configurable timeouts for exchange API calls and operations.
+  // Set via Settings > System > API & Exchange Timeouts.
+  // All values in milliseconds.
+  apiCallTimeoutMs?: number // 5s - 60s, default 20s - general API call timeout
+  orderPlacementTimeoutMs?: number // 10s - 120s, default 40s - order placement timeout
+  orderStatusTimeoutMs?: number // 5s - 60s, default 20s - order status/fill check timeout
+  positionSyncTimeoutMs?: number // 5s - 60s, default 20s - position sync with exchange timeout
+  orderCancellationTimeoutMs?: number // 5s - 60s, default 15s - order cancellation timeout
+  accountQueryTimeoutMs?: number // 3s - 45s, default 15s - balance/account query timeout
 }
 
 export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {

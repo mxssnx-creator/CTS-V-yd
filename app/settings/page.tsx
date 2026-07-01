@@ -373,6 +373,13 @@ interface Settings {
   activeLastPartFrom: number
   activeLastPartTo: number
   activeLastPartStep: number
+  // ── API & Exchange Timeouts (Settings > System > API & Exchange Timeouts) ──
+  apiCallTimeoutMs?: number // 5s - 60s, default 20s
+  orderPlacementTimeoutMs?: number // 10s - 120s, default 40s
+  orderStatusTimeoutMs?: number // 5s - 60s, default 20s
+  positionSyncTimeoutMs?: number // 5s - 60s, default 20s
+  orderCancellationTimeoutMs?: number // 5s - 60s, default 15s
+  accountQueryTimeoutMs?: number // 3s - 45s, default 15s
 }
 
 const initialSettings: Settings = {
