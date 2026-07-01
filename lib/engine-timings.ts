@@ -143,12 +143,10 @@ export interface EngineTimings {
   // Configurable timeouts for exchange API calls and operations.
   // Set via Settings > System > API & Exchange Timeouts.
   // All values in milliseconds.
-  apiCallTimeoutMs?: number // 5s - 60s, default 20s - general API call timeout
-  orderPlacementTimeoutMs?: number // 10s - 120s, default 40s - order placement timeout
-  orderStatusTimeoutMs?: number // 5s - 60s, default 20s - order status/fill check timeout
-  positionSyncTimeoutMs?: number // 5s - 60s, default 20s - position sync with exchange timeout
-  orderCancellationTimeoutMs?: number // 5s - 60s, default 15s - order cancellation timeout
-  accountQueryTimeoutMs?: number // 3s - 45s, default 15s - balance/account query timeout
+  apiTimeoutMs: number // 5s - 120s, default 40s - general API call timeout
+  apiPlaceOrderTimeoutMs: number // 10s - 120s, default 40s - order placement timeout
+  apiCancelOrderTimeoutMs: number // 5s - 60s, default 20s - order cancellation timeout
+  apiPositionTimeoutMs: number // 5s - 60s, default 20s - position queries timeout
 }
 
 export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
@@ -171,6 +169,11 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
+  // ── API/Exchange operation timeout defaults ────────────────────────────
+  apiTimeoutMs:            40_000,  // 40s general timeout for BingX API
+  apiPlaceOrderTimeoutMs:  40_000,  // 40s for order placement
+  apiCancelOrderTimeoutMs: 20_000,  // 20s for order cancellation
+  apiPositionTimeoutMs:    20_000,  // 20s for position queries
   // ── Three-progression defaults ────────────────────────────────────────
   // *IntervalMs  = start-to-start cadence (skips new cycle if too soon)
   // *CyclePauseMs = post-COMPLETION breath — anti-hang protection only.
