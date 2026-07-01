@@ -13,6 +13,20 @@ import { buildMissingTradeEngineWorkerDiagnostic } from "@/lib/trade-engine-work
 // When enabling, also triggers engine start for this connection
 export const dynamic = "force-dynamic"
 export const maxDuration = 15
+
+async function queueCoordinatorRefresh(connectionId: string, action: "start" | "stop", reason: string, stateSwitchVersion?: string) {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    connectionId,
+    action,
+    reason,
+    state_switch_version: stateSwitchVersion || null,
+  }
+  await Promise.all([
+    setSettings("engine_coordinator:refresh_requested", payload),
+    setSettings(`engine_coordinator:refresh_requested:${connectionId}`, payload),
+  ])
+}
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -152,6 +166,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     // Save connection state only if state changed. Stamp a per-connection
     // switch generation so status/progression readers and coordinator workers
     // can distinguish this operator intent from stale queued start/stop work.
+    let stateSwitchVersion: string | undefined
+    if (needsUpdate && updatedConnection) {
+      stateSwitchVersion = `${Date.now()}`
     if (needsUpdate && updatedConnection) {
       const stateSwitchVersion = `${Date.now()}`
       updatedConnection = {
@@ -265,6 +282,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
             engineStatus = "started"
           } else {
+            await queueCoordinatorRefresh(resolvedId, "start", "dashboard_toggle_enable", stateSwitchVersion)
             await queueEngineRefreshRequest({
               connectionId: resolvedId,
               action: "start",
@@ -289,6 +307,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         } catch (engineStartError) {
           console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
           // Still set the flag as fallback - coordinator may pick it up
+          await queueCoordinatorRefresh(resolvedId, "start", "dashboard_toggle_enable_fallback", stateSwitchVersion)
           await queueEngineRefreshRequest({
             connectionId: resolvedId,
             action: "start",
@@ -368,6 +387,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         } catch (engineStopError) {
           console.warn(`[v0] [Toggle] Failed to stop engine directly:`, engineStopError)
           // Fallback refresh request so coordinator picks up desired stop state
+          await queueCoordinatorRefresh(resolvedId, "stop", "dashboard_toggle_disable_fallback", stateSwitchVersion)
           await queueEngineRefreshRequest({
             connectionId: resolvedId,
             action: "stop",

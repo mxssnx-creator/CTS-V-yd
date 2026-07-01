@@ -13,6 +13,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { ConnectionCoordinator } from "@/lib/connection-coordinator"
 import { BatchProcessor } from "@/lib/batch-processor"
 import { isTruthyFlag } from "@/lib/boolean-utils"
+import { isConnectionReadyForEngine } from "@/lib/connection-state-helpers"
 import { buildMissingTradeEngineWorkerDiagnostic } from "@/lib/trade-engine-worker-heartbeat"
 
 const HEARTBEAT_FRESH_MS = 90_000;
@@ -39,7 +40,17 @@ export async function GET(request: NextRequest) {
     // connections even though Redis has been migrated and seeded correctly.
     await coordinator.initializeConnections();
 
+    // Production route workers can be cold-started independently from the
+    // browser/dev boot path. Hydrate the coordinator from Redis before reading
+    // its in-memory maps; otherwise production health/status reports zero
+    // connections even though Redis has been migrated and seeded correctly.
+    await coordinator.initializeConnections()
+
     // Get system-wide statistics
+    const allConnections = coordinator.getAllConnections()
+    const activeConnections = allConnections.filter((c) => isConnectionReadyForEngine(c))
+    const allHealth = coordinator.getAllConnectionsHealth()
+    const allMetrics = coordinator.getAllConnectionsMetrics()
     const allConnections = coordinator.getAllConnections();
     const activeConnections = allConnections.filter(
       (c) => isTruthyFlag(c.is_enabled) && isTruthyFlag(c.is_active),
@@ -216,6 +227,8 @@ export async function GET(request: NextRequest) {
       connections: {
         total: allConnections.length,
         active: activeConnections.length,
+        enabled: allConnections.filter((c) => isTruthyFlag(c.is_enabled_dashboard)).length,
+        disabled: allConnections.filter((c) => !isTruthyFlag(c.is_enabled_dashboard)).length,
         enabled: allConnections.filter((c) => isTruthyFlag(c.is_enabled))
           .length,
         disabled: allConnections.filter((c) => !isTruthyFlag(c.is_enabled))

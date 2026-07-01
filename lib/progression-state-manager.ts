@@ -1051,6 +1051,13 @@ return {
           last_update: new Date().toISOString(),
         }).catch(() => {})
 
+        const actualProcessedCount = await client
+          .scard(`prehistoric:${connectionId}:symbols`)
+          .catch(async () => client.scard(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => 0))
+        await client
+          .hset(`settings:trade_engine_state:${connectionId}`, {
+            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
+            config_set_symbols_processed: String(Math.min(Math.max(0, actualProcessedCount || 0), liveSymbolCount)),
         await client
           .hset(`settings:trade_engine_state:${connectionId}`, {
             config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),

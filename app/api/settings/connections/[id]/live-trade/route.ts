@@ -6,6 +6,8 @@ import { loadSettingsAsync } from "@/lib/settings-storage"
 import { parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
 import { nextStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
@@ -155,6 +157,23 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       updated_at: new Date().toISOString(),
     }
     await updateConnection(connectionId, updatedConnection)
+    await notifySettingsChanged(
+      connectionId,
+      ["is_live_trade", "live_trade_requested"],
+      {
+        is_live_trade: connection.is_live_trade,
+        live_trade_requested: connection.live_trade_requested,
+      },
+      {
+        is_live_trade: updatedConnection.is_live_trade,
+        live_trade_requested: updatedConnection.live_trade_requested,
+      },
+    ).catch((settingsErr) => {
+      console.warn(
+        `[v0] [LiveTrade] Settings-change signal failed for ${connectionId}:`,
+        settingsErr instanceof Error ? settingsErr.message : String(settingsErr),
+      )
+    })
 
     // Live-trade mode changes alter the processing fingerprint used by
     // progression/coordinator stats. Re-coordinate immediately so the UI does
@@ -240,11 +259,18 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engineStartedNow = started
             console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
           } else {
+            const refreshPayload = {
+              timestamp: new Date().toISOString(),
             await queueEngineRefreshRequest({
               connectionId,
               action: "start",
               state_switch_version: stateSwitchVersion,
               reason: "live_trade_enable",
+            }
+            await Promise.all([
+              setSettings("engine_coordinator:refresh_requested", refreshPayload),
+              setSettings(`engine_coordinator:refresh_requested:${connectionId}`, refreshPayload),
+            ])
               timestamp: new Date().toISOString(),
             })
             await logProgressionEvent(connectionId, "engine_start_queued", "info", "Live Trade enabled; start queued for coordinator worker", {

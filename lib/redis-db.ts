@@ -3684,6 +3684,11 @@ export async function getEnabledConnections(): Promise<any[]> {
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
   return allConnections.filter(conn => {
+    // A connection is eligible for the engine when it is both:
+    // 1. Assigned/inserted into the active panel  
+    // 2. Processing-enabled via the dashboard toggle. Settings-level
+    //    `is_enabled` only means the base connection exists/is available; it
+    //    must not start engine processing by itself.
     // A connection is eligible for engine processing only when it is both:
     // 1. Assigned/visible in the Main/Active panel. Assignment remains based
     //    on the assignment/visibility fields so cards do not disappear when

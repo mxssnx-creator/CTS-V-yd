@@ -18,6 +18,11 @@ export function getConnectionState(conn: any): ConnectionState {
   const toBoolean = (val: any) => val === true || val === 1 || val === "1" || val === "true"
   
   return {
+    main_assigned: toBoolean(conn.is_assigned) || toBoolean(conn.is_active_inserted),
+    // main_enabled is the processing switch only. Assignment/visibility is
+    // tracked separately by main_assigned so disabled-but-visible cards do not
+    // accidentally qualify for engine processing.
+    main_enabled: toBoolean(conn.is_enabled_dashboard),
     // Assignment/visibility and processing are deliberately separate.
     // is_active_inserted / is_assigned only decide whether the card appears
     // in Main Connections; is_enabled_dashboard is the processing switch.
@@ -108,6 +113,9 @@ export function isConnectionProcessingEnabled(conn: any): boolean {
 
 export function isConnectionReadyForEngine(conn: any): boolean {
   return (
+    (toBoolean(conn.is_assigned) || toBoolean(conn.is_active_inserted) || toBoolean(conn.is_dashboard_inserted)) &&
+    // Processing is controlled exclusively by the dashboard toggle.
+    toBoolean(conn.is_enabled_dashboard) &&
     isConnectionAssignedToMain(conn) &&
     isConnectionProcessingEnabled(conn) &&
     !!conn.exchange &&
