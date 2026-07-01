@@ -5823,20 +5823,6 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // causing timeouts and stalls. Increased to 20s to handle real exchange latency.
     const SYNC_PER_POS_TIMEOUT_MS = 20_000
 
-    // MEMORY OPTIMIZATION: Skip sync reconciliation if positions haven't changed recently
-    // and all are in stable state (not in formation, not pending close).
-    // This reduces API calls and memory churn on idle cycles significantly.
-    const SYNC_SKIP_IF_STABLE_MS = 30_000
-    const allStableAndRecent = positions.every((p) => {
-      const isSynced = p.exchangeData?.syncedAt && (Date.now() - p.exchangeData.syncedAt) < SYNC_SKIP_IF_STABLE_MS
-      const isStable = p.status === "open" && !p.closing && !p.inFormation
-      return isSynced && isStable
-    })
-    if (allStableAndRecent && positions.length > 0) {
-      console.log(`[v0] [LiveStage] All ${positions.length} positions stable & synced recently, skipping reconciliation`)
-      return // Early exit: skip expensive sync on idle cycles
-    }
-
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
         const mapKey = `${normSym(position.symbol)}|${position.direction}`

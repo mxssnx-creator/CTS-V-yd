@@ -1501,25 +1501,6 @@ export class StrategyCoordinator {
     await this.memoryCircuitBreaker(symbol)
 
     try {
-      // ── Check for unchanged position state (skip redundant calculations) ──
-      // Early exit if no new positions opened/closed — prevents recalculating
-      // P&F/DDT every cycle when market data hasn't produced new entries.
-      const posCtx: PositionContext = sharedContext
-        ?? (isPrehistoric
-          ? this.neutralPositionContext()
-          : await this.getPositionContext())
-      
-      const posFingerprint = `${posCtx.openPositions.length}|${posCtx.closedPositions.length}`
-      const prevFingerprint = (this as any)._lastPosFingerprint?.[symbol]
-      if (prevFingerprint === posFingerprint && !isPrehistoric && indications.length === (this as any)._lastIndicationCount?.[symbol]) {
-        console.log(`[v0] [StrategyCoordinator] ${symbol}: unchanged position/indication state, skipping calculations`)
-        return results
-      }
-      if (!(this as any)._lastPosFingerprint) (this as any)._lastPosFingerprint = {}
-      if (!(this as any)._lastIndicationCount) (this as any)._lastIndicationCount = {}
-      ;(this as any)._lastPosFingerprint[symbol] = posFingerprint
-      ;(this as any)._lastIndicationCount[symbol] = indications.length
-
       // ── Hydrate PF thresholds + Coordination settings + stage thresholds + normalise ─
       await Promise.all([
         this.loadAppPFThresholds(),
@@ -1536,6 +1517,24 @@ export class StrategyCoordinator {
         ?? (isPrehistoric
           ? this.neutralPositionContext()
           : await this.getPositionContext())
+
+      // ── OPTIMIZATION: Skip processing if position state unchanged ──
+      // Check fingerprint of position counts to skip redundant calculations when
+      // no new positions have opened/closed. Prevents recalculating P&F/DDT every
+      // cycle when the market hasn't generated new entries.
+      const posFingerprint = `${posCtx.continuousCount}|${posCtx.lastPosCount}|${posCtx.prevPosCount}`
+      const prevFingerprint = (this as any)._lastPosFingerprint?.[symbol]
+      if (prevFingerprint === posFingerprint && !isPrehistoric) {
+        // Position state unchanged AND indication count stable
+        if (indications.length === (this as any)._lastIndicationCount?.[symbol]) {
+          console.log(`[v0] [StrategyCoordinator] ${symbol}: position+indication state unchanged, skipping cycle`)
+          return results // Early exit — no recalculation needed
+        }
+      }
+      if (!(this as any)._lastPosFingerprint) (this as any)._lastPosFingerprint = {}
+      if (!(this as any)._lastIndicationCount) (this as any)._lastIndicationCount = {}
+      ;(this as any)._lastPosFingerprint[symbol] = posFingerprint
+      ;(this as any)._lastIndicationCount[symbol] = indications.length
 
       // Refresh per-cycle trailing-matrix cache when this entry-point is
       // called standalone (the batch entry-point invalidates already).
@@ -1568,27 +1567,7 @@ export class StrategyCoordinator {
       // additional related variants flow uniformly through this filter).
       // CoordIndex.validRealKeys is populated here; Real tuner writes sizeDelta
       // / tunedAvgPF onto each record for O(1) access at Live dispatch.
-      // OPTIMIZATION: Skip Real evaluation if no Main sets and no active positions
-      // to evaluate (avoids P&F/DDT recalculation on idle cycles).
-      let realSets: StrategySet[] = []
-      let realResult: StrategyEvaluation
-      if (mainSets.length > 0 || posCtx.openPositions.length > 0) {
-        const realEval = await this.evaluateRealSets(symbol, mainSets, coordIndex)
-        realSets = realEval.sets
-        realResult = realEval.result
-      } else {
-        realResult = {
-          stage: "real",
-          symbol,
-          timestamp: new Date().toISOString(),
-          message: "real: skipped (no main sets, no open positions)",
-          created_sets: 0,
-          passed_sets: 0,
-          rejected_sets: 0,
-          avgProfitFactor: 0,
-          avgDrawdownTime: 0,
-        }
-      }
+      const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets, coordIndex)
       results.push(realResult)
 
       // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode).
