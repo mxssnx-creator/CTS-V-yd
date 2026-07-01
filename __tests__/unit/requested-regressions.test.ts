@@ -88,10 +88,11 @@ describe("requested regression guardrails", () => {
     expect(intentBlock).toContain('mode: hasCredentials ? "live" : "live_requested"')
   })
 
-  test("live-trade queued starts use settings namespace consumed by coordinator", () => {
+  test("live-trade queued starts use per-connection refresh requests consumed by coordinator", () => {
     const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
 
-    expect(source).toContain('setSettings("engine_coordinator:refresh_requested"')
+    expect(source).toContain("queueEngineRefreshRequest({")
+    expect(source).toContain("state_switch_version: stateSwitchVersion")
     expect(source).not.toContain('hset("engine_coordinator:refresh_requested"')
     expect(source).toContain('engineStatus = "queued"')
   })
@@ -306,15 +307,17 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Success Rate: ${tradeSuccessRate.toFixed(1)}%")
   })
 
-  test("startEngine retries stale cross-worker startup locks", () => {
+  test("startEngine leaves healthy cross-worker startup locks untouched", () => {
     const source = read("lib/trade-engine.ts")
     const lockBranch = source.slice(
       source.indexOf("Cannot start engine ${connectionId}"),
       source.indexOf("lockHandle = acquired.handle"),
     )
 
-    expect(lockBranch).toContain("forceBreakProgressionLock")
-    expect(lockBranch).not.toMatch(/return false\s+try/)
+    expect(lockBranch).toContain("Leaving existing owner untouched")
+    expect(lockBranch).toContain("return false")
+    expect(lockBranch).not.toContain("forceBreakProgressionLock")
+    expect(lockBranch).not.toContain("stopEngine(connectionId)")
   })
 
   test("startMissingEngines keeps the Main pipeline running without credentials", () => {

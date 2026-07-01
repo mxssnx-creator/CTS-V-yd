@@ -1,26 +1,30 @@
-const redisStore = new Map<string, unknown>()
-const clientStore = new Map<string, string>()
+import { StrategySetsProcessor, MAX_INPUT_MULTIPLIER } from "@/lib/strategy-sets-processor"
+import { loadCompactionConfig } from "@/lib/sets-compaction"
+import { setSettings } from "@/lib/redis-db"
 
-const getMock = jest.fn(async (key: string) => clientStore.get(key) ?? null)
-const setMock = jest.fn(async (key: string, value: string) => {
-  clientStore.set(key, value)
+const mockRedisStore = new Map<string, unknown>()
+const mockClientStore = new Map<string, string>()
+
+const mockGet = jest.fn(async (key: string) => mockClientStore.get(key) ?? null)
+const mockSet = jest.fn(async (key: string, value: string) => {
+  mockClientStore.set(key, value)
   return "OK"
 })
 
 jest.mock("@/lib/redis-db", () => ({
   initRedis: jest.fn(async () => undefined),
   getRedisClient: jest.fn(() => ({
-    get: getMock,
-    set: setMock,
+    get: mockGet,
+    set: mockSet,
   })),
   getSettings: jest.fn(async (key: string) => {
     if (key === "strategy_sets_config") {
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
-    return redisStore.get(key) ?? null
+    return mockRedisStore.get(key) ?? null
   }),
   setSettings: jest.fn(async (key: string, value: unknown) => {
-    redisStore.set(key, value)
+    mockRedisStore.set(key, value)
   }),
 }))
 
@@ -32,22 +36,57 @@ jest.mock("@/lib/broadcast-helpers", () => ({
   emitStrategyUpdate: jest.fn(),
 }))
 
+jest.mock("@/lib/sets-compaction", () => {
+  const actual = jest.requireActual("@/lib/sets-compaction")
+  return {
+    ...actual,
+    loadCompactionConfig: jest.fn(async (type: string) =>
+      type === "strategy.base"
+        ? { floor: 5000, thresholdPct: 20 }
+        : { floor: 250, thresholdPct: 20 },
+    ),
+  }
+})
+
 describe("StrategySetsProcessor", () => {
   beforeEach(() => {
     jest.clearAllMocks()
-    redisStore.clear()
-    clientStore.clear()
+    mockRedisStore.clear()
+    mockClientStore.clear()
+  })
+
+  test("uses resolved compaction floors when selecting top strategy candidates", async () => {
+    const processor = new StrategySetsProcessor("conn-1")
+    const candidateCount = 5000 * MAX_INPUT_MULTIPLIER + 25
+    const indications = Array.from({ length: candidateCount }, (_, i) => ({
+      type: "mock",
+      confidence: 0.9,
+      profitFactor: 2 + i / candidateCount,
+      metadata: {},
+    }))
+
+    await processor.processAllStrategySets("BTCUSDT", indications)
+
+    expect(loadCompactionConfig).toHaveBeenCalledWith("strategy.base")
+    expect(setSettings).toHaveBeenCalledWith(
+      "strategy_set:conn-1:BTCUSDT:base:stats",
+      expect.objectContaining({
+        totalCalculated: expect.any(Number),
+      }),
+    )
+    const baseStatsCall = (setSettings as jest.Mock).mock.calls.find(
+      ([key]) => key === "strategy_set:conn-1:BTCUSDT:base:stats",
+    )
+    expect(baseStatsCall?.[1].totalCalculated).toBeGreaterThanOrEqual(5000 * MAX_INPUT_MULTIPLIER)
   })
 
   test("awaits constructor-loaded non-default settings before processing candidates", async () => {
-    redisStore.set("strategy_sets_config", {
+    mockRedisStore.set("strategy_sets_config", {
       base: 300,
       main: 301,
       real: 302,
       live: 303,
     })
-
-    const { StrategySetsProcessor } = await import("@/lib/strategy-sets-processor")
 
     const indications = Array.from({ length: 400 }, (_, index) => ({
       type: `indication-${index}`,
@@ -60,10 +99,10 @@ describe("StrategySetsProcessor", () => {
     await processor.processAllStrategySets("BTC-USDT", indications)
 
     const baseEntries = JSON.parse(
-      clientStore.get("strategy_set:conn-strategy-settings:BTC-USDT:base") ?? "[]",
+      mockClientStore.get("strategy_set:conn-strategy-settings:BTC-USDT:base") ?? "[]",
     )
     const mainEntries = JSON.parse(
-      clientStore.get("strategy_set:conn-strategy-settings:BTC-USDT:main") ?? "[]",
+      mockClientStore.get("strategy_set:conn-strategy-settings:BTC-USDT:main") ?? "[]",
     )
 
     expect(baseEntries).toHaveLength(300)

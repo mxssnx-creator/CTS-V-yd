@@ -8,7 +8,7 @@ export interface TradeEngineStatusData {
   exchange: string
   enabled: boolean
   activelyUsing: boolean
-  status: "running" | "stopped" | "paused" | "error"
+  status: "running" | "stopped" | "paused" | "queued" | "error"
   trades: number
   positions: number
   progression: {
@@ -60,9 +60,12 @@ export function useTradeEngineStatus(options: UseTradeEngineStatusOptions = {}) 
       const data = await response.json()
       const statusArray = connectionId 
         ? (Array.isArray(data) ? data : [data])
-        : (Array.isArray(data) ? data : data.statuses || [])
+        : (Array.isArray(data) ? data : data.connections || data.statuses || [])
       
-      setStatuses(statusArray)
+      setStatuses(statusArray.map((status: any) => ({
+        ...status,
+        status: status.actualRuntimeStatus === "queued" ? "queued" : status.status,
+      })))
       setIsLoading(false)
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to fetch status"

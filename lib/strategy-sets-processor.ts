@@ -1,9 +1,7 @@
 /**
- * Strategy Sets Processor
- * Runs one logical intervaled strategy progression for each symbol.
- * Evaluates candidates once, then persists Base → Main → Real → Live in order.
- * Each stage can still use separate retention and compaction settings, but
- * stages are not separate processing loops.
+ * Independent Strategy Sets Processor
+ * Maintains separate 500-entry pools for each strategy calculation type
+ * Each type evaluates independently with own set configurations
  */
 
 import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
@@ -27,6 +25,8 @@ async function getCachedClient() {
 }
 
 // Default limits per strategy type (independently configurable)
+export const MAX_INPUT_MULTIPLIER = 2
+
 const DEFAULT_LIMITS = {
   base: 900,
   main: 300,
@@ -64,11 +64,8 @@ export interface StrategySet {
 
 export class StrategySetsProcessor {
   private connectionId: string
-  private settingsReady: Promise<void>
   private limits: StrategySetLimits = { ...DEFAULT_LIMITS }
-  private lastSettingsRefreshAt = 0
-  private settingsRefreshInFlight: Promise<void> | null = null
-  private readonly SETTINGS_REFRESH_INTERVAL_MS = 5_000
+  private explicitLimitOverrides: Partial<Record<keyof StrategySetLimits, boolean>> = {}
   private settingsReady: Promise<void>
   /**
    * Per-type compaction config cache. Refreshed lazily by the underlying
@@ -99,7 +96,7 @@ export class StrategySetsProcessor {
     // Set-Compaction override is set — detected by the resolved floor
     // being the hard-coded 250 default.
     const finalCfg: CompactionConfig =
-      cfg.floor === 250 && legacyLimit > 250
+      this.explicitLimitOverrides[type] || (cfg.floor === 250 && legacyLimit > 250)
         ? { floor: legacyLimit, thresholdPct: cfg.thresholdPct }
         : cfg
     this.compactionCfgs[ckey] = finalCfg
@@ -114,43 +111,26 @@ export class StrategySetsProcessor {
   private async loadSettings(): Promise<void> {
     try {
       const settings = await getSettings("strategy_sets_config")
-      const nextLimits: StrategySetLimits = { ...DEFAULT_LIMITS }
-
       if (settings) {
         // Load independent limits per type
-        if (settings.base) nextLimits.base = Number(settings.base)
-        if (settings.main) nextLimits.main = Number(settings.main)
-        if (settings.real) nextLimits.real = Number(settings.real)
-        if (settings.live) nextLimits.live = Number(settings.live)
+        if (settings.base) { this.limits.base = Number(settings.base); this.explicitLimitOverrides.base = true }
+        if (settings.main) { this.limits.main = Number(settings.main); this.explicitLimitOverrides.main = true }
+        if (settings.real) { this.limits.real = Number(settings.real); this.explicitLimitOverrides.real = true }
+        if (settings.live) { this.limits.live = Number(settings.live); this.explicitLimitOverrides.live = true }
         // Fallback: legacy maxEntriesPerSet applies weighted by type.
         if (settings.maxEntriesPerSet && !settings.base) {
           const limit = Number(settings.maxEntriesPerSet)
-          nextLimits.base = Math.max(300, Math.round(limit * 1.8))
-          nextLimits.main = Math.max(120, Math.round(limit * 0.8))
-          nextLimits.real = Math.max(60, Math.round(limit * 0.35))
-          nextLimits.live = Math.max(120, limit)
+          this.limits = {
+            base: Math.max(300, Math.round(limit * 1.8)),
+            main: Math.max(120, Math.round(limit * 0.8)),
+            real: Math.max(60, Math.round(limit * 0.35)),
+            live: Math.max(120, limit),
+          }
         }
       }
-
-      this.limits = nextLimits
-      this.compactionCfgs = {}
-      this.lastSettingsRefreshAt = Date.now()
     } catch (error) {
       console.error("[v0] [StrategySets] Failed to load settings:", error)
     }
-  }
-
-  private async refreshSettingsIfNeeded(): Promise<void> {
-    const now = Date.now()
-    if (now - this.lastSettingsRefreshAt < this.SETTINGS_REFRESH_INTERVAL_MS) return
-
-    if (!this.settingsRefreshInFlight) {
-      this.settingsRefreshInFlight = this.loadSettings().finally(() => {
-        this.settingsRefreshInFlight = null
-      })
-    }
-
-    await this.settingsRefreshInFlight
   }
 
   /** Get the limit for a specific strategy type */
@@ -163,11 +143,17 @@ export class StrategySetsProcessor {
    */
   async processAllStrategySets(symbol: string, indications: any[]): Promise<void> {
     try {
+      const startTime = Date.now()
       await this.settingsReady
 
-      const startTime = Date.now()
-
-      await this.refreshSettingsIfNeeded()
+      const [baseCfg, mainCfg, realCfg, liveCfg] = await Promise.all([
+        this.resolveCompaction("base"),
+        this.resolveCompaction("main"),
+        this.resolveCompaction("real"),
+        this.resolveCompaction("live"),
+      ])
+      const maxLimit = Math.max(baseCfg.floor, mainCfg.floor, realCfg.floor, liveCfg.floor)
+      const candidateLimit = Math.max(100, maxLimit * MAX_INPUT_MULTIPLIER)
 
       // Sort indications by profitFactor descending so that the best-performing
       // signals are processed first across all strategy type pools.
@@ -176,6 +162,9 @@ export class StrategySetsProcessor {
         (a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0)
       )
       const selectedTotal = sortedIndications.length
+      const sortedIndications = [...indications]
+        .sort((a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
+        .slice(0, candidateLimit)
 
       // Process all 4 strategy types in parallel with independent logic
       const [baseResults, mainResults, realResults, liveResults] = await Promise.all([
@@ -341,11 +330,15 @@ export class StrategySetsProcessor {
   /**
    * Batch-save multiple qualifying strategies to the same set pool in
    * ONE read-merge-compact-write transaction.
-   * Batch-save all qualifying strategies for a type-specific pool in one
-   * staged read-merge-compact-write transaction. The strategy-set pipeline
-   * accumulates qualifying entries in memory while evaluating indications,
-   * then writes the staged batch once per strategy type to avoid repeated
-   * Redis I/O and read-modify-write races on the same key.
+   *
+   * The original `saveStrategyToSet` was called once per qualifying
+   * indication in a sequential loop, paying the read-modify-write cost
+   * per entry. With ~hundreds of qualifying indications per symbol
+   * that was the dominant CPU + Redis cost of the strategy-sets stage.
+   *
+   * Parallelising the individual `saveStrategyToSet` calls would
+   * RACE because they all read-modify-write the SAME `setKey`. This
+   * batch path avoids the race AND collapses the I/O.
    */
   private async saveBatchToSet(
     setKey: string,
@@ -413,6 +406,86 @@ export class StrategySetsProcessor {
       }
     } catch (error) {
       console.error(`[v0] [StrategySets] Failed to batch-save ${strategies.length} entries to ${setKey}:`, error)
+    }
+  }
+
+  /**
+   * Save strategy to its independent set pool (max 250 entries)
+   */
+  private async saveStrategyToSet(
+    setKey: string,
+    strategy: any,
+    strategyType: string,
+    indicationType: string
+  ): Promise<void> {
+    try {
+      const client = await getCachedClient()
+      let entries: any[] = []
+
+      const existing = await client.get(setKey)
+      if (existing) {
+        try {
+          entries = JSON.parse(existing)
+        } catch {
+          entries = []
+        }
+      }
+
+      // Newest-at-last (per spec) — use push, not unshift. The "best"
+      // compactor below sorts by PF when the buffer crosses the
+      // ceiling, so insertion order doesn't strictly matter for
+      // correctness, but staying chronological keeps the pre-compaction
+      // shape inspectable in admin tools.
+      entries.push({
+        id: `${strategyType}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        profitFactor: strategy.profitFactor,
+        confidence: strategy.confidence,
+        indicationType,
+        strategyType,
+        metadata: strategy.metadata,
+      })
+
+      // ── Debounced threshold compaction (mode: "best") ────────────────
+      // Strategy pools care about *quality* — when the buffer overflows
+      // we want to keep the highest-PF entries, not the most recent
+      // ones. The compactor stable-sorts by PF desc, keeps the top
+      // `floor`, then re-sorts by timestamp ascending so downstream
+      // consumers preserve chronological semantics.
+      //
+      // The pre-existing "sort + slice on every call" pattern was the
+      // dominant CPU cost on the strategy pipeline; the new debounced
+      // policy only pays the sort once every (ceiling - floor) calls.
+      const cfg = await this.resolveCompaction(strategyType as keyof StrategySetLimits)
+      entries = compact(entries, cfg, "best")
+      const maxEntries = cfg.floor
+
+      // Save back
+      await client.set(setKey, JSON.stringify(entries))
+
+      // Update stats
+      const statsKey = `${setKey}:stats`
+      const prevStats = (await getSettings(statsKey)) || {}
+      const stats = {
+        maxEntries: maxEntries,
+        currentEntries: entries.length,
+        totalCalculated: (prevStats.totalCalculated || 0) + 1,
+        totalQualified: (prevStats.totalQualified || 0) + 1,
+        avgProfitFactor: entries.reduce((sum: number, e: any) => sum + e.profitFactor, 0) / entries.length,
+        lastCalculated: new Date().toISOString(),
+      }
+      await setSettings(statsKey, stats)
+
+      // Broadcast strategy update to connected clients
+      emitStrategyUpdate(this.connectionId, {
+        id: entries[0].id,
+        symbol: setKey.split(':')[2], // Extract symbol from setKey
+        profit_factor: strategy.profitFactor || 0,
+        win_rate: strategy.confidence || 0,
+        active_positions: entries.length,
+      })
+    } catch (error) {
+      console.error(`[v0] [StrategySets] Failed to save to ${setKey}:`, error)
     }
   }
 

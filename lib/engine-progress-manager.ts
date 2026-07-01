@@ -153,6 +153,9 @@ export interface EngineProgressState {
 export class EngineProgressManager {
   private connectionId: string
   private state: EngineProgressState
+  private lastSaveAt = 0
+  private pendingSave: Promise<void> | null = null
+  private static readonly SAVE_THROTTLE_MS = 500
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -245,10 +248,24 @@ export class EngineProgressManager {
   }
 
   async saveState(): Promise<void> {
+    const now = Date.now()
+    if (this.pendingSave) return this.pendingSave
+    if (now - this.lastSaveAt < EngineProgressManager.SAVE_THROTTLE_MS) {
+      this.pendingSave = new Promise((resolve) => {
+        const delay = EngineProgressManager.SAVE_THROTTLE_MS - (now - this.lastSaveAt)
+        setTimeout(() => {
+          this.pendingSave = null
+          this.saveState().then(resolve).catch(() => resolve())
+        }, delay).unref?.()
+      })
+      return this.pendingSave
+    }
+
     try {
       const client = getRedisClient()
       const key = `engine_progress:${this.connectionId}`
       await client.set(key, JSON.stringify(this.state), { EX: 86400 }) // 24h TTL
+      this.lastSaveAt = Date.now()
     } catch (error) {
       console.error(`[ProgressManager] Failed to save state for ${this.connectionId}:`, error)
     }
@@ -341,8 +358,8 @@ export class EngineProgressManager {
     }
     const sp = this.state.symbols[symbol]
     const wasConnected = sp.wsConnected
-    const messageDelta = Math.max(0, messages - sp.wsMessagesReceived)
-    const errorDelta = Math.max(0, errors - sp.wsErrors)
+    const messageDelta = Math.max(0, messages - (sp.wsMessagesReceived || 0))
+    const errorDelta = Math.max(0, errors - (sp.wsErrors || 0))
 
     this.state.wsMessagesTotal += messageDelta
     this.state.wsErrorsTotal += errorDelta
@@ -356,7 +373,6 @@ export class EngineProgressManager {
     sp.wsMessagesReceived = messages
     sp.wsErrors = errors
     sp.wsLastUpdate = new Date().toISOString()
-
     this.state.wsLastUpdate = new Date().toISOString()
     await this.saveState()
   }
@@ -657,14 +673,15 @@ export class EngineProgressManager {
 // Global Manager Registry
 // ============================================
 
-const g = globalThis as unknown as {
+const progressGlobals = globalThis as unknown as {
   __engineProgressManagers?: Map<string, EngineProgressManager>
 }
 
 // Keep managers process-singleton across module reloads (for example Next.js HMR).
 // This reduces same-process stale manager duplication while Redis persistence is
 // migrated to hash/delta updates for cross-worker overwrite safety.
-const managerRegistry = g.__engineProgressManagers ??= new Map<string, EngineProgressManager>()
+const managerRegistry =
+  progressGlobals.__engineProgressManagers ?? (progressGlobals.__engineProgressManagers = new Map<string, EngineProgressManager>())
 
 export function getProgressManager(connectionId: string): EngineProgressManager {
   if (!managerRegistry.has(connectionId)) {

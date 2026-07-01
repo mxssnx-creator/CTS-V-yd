@@ -68,15 +68,9 @@ export async function GET(
     }
 
     // DB flags — the canonical source of truth for the slider `checked` state.
-    // Enable flag: true when either is_enabled_dashboard OR is_active_inserted
-    // is set. Migrations sometimes seed only is_active_inserted without setting
-    // is_enabled_dashboard, leaving the Enable switch showing "off" while the
-    // engine is actually running. Using OR here means the switch correctly shows
-    // "on" whenever the connection is in the active panel regardless of which
-    // flag path set it. Both flags are written in sync by toggle-dashboard after
-    // the first manual toggle.
+    // is_active_inserted / is_assigned are panel assignment only;
+    // is_enabled_dashboard is the explicit processing switch.
     const flagEnabled = toBoolean((connection as any).is_enabled_dashboard)
-                     || toBoolean((connection as any).is_active_inserted)
     // UI sliders represent the operator's requested state, not only the
     // immediately executable/effective flag. When credentials are missing the
     // live-trade endpoint preserves `live_trade_requested=1` while keeping

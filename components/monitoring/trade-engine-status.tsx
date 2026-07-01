@@ -49,9 +49,10 @@ export function TradeEngineStatus() {
   const [isLoading, setIsLoading] = useState(false)
   const [globalStatus, setGlobalStatus] = useState<{
     isRunning: boolean
+    queued: boolean
     activeEngines: number
     totalConnections: number
-  }>({ isRunning: false, activeEngines: 0, totalConnections: 0 })
+  }>({ isRunning: false, queued: false, activeEngines: 0, totalConnections: 0 })
 
   const loadEnginesStatus = async () => {
     setIsLoading(true)
@@ -61,7 +62,8 @@ export function TradeEngineStatus() {
       if (globalResponse.ok) {
         const globalData = await globalResponse.json()
         setGlobalStatus({
-          isRunning: globalData.isRunning,
+          isRunning: globalData.actualRuntimeStatus === "running" || globalData.running === true,
+          queued: globalData.actualRuntimeStatus === "queued",
           activeEngines: globalData.activeEngineCount,
           totalConnections: globalData.connections?.length || 0,
         })
@@ -249,7 +251,7 @@ export function TradeEngineStatus() {
               <span className="text-sm font-medium">Status</span>
               <div>
                 <Badge variant={globalStatus.isRunning ? "default" : "secondary"}>
-                  {globalStatus.isRunning ? "RUNNING" : "STOPPED"}
+                  {globalStatus.isRunning ? "RUNNING" : (globalStatus.queued ? "QUEUED / WAITING FOR WORKER" : "STOPPED")}
                 </Badge>
               </div>
             </div>
