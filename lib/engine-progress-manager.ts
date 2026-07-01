@@ -323,15 +323,6 @@ export class EngineProgressManager {
     sp.prehistoricDuration = duration
     sp.prehistoricLoaded = completed
 
-    if (completed && !wasLoaded) {
-      this.state.prehistoricLoadedSymbols++
-    } else if (!completed && wasLoaded) {
-      this.state.prehistoricLoadedSymbols = Math.max(0, this.state.prehistoricLoadedSymbols - 1)
-    }
-    this.state.prehistoricTotalCandles = Math.max(0, this.state.prehistoricTotalCandles + candles - previousCandles)
-    this.state.prehistoricErrors = Math.max(0, this.state.prehistoricErrors + errors - previousErrors)
-    this.state.prehistoricDuration = Math.max(0, this.state.prehistoricDuration + duration - previousDuration)
-
     this.addLog('info', `Symbol ${symbol}: ${candles} candles loaded in ${duration}ms (${errors} errors)`)
     await this.saveState()
   }
@@ -366,11 +357,9 @@ export class EngineProgressManager {
       this.state.symbols[symbol] = this.createSymbolProgress(symbol)
     }
     const sp = this.state.symbols[symbol]
+    const wasConnected = sp.wsConnected
     const messageDelta = Math.max(0, messages - (sp.wsMessagesReceived || 0))
     const errorDelta = Math.max(0, errors - (sp.wsErrors || 0))
-    const wasConnected = sp.wsConnected
-    const messageDelta = Math.max(0, messages - sp.wsMessagesReceived)
-    const errorDelta = Math.max(0, errors - sp.wsErrors)
 
     this.state.wsMessagesTotal += messageDelta
     this.state.wsErrorsTotal += errorDelta
@@ -384,15 +373,6 @@ export class EngineProgressManager {
     sp.wsMessagesReceived = messages
     sp.wsErrors = errors
     sp.wsLastUpdate = new Date().toISOString()
-
-    this.state.wsMessagesTotal += messageDelta
-    this.state.wsErrorsTotal += errorDelta
-    if (connected && !sp.wsConnected) {
-      this.state.wsSymbolsConnected++
-    } else if (!connected && sp.wsConnected) {
-      this.state.wsSymbolsConnected = Math.max(0, this.state.wsSymbolsConnected - 1)
-    }
-    sp.wsConnected = connected
     this.state.wsLastUpdate = new Date().toISOString()
     await this.saveState()
   }
@@ -696,16 +676,12 @@ export class EngineProgressManager {
 const progressGlobals = globalThis as unknown as {
   __engineProgressManagers?: Map<string, EngineProgressManager>
 }
-const managerRegistry =
-  progressGlobals.__engineProgressManagers ?? (progressGlobals.__engineProgressManagers = new Map<string, EngineProgressManager>())
-const g = globalThis as unknown as {
-  __engineProgressManagers?: Map<string, EngineProgressManager>
-}
 
 // Keep managers process-singleton across module reloads (for example Next.js HMR).
 // This reduces same-process stale manager duplication while Redis persistence is
 // migrated to hash/delta updates for cross-worker overwrite safety.
-const managerRegistry = g.__engineProgressManagers ??= new Map<string, EngineProgressManager>()
+const managerRegistry =
+  progressGlobals.__engineProgressManagers ?? (progressGlobals.__engineProgressManagers = new Map<string, EngineProgressManager>())
 
 export function getProgressManager(connectionId: string): EngineProgressManager {
   if (!managerRegistry.has(connectionId)) {
