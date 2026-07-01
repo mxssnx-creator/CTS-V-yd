@@ -48,6 +48,7 @@ import {
   // `lib/trade-engine/progression-lock.ts` for the full schema.
   acquireProgressionLock,
   forceBreakProgressionLock,
+  releaseProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
 
@@ -205,17 +206,23 @@ export class GlobalTradeEngineCoordinator {
       return false
     }
 
+    // Register the same-process start mutex before any awaited work so two
+    // concurrent calls for the same connection cannot both progress into the
+    // distributed-lock recovery path and disrupt each other.
+    if (this.startingEngines.has(connectionId)) {
+      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
+      return false
+    }
+    this.startingEngines.add(connectionId)
+    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
+
+    let lockHandle: LockHandle | undefined
+    try {
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
 
     if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
-      return false
-    }
-
-    // Step 1: Check if already starting
-    if (this.startingEngines.has(connectionId)) {
-      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
       return false
     }
 
@@ -255,12 +262,6 @@ export class GlobalTradeEngineCoordinator {
       console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
     }
 
-    // Step 3: Add to lock set
-    this.startingEngines.add(connectionId)
-    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
-
-    let lockHandle: LockHandle | undefined
-    try {
       // ── Step 3b: Acquire the cross-process ownership lock ──────────
       // This is the SECOND guard — the in-process `startingEngines`
       // set blocks duplicate starts within this Node worker; the
@@ -281,40 +282,9 @@ export class GlobalTradeEngineCoordinator {
       })
       if (!acquired.acquired || !acquired.handle) {
         console.warn(
-          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
+          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Leaving existing owner untouched.`,
         )
-        try {
-          const { getRedisClient } = await import("@/lib/redis-db")
-          const client = getRedisClient()
-          await Promise.all([
-            client.hset(`trade_engine_state:${connectionId}`, {
-              stop_requested: "1",
-              stop_reason: "superseded_by_new_start",
-              stop_requested_at: new Date().toISOString(),
-            }),
-            client.hset(`progression:${connectionId}`, {
-              stop_requested: "1",
-              stop_reason: "superseded_by_new_start",
-              stop_requested_at: new Date().toISOString(),
-            }),
-          ])
-        } catch { /* best-effort signal for the previous worker */ }
-        try {
-          await this.stopEngine(connectionId)
-        } catch { /* local worker may not own the previous engine */ }
-        try {
-          await forceBreakProgressionLock(connectionId)
-        } catch { /* TTL fallback */ }
-        acquired = await acquireProgressionLock(connectionId, undefined, {
-          selfOwnedIfAlive: false,
-          staleAfterMs: 0,
-        })
-        if (!acquired.acquired || !acquired.handle) {
-          console.warn(
-            `[v0] [STARTUP LOCK] Retry failed for ${connectionId}; still owned by ${acquired.existingOwner ?? "unknown"}.`,
-          )
-          return false
-        }
+        return false
       }
       lockHandle = acquired.handle
       console.log(
@@ -370,13 +340,12 @@ export class GlobalTradeEngineCoordinator {
       } catch { /* non-critical — dashboard can lag */ }
       return true
     } catch (err) {
-      // On startup failure, give the lock back so a retry can succeed
-      // without waiting for the TTL to expire. We use force-break
-      // here (NOT release-with-owner) because the manager may have
-      // partially started, and we want a clean slate.
+      // On startup failure, release only the lock handle acquired by this
+      // start attempt. Never force-break by connection id here; another owner
+      // may have legitimately taken over after this attempt failed.
       if (lockHandle) {
         try {
-          await forceBreakProgressionLock(connectionId)
+          await releaseProgressionLock(connectionId, lockHandle)
         } catch {
           /* TTL will reclaim */
         }
@@ -410,7 +379,26 @@ export class GlobalTradeEngineCoordinator {
       const manager = this.engineManagers.get(connectionId)
 
       if (!manager) {
-        console.log(`[v0] No in-memory engine found for connection: ${connectionId}; running Redis cleanup anyway`)
+        const { getRedisClient } = await import("@/lib/redis-db")
+        const client = getRedisClient()
+        const remoteState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+        const remoteHeartbeat = Number((remoteState as any)?.last_processor_heartbeat || 0)
+        const remoteHeartbeatFresh =
+          Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
+        if (remoteHeartbeatFresh) {
+          const stopPayload = {
+            stop_requested: "1",
+            stop_reason: "operator_or_coordinator_stop_requested",
+            stop_requested_at: new Date().toISOString(),
+          }
+          await Promise.all([
+            client.hset(`trade_engine_state:${connectionId}`, stopPayload).catch(() => 0),
+            client.hset(`progression:${connectionId}`, stopPayload).catch(() => 0),
+          ])
+          console.log(`[v0] No local engine for ${connectionId}; remote owner has fresh heartbeat, wrote stop request without clearing runtime state`)
+          return
+        }
+        console.log(`[v0] No in-memory engine found for connection: ${connectionId}; remote owner is stale/missing, running Redis cleanup`)
         await this.cleanupStoppedRuntimeState(connectionId)
         return
       }
@@ -513,11 +501,6 @@ export class GlobalTradeEngineCoordinator {
     }
     this.escalatingEngines.add(connectionId)
     try {
-      // Pre-emptively break the progression lock so the restart can
-      // acquire a fresh slot without waiting for the TTL.
-      try {
-        await forceBreakProgressionLock(connectionId)
-      } catch { /* TTL will reclaim */ }
       try {
         await this.stopEngine(connectionId)
       } catch (stopErr) {
@@ -821,17 +804,9 @@ export class GlobalTradeEngineCoordinator {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
 
-      // ── DEV ONE-ENGINE OOM GUARD ──────────────────────────────────────────
-      // This is the single chokepoint through which BOTH the auto-start healing
-      // sweep and the operator Start route request engines. On the low-RAM dev
-      // VM (4.39 GB, no swap) two engines running their prehistoric StrategySet
-      // pass at once reliably OOM-kills the worker. Both bingx-x01 and bybit-x03
-      // are always inited + visible, but in DEVELOPMENT only ONE engine may run
-      // Process all connections consistently in both dev and prod.
+      // Process all enabled connections consistently in both dev and prod.
       // Use connection enable/disable settings (is_enabled_dashboard) to manage
       // scope instead of env-based filtering. Dev-only filtering masked prod bugs.
-        connections = capped
-      }
 
       if (!(await this.isGlobalCoordinatorEnabled("startMissingEngines"))) {
         return 0
