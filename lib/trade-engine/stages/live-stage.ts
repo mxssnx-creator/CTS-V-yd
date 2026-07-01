@@ -2005,7 +2005,19 @@ async function updateProtectionOrders(
     }
   })()
 
-  await Promise.all([slLeg, tpLeg])
+  // Use allSettled to prevent one failed leg from crashing both SL and TP.
+  // Individually catch errors for graceful degradation instead of crashing.
+  await Promise.allSettled([slLeg, tpLeg]).then((results) => {
+    results.forEach((result, idx) => {
+      if (result.status === "rejected") {
+        const legName = idx === 0 ? "StopLoss" : "TakeProfit"
+        console.warn(
+          `${LOG_PREFIX} armProtection: ${legName} leg failed:`,
+          result.reason instanceof Error ? result.reason.message : String(result.reason),
+        )
+      }
+    })
+  })
 
   // Record the qty we armed for only when at least one leg was actually
   // (re-)placed on the exchange. A liveness-verify clear sets result.changed
@@ -3946,7 +3958,7 @@ export async function closeLivePosition(
           // single timestamp-retry re-sync inside cancelOrder.
           const closePromise = exchangeConnector.closePosition(position.symbol, position.direction)
           const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Exchange close timeout after 8s")), 8000),
+            setTimeout(() => reject(new Error("Exchange close timeout after 20s")), 20_000),
           )
           const r = (await Promise.race([closePromise, timeoutPromise])) as
             | { success?: boolean; error?: string }
@@ -5743,7 +5755,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
       }
-    // ─�� end orphan adoption ───────────────────────────────────────────
+    // ─�� end orphan adoption ────────────────────��──────────────────────
 
     if (openPositions.length === 0) {
       // Nothing to sync after adoption — fire-and-forget the TTL expiry
@@ -5800,22 +5812,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // ── Parallelised per-position sync (bounded concurrency) ────────────
     // Target: all positions complete in <1 s total.
     //
-    // SYNC_CONCURRENCY=12: with tightened per-call timeouts (getOrder 3 s,
-    // placeStop 5 s) and typical ≤10 open positions, all positions start
-    // concurrently (ceil(10/12)=1 pass). Every position's calls run in
-    // parallel within updateProtectionOrders' own Promise.all(slLeg, tpLeg)
-    // — the outer pool just bounds the total fanout to prevent rate-limit
-    // spikes on venue buckets (BingX: 100 req/s sustained, 200 burst).
-    //
-    // SYNC_PER_POS_TIMEOUT_MS=4 s: the tightest single-call timeout is
-    // placeStop at 5 s, but within processOneSync the heaviest path is
-    // fill-detect (getOrder 3 s) + updateProtectionOrders (parallel cancel
-    // 4 s + place 5 s, but both legs run concurrently so ~5 s total).
-    // 6 s gives that path 1 s of slack. Any position that can't complete
-    // in 6 s on a working exchange has already timed out at the inner
-    // call level and logged a warning.
+    // SYNC_CONCURRENCY: Max concurrent positions to sync in parallel.
+    // Bounds total fanout to prevent rate-limit spikes on venue buckets.
+    // BingX: 100 req/s sustained, 200 burst. With ≤10 open positions,
+    // all positions start concurrently (ceil(10/12)=1 pass).
     const SYNC_CONCURRENCY = 12
-    const SYNC_PER_POS_TIMEOUT_MS = 6_000
+    
+    // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout for syncWithExchange.
+    // BingX can take 10-20 seconds on slow operations. Previously 6s but was
+    // causing timeouts and stalls. Increased to 20s to handle real exchange latency.
+    const SYNC_PER_POS_TIMEOUT_MS = 20_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
@@ -6368,7 +6374,7 @@ export async function recalculateAndApplySLTP(
       )
     }
 
-    // ── Bug-3 fix: fetch live order IDs and pass to updateProtectionOrders ───
+    // ── Bug-3 fix: fetch live order IDs and pass to updateProtectionOrders ��──
     // Without `liveOrderIds` the liveness-verification block in
     // `updateProtectionOrders` is skipped entirely (guarded by
     // `if (liveOrderIds && …)`). If a SL/TP order silently disappeared on the
