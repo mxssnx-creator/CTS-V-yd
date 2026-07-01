@@ -24,7 +24,7 @@ export async function GET() {
     const _isOn = (v: unknown) => v === true || v === 1 || v === "1" || v === "true"
     const activeConnections = connections.filter((c: any) => {
       const assigned = _isOn(c.is_active_inserted) || _isOn(c.is_assigned) || _isOn(c.is_dashboard_inserted)
-      const enabled  = _isOn(c.is_enabled) || _isOn(c.enabled) || _isOn(c.is_enabled_dashboard)
+      const enabled  = _isOn(c.is_enabled_dashboard)
       return assigned && enabled
     })
 

@@ -3258,8 +3258,9 @@ export async function getActiveConnectionsForEngine(): Promise<any[]> {
     if (key.includes(":settings") || key.includes(":state")) continue
     const data = await client.hgetall(key)
     if (data && Object.keys(data).length > 0) {
-      // Check if connection is active for engine (is_active_inserted = 1)
-      if (isEnabledFlag(data.is_active_inserted) || isEnabledFlag(data.is_active)) {
+      // Check if connection is assigned/visible in the Main/Active panel.
+      // Processing is gated separately by is_enabled_dashboard.
+      if (isEnabledFlag(data.is_active_inserted) || isEnabledFlag(data.is_assigned) || isEnabledFlag(data.is_dashboard_inserted)) {
         connections.push({
           id: key.replace("connection:", ""),
           ...data,
@@ -3652,21 +3653,18 @@ export async function getEnabledConnections(): Promise<any[]> {
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
   return allConnections.filter(conn => {
-    // A connection is eligible for the engine when it is both:
-    // 1. Assigned/inserted into the active panel  
-    // 2. Enabled — either the base is_enabled flag OR the dashboard toggle
-    //    (is_enabled_dashboard). The dashboard toggle is what migration 021
-    //    and the quickstart route write, so checking it here means the engine
-    //    starts as soon as the user enables a connection via the UI or runs
-    //    quickstart — no extra Redis flag writes needed.
+    // A connection is eligible for engine processing only when it is both:
+    // 1. Assigned/visible in the Main/Active panel. Assignment remains based
+    //    on the assignment/visibility fields so cards do not disappear when
+    //    processing is disabled.
+    // 2. Processing-enabled via the dashboard toggle. Base `is_enabled` /
+    //    legacy `enabled` are settings-availability flags only and must not
+    //    start engine processing.
     const isAssigned =
       isEnabledFlag(conn.is_active_inserted) ||
       isEnabledFlag(conn.is_assigned) ||
       isEnabledFlag(conn.is_dashboard_inserted)
-    const isEnabled =
-      isEnabledFlag(conn.is_enabled) ||
-      isEnabledFlag(conn.enabled) ||
-      isEnabledFlag(conn.is_enabled_dashboard)
+    const isEnabled = isEnabledFlag(conn.is_enabled_dashboard)
     return isAssigned && isEnabled
   })
 }
