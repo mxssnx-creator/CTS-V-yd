@@ -155,7 +155,8 @@ export class ComprehensiveErrorHandler {
     options: RecoveryOptions
   ): Promise<any> {
     const maxRetries = options.maxRetries ?? 3
-    const baseDelay = options.retryDelayMs ?? 1000
+    // CRITICAL: Reduced from 1000ms to 100ms base delay for second-trading (must complete within 1s)
+    const baseDelay = options.retryDelayMs ?? 100
     const fn = options.retryFn
 
     // If no retryFn was supplied the caller cannot be retried — fall back
@@ -169,7 +170,8 @@ export class ComprehensiveErrorHandler {
     }
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      const delay = baseDelay * Math.pow(2, attempt - 1)
+      // CRITICAL: Cap delay at 500ms total (exponential backoff: 100, 200, 400, 500)
+      const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), 500)
 
       logger.info(
         `Retry attempt ${attempt}/${maxRetries} for ${context.operation}`,
