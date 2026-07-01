@@ -824,6 +824,9 @@ export class GlobalTradeEngineCoordinator {
       // Process all assigned/enabled connections consistently in both dev and prod.
       // Connection enablement settings (is_enabled_dashboard) define scope;
       // env-based filtering previously masked production coordinator bugs.
+      // Process all connections consistently in both dev and prod.
+      // Use connection enable/disable settings (is_enabled_dashboard) to manage
+      // scope instead of env-based filtering. Dev-only filtering masked prod bugs.
 
       if (!(await this.isGlobalCoordinatorEnabled("startMissingEngines"))) {
         return 0
