@@ -90,7 +90,7 @@ export interface ComponentHealth {
  */
 export class GlobalTradeEngineCoordinator {
   private engineManagers: Map<string, TradeEngineManager> = new Map()
-  private startingEngines = new Set<string>()  // PHASE 1 FIX: Startup lock to prevent duplicate starts
+  private startingEngines = new Map<string, Promise<boolean>>()  // PHASE 1 FIX: Startup lock to prevent duplicate starts
   private stoppingEngines = new Set<string>()  // PHASE 2 FIX: Stop lock to prevent race conditions
   private isGloballyRunning = false
   private isPaused = false
@@ -188,6 +188,27 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
   async startEngine(connectionId: string, config: EngineConfig): Promise<boolean> {
+    const existingStart = this.startingEngines.get(connectionId)
+    if (existingStart) {
+      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}; awaiting existing start request`)
+      return existingStart
+    }
+
+    const startPromise = Promise.resolve()
+      .then(() => this.startEngineWithRegisteredMutex(connectionId, config))
+      .finally(() => {
+        if (this.startingEngines.get(connectionId) === startPromise) {
+          this.startingEngines.delete(connectionId)
+          console.log(`[v0] [STARTUP LOCK] Removed ${connectionId} from startup lock`)
+        }
+      })
+
+    this.startingEngines.set(connectionId, startPromise)
+    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
+    return startPromise
+  }
+
+  private async startEngineWithRegisteredMutex(connectionId: string, config: EngineConfig): Promise<boolean> {
     const inProcessStartAllowed =
       process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" ||
       (config as any)?.allowInProcessStart === true
@@ -210,12 +231,6 @@ export class GlobalTradeEngineCoordinator {
     this.ensureBackgroundTimers()
 
     if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
-      return false
-    }
-
-    // Step 1: Check if already starting
-    if (this.startingEngines.has(connectionId)) {
-      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
       return false
     }
 
@@ -254,10 +269,6 @@ export class GlobalTradeEngineCoordinator {
     } catch (e) {
       console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
     }
-
-    // Step 3: Add to lock set
-    this.startingEngines.add(connectionId)
-    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
 
     let lockHandle: LockHandle | undefined
     try {
@@ -382,10 +393,6 @@ export class GlobalTradeEngineCoordinator {
         }
       }
       throw err
-    } finally {
-      // Step 6: Remove from lock set (always, even on error)
-      this.startingEngines.delete(connectionId)
-      console.log(`[v0] [STARTUP LOCK] Removed ${connectionId} from startup lock`)
     }
   }
 
