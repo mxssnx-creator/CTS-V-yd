@@ -166,11 +166,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     // Save connection state only if state changed. Stamp a per-connection
     // switch generation so status/progression readers and coordinator workers
     // can distinguish this operator intent from stale queued start/stop work.
-    let stateSwitchVersion: string | undefined
     if (needsUpdate && updatedConnection) {
       stateSwitchVersion = `${Date.now()}`
-    if (needsUpdate && updatedConnection) {
-      const stateSwitchVersion = `${Date.now()}`
       updatedConnection = {
         ...updatedConnection,
         state_switch_version: stateSwitchVersion,

@@ -261,15 +261,13 @@ export async function GET() {
           workerDiagnostic.error ||
           (isGloballyRunning && activeEngineCount === 0
             ? "Global Redis operator intent is running, but no local manager or fresh distributed processor heartbeat is attached. In production this means the UI worker only has operator intent; a dedicated opted-in engine worker/cron heartbeat is not actually running."
-            : null,
+            : null),
         hint:
           process.env.ENABLE_TRADE_ENGINE_AUTOSTART !== "1" && activeEngineCount === 0
             ? "ENABLE_TRADE_ENGINE_AUTOSTART is not set on this process and no active worker heartbeat exists. Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on exactly one dedicated worker/process to run engine loops."
             : null,
-        requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 (and ENABLE_IN_PROCESS_CONTINUITY=1 for in-process timers) on exactly one dedicated worker/process",
-            : null),
-        worker: workerDiagnostic,
         requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 on exactly one dedicated worker/process; add ENABLE_IN_PROCESS_CONTINUITY=1 on that same process only when in-process continuity timers are expected",
+        worker: workerDiagnostic,
       },
       connections: connectionStatuses,
       summary,
