@@ -134,6 +134,7 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
     const { initRedis, getRedisClient, getAllConnections } = await loadRedisDb()
     const { loadSettingsAsync } = await import("./settings-storage")
     const { isConnectionEligibleForEngine } = await import("./connection-state-utils")
+    const { writeTradeEngineWorkerHeartbeat } = await import("./trade-engine-worker-heartbeat")
 
     await initRedis()
     const client = getRedisClient()
@@ -170,6 +171,12 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
 
     const coordinator = await loadTradeEngineCoordinator()
     const startedCount = await coordinator.startMissingEngines(eligibleConnections)
+
+    const activeEngineCount = typeof coordinator.getActiveEngineCount === "function" ? coordinator.getActiveEngineCount() : 0
+    if (coordinator.isRunning() || activeEngineCount > 0) {
+      await writeTradeEngineWorkerHeartbeat(client, `auto-start:${process.pid}`)
+    }
+
     if (startedCount > 0 || isStartup) {
       console.log(
         `[v0] [AutoStart] Healing sweep: ${startedCount} engines started ` +

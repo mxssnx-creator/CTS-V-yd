@@ -6,6 +6,7 @@ import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { isTruthyFlag, parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
+import { buildMissingTradeEngineWorkerDiagnostic } from "@/lib/trade-engine-worker-heartbeat"
 
 // POST toggle connection active status (inserted/enabled) - INDEPENDENT from Settings
 // When enabling, also triggers engine start for this connection
@@ -151,6 +152,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     // Trigger engine action based on toggle state
     let engineStatus = "unchanged"
+    let engineWarning: string | null = null
     if (engineAction === "start") {
       try {
         // Log progression event for UI feedback
@@ -256,6 +258,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               exchange: connection.exchange,
               hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
             })
+            const queuedGlobalState = await toggleClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) as Record<string, string>
+            const workerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(queuedGlobalState)
+            engineWarning = workerDiagnostic.error
             engineStatus = "queued"
             console.log(
               `[v0] [Toggle] Engine start queued for ${connection.name}; this UI worker is not opted in for local engine loops`,
@@ -269,6 +274,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             connectionId: resolvedId,
             action: "start",
           })
+          const fallbackClient = getRedisClient()
+          const fallbackGlobalState = await fallbackClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) as Record<string, string>
+          const workerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(fallbackGlobalState)
+          engineWarning = workerDiagnostic.error
           engineStatus = "queued"
         }
           
@@ -374,6 +383,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       engine: {
         action: engineAction,
         status: engineStatus,
+        warning: engineWarning,
       },
       progressionUrl: `/api/connections/progression/${resolvedId}`,
     })
