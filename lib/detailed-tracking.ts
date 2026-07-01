@@ -275,26 +275,36 @@ export async function getIndicationTracking(
   const progKey = `progression:${connectionId}`
   const settingsKey = `connection_settings:${connectionId}`
 
-  const [progHash, settingsHash, activeHash, w5Hash, w60Hash] = await Promise.all([
+  const [progHash, settingsHash, setActiveHash, setW5Hash, setW60Hash] = await Promise.all([
     client.hgetall(progKey).catch(() => ({})),
     client.hgetall(settingsKey).catch(() => ({})),
-    client.hgetall(`indications_active:${connectionId}`).catch(() => ({})),
-    client.hgetall(`indications_window:${connectionId}:last5`).catch(() => ({})),
-    client.hgetall(`indications_window:${connectionId}:last60min`).catch(() => ({})),
+    client.hgetall(`indication_sets_active:${connectionId}`).catch(() => ({})),
+    client.hgetall(`indication_sets_window:${connectionId}:last5`).catch(() => ({})),
+    client.hgetall(`indication_sets_window:${connectionId}:last60min`).catch(() => ({})),
   ])
 
   const prog = (progHash || {}) as Record<string, string>
   const settings = (settingsHash || {}) as Record<string, string>
-  // indications_active:{id} fields are written as "{symbol}:{type}" (e.g. "BTCUSDT:direction").
+  // indication_sets_active:{id} fields are written as "{symbol}:{type}" (e.g. "BTCUSDT:direction").
+  // Do not read the raw indications_active:{id} namespace here: raw signal
+  // processors and set processors used to share that key in production, which
+  // mixed 0/1 raw signal counts with 30+ set-qualified config counts. This
+  // endpoint is the set-detail reader, so it uses only indication_sets_*.
   // Aggregate by type across all symbols using lastIndexOf(":") as the split point — same
   // pattern as stats/route.ts so both readers are consistent.
-  const active = (activeHash || {}) as Record<string, string>
+  const active = (setActiveHash || {}) as Record<string, string>
 
   const types = INDICATION_TYPES
   const byType = aggregateWindowByType(active)
   const totalActive = Object.values(byType).reduce((s, v) => s + v, 0)
 
   // ── Windowed evaluated counts (Last 5 cycles / Last 60 min) ─────────────
+  // Source: indication_sets_window:{id}:last5 / last60min hashes written by
+  // the set processor per type. These are intentionally separate from raw
+  // indications_window:* hashes so set details cannot be polluted by raw signal
+  // counts or legacy mixed deployments.
+  const w5 = (setW5Hash || {}) as Record<string, string>
+  const w60 = (setW60Hash || {}) as Record<string, string>
   // Primary source: indications_window:{id}:last5 / last60min hashes written
   // by the engine and cron per-type.
   // Fallback: derive from cumulative progHash counters when window keys are
@@ -315,11 +325,12 @@ export async function getIndicationTracking(
     // counts stable across overlapping/retried cycles.
     const v5  = w5ByType[t] || 0
     const v60 = w60ByType[t] || 0
-    // Fallback: use per-type cumulative count from progression hash.
-    // This ensures non-zero values on first boot before windowed writes happen.
-    const cumulative = Number(prog[`indications_${t}_count`] || "0")
-    last5ByType[t] = v5  || Math.min(cumulative, 9999)
-    last60ByType[t] = v60 || Math.min(cumulative, 9999)
+    // No cumulative fallback here. Detailed indication tracking is a current
+    // set-processing view; falling back to all-time progression counters made
+    // production "Last 5" and "Last 60" panels show inflated historical totals
+    // when no fresh set-window snapshot existed yet.
+    last5ByType[t] = v5
+    last60ByType[t] = v60
     last5Total  += last5ByType[t]
     last60Total += last60ByType[t]
   }
@@ -333,11 +344,7 @@ export async function getIndicationTracking(
   const setsAtLimit = Number(prog.indication_sets_at_limit || "0")
   // totalIndicationSets: prefer dedicated counter written by processor/cron,
   // fall back to cumulative indications_count (proxy: total indications ≈ total sets if 1/set).
-  const totalIndicationSets = Number(
-    prog.indication_sets_total ||
-    prog.indications_count      ||
-    "0",
-  )
+  const totalIndicationSets = totalActive || last5Total || 0
 
   return {
     active: { total: totalActive, byType },

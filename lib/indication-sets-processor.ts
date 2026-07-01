@@ -412,18 +412,18 @@ export class IndicationSetsProcessor {
       // single hash field per (symbol, type) on every cycle so the most
       // recent qualified count for that pair is always the one read.
       //
-      //   indications_active:{connectionId} → hash
+      //   indication_sets_active:{connectionId} → hash
       //     fields: "{symbol}:direction", "{symbol}:move", "{symbol}:active",
       //             "{symbol}:active_advanced", "{symbol}:optimal"
       //
-      // The stats API hgetalls this hash and aggregates by type — fields are
+      // Detailed set tracking hgetalls this hash and aggregates by type — fields are
       // O(symbols × types) total which is small (≤ 5 × 5 = 25 fields). TTL
       // is short so a stopped engine doesn't leave stale "active" rows
       // forever; the next cycle naturally refreshes them.
       try {
         const { getRedisClient: _getRedis } = await import("@/lib/redis-db")
         const client = _getRedis()
-        const activeKey = `indications_active:${this.connectionId}`
+        const activeKey = `indication_sets_active:${this.connectionId}`
         await client.hset(activeKey, {
           [`${symbol}:direction`]:       String(directionResults?.qualified ?? 0),
           [`${symbol}:move`]:            String(moveResults?.qualified      ?? 0),
@@ -442,8 +442,8 @@ export class IndicationSetsProcessor {
         // with every retry/overlap instead of reflecting the current window.
         // Per-symbol HSET keeps sibling symbols independent and idempotent.
         const progKey    = `progression:${this.connectionId}`
-        const w5Key      = `indications_window:${this.connectionId}:last5`
-        const w60Key     = `indications_window:${this.connectionId}:last60min`
+        const w5Key      = `indication_sets_window:${this.connectionId}:last5`
+        const w60Key     = `indication_sets_window:${this.connectionId}:last60min`
         const dirQ  = directionResults?.qualified  ?? 0
         const moveQ = moveResults?.qualified       ?? 0
         const actQ  = activeResults?.qualified     ?? 0

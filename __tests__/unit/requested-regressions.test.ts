@@ -442,6 +442,11 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Production must allow in-process starts from the coordinator")
     expect(source).toContain("Duplicate starts")
     expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain("Production must allow in-process starts from the coordinator")
+    expect(source).toContain("Duplicate starts")
+    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
   test("coordinator startEngine allows explicit foreground UI starts", () => {
     const source = read("lib/trade-engine.ts")
 
@@ -485,10 +490,16 @@ describe("requested regression guardrails", () => {
     const migrations = read("lib/redis-migrations.ts")
 
     expect(detailedTracking).toContain("const byType = aggregateWindowByType(active)")
+    expect(detailedTracking).toContain("indication_sets_active")
+    expect(detailedTracking).toContain("indication_sets_window")
+    expect(detailedTracking).toContain("Do not read the raw indications_active")
+    expect(detailedTracking).toContain("last5ByType[t] = v5")
+    expect(detailedTracking).toContain("const totalIndicationSets = totalActive || last5Total || 0")
     expect(detailedTracking).not.toContain("const aggregateWindowByType = (hash: Record<string, string>): Record<string, number> =>")
     expect(statsRoute).toContain("function aggregateIndicationSnapshot")
     expect(statsRoute).toContain("ignore the plain field so mixed deploys do not double")
     expect(migrations).toContain('name: "063-reset-legacy-indication-snapshots"')
+    expect(migrations).toContain('name: "064-split-raw-and-set-indication-snapshots"')
     expect(migrations).toContain('"indications_active:*"')
     expect(migrations).toContain('"indications_window:*:last5"')
     expect(migrations).toContain("do NOT touch cumulative progression counters")
@@ -503,6 +514,8 @@ describe("requested regression guardrails", () => {
     expect(setProcessor).toContain('await this.batchSaveIndications(pendingWrites, "active_advanced")')
     expect(setProcessor).toContain('active_advanced: activeAdvancedResults')
     expect(setProcessor).toContain('`${symbol}:active_advanced`]: String(advQ)')
+    expect(setProcessor).toContain('const activeKey = `indication_sets_active:${this.connectionId}`')
+    expect(setProcessor).toContain('const w5Key      = `indication_sets_window:${this.connectionId}:last5`')
     expect(rawProcessor).toContain("active_advanced: 0")
     expect(rawProcessor).toContain('const w5Key = `indications_window:${this.connectionId}:last5`')
     expect(rawProcessor).toContain("pipe.hset(w5Key, fields)")
