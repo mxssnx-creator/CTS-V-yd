@@ -830,8 +830,6 @@ export class GlobalTradeEngineCoordinator {
       // Process all connections consistently in both dev and prod.
       // Use connection enable/disable settings (is_enabled_dashboard) to manage
       // scope instead of env-based filtering. Dev-only filtering masked prod bugs.
-        connections = capped
-      }
 
       if (!(await this.isGlobalCoordinatorEnabled("startMissingEngines"))) {
         return 0
