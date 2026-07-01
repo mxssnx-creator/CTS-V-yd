@@ -286,17 +286,25 @@ export class EngineProgressManager {
       this.state.symbols[symbol] = this.createSymbolProgress(symbol)
     }
     const sp = this.state.symbols[symbol]
+    const wasLoaded = sp.prehistoricLoaded
+    const previousCandles = sp.prehistoricCandles || 0
+    const previousErrors = sp.prehistoricErrors || 0
+    const previousDuration = sp.prehistoricDuration || 0
+
+    if (completed && !wasLoaded) {
+      this.state.prehistoricLoadedSymbols++
+    } else if (!completed && wasLoaded) {
+      this.state.prehistoricLoadedSymbols = Math.max(0, this.state.prehistoricLoadedSymbols - 1)
+    }
+
+    this.state.prehistoricTotalCandles = Math.max(0, this.state.prehistoricTotalCandles + candles - previousCandles)
+    this.state.prehistoricErrors = Math.max(0, this.state.prehistoricErrors + errors - previousErrors)
+    this.state.prehistoricDuration = Math.max(0, this.state.prehistoricDuration + duration - previousDuration)
+
     sp.prehistoricCandles = candles
     sp.prehistoricErrors = errors
     sp.prehistoricDuration = duration
     sp.prehistoricLoaded = completed
-
-    if (completed) {
-      this.state.prehistoricLoadedSymbols++
-    }
-    this.state.prehistoricTotalCandles += candles
-    this.state.prehistoricErrors += errors
-    this.state.prehistoricDuration += duration
 
     this.addLog('info', `Symbol ${symbol}: ${candles} candles loaded in ${duration}ms (${errors} errors)`)
     await this.saveState()
