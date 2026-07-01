@@ -11,6 +11,12 @@ import { PresetSelectionDialog } from "./preset-selection-dialog"
 interface EngineStatus {
   running: boolean
   paused: boolean
+  operatorIntent?: string
+  actualRuntimeStatus?: string
+  workerAttached?: boolean
+  globalHeartbeatFresh?: boolean
+  connectionHeartbeatFresh?: boolean
+  diagnosticHint?: string | null
   connectedExchanges: number
   activePositions: number
   totalProfit: number
@@ -68,8 +74,14 @@ export function GlobalTradeEngineControls() {
       if (response.ok) {
         const data = await response.json()
         const statusData: EngineStatus = {
-          running: data.running === true || data.running === "true" || data.status === "running",
+          running: data.actualRuntimeStatus === "running" || data.running === true,
           paused: data.paused === true || data.paused === "true",
+          operatorIntent: data.operatorIntent || data.operatorStatus,
+          actualRuntimeStatus: data.actualRuntimeStatus,
+          workerAttached: data.workerAttached === true,
+          globalHeartbeatFresh: data.globalHeartbeatFresh === true,
+          connectionHeartbeatFresh: data.connectionHeartbeatFresh === true,
+          diagnosticHint: data.diagnostics?.hint || null,
           connectedExchanges: data.connectedExchanges || data.summary?.total || 0,
           activePositions: data.activePositions || data.summary?.totalPositions || 0,
           totalProfit: data.totalProfit || 0,
@@ -217,6 +229,11 @@ export function GlobalTradeEngineControls() {
 
   const getStatusBadge = () => {
     if (!status) return <Badge variant="outline">Unknown</Badge>
+    const intentRunning = status.operatorIntent === "running"
+    const heartbeatFresh = status.workerAttached || status.connectionHeartbeatFresh || status.globalHeartbeatFresh
+    if (!status.running && intentRunning && !heartbeatFresh) {
+      return <Badge variant="outline" className="bg-amber-500/10 text-amber-700">Queued / waiting for worker</Badge>
+    }
     if (!status.running) return <Badge variant="secondary">Stopped</Badge>
     if (status.paused)
       return (
@@ -305,6 +322,10 @@ export function GlobalTradeEngineControls() {
             Preset
           </Button>
         </div>
+
+        {status?.diagnosticHint && (
+          <p className="text-xs text-amber-700 dark:text-amber-300">{status.diagnosticHint}</p>
+        )}
 
         <PresetSelectionDialog
           open={presetDialogOpen}

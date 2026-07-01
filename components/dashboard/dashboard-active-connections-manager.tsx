@@ -31,6 +31,8 @@ export function DashboardActiveConnectionsManager() {
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set())
   const [resetting, setResetting] = useState(false)
   const [globalEngineRunning, setGlobalEngineRunning] = useState(false)
+  const [globalEngineQueued, setGlobalEngineQueued] = useState(false)
+  const [globalEngineDiagnosticHint, setGlobalEngineDiagnosticHint] = useState<string | null>(null)
   const [globalEngineLoading, setGlobalEngineLoading] = useState(true)
   const globalEngineRef = React.useRef(false)
   const activeConnectionsRef = React.useRef<ActiveConnectionWithDetails[]>([])
@@ -161,9 +163,13 @@ export function DashboardActiveConnectionsManager() {
       if (res.ok) {
         const data = await res.json()
         const wasRunning = globalEngineRef.current
-        const nowRunning = data.running === true || data.running === "true" || data.status === "running"
+        const nowRunning = data.actualRuntimeStatus === "running" || data.running === true
+        const heartbeatFresh = data.workerAttached === true || data.connectionHeartbeatFresh === true || data.globalHeartbeatFresh === true
+        const intentRunning = data.operatorIntent === "running" || data.operatorStatus === "running"
         globalEngineRef.current = nowRunning
         setGlobalEngineRunning(nowRunning)
+        setGlobalEngineQueued(intentRunning && !heartbeatFresh)
+        setGlobalEngineDiagnosticHint(data.diagnostics?.hint || null)
         if (!wasRunning && nowRunning) {
           loadConnections()
         }
@@ -418,10 +424,10 @@ export function DashboardActiveConnectionsManager() {
           <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
-              Engine starting up
+              {globalEngineQueued ? "Queued / waiting for worker" : "Engine starting up"}
             </p>
             <p className="text-xs text-amber-600 dark:text-amber-400">
-              Engine is initializing for enabled connections. Status will update shortly.
+              {globalEngineDiagnosticHint || "Engine is initializing for enabled connections. Status will update shortly."}
             </p>
           </div>
         </div>

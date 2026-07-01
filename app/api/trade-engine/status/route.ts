@@ -55,7 +55,8 @@ export async function GET() {
       (await client.hgetall("trade_engine:global").catch(() => null) as Record<string, string> | null) ?? {}
 
     const operatorIntent = engineHash.operator_intent || engineHash.desired_status || engineHash.status || "stopped"
-    const isGloballyRunning = operatorIntent === "running"
+    const globalCoordinatorIntent = engineHash.desired_status || engineHash.status || operatorIntent
+    const isGloballyRunning = operatorIntent === "running" || globalCoordinatorIntent === "running"
     const isGloballyPaused  = operatorIntent === "paused"
     const globalHeartbeatAt = Number(engineHash.last_heartbeat_at || 0)
     const hasFreshGlobalHeartbeat =
@@ -87,10 +88,10 @@ export async function GET() {
       })
     }
 
-    // A fresh global heartbeat or local coordinator proves process-level
-    // liveness. Per-connection processor heartbeats are folded into the final
-    // response after connection statuses are loaded below.
-    const hasRuntimeProof = coordinatorRunning || hasFreshGlobalHeartbeat
+    // Only a local coordinator manager proves in-process runtime liveness here.
+    // Per-connection processor heartbeats are folded into the final response
+    // after connection statuses are loaded below.
+    const hasRuntimeProof = coordinatorRunning
     
     // Get active connections
     const connections = await getActiveConnectionsForEngine()
@@ -123,7 +124,12 @@ export async function GET() {
         paused: isGloballyPaused,
         status: isGloballyPaused ? "paused" : (isGloballyRunning ? "degraded" : "stopped"),
         actualStatus: isGloballyPaused ? "paused" : (isGloballyRunning ? "degraded" : "stopped"),
+        operatorIntent,
+        globalCoordinatorIntent,
+        workerAttached: hasLocalEngineRuntime,
         globalHeartbeatFresh: hasFreshGlobalHeartbeat,
+        connectionHeartbeatFresh: false,
+        actualRuntimeStatus: isGloballyPaused ? "paused" : (isGloballyRunning ? "queued" : "stopped"),
         activeWorkerId: engineHash.active_worker_id || null,
         lastHeartbeatAt: globalHeartbeatAt || null,
         activeEngineCount: coordinator?.getActiveEngineCount() || 0,
@@ -167,7 +173,7 @@ export async function GET() {
           // engine progress and avoids both false "running" and false "stopped"
           // in multi-worker/OpenNext deployments.
           const connectionRunning =
-            isGloballyRunning && !isGloballyPaused && (hasLocalEngineRuntime || hasFreshDistributedHeartbeat || hasFreshGlobalHeartbeat)
+            isGloballyRunning && !isGloballyPaused && (hasLocalEngineRuntime || hasFreshDistributedHeartbeat)
 
           return {
             id: conn.id,
@@ -176,6 +182,8 @@ export async function GET() {
             status: connectionRunning ? "running" : "stopped",
             workerAttached: hasLocalEngineRuntime,
             distributedHeartbeatFresh: hasFreshDistributedHeartbeat,
+            connectionHeartbeatFresh: hasFreshDistributedHeartbeat,
+            actualRuntimeStatus: connectionRunning ? "running" : (isGloballyPaused ? "paused" : (isGloballyRunning ? "queued" : "stopped")),
             lastProcessorHeartbeat: processorHeartbeat || null,
             enabled: conn.is_enabled_dashboard === true || conn.is_enabled_dashboard === "1",
             activelyUsing: conn.is_enabled_dashboard === true || conn.is_enabled_dashboard === "1",
@@ -218,7 +226,7 @@ export async function GET() {
     }
 
     const distributedEngineCount = connectionStatuses.filter((c: any) => c.distributedHeartbeatFresh).length
-    const activeEngineCount = Math.max(coordinatorEngineCount, distributedEngineCount, hasFreshGlobalHeartbeat ? 1 : 0)
+    const activeEngineCount = Math.max(coordinatorEngineCount, distributedEngineCount)
     const effectivelyRunning = isGloballyRunning && !isGloballyPaused && (hasRuntimeProof || distributedEngineCount > 0)
 
     const responseBody = {
@@ -229,15 +237,23 @@ export async function GET() {
       activeEngineCount,
       workerAttached: hasLocalEngineRuntime,
       distributedEngineCount,
+      operatorIntent,
+      globalCoordinatorIntent,
       operatorStatus: operatorIntent,
+      actualRuntimeStatus: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : (isGloballyRunning ? "queued" : "stopped")),
       actualStatus: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "degraded"),
       globalHeartbeatFresh: hasFreshGlobalHeartbeat,
+      connectionHeartbeatFresh: distributedEngineCount > 0,
       activeWorkerId: engineHash.active_worker_id || null,
       lastHeartbeatAt: globalHeartbeatAt || null,
       diagnostics: {
         rootCause:
           isGloballyRunning && activeEngineCount === 0
             ? "Global Redis operator intent is running, but no local manager or fresh distributed processor heartbeat is attached. In production this means the UI worker only has operator intent; a dedicated opted-in engine worker/cron heartbeat is not actually running."
+            : null,
+        hint:
+          process.env.ENABLE_TRADE_ENGINE_AUTOSTART !== "1" && activeEngineCount === 0
+            ? "ENABLE_TRADE_ENGINE_AUTOSTART is not set on this process and no active worker heartbeat exists. Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on exactly one dedicated worker/process to run engine loops."
             : null,
         requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 (and ENABLE_IN_PROCESS_CONTINUITY=1 for in-process timers) on exactly one dedicated worker/process",
       },

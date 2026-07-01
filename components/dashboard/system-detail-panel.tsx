@@ -159,8 +159,8 @@ export function SystemDetailPanel() {
 
       setSystemData({
         engine: {
-          running: engineStatus?.running ?? progressionState?.processingCompleteness?.realtimeRunning ?? false,
-          status: engineStatus?.status ?? (progressionState?.processingCompleteness?.realtimeRunning ? "running" : "stopped"),
+          running: engineStatus?.actualRuntimeStatus === "running" || engineStatus?.running === true || progressionState?.processingCompleteness?.realtimeRunning || false,
+          status: engineStatus?.actualRuntimeStatus === "queued" ? "Queued / waiting for worker" : (engineStatus?.actualRuntimeStatus ?? engineStatus?.status ?? (progressionState?.processingCompleteness?.realtimeRunning ? "running" : "stopped")),
           uptime: engineStatus?.uptime ?? 0,
           lastCycleMs: progressionState?.cycleTimeMs ?? 0,
           avgCycleMs: progressionState?.redisDbSizeMb ? Math.round(progressionState.redisDbSizeMb * 100) : 0,
