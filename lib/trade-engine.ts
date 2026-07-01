@@ -69,6 +69,8 @@ export interface ConnectionStatus {
   errorCount: number
 }
 
+export interface StartEngineOptions {
+  markAssigned?: boolean
 export interface StopEngineOptions {
   /**
    * True when the request came from an explicit operator action that should
@@ -217,6 +219,7 @@ export class GlobalTradeEngineCoordinator {
    * Start engine for a specific connection
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
+  async startEngine(connectionId: string, config: EngineConfig, options: StartEngineOptions = {}): Promise<boolean> {
   async startEngine(connectionId: string, config: EngineConfig): Promise<boolean> {
     return this.enqueueConnectionTransition(connectionId, () => this.startEngineUnlocked(connectionId, config))
   }
@@ -279,6 +282,9 @@ export class GlobalTradeEngineCoordinator {
       if (runningFlag === "true" || runningFlag === "1") {
         if (managerRunning) {
           console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
+          if (options.markAssigned) {
+            await this.markConnectionAssignedFromUserIntent(connectionId)
+          }
           return true
         }
         const remoteState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
@@ -289,6 +295,9 @@ export class GlobalTradeEngineCoordinator {
           console.log(
             `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker with a fresh heartbeat; not clearing distributed running flag`,
           )
+          if (options.markAssigned) {
+            await this.markConnectionAssignedFromUserIntent(connectionId)
+          }
           return true
         }
         // Redis flag can become stale across crashes/restarts; clear stale state
@@ -417,26 +426,9 @@ export class GlobalTradeEngineCoordinator {
       // (`if (!this.isGloballyRunning) return`) and never recovers stalls.
       this.isGloballyRunning = true
 
-      // ── Mark connection as active-inserted now that engine is live ────
-      // is_active_inserted controls the "Active Connections" panel on the
-      // dashboard. The migration seeds it as "0" (operator hasn't inserted
-      // it yet). Flip it to "1" on first successful engine start so the
-      // dashboard card moves into the Active panel automatically — the
-      // operator pressed Start, which is the explicit activation event.
-      // Idempotent: repeated starts on an already-active connection are safe.
-      try {
-        // Use updateConnection (not raw hset) so the getAllConnections()
-        // 2-second in-memory cache is invalidated immediately. Without this,
-        // the connections API can serve stale is_enabled_dashboard="0" for up
-        // to 2 seconds after the engine starts, causing "Enabled dashboard: none"
-        // in every dashboard poll that hits within that window.
-        const { updateConnection: _uc } = await import("@/lib/redis-db")
-        await _uc(connectionId, {
-          is_active_inserted:   "1",
-          is_active:            "1",
-          is_enabled_dashboard: "1",
-        })
-      } catch { /* non-critical — dashboard can lag */ }
+      if (options.markAssigned) {
+        await this.markConnectionAssignedFromUserIntent(connectionId)
+      }
       return true
     } catch (err) {
       // On startup failure, give the lock back so a retry can succeed
@@ -451,6 +443,27 @@ export class GlobalTradeEngineCoordinator {
         }
       }
       throw err
+    }
+  }
+
+
+  /**
+   * Mark assignment/enabled dashboard state only for explicit operator
+   * actions. Generic runtime starts/restarts must not mutate user-intent
+   * flags.
+   */
+  private async markConnectionAssignedFromUserIntent(connectionId: string): Promise<void> {
+    try {
+      // Use updateConnection (not raw hset) so getAllConnections() cache is
+      // invalidated immediately after dashboard/user intent changes.
+      const { updateConnection } = await import("@/lib/redis-db")
+      await updateConnection(connectionId, {
+        is_active_inserted: "1",
+        is_active: "1",
+        is_enabled_dashboard: "1",
+      })
+    } catch {
+      /* non-critical — dashboard can lag */
     }
   }
 
@@ -847,6 +860,7 @@ export class GlobalTradeEngineCoordinator {
 
     if (enabled) {
       if (config) {
+        await this.startEngine(connectionId, config, { markAssigned: true })
         await this.startEngineUnlocked(connectionId, config)
       } else {
         console.warn(`[v0] [TOGGLE] Cannot start engine ${connectionId} - missing config`)
@@ -1028,6 +1042,9 @@ export class GlobalTradeEngineCoordinator {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
 
+      // Process all connections consistently in both dev and prod. Use connection
+      // enable/disable settings (is_enabled_dashboard) to manage scope instead
+      // of env-based filtering. Dev-only filtering masked prod bugs.
       // Process all assigned/enabled connections consistently in both dev and prod.
       // Connection enablement settings (is_enabled_dashboard) define scope;
       // env-based filtering previously masked production coordinator bugs.
@@ -1119,22 +1136,6 @@ export class GlobalTradeEngineCoordinator {
             }
             started++
 
-            // Mirror the enabled/inserted flags that toggle-dashboard writes so
-            // the connections API + system-stats-v3 show correct counts even
-            // when this code path (auto-restart after OOM) bypasses toggle-dashboard.
-            try {
-              const { updateConnection } = await import("@/lib/redis-db")
-              await updateConnection(connection.id, {
-                is_active_inserted: "1",
-                is_enabled_dashboard: "1",
-              })
-            } catch (flagErr) {
-              console.warn(
-                `[v0] [Coordinator] Could not update is_active_inserted for ${connection.id}:`,
-                flagErr instanceof Error ? flagErr.message : flagErr,
-              )
-            }
-            
             await logProgressionEvent(connection.id, "engine_started", "info", "Main Trade Engine started for progression", {
               connectionId: connection.id,
               engineType: "main",

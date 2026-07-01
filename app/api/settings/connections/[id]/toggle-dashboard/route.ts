@@ -231,7 +231,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(resolvedId, engineConfig)
+            const started = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true })
             if (!started && !coordinator.isEngineRunning(resolvedId)) {
               throw new Error("Coordinator did not start the engine after enable; startup lock may be held by another worker")
             }
