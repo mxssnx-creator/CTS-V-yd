@@ -46,6 +46,12 @@ interface EngineTimings {
   lockExtendIntervalMs: number
   maxPositionHoldMs: number
   progressionBufferFlushMs: number
+  // ── API Timeouts ──────────────────────────────────────────────────────────
+  // Configurable timeouts for exchange API calls to handle varying network latency
+  apiTimeoutMs: number             // General API timeout (default 40s for BingX)
+  apiPlaceOrderTimeoutMs: number   // Specific timeout for order placement
+  apiCancelOrderTimeoutMs: number  // Specific timeout for order cancellation
+  apiPositionTimeoutMs: number     // Specific timeout for position queries
   // ── Hedge / Directional Accumulation (read-live, no engine restart) ────────
   // Read at every cycle from strategy-coordinator and live-stage via getEngineTimings().
   // Stored as number in Redis (0/1 for boolean). Live-settings contract: hot-path,
@@ -77,6 +83,11 @@ const DEFAULT_TIMINGS: EngineTimings = {
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
+  // ── API Timeouts (live settings, updated on write) ────────────────────────
+  apiTimeoutMs:            40_000, // 40s general timeout for BingX API
+  apiPlaceOrderTimeoutMs:  40_000, // 40s for order placement
+  apiCancelOrderTimeoutMs: 20_000, // 20s for cancellation
+  apiPositionTimeoutMs:    20_000, // 20s for position queries
   // ── Three-progression defaults. NOTE: per the no-pause refactor, the
   // Prehistoric loop ignores its interval/pause fields at runtime and
   // always cycles back-to-back via setTimeout(_, 0). The fields are
@@ -138,6 +149,23 @@ const TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number; uni
   progressionBufferFlushMs: {
     min: 500, max: 60_000, unit: "ms", live: false,
     help: "Progression log buffer flushes after this interval OR when it hits 50 entries. Restart engine to apply.",
+  },
+  // ── API Timeouts ──────────────────────────────────────────────────────────
+  apiTimeoutMs: {
+    min: 5_000, max: 120_000, unit: "ms", live: true,
+    help: "General API timeout for all exchange calls. 40s accommodates BingX latency. Range 5–120 seconds.",
+  },
+  apiPlaceOrderTimeoutMs: {
+    min: 5_000, max: 120_000, unit: "ms", live: true,
+    help: "Specific timeout for order placement. Critical path — higher value reduces 'order timeout' errors.",
+  },
+  apiCancelOrderTimeoutMs: {
+    min: 5_000, max: 60_000, unit: "ms", live: true,
+    help: "Timeout for order cancellation. Range 5–60 seconds. Shorter is safer for position management.",
+  },
+  apiPositionTimeoutMs: {
+    min: 5_000, max: 60_000, unit: "ms", live: true,
+    help: "Timeout for position queries and balance checks. Range 5–60 seconds.",
   },
   // ── Three-progression tunables ────────────────────────────────────────
   // Important: the Prehistoric loop runs continuously back-to-back per
@@ -219,7 +247,7 @@ export function SystemSettings() {
         // (e.g. a fresh deploy where nobody has saved yet).
         if (sys) {
           const next: EngineTimings = { ...DEFAULT_TIMINGS }
-          const readNum = (snake: string, camel: keyof Pick<EngineTimings, 'cronSyncIntervalSeconds' | 'liveSyncIntervalMs' | 'liveSyncPauseMs' | 'heartbeatIntervalMs' | 'strategyFlowMinIntervalMs' | 'strategyFlowHardThrottleMs' | 'strategyFlowMaxIntervalMs' | 'lockExtendIntervalMs' | 'maxPositionHoldMs' | 'progressionBufferFlushMs' | 'prehistoricIntervalMs' | 'prehistoricCyclePauseMs' | 'realtimeIntervalMs' | 'realtimeCyclePauseMs' | 'livePositionsCyclePauseMs' | 'normalizeThresholdPct' | 'normalizeMaxPerDirection'>) => {
+          const readNum = (snake: string, camel: keyof EngineTimings) => {
             const raw = sys[snake] ?? (sys as any)[camel]
             if (raw === undefined || raw === null || raw === "") return
             const n = parseFloat(String(raw))
@@ -235,6 +263,10 @@ export function SystemSettings() {
           readNum("lock_extend_interval_ms",       "lockExtendIntervalMs")
           readNum("max_position_hold_ms",          "maxPositionHoldMs")
           readNum("progression_buffer_flush_ms",   "progressionBufferFlushMs")
+          readNum("api_timeout_ms",                "apiTimeoutMs")
+          readNum("api_place_order_timeout_ms",    "apiPlaceOrderTimeoutMs")
+          readNum("api_cancel_order_timeout_ms",   "apiCancelOrderTimeoutMs")
+          readNum("api_position_timeout_ms",       "apiPositionTimeoutMs")
           readNum("prehistoric_interval_ms",       "prehistoricIntervalMs")
           readNum("prehistoric_cycle_pause_ms",    "prehistoricCyclePauseMs")
           readNum("realtime_interval_ms",          "realtimeIntervalMs")
@@ -306,6 +338,10 @@ export function SystemSettings() {
             lock_extend_interval_ms:       timings.lockExtendIntervalMs,
             max_position_hold_ms:          timings.maxPositionHoldMs,
             progression_buffer_flush_ms:   timings.progressionBufferFlushMs,
+            api_timeout_ms:                timings.apiTimeoutMs,
+            api_place_order_timeout_ms:    timings.apiPlaceOrderTimeoutMs,
+            api_cancel_order_timeout_ms:   timings.apiCancelOrderTimeoutMs,
+            api_position_timeout_ms:       timings.apiPositionTimeoutMs,
             // ── Hedge / Directional Accumulation settings ───────────────────
             normalize_enabled:             timings.normalizeEnabled,
             normalize_threshold_pct:       timings.normalizeThresholdPct,
@@ -653,6 +689,65 @@ value={timings.normalizeMaxPerDirection}
                 normalization. Spec default: neutralize.
               </p>
             </div>
+          </div>
+        </CardContent>
+      </Card>
+
+{/* API Timeouts */}
+      <Card className="border-orange-200 bg-orange-50/30">
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Clock className="h-5 w-5 text-orange-600" />
+            <div>
+              <CardTitle>API Timeouts</CardTitle>
+              <CardDescription>
+                Configure request timeouts for exchange API calls. Higher values reduce "timeout" errors on slow networks;
+                lower values fail faster on unresponsive exchanges.
+              </CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="p-3 bg-orange-100 border border-orange-300 rounded-lg flex gap-2">
+            <AlertCircle className="h-5 w-5 text-orange-700 shrink-0 mt-0.5" />
+            <div className="text-sm text-orange-900">
+              <p className="font-medium">Critical for reliable trading</p>
+              <p className="text-xs mt-1">
+                API timeouts prevent indefinite hangs when exchanges respond slowly. BingX typically responds within 5–10s
+                under normal conditions. Set higher on unstable networks, lower on fast networks.
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {(["apiTimeoutMs", "apiPlaceOrderTimeoutMs", "apiCancelOrderTimeoutMs", "apiPositionTimeoutMs"] as (keyof EngineTimings)[]).map((key) => {
+              const b = TIMING_BOUNDS[key]
+              const labelText = key
+                .replace(/([A-Z])/g, " $1")
+                .replace(/^./, (c) => c.toUpperCase())
+                .replace(/\bMs\b/, "(ms)")
+              return (
+                <div key={key} className="space-y-2 p-3 border rounded-lg bg-white">
+                  <div className="flex items-center justify-between gap-2">
+                    <Label className="text-sm font-medium leading-tight">{labelText}</Label>
+                    <Badge variant="secondary" className="bg-orange-100 text-orange-700 text-[10px]">Live</Badge>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min={b.min}
+                      max={b.max}
+                      step={1000}
+                      value={timings[key] as number}
+                      onChange={(e) => setTimings({ ...timings, [key]: Number(e.target.value) })}
+                      className="flex-1 h-9 rounded-md border border-input bg-background px-3 py-1 text-sm"
+                    />
+                    <span className="text-sm font-semibold w-16 text-right">{((timings[key] as number) / 1000).toFixed(1)}s</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">{b.help}</p>
+                </div>
+              )
+            })}
           </div>
         </CardContent>
       </Card>
