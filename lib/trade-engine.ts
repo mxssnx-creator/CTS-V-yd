@@ -821,18 +821,6 @@ export class GlobalTradeEngineCoordinator {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
 
-      // ── DEV ONE-ENGINE OOM GUARD ──────────────────────────────────────────
-      // This is the single chokepoint through which BOTH the auto-start healing
-      // sweep and the operator Start route request engines. On the low-RAM dev
-      // VM (4.39 GB, no swap) two engines running their prehistoric StrategySet
-      // pass at once reliably OOM-kills the worker. Both bingx-x01 and bybit-x03
-      // are always inited + visible, but in DEVELOPMENT only ONE engine may run
-      // Process all connections consistently in both dev and prod.
-      // Use connection enable/disable settings (is_enabled_dashboard) to manage
-      // scope instead of env-based filtering. Dev-only filtering masked prod bugs.
-        connections = capped
-      }
-
       if (!(await this.isGlobalCoordinatorEnabled("startMissingEngines"))) {
         return 0
       }
@@ -849,7 +837,8 @@ export class GlobalTradeEngineCoordinator {
 
       const { getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
-      const enabledIds = new Set(connections.map(c => c.id))
+      const uniqueConnections = new Map(connections.map((c) => [c.id, c]))
+      const enabledIds = new Set(uniqueConnections.keys())
       // Only count managers whose engine is actually running, not zombie Map entries from stale closures
       const runningIds = new Set(
         Array.from(this.engineManagers.entries())
@@ -861,7 +850,7 @@ export class GlobalTradeEngineCoordinator {
       
       // Start engines for connections that should be running but aren't
       let started = 0
-      for (const connection of connections) {
+      for (const connection of uniqueConnections.values()) {
         if (!runningIds.has(connection.id)) {
           try {
             const hasCredentials = Boolean((connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret))
@@ -901,6 +890,11 @@ export class GlobalTradeEngineCoordinator {
               realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
+            const currentManager = this.engineManagers.get(connection.id)
+            if (currentManager?.isEngineRunning || this.startingEngines.has(connection.id)) {
+              continue
+            }
+
             const didStart = await this.startEngine(connection.id, config)
             if (!didStart) {
               await logProgressionEvent(connection.id, "engine_start_skipped", "warning", "Coordinator start skipped - engine is already owned by another worker or starting", {
@@ -975,8 +969,9 @@ export class GlobalTradeEngineCoordinator {
       await initRedis()
       const enabledConnections = await getAssignedAndEnabledConnections()
       const allConnections = await getAllConnections()
+      const uniqueConnections = new Map(enabledConnections.map((c) => [c.id, c]))
       
-      const enabledIds = new Set(enabledConnections.map(c => c.id))
+      const enabledIds = new Set(uniqueConnections.keys())
       // Only count managers whose engine is actually running (not just present in the Map)
       const runningIds = new Set(
         Array.from(this.engineManagers.entries())
@@ -984,12 +979,12 @@ export class GlobalTradeEngineCoordinator {
           .map(([id]) => id)
       )
       
-      console.log(`[v0] [Coordinator] State: enabled=${enabledConnections.length}, running=${runningIds.size}`)
+      console.log(`[v0] [Coordinator] State: enabled=${uniqueConnections.size}, running=${runningIds.size}`)
       
       // Start engines for newly enabled connections
       let started = 0
       let skipped = 0
-      for (const connection of enabledConnections) {
+      for (const connection of uniqueConnections.values()) {
         if (!runningIds.has(connection.id)) {
           try {
             const hasCredentials = Boolean((connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret))
@@ -1029,6 +1024,12 @@ export class GlobalTradeEngineCoordinator {
               realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
             }
             
+            const currentManager = this.engineManagers.get(connection.id)
+            if (currentManager?.isEngineRunning || this.startingEngines.has(connection.id)) {
+              skipped++
+              continue
+            }
+
             const didStart = await this.startEngine(connection.id, config)
             if (!didStart) {
               await logProgressionEvent(connection.id, "engine_start_skipped", "warning", "Coordinator start skipped - engine is already owned by another worker or starting", {
