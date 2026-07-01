@@ -3035,12 +3035,30 @@ export function getConnectionStates(connection: any): {
     base_enabled: isEnabledFlag(connection.is_enabled),
     base_inserted: isEnabledFlag(connection.is_inserted),
     main_enabled: isEnabledFlag(connection.is_enabled_dashboard),
+    main_assigned:
+      isEnabledFlag(connection.is_assigned) ||
+      isEnabledFlag(connection.is_active_inserted) ||
+      isEnabledFlag(connection.is_dashboard_inserted),
+    is_active:
+      (isEnabledFlag(connection.is_assigned) ||
+        isEnabledFlag(connection.is_active_inserted) ||
+        isEnabledFlag(connection.is_dashboard_inserted)) &&
+      isEnabledFlag(connection.is_enabled_dashboard),
     main_assigned: isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned),
     is_active: isEnabledFlag(connection.is_active_inserted) && isEnabledFlag(connection.is_enabled_dashboard),
   }
 }
 
 export function isConnectionAssignedToMain(connection: any): boolean {
+  return (
+    isEnabledFlag(connection.is_assigned) ||
+    isEnabledFlag(connection.is_active_inserted) ||
+    isEnabledFlag(connection.is_dashboard_inserted)
+  )
+}
+
+export function isConnectionMainEnabled(connection: any): boolean {
+  return isConnectionAssignedToMain(connection) && isEnabledFlag(connection.is_enabled_dashboard)
   return isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned)
 }
 
@@ -3059,6 +3077,7 @@ export function isConnectionBaseEnabled(connection: any): boolean {
 export function buildMainConnectionEnableUpdate(connection: any): any {
   return {
     ...connection,
+    is_assigned: "1",
     is_enabled_dashboard: "1",
     is_dashboard_inserted: "1",
     is_active_inserted: "1",
@@ -3070,6 +3089,7 @@ export function buildMainConnectionEnableUpdate(connection: any): any {
 export function buildMainConnectionDisableUpdate(connection: any): any {
   return {
     ...connection,
+    is_assigned: "1",
     is_enabled_dashboard: "0",
     is_active: "0",
     updated_at: new Date().toISOString(),
@@ -3079,6 +3099,7 @@ export function buildMainConnectionDisableUpdate(connection: any): any {
 export function buildMainConnectionRemoveUpdate(connection: any): any {
   return {
     ...connection,
+    is_assigned: "0",
     is_active_inserted: "0",
     is_dashboard_inserted: "0",
     is_enabled_dashboard: "0",
@@ -3257,21 +3278,21 @@ export async function getActiveConnectionsForEngine(): Promise<any[]> {
   const client = getRedisClient()
   const keys = await client.keys("connection:*")
   const connections: any[] = []
-  
+
   for (const key of keys) {
     if (key.includes(":settings") || key.includes(":state")) continue
     const data = await client.hgetall(key)
     if (data && Object.keys(data).length > 0) {
-      // Check if connection is active for engine (is_active_inserted = 1)
-      if (isEnabledFlag(data.is_active_inserted) || isEnabledFlag(data.is_active)) {
-        connections.push({
-          id: key.replace("connection:", ""),
-          ...data,
-        })
+      const connection = {
+        id: key.replace("connection:", ""),
+        ...data,
+      }
+      if (isConnectionMainEnabled(connection)) {
+        connections.push(connection)
       }
     }
   }
-  
+
   return connections
 }
 
@@ -3656,6 +3677,10 @@ export async function getEnabledConnections(): Promise<any[]> {
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
   return allConnections.filter(conn => {
+    // A connection is eligible for engine processing only when it is assigned
+    // to Main Connections and the dashboard processing toggle is enabled. Base
+    // Settings flags and active-panel visibility alone are not enable signals.
+    return isConnectionMainEnabled(conn)
     // A connection is eligible for engine processing only when it is both:
     // 1. Assigned/inserted into the Main Connections panel, and
     // 2. Explicitly enabled via the dashboard processing switch.
