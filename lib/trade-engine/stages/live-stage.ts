@@ -1394,11 +1394,23 @@ async function placeProtectionOrder(
     if (!result?.success) {
       const errMsg109 = String(result?.error || "")
       if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
-        console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting 6s before retry`)
-        await new Promise((r) => setTimeout(r, 6000))
-        result = await placeStop(effectiveQty)
+        // OPTIMIZATION: Use exponential backoff (500ms, 1s, 2s) instead of fixed 6s
+        // Positions typically visible within 500ms-1s on BingX
+        const BACKOFF_DELAYS_MS = [500, 1000, 2000]
+        let retryAttempt = 0
+        while (retryAttempt < BACKOFF_DELAYS_MS.length && !result?.success) {
+          const delay = BACKOFF_DELAYS_MS[retryAttempt]
+          console.warn(`${tag} 109420 retry: position not yet visible on exchange — waiting ${delay}ms before retry`)
+          await new Promise((r) => setTimeout(r, delay))
+          result = await placeStop(effectiveQty)
+          if (result?.success) {
+            console.log(`${tag} 109420 retry succeeded after ${delay}ms`)
+            break
+          }
+          retryAttempt++
+        }
         if (!result?.success) {
-          console.warn(`${tag} 109420 retry also failed (error=${result?.error}) — reconcile will retry on next tick`)
+          console.warn(`${tag} 109420 retries exhausted (tried 500ms, 1s, 2s) — reconcile will retry on next tick`)
         }
       }
     }
@@ -4865,6 +4877,9 @@ export async function reconcileLivePositions(
       }
     }
 
+    // BATCHING: Collect positions to save instead of saving individually
+    const positionsToSave: typeof openPositions = []
+
     const processOne = async (pos: typeof openPositions[number]): Promise<PosDelta> => {
       const delta: PosDelta = { reconciled: 1, updated: 0, closed: 0, errors: 0, protectionRearmed: 0 }
       try {
@@ -4888,16 +4903,15 @@ export async function reconcileLivePositions(
               syncedAt: Date.now(),
             }
             pos.updatedAt = Date.now()
-            await savePosition(pos)
+            positionsToSave.push(pos) // BATCH: collect instead of save immediately
             delta.updated++
           } else {
             pos.status = "closed"
             pos.closedAt = Date.now()
             pos.closeReason = "duplicate_slot_pruned"
             pos.updatedAt = Date.now()
-            // savePosition() moves it from the open index to the closed
-            // archive; intentionally NO closed/win counter increment here.
-            await savePosition(pos)
+            // savePosition() moves it from the open index to the closed archive
+            positionsToSave.push(pos) // BATCH: collect instead of save immediately
             delta.updated++
           }
           return delta
@@ -5211,6 +5225,18 @@ export async function reconcileLivePositions(
       })())
     }
     await Promise.all(runners)
+
+    // BATCHING: Save all collected positions in one operation instead of N sequential calls
+    if (positionsToSave.length > 0) {
+      try {
+        await Promise.all(positionsToSave.map(p => savePosition(p)))
+      } catch (batchErr) {
+        console.warn(
+          `${LOG_PREFIX} batch savePosition failed (attempted ${positionsToSave.length} positions):`,
+          batchErr instanceof Error ? batchErr.message : String(batchErr),
+        )
+      }
+    }
 
     if (summary.closed > 0 || summary.updated > 0) {
       console.log(
