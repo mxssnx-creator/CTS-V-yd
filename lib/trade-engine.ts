@@ -69,6 +69,16 @@ export interface ConnectionStatus {
   errorCount: number
 }
 
+export interface StopEngineOptions {
+  /**
+   * True when the request came from an explicit operator action that should
+   * stop whichever worker currently owns the connection runtime. When false,
+   * this process may only clean up runtime state for an in-memory manager it
+   * actually owns.
+   */
+  operatorRequested?: boolean
+}
+
 export interface HealthStatus {
   overall: "healthy" | "degraded" | "unhealthy"
   components: Record<string, ComponentHealth>
@@ -90,7 +100,7 @@ export interface ComponentHealth {
  */
 export class GlobalTradeEngineCoordinator {
   private engineManagers: Map<string, TradeEngineManager> = new Map()
-  private startingEngines = new Set<string>()  // PHASE 1 FIX: Startup lock to prevent duplicate starts
+  private startingEngines = new Map<string, Promise<boolean>>()  // PHASE 1 FIX: Startup lock to prevent duplicate starts
   private stoppingEngines = new Set<string>()  // PHASE 2 FIX: Stop lock to prevent race conditions
   private transitionQueues = new Map<string, Promise<unknown>>()
   private isGloballyRunning = false
@@ -212,6 +222,27 @@ export class GlobalTradeEngineCoordinator {
   }
 
   private async startEngineUnlocked(connectionId: string, config: EngineConfig): Promise<boolean> {
+    const existingStart = this.startingEngines.get(connectionId)
+    if (existingStart) {
+      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}; awaiting existing start request`)
+      return existingStart
+    }
+
+    const startPromise = Promise.resolve()
+      .then(() => this.startEngineWithRegisteredMutex(connectionId, config))
+      .finally(() => {
+        if (this.startingEngines.get(connectionId) === startPromise) {
+          this.startingEngines.delete(connectionId)
+          console.log(`[v0] [STARTUP LOCK] Removed ${connectionId} from startup lock`)
+        }
+      })
+
+    this.startingEngines.set(connectionId, startPromise)
+    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
+    return startPromise
+  }
+
+  private async startEngineWithRegisteredMutex(connectionId: string, config: EngineConfig): Promise<boolean> {
     const inProcessStartAllowed =
       process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" ||
       (config as any)?.allowInProcessStart === true
@@ -234,12 +265,6 @@ export class GlobalTradeEngineCoordinator {
     this.ensureBackgroundTimers()
 
     if (!(await this.isGlobalCoordinatorEnabled(`startEngine(${connectionId})`))) {
-      return false
-    }
-
-    // Step 1: Check if already starting
-    if (this.startingEngines.has(connectionId)) {
-      console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
       return false
     }
 
@@ -279,10 +304,6 @@ export class GlobalTradeEngineCoordinator {
       console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)
     }
 
-    // Step 3: Add to lock set
-    this.startingEngines.add(connectionId)
-    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
-
     let lockHandle: LockHandle | undefined
     try {
       // ── Step 3b: Acquire the cross-process ownership lock ──────────
@@ -304,8 +325,30 @@ export class GlobalTradeEngineCoordinator {
         selfOwnedIfAlive: localManagerAlive,
       })
       if (!acquired.acquired || !acquired.handle) {
+        const ownerHeartbeatFreshnessMs = 90_000
+        let ownerHeartbeatFresh = false
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          const ownerState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+          const ownerHeartbeat = Number((ownerState as any)?.last_processor_heartbeat || 0)
+          ownerHeartbeatFresh =
+            Number.isFinite(ownerHeartbeat) &&
+            ownerHeartbeat > 0 &&
+            Date.now() - ownerHeartbeat < ownerHeartbeatFreshnessMs
+        } catch {
+          ownerHeartbeatFresh = false
+        }
+
+        if (ownerHeartbeatFresh) {
+          console.warn(
+            `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}) with a fresh heartbeat; leaving owner state untouched.`,
+          )
+          return true
+        }
+
         console.warn(
-          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
+          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}) with a stale heartbeat. Requesting prior progress stop and retrying once.`,
         )
         try {
           const { getRedisClient } = await import("@/lib/redis-db")
@@ -322,10 +365,12 @@ export class GlobalTradeEngineCoordinator {
               stop_requested_at: new Date().toISOString(),
             }),
           ])
-        } catch { /* best-effort signal for the previous worker */ }
+        } catch { /* best-effort signal for the previous stale worker */ }
         try {
           await this.stopEngineUnlocked(connectionId)
         } catch { /* local worker may not own the previous engine */ }
+          await this.stopEngine(connectionId)
+        } catch { /* local worker may not own the previous stale engine */ }
         try {
           await forceBreakProgressionLock(connectionId)
         } catch { /* TTL fallback */ }
@@ -406,10 +451,6 @@ export class GlobalTradeEngineCoordinator {
         }
       }
       throw err
-    } finally {
-      // Step 6: Remove from lock set (always, even on error)
-      this.startingEngines.delete(connectionId)
-      console.log(`[v0] [STARTUP LOCK] Removed ${connectionId} from startup lock`)
     }
   }
 
@@ -422,6 +463,7 @@ export class GlobalTradeEngineCoordinator {
   }
 
   private async stopEngineUnlocked(connectionId: string): Promise<void> {
+  async stopEngine(connectionId: string, options: StopEngineOptions = {}): Promise<void> {
     // Step 1: Check if already stopping
     if (this.stoppingEngines.has(connectionId)) {
       console.log(`[v0] [STOP LOCK] Engine already stopping for ${connectionId}, skipping duplicate stop request`)
@@ -438,8 +480,16 @@ export class GlobalTradeEngineCoordinator {
       const manager = this.engineManagers.get(connectionId)
 
       if (!manager) {
-        console.log(`[v0] No in-memory engine found for connection: ${connectionId}; running Redis cleanup anyway`)
-        await this.cleanupStoppedRuntimeState(connectionId)
+        if (options.operatorRequested === true) {
+          console.log(`[v0] No in-memory engine found for connection: ${connectionId}; operator stop will clean runtime state`)
+          await this.cleanupStoppedRuntimeState(connectionId)
+        } else {
+          console.log(
+            `[v0] No in-memory engine found for connection: ${connectionId}; ` +
+              "not deleting runtime state because another worker may own it",
+          )
+          await this.requestRemoteStop(connectionId, "stop_engine_no_local_manager")
+        }
         return
       }
 
@@ -457,8 +507,40 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Best-effort runtime cleanup shared by both normal stops and "no local
-   * manager" stops. This intentionally does NOT mutate Main Connections
+   * Signal a remote owner to stop without deleting runtime keys or marking the
+   * connection stopped. The owning worker is responsible for observing this
+   * flag and performing ownership-safe cleanup when it actually stops.
+   */
+  private async requestRemoteStop(connectionId: string, reason: string): Promise<void> {
+    try {
+      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
+      await initRedis().catch(() => undefined)
+      const redisClient = getRedisClient()
+      const nowIso = new Date().toISOString()
+      await Promise.all([
+        redisClient.hset(`trade_engine_state:${connectionId}`, {
+          stop_requested: "1",
+          stop_reason: reason,
+          stop_requested_at: nowIso,
+          updated_at: nowIso,
+        }).catch(() => 0),
+        redisClient.hset(`progression:${connectionId}`, {
+          stop_requested: "1",
+          stop_reason: reason,
+          stop_requested_at: nowIso,
+          last_update: nowIso,
+        }).catch(() => 0),
+      ])
+      console.log(`[v0] Requested remote engine stop for ${connectionId} without clearing runtime state`)
+    } catch (redisErr) {
+      console.warn(`[v0] [STOP LOCK] Could not request remote stop for ${connectionId}:`, redisErr)
+    }
+  }
+
+  /**
+   * Best-effort runtime cleanup for a locally-owned manager stop or an explicit
+   * operator stop that is allowed to stop any owner. This intentionally does
+   * NOT mutate Main Connections
    * assignment/enabled flags (`is_active_inserted`, `is_dashboard_inserted`,
    * `is_assigned`, `is_active`). Assignment is user intent and is only cleared
    * by explicit remove/unassign flows; a normal engine stop should only clear
@@ -867,12 +949,9 @@ export class GlobalTradeEngineCoordinator {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
 
-      // ── DEV ONE-ENGINE OOM GUARD ──────────────────────────────────────────
-      // This is the single chokepoint through which BOTH the auto-start healing
-      // sweep and the operator Start route request engines. On the low-RAM dev
-      // VM (4.39 GB, no swap) two engines running their prehistoric StrategySet
-      // pass at once reliably OOM-kills the worker. Both bingx-x01 and bybit-x03
-      // are always inited + visible, but in DEVELOPMENT only ONE engine may run
+      // Process all assigned/enabled connections consistently in both dev and prod.
+      // Connection enablement settings (is_enabled_dashboard) define scope;
+      // env-based filtering previously masked production coordinator bugs.
       // Process all connections consistently in both dev and prod.
       // Use connection enable/disable settings (is_enabled_dashboard) to manage
       // scope instead of env-based filtering. Dev-only filtering masked prod bugs.
