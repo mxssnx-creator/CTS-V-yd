@@ -27,6 +27,8 @@ async function getCachedClient() {
 }
 
 // Default limits per strategy type (independently configurable)
+export const MAX_INPUT_MULTIPLIER = 2
+
 const DEFAULT_LIMITS = {
   base: 900,
   main: 300,
@@ -167,6 +169,21 @@ export class StrategySetsProcessor {
 
       const startTime = Date.now()
 
+      const [baseCfg, mainCfg, realCfg, liveCfg] = await Promise.all([
+        this.resolveCompaction("base"),
+        this.resolveCompaction("main"),
+        this.resolveCompaction("real"),
+        this.resolveCompaction("live"),
+      ])
+      const maxLimit = Math.max(
+        baseCfg.floor,
+        mainCfg.floor,
+        realCfg.floor,
+        liveCfg.floor,
+        this.limits.base,
+        this.limits.main,
+        this.limits.real,
+        this.limits.live,
       await this.refreshSettingsIfNeeded()
 
       // Sort indications by profitFactor descending so that the best-performing
@@ -177,8 +194,20 @@ export class StrategySetsProcessor {
       )
       const selectedTotal = sortedIndications.length
 
+      // Sort indications by profitFactor descending so that the best-performing
+      // signals are processed first across all strategy type pools. Keep enough
+      // headroom for the largest resolved compaction floor before the per-pool
+      // filters select their own qualifying entries.
+      const sortedIndications = [...indications]
+        .sort((a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
+        .slice(0, maxLimit * MAX_INPUT_MULTIPLIER)
+
       // Process all 4 strategy types in parallel with independent logic
       const [baseResults, mainResults, realResults, liveResults] = await Promise.all([
+        this.processBaseStrategySet(symbol, sortedIndications, baseCfg),
+        this.processMainStrategySet(symbol, sortedIndications, mainCfg),
+        this.processRealStrategySet(symbol, sortedIndications, realCfg),
+        this.processLiveStrategySet(symbol, sortedIndications, liveCfg),
         this.processBaseStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
         this.processMainStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
         this.processRealStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
@@ -213,6 +242,7 @@ export class StrategySetsProcessor {
   /**
    * Base Strategy Set - Conservative, low-risk signals only
    */
+  private async processBaseStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
   private toStageResult(
     type: "base" | "main" | "real" | "live",
     rawTotal: number,
@@ -246,6 +276,8 @@ export class StrategySetsProcessor {
         }
       }
     }
+    await this.saveBatchToSet(setKey, batch, "base", cfg)
+    return { type: "base", total, qualified }
     await this.saveBatchToSet(setKey, batch, "base")
     return this.toStageResult("base", rawTotal, selectedTotal, qualified)
   }
@@ -253,6 +285,7 @@ export class StrategySetsProcessor {
   /**
    * Main Strategy Set - Balanced, medium-risk signals
    */
+  private async processMainStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
   private async processMainStrategySet(
     symbol: string,
     indications: any[],
@@ -276,6 +309,8 @@ export class StrategySetsProcessor {
         }
       }
     }
+    await this.saveBatchToSet(setKey, batch, "main", cfg)
+    return { type: "main", total, qualified }
     await this.saveBatchToSet(setKey, batch, "main")
     return this.toStageResult("main", rawTotal, selectedTotal, qualified)
   }
@@ -283,6 +318,7 @@ export class StrategySetsProcessor {
   /**
    * Real Strategy Set - Aggressive, higher-risk signals
    */
+  private async processRealStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
   private async processRealStrategySet(
     symbol: string,
     indications: any[],
@@ -306,6 +342,8 @@ export class StrategySetsProcessor {
         }
       }
     }
+    await this.saveBatchToSet(setKey, batch, "real", cfg)
+    return { type: "real", total, qualified }
     await this.saveBatchToSet(setKey, batch, "real")
     return this.toStageResult("real", rawTotal, selectedTotal, qualified)
   }
@@ -313,6 +351,7 @@ export class StrategySetsProcessor {
   /**
    * Live Strategy Set - All qualifying signals, real-time only
    */
+  private async processLiveStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
   private async processLiveStrategySet(
     symbol: string,
     indications: any[],
@@ -334,6 +373,8 @@ export class StrategySetsProcessor {
         batch.push({ strategy, indicationType: indication.type })
       }
     }
+    await this.saveBatchToSet(setKey, batch, "live", cfg)
+    return { type: "live", total, qualified }
     await this.saveBatchToSet(setKey, batch, "live")
     return this.toStageResult("live", rawTotal, selectedTotal, qualified)
   }
@@ -351,6 +392,7 @@ export class StrategySetsProcessor {
     setKey: string,
     strategies: Array<{ strategy: any; indicationType: string }>,
     strategyType: string,
+    resolvedCfg?: CompactionConfig,
   ): Promise<void> {
     if (strategies.length === 0) return
     try {
@@ -375,7 +417,7 @@ export class StrategySetsProcessor {
         })
       }
 
-      const cfg = await this.resolveCompaction(strategyType as keyof StrategySetLimits)
+      const cfg = resolvedCfg ?? (await this.resolveCompaction(strategyType as keyof StrategySetLimits))
       entries = compact(entries, cfg, "best")
 
       // Pipeline the writes — the set value and its stats are
