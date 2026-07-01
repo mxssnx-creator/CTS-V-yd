@@ -1723,7 +1723,7 @@ async function updateProtectionOrders(
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
 
-  // ── System-close-only mode (cached) ────────────────────────────��──���
+  // ── System-close-only mode (cached) ────────────────────────────��──�����
   // Reconcile fans out across every live position on every tick, so
   // calling `getAppSettings()` here would issue one HGETALL per
   // position per tick — at 50 positions × 1 Hz that's 50 round-trips
@@ -3126,11 +3126,17 @@ export async function executeLivePosition(
               `${LOG_PREFIX} [101400 Correction] Detected minimum ${minQty} > current ${computedVolume.toFixed(8)} for ${realPosition.symbol}; retrying in same cycle`,
             )
             
+            // Use minimum + 10% margin to ensure acceptance
+            const retryQty = minQty * 1.1
+            console.log(
+              `${LOG_PREFIX} [101400 Retry] Sending with margin: ${retryQty.toFixed(8)} (min: ${minQty.toFixed(8)} × 1.1)`,
+            )
+            
             // Retry immediately with corrected quantity
             const retryOrderResult = await exchangeConnector.placeOrder(
               realPosition.symbol,
               exchangeSide,
-              minQty,
+              retryQty,
               undefined,
               "market",
               {
@@ -3140,19 +3146,20 @@ export async function executeLivePosition(
             
             if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {
               console.log(
-                `${LOG_PREFIX} [101400 Retry] Successfully placed order with corrected volume ${minQty.toFixed(8)} for ${realPosition.symbol}`,
+                `${LOG_PREFIX} [101400 Retry] Successfully placed order with volume ${retryQty.toFixed(8)} for ${realPosition.symbol}`,
               )
               // Continue with the corrected order
               Object.assign(orderResult, retryOrderResult)
-              computedVolume = minQty  // Update for subsequent logging
-              retryWasAttempted = false  // Signal success
+              computedVolume = retryQty  // Update for subsequent logging
+              retryWasAttempted = true  // Mark retry was attempted and succeeded
               entryOrderId = retryOrderResult?.orderId || retryOrderResult?.id
             } else {
               // Retry also failed
               console.warn(
-                `${LOG_PREFIX} [101400 Retry] Retry with ${minQty.toFixed(8)} also failed:`,
+                `${LOG_PREFIX} [101400 Retry] Retry with ${retryQty.toFixed(8)} also failed:`,
                 retryOrderResult?.error || retryOrderResult?.message || "unknown",
               )
+              retryWasAttempted = false  // Retry was attempted but failed
             }
           } catch (err) {
             console.warn(
@@ -3587,7 +3594,7 @@ export async function executeLivePosition(
       pushStep(livePosition, "place_sl_tp", false, "skipped — no fill yet")
     }
 
-    // ── Step 8: Sync with exchange for position data ───────────────────────
+    // ── Step 8: Sync with exchange for position data ──────────────���────────
     if (typeof exchangeConnector.getPosition === "function") {
       try {
         // Pass direction for hedge-mode accounts.
@@ -4761,7 +4768,7 @@ export async function reconcileLivePositions(
       exchangeMap.set(`${sym}|${direction}`, ep)
     }
 
-    // ── Once-per-tick venue open-orders snapshot ────���──────────────────
+    // ── Once-per-tick venue open-orders snapshot ────���─────────────────���
     // Used by `updateProtectionOrders` to detect silently-gone SL/TP
     // (filled, externally cancelled, expired, sweep). One `getOpenOrders`
     // call amortized across every position in the reconcile sweep, vs.
