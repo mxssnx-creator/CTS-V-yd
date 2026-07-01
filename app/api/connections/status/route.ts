@@ -27,11 +27,16 @@ export async function GET() {
         try {
           const engineStatus = await getTradeEngineStatus(connection.id)
 
+          const assigned = connection.is_active_inserted === true || connection.is_active_inserted === "1" || connection.is_assigned === true || connection.is_assigned === "1" || connection.is_dashboard_inserted === true || connection.is_dashboard_inserted === "1"
+          const processingEnabled = connection.is_enabled_dashboard === true || connection.is_enabled_dashboard === "1"
+
           return {
             id: connection.id,
             name: connection.name,
             exchange: connection.exchange,
-            status: connection.is_enabled ? (connection.is_live_trade ? "connected" : "connecting") : "disabled",
+            assigned,
+            processingEnabled,
+            status: processingEnabled ? (connection.is_live_trade ? "connected" : "connecting") : "disabled",
             progress: engineStatus?.loadingProgress || 0,
             balance: engineStatus?.balance || 0,
             activePositions: engineStatus?.activePositions || 0,
@@ -48,6 +53,8 @@ export async function GET() {
             id: connection.id,
             name: connection.name,
             exchange: connection.exchange,
+            assigned: connection.is_active_inserted === true || connection.is_active_inserted === "1" || connection.is_assigned === true || connection.is_assigned === "1" || connection.is_dashboard_inserted === true || connection.is_dashboard_inserted === "1",
+            processingEnabled: connection.is_enabled_dashboard === true || connection.is_enabled_dashboard === "1",
             status: "error",
             progress: 0,
             error: error instanceof Error ? error.message : "Unknown error",
