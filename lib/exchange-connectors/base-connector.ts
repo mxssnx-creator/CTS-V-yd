@@ -113,7 +113,7 @@ export interface PlaceOrderOptions {
 export abstract class BaseExchangeConnector {
   protected credentials: ExchangeCredentials
   protected logs: string[] = []
-  protected timeout = 10000 // 10 seconds
+  protected timeout = 40000 // 40 seconds (increased from 10s to handle BingX API latency)
   protected rateLimiter: ReturnType<typeof getRateLimiter>
 
   constructor(credentials: ExchangeCredentials, exchange: string) {
