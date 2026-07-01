@@ -61,6 +61,13 @@ interface EngineTimings {
   normalizeMaxPerDirection: number // per-direction cap for hedge accumulator
   normalizeVolumeMode: string      // "neutralize" | "rebalance" | "reduce"
 
+  // ── Position Ceilings (live settings, updated on write) ──────────────────
+  // Max concurrent positions per direction. Read at every cycle.
+  // Stored as number in Redis. Live-settings contract: hot-path,
+  // changes apply within ~10 s (engine-timings cache TTL), no engine restart needed.
+  maxPositionsLong: number         // Max concurrent long positions (default 1)
+  maxPositionsShort: number        // Max concurrent short positions (default 1)
+
   // Three-progression loop tunables
   prehistoricIntervalMs: number
   prehistoricCyclePauseMs: number
@@ -105,6 +112,9 @@ const DEFAULT_TIMINGS: EngineTimings = {
    normalizeThresholdPct:       10,
    normalizeMaxPerDirection:    200,
    normalizeVolumeMode:         "neutralize",
+   // ── Position Ceilings defaults ────────────────────────────────────────
+   maxPositionsLong:            1,   // Default: 1 concurrent long position
+   maxPositionsShort:           1,   // Default: 1 concurrent short position
 }
 
 // Mirror of `ENGINE_TIMING_BOUNDS`. The API clamps server-side too;
@@ -210,6 +220,15 @@ normalizeMaxPerDirection: {
     min: 0, max: 0, unit: "enum", live: true,
     help: "How accumulated volume is adjusted on normalize trigger: neutralize (net-delta only), rebalance (full vol. toward dominant), reduce (scale by imbalance ratio). Default: neutralize.",
   },
+  // ── Position Ceilings ─────────────────────────────────────────────────────
+  maxPositionsLong: {
+    min: 1, max: 50, unit: "positions", live: true,
+    help: "Max concurrent long positions. Range 1–50. Default 1 (conservative). Increase to allow more simultaneous long entries.",
+  },
+  maxPositionsShort: {
+    min: 1, max: 50, unit: "positions", live: true,
+    help: "Max concurrent short positions. Range 1–50. Default 1 (conservative). Increase to allow more simultaneous short entries.",
+  },
 }
 
 export function SystemSettings() {
@@ -280,6 +299,8 @@ export function SystemSettings() {
           }
           readNum("neutralize_threshold_pct",     "normalizeThresholdPct")
           readNum("neutralize_max_per_direction", "normalizeMaxPerDirection")
+          readNum("max_positions_long",           "maxPositionsLong")
+          readNum("max_positions_short",          "maxPositionsShort")
           const readNormalizeStr = (snake: string, camel: keyof EngineTimings) => {
             const raw = sys[snake] ?? (sys as any)[camel]
             if (typeof raw === "string" && raw.trim() !== "") return raw.trim()
@@ -348,6 +369,9 @@ export function SystemSettings() {
             normalize_max_per_direction:   timings.normalizeMaxPerDirection,
             // string — not numeric — included verbatim
             normalize_volume_mode:         timings.normalizeVolumeMode,
+            // ── Position Ceilings ─────────────────────────────────────────
+            max_positions_long:            timings.maxPositionsLong,
+            max_positions_short:           timings.maxPositionsShort,
           }),
         }),
       ])
