@@ -208,6 +208,11 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   lockExtendIntervalMs:      { min: 1_000,       max: 60_000              },
   maxPositionHoldMs:         { min: 0 /* off */, max: 7 * 24 * 60 * 60_000 },
   progressionBufferFlushMs:  { min: 500,         max: 60_000              },
+  // ── API/Exchange operation timeouts ───────────────────────────────────
+  apiTimeoutMs:              { min: 5_000,       max: 120_000             },
+  apiPlaceOrderTimeoutMs:    { min: 5_000,       max: 120_000             },
+  apiCancelOrderTimeoutMs:   { min: 5_000,       max: 60_000              },
+  apiPositionTimeoutMs:      { min: 5_000,       max: 60_000              },
   // ── Three-progression bounds ──────────────────────────────────────────
   // Interval floors at 200 ms prevent a runaway 1 ms cadence from locking
   // the event loop. Interval ceilings at 60 s let operators "park" a loop.
@@ -240,6 +245,10 @@ const REDIS_KEY_MAP: Record<keyof EngineTimings, string[]> = {
   lockExtendIntervalMs:       ["lock_extend_interval_ms",       "lockExtendIntervalMs"],
   maxPositionHoldMs:          ["max_position_hold_ms",          "maxPositionHoldMs"],
   progressionBufferFlushMs:   ["progression_buffer_flush_ms",   "progressionBufferFlushMs"],
+  apiTimeoutMs:               ["api_timeout_ms",                "apiTimeoutMs"],
+  apiPlaceOrderTimeoutMs:     ["api_place_order_timeout_ms",    "apiPlaceOrderTimeoutMs"],
+  apiCancelOrderTimeoutMs:    ["api_cancel_order_timeout_ms",   "apiCancelOrderTimeoutMs"],
+  apiPositionTimeoutMs:       ["api_position_timeout_ms",       "apiPositionTimeoutMs"],
   prehistoricIntervalMs:      ["prehistoric_interval_ms",       "prehistoricIntervalMs"],
   prehistoricCyclePauseMs:    ["prehistoric_cycle_pause_ms",    "prehistoricCyclePauseMs"],
   realtimeIntervalMs:         ["realtime_interval_ms",          "realtimeIntervalMs"],
