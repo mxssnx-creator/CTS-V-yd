@@ -437,6 +437,11 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Production must allow in-process starts from the coordinator")
     expect(source).toContain("Duplicate starts")
     expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain("Production must allow in-process starts from the coordinator")
+    expect(source).toContain("Duplicate starts")
+    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
   test("coordinator startEngine allows explicit foreground UI starts", () => {
     const source = read("lib/trade-engine.ts")
 
@@ -487,6 +492,21 @@ describe("requested regression guardrails", () => {
     expect(migrations).toContain('"indications_active:*"')
     expect(migrations).toContain('"indications_window:*:last5"')
     expect(migrations).toContain("do NOT touch cumulative progression counters")
+  })
+
+  test("indication processing keeps every type independent and windowed", () => {
+    const setProcessor = read("lib/indication-sets-processor.ts")
+    const rawProcessor = read("lib/trade-engine/indication-processor-fixed.ts")
+
+    expect(setProcessor).toContain('runType("active_advanced", () => this.processActiveAdvancedSet(symbol, marketData))')
+    expect(setProcessor).toContain("private async processActiveAdvancedSet")
+    expect(setProcessor).toContain('await this.batchSaveIndications(pendingWrites, "active_advanced")')
+    expect(setProcessor).toContain('active_advanced: activeAdvancedResults')
+    expect(setProcessor).toContain('`${symbol}:active_advanced`]: String(advQ)')
+    expect(rawProcessor).toContain("active_advanced: 0")
+    expect(rawProcessor).toContain('const w5Key = `indications_window:${this.connectionId}:last5`')
+    expect(rawProcessor).toContain("pipe.hset(w5Key, fields)")
+    expect(rawProcessor).toContain("pipe.hset(w60Key, fields)")
   })
 
   test("server continuity cron awaits direct healing sweep instead of relying on auto-start timers", () => {
