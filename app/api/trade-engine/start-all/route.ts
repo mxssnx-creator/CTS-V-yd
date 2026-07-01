@@ -89,7 +89,7 @@ async function handleStartAll() {
           realtimeInterval,
         }
         setImmediate(() => {
-          coordinator.startEngine(connection.id, engineConfig).catch(async (error: unknown) => {
+          coordinator.startEngine(connection.id, engineConfig, { markAssigned: true }).catch(async (error: unknown) => {
             console.error(`[START-ALL] Background start failed for ${connection.id}:`, error)
             await client.set(`engine_is_running:${connection.id}`, "0").catch(() => {})
             await SystemLogger.logError(error, "api", `Background start-all engine ${connection.id}`).catch(() => {})
