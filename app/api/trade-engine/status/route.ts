@@ -260,15 +260,13 @@ export async function GET() {
         rootCause:
           workerDiagnostic.error ||
           (isGloballyRunning && activeEngineCount === 0
-            ? "Global engine intent is running; no local runtime is attached yet, so the next explicit UI action or continuity sweep will reconcile engine work."
-            ? "Global Redis operator intent is running, but no local manager or fresh distributed processor heartbeat is attached. In production this means the UI worker only has operator intent; a dedicated opted-in engine worker/cron heartbeat is not actually running."
+            ? "Global Redis operator intent is running, but no local manager or fresh distributed processor heartbeat is attached. The server boot auto-start/continuity sweep should attach processing; if it does not, check production boot logs and cron execution."
             : null),
         hint:
           activeEngineCount === 0
             ? "No local engine runtime is attached yet; explicit UI actions and continuity sweeps will reconcile queued engine work."
             : null,
-        requiredWorkerEnv: "Optional for always-on processing: set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker/process. UI actions can still start engines foreground when needed.",
-        requiredWorkerEnv: "ENABLE_TRADE_ENGINE_AUTOSTART=1 on exactly one dedicated worker/process; add ENABLE_IN_PROCESS_CONTINUITY=1 on that same process only when in-process continuity timers are expected",
+        requiredWorkerEnv: "Optional for dedicated-worker deployments: set ENABLE_TRADE_ENGINE_AUTOSTART=1 on exactly one long-lived worker/process; normal production Node processes auto-start foreground work from boot and continuity sweeps unless disabled.",
         worker: workerDiagnostic,
       },
       connections: connectionStatuses,

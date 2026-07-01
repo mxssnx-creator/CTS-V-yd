@@ -436,23 +436,8 @@ describe("requested regression guardrails", () => {
 
     expect(source).toContain("Production must allow in-process starts from the coordinator")
     expect(source).toContain("Duplicate starts")
+    expect(source).not.toContain("runningUnderProdStart")
     expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
-    const source = read("lib/trade-engine.ts")
-
-    expect(source).toContain("Production must allow in-process starts from the coordinator")
-    expect(source).toContain("Duplicate starts")
-    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
-    const source = read("lib/trade-engine.ts")
-
-    expect(source).toContain("Production must allow in-process starts from the coordinator")
-    expect(source).toContain("Duplicate starts")
-    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
-  test("coordinator startEngine allows explicit foreground UI starts", () => {
-    const source = read("lib/trade-engine.ts")
-
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(source).toContain('(config as any)?.allowInProcessStart === true')
-    expect(source).toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {
@@ -568,9 +553,23 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("distributedHeartbeatFresh: hasFreshDistributedHeartbeat")
     expect(source).toContain("distributedEngineCount")
     expect(source).toContain("No local engine runtime is attached yet; explicit UI actions and continuity sweeps will reconcile queued engine work.")
-    expect(source).toContain("Optional for always-on processing")
+    expect(source).toContain("Optional for dedicated-worker deployments")
     expect(source).toContain("operatorStatus: operatorIntent")
     expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
+  })
+
+
+  test("startup cleanup preserves fresh distributed engine owners", () => {
+    const source = read("lib/startup-coordinator.ts")
+    const cleanupBlock = source.slice(
+      source.indexOf("export async function cleanupOrphanedProgress"),
+      source.indexOf("export async function completeStartup"),
+    )
+
+    expect(cleanupBlock).toContain("fresh distributed heartbeat present")
+    expect(cleanupBlock).toContain("last_processor_heartbeat")
+    expect(cleanupBlock).toContain("Date.now() - remoteHeartbeat < 90_000")
+    expect(cleanupBlock.indexOf("remoteHeartbeatFresh")).toBeLessThan(cleanupBlock.indexOf("Cleaning orphaned running flag"))
   })
 
   test("startup lock preserves a fresh remote engine owner instead of clearing its Redis flag", () => {
