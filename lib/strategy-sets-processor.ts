@@ -314,6 +314,8 @@ export class StrategySetsProcessor {
   }
 
   /**
+   * Batch-save multiple qualifying strategies to the same set pool in
+   * ONE read-merge-compact-write transaction.
    * Batch-save all qualifying strategies for a type-specific pool in one
    * staged read-merge-compact-write transaction. The strategy-set pipeline
    * accumulates qualifying entries in memory while evaluating indications,
