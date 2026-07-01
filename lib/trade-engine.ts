@@ -194,18 +194,8 @@ export class GlobalTradeEngineCoordinator {
       return existingStart
     }
 
-    let resolveStart!: (started: boolean) => void
-    let rejectStart!: (reason?: unknown) => void
-    const startPromise = new Promise<boolean>((resolve, reject) => {
-      resolveStart = resolve
-      rejectStart = reject
-    })
-
-    this.startingEngines.set(connectionId, startPromise)
-    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
-
-    void this.startEngineWithRegisteredMutex(connectionId, config)
-      .then(resolveStart, rejectStart)
+    const startPromise = Promise.resolve()
+      .then(() => this.startEngineWithRegisteredMutex(connectionId, config))
       .finally(() => {
         if (this.startingEngines.get(connectionId) === startPromise) {
           this.startingEngines.delete(connectionId)
@@ -213,6 +203,8 @@ export class GlobalTradeEngineCoordinator {
         }
       })
 
+    this.startingEngines.set(connectionId, startPromise)
+    console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
     return startPromise
   }
 
@@ -401,11 +393,6 @@ export class GlobalTradeEngineCoordinator {
         }
       }
       throw err
-    } finally {
-      // Step 6: Startup lock cleanup is handled by startEngine(), whose
-      // registered promise covers every early return and thrown error in this
-      // method. Keep this finally block so lock ownership cleanup remains
-      // structurally tied to the guarded start attempt.
     }
   }
 
@@ -840,18 +827,6 @@ export class GlobalTradeEngineCoordinator {
   async startMissingEngines(connections: any[]): Promise<number> {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
-
-      // ── DEV ONE-ENGINE OOM GUARD ──────────────────────────────────────────
-      // This is the single chokepoint through which BOTH the auto-start healing
-      // sweep and the operator Start route request engines. On the low-RAM dev
-      // VM (4.39 GB, no swap) two engines running their prehistoric StrategySet
-      // pass at once reliably OOM-kills the worker. Both bingx-x01 and bybit-x03
-      // are always inited + visible, but in DEVELOPMENT only ONE engine may run
-      // Process all connections consistently in both dev and prod.
-      // Use connection enable/disable settings (is_enabled_dashboard) to manage
-      // scope instead of env-based filtering. Dev-only filtering masked prod bugs.
-        connections = capped
-      }
 
       if (!(await this.isGlobalCoordinatorEnabled("startMissingEngines"))) {
         return 0
