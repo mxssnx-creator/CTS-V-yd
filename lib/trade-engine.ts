@@ -311,8 +311,26 @@ export class GlobalTradeEngineCoordinator {
         selfOwnedIfAlive: localManagerAlive,
       })
       if (!acquired.acquired || !acquired.handle) {
+        const ownerHeartbeatFreshnessMs = 90_000
+        let ownerHeartbeatFresh = false
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          const ownerState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+          const ownerHeartbeat = Number((ownerState as any)?.last_processor_heartbeat || 0)
+          ownerHeartbeatFresh =
+            Number.isFinite(ownerHeartbeat) && ownerHeartbeat > 0 && Date.now() - ownerHeartbeat < ownerHeartbeatFreshnessMs
+        } catch { /* heartbeat read is best-effort */ }
+
+        if (ownerHeartbeatFresh) {
+          console.warn(
+            `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker (${acquired.existingOwner ?? "unknown"}) with a fresh heartbeat. Leaving existing owner untouched.`,
+          )
+          return true
+        }
+
         console.warn(
-          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Requesting prior progress stop and retrying once.`,
+          `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker (${acquired.existingOwner ?? "unknown"}) with a stale heartbeat. Requesting prior progress stop and retrying once.`,
         )
         try {
           const { getRedisClient } = await import("@/lib/redis-db")
@@ -347,6 +365,7 @@ export class GlobalTradeEngineCoordinator {
           return false
         }
       }
+      // Cannot start engine ${connectionId}: Leaving existing owner untouched; return false remains the retry-failure path above.
       lockHandle = acquired.handle
       console.log(
         `[v0] [STARTUP LOCK] Acquired progression lock for ${connectionId} (epoch=${lockHandle.epoch}${acquired.healedStaleLock ? ", healed stale" : ""})`,
@@ -544,13 +563,32 @@ export class GlobalTradeEngineCoordinator {
     }
     this.escalatingEngines.add(connectionId)
     try {
-      // Pre-emptively break the progression lock so the restart can
-      // acquire a fresh slot without waiting for the TTL.
+      const hasLocalRunningManager = this.engineManagers.get(connectionId)?.isEngineRunning === true
+      if (hasLocalRunningManager) {
+        // A local restart can stop normally so the manager releases its own
+        // lock/heartbeat before we acquire a replacement generation below.
+        try {
+          await this.stopEngine(connectionId)
+        } catch (stopErr) {
+          console.warn(
+            `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
+            stopErr instanceof Error ? stopErr.message : String(stopErr),
+          )
+        }
+      } else if (await this.markRemoteRestartRequestIfFresh(connectionId)) {
+        console.log(
+          `[v0] [Coordinator] restartEngine(${connectionId}) queued for remote owner has fresh heartbeat; treat the distributed owner as active`,
+        )
+        return
+      }
+
+      // Pre-emptively break the progression lock only after proving there is no
+      // local manager to stop normally and no remote owner with a fresh heartbeat.
       try {
         await forceBreakProgressionLock(connectionId)
       } catch { /* TTL will reclaim */ }
       try {
-        await this.stopEngine(connectionId)
+        if (!hasLocalRunningManager) await this.stopEngine(connectionId)
       } catch (stopErr) {
         console.warn(
           `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
@@ -567,6 +605,30 @@ export class GlobalTradeEngineCoordinator {
       }
     } finally {
       this.escalatingEngines.delete(connectionId)
+    }
+  }
+
+  private async markRemoteRestartRequestIfFresh(connectionId: string): Promise<boolean> {
+    try {
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      const remoteState = await client.hgetall(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string, string>))
+      const remoteHeartbeat = Number((remoteState as any)?.last_processor_heartbeat || 0)
+      if (!(Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000)) {
+        return false
+      }
+      await client.hset(`trade_engine_state:${connectionId}`, {
+        restart_request: "1",
+        settings_change_marker: new Date().toISOString(),
+        restart_requested_at: new Date().toISOString(),
+      })
+      return true
+    } catch (error) {
+      console.warn(
+        `[v0] [Coordinator] remote restart marker failed for ${connectionId}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+      return false
     }
   }
 
