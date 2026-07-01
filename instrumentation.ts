@@ -68,6 +68,7 @@ export async function register(): Promise<void> {
     }
   } else {
     console.warn("[v0] [Instrumentation] trade-engine auto-start disabled by DISABLE_TRADE_ENGINE_AUTOSTART=1")
+    console.warn("[v0] [Instrumentation] background trade-engine auto-start skipped; explicit UI actions and continuity sweeps can start/reconcile engines")
   }
 
   if (process.env.DISABLE_IN_PROCESS_CONTINUITY !== "1") {
@@ -79,6 +80,7 @@ export async function register(): Promise<void> {
     }
   } else {
     console.warn("[v0] [Instrumentation] in-process continuity disabled by DISABLE_IN_PROCESS_CONTINUITY=1")
+    console.warn("[v0] [Instrumentation] background in-process continuity skipped; deployment cron or UI-triggered reconciliation remains available")
   }
 
   console.log("[v0] [Instrumentation] ✓ Server boot complete")

@@ -305,6 +305,13 @@ export async function getIndicationTracking(
   // counts or legacy mixed deployments.
   const w5 = (setW5Hash || {}) as Record<string, string>
   const w60 = (setW60Hash || {}) as Record<string, string>
+  // Primary source: indications_window:{id}:last5 / last60min hashes written
+  // by the engine and cron per-type.
+  // Fallback: derive from cumulative progHash counters when window keys are
+  // absent (e.g. first boot before any cycles have completed). The fallback
+  // is coarser (it's all-time, not windowed) but keeps the UI non-zero.
+  const w5 = (w5Hash || {}) as Record<string, string>
+  const w60 = (w60Hash || {}) as Record<string, string>
   const w5ByType = aggregateWindowByType(w5)
   const w60ByType = aggregateWindowByType(w60)
 
