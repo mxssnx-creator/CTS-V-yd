@@ -214,8 +214,6 @@ export function SystemDetailPanel() {
 
       setSystemData({
         engine: {
-          running: engineStatus?.actualRuntimeStatus === "running" || engineStatus?.running === true || progressionState?.processingCompleteness?.realtimeRunning || false,
-          status: engineStatus?.actualRuntimeStatus === "queued" ? "Queued / waiting for worker" : (engineStatus?.actualRuntimeStatus ?? engineStatus?.status ?? (progressionState?.processingCompleteness?.realtimeRunning ? "running" : "stopped")),
           running:
             systemStatus?.engineRuntime?.running ??
             engineStatus?.running ??
@@ -223,6 +221,7 @@ export function SystemDetailPanel() {
             false,
           status:
             systemStatus?.engineRuntime?.status ??
+            engineStatus?.actualRuntimeStatus ??
             engineStatus?.status ??
             (progressionState?.processingCompleteness?.realtimeRunning
               ? "running"

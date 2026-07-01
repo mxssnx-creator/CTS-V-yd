@@ -50,20 +50,11 @@ export function isConnectionInActivePanel(connection: any): boolean {
   return isConnectionAssignedToMain(connection)
 }
 
-// PHASE 2 FIX: Add independent state check for main processing
-export function isConnectionProcessingEnabled(connection: any): boolean {
-  // Connection is processing if BOTH assigned AND dashboard-enabled. Active-panel
-  // visibility alone must not enable engine work.
-  return isConnectionAssignedToMain(connection) && isConnectionDashboardEnabled(connection)
 export function isConnectionMainProcessing(connection: any): boolean {
   // Connection is processing if BOTH assigned AND dashboard-enabled.
   // is_active_inserted / is_assigned are panel-assignment flags only;
   // is_enabled_dashboard is the explicit processing switch.
   return isConnectionAssignedToMain(connection) && isConnectionProcessingEnabled(connection)
-}
-
-export function isConnectionMainProcessing(connection: any): boolean {
-  return isConnectionProcessingEnabled(connection)
 }
 
 export function isConnectionSystemEnabled(connection: any): boolean {
@@ -88,16 +79,7 @@ export function isConnectionEligibleForEngine(connection: any): boolean {
   // Engine processing requires assignment plus the dashboard processing toggle.
   // Base `is_enabled` / legacy `enabled` are intentionally ignored here; they
   // only describe base connection availability/settings visibility.
-  const isAssigned = isConnectionAssignedToMain(connection)
-  const processingEnabled = isConnectionDashboardEnabled(connection)
-  // Connection must be assigned to the main panel and explicitly enabled for
-  // dashboard processing. Active-panel visibility alone does not start engines.
-
-  const isProcessingEnabled = isConnectionProcessingEnabled(connection)
-  // Connection must be assigned to the main panel AND explicitly enabled for
-  // processing. Assignment flags only control panel visibility.
-  const isAssigned = isConnectionAssignedToMain(connection)
-  const processingEnabled = isConnectionProcessingEnabled(connection)
+  const isProcessingEnabled = isConnectionMainProcessing(connection)
 
   // Any credentials count — placeholder and testnet are accepted; credentials are
   // validated per-operation by the exchange connector, not at eligibility check time.
@@ -107,7 +89,6 @@ export function isConnectionEligibleForEngine(connection: any): boolean {
   const isPredefined = isTruthyFlag(connection?.is_predefined)
 
   return isProcessingEnabled && (hasCredentials || isTestnet || isDemoMode || isPredefined)
-  return isAssigned && processingEnabled && (hasCredentials || isTestnet || isDemoMode || isPredefined)
 }
 
 export function isOpenPosition(position: any): boolean {
