@@ -30,6 +30,49 @@ export const revalidate = 0
     return Math.round(x * m) / m
   }
 
+  const INDICATION_TYPES = ["direction", "move", "active", "active_advanced", "optimal", "auto"] as const
+
+  function aggregateIndicationSnapshot(hash: Record<string, string> | null | undefined): {
+    counts: Record<string, number>
+    activeSets: Record<string, number>
+  } {
+    const counts: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const activeSets: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const fields = hash && typeof hash === "object" ? hash : {}
+
+    // Legacy production deployments wrote plain fields ("direction") while
+    // current writers use scoped fields ("BTCUSDT:direction"). When both exist
+    // for the same type, ignore the plain field so mixed deploys do not double
+    // count. If only the legacy shape exists, keep reading it so Kilo/old Redis
+    // data does not show false zeroes until the next cron tick rewrites scoped
+    // fields.
+    const hasScopedField: Record<string, boolean> = {
+      direction: false, move: false, active: false, active_advanced: false, optimal: false, auto: false,
+    }
+    for (const field of Object.keys(fields)) {
+      const idx = field.lastIndexOf(":")
+      if (idx <= 0) continue
+      const type = field.slice(idx + 1)
+      if (type in hasScopedField) hasScopedField[type] = true
+    }
+
+    for (const [field, raw] of Object.entries(fields)) {
+      const idx = field.lastIndexOf(":")
+      const type = idx > 0 ? field.slice(idx + 1) : field
+      if (!(type in counts)) continue
+      if (idx <= 0 && hasScopedField[type]) continue
+      const value = n(raw)
+      counts[type] += value
+      if (value > 0) activeSets[type] += 1
+    }
+
+    return { counts, activeSets }
+  }
+
   /**
    * Compute live-stage performance metrics from a closed-position snapshot.
    * Used by both `buildTradeHistory` (row-level PF) and `aggregateClosedStats`
@@ -1053,20 +1096,10 @@ export async function GET(
         ? (_stratActiveHash as Record<string, string>)
         : null
       if (indActiveHash && typeof indActiveHash === "object") {
-        for (const [field, val] of Object.entries(indActiveHash)) {
-          // field shape: "{symbol}:{type}" — split on the LAST colon so
-          // symbols containing colons (none today, but future-proof) survive.
-          const idx = field.lastIndexOf(":")
-          if (idx <= 0) continue
-          const type = field.slice(idx + 1)
-          const numVal = n(val)
-          if (type in activeIndByType) {
-            activeIndByType[type] += numVal
-            // Each non-zero (symbol×type) field == one Set actively
-            // producing qualified entries this cycle. Cardinality is
-            // the operator-asked "Active Progressing Sets" count.
-            if (numVal > 0) activeSetsIndByType[type] += 1
-          }
+        const snapshot = aggregateIndicationSnapshot(indActiveHash as Record<string, string>)
+        for (const type of INDICATION_TYPES) {
+          activeIndByType[type] = snapshot.counts[type] || 0
+          activeSetsIndByType[type] = snapshot.activeSets[type] || 0
         }
       }
       if (stratActiveHash && typeof stratActiveHash === "object") {

@@ -31,8 +31,6 @@
 // process (register() is only meant to run once per real process start).
 const bootGuard = globalThis as unknown as { __v0_instrumentation_booted?: boolean }
 
-const dynamicServerImport = new Function("specifier", "return import(specifier)") as <T>(specifier: string) => Promise<T>
-
 export async function register(): Promise<void> {
   // Only skip the Edge runtime. In `next start` / OpenNext production workers
   // `NEXT_RUNTIME` can be undefined during instrumentation registration, while
@@ -57,33 +55,30 @@ export async function register(): Promise<void> {
     console.error("[v0] [Instrumentation] completeStartup failed (continuing):", err instanceof Error ? err.message : err)
   }
 
-  // Production web workers must stay responsive for UI/API health probes.
-  // Starting heavy trade-engine loops inside the same Next.js request worker on
-  // cold boot can monopolize the event loop and make /api/health time out before
-  // operators can even open the dashboard. Run the in-process engine monitor only
-  // when a dedicated worker explicitly opts in; otherwise users still start the
-  // engine from the UI/API and hosted deployments can use external cron/worker
-  // processes for continuity.
-  if (process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1") {
+  // Production Node processes should be self-contained: initialize the
+  // auto-start/healing sweep and continuity runner by default so explicit UI
+  // actions and persisted running intent work without a separate worker env flag.
+  // Serverless/edge safety is handled inside the imported runners.
+  if (process.env.DISABLE_TRADE_ENGINE_AUTOSTART !== "1") {
     try {
-      const { initializeTradeEngineAutoStart } = await dynamicServerImport<typeof import("@/lib/trade-engine-auto-start")>("@/lib/trade-engine-auto-start")
+      const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
       await initializeTradeEngineAutoStart()
     } catch (err) {
       console.error("[v0] [Instrumentation] auto-start init failed (continuing):", err instanceof Error ? err.message : err)
     }
   } else {
-    console.warn("[v0] [Instrumentation] trade-engine auto-start skipped; set ENABLE_TRADE_ENGINE_AUTOSTART=1 in a dedicated worker to opt in")
+    console.warn("[v0] [Instrumentation] trade-engine auto-start disabled by DISABLE_TRADE_ENGINE_AUTOSTART=1")
   }
 
-  if (process.env.ENABLE_IN_PROCESS_CONTINUITY === "1") {
+  if (process.env.DISABLE_IN_PROCESS_CONTINUITY !== "1") {
     try {
-      const { startServerContinuityRunner } = await dynamicServerImport<typeof import("@/lib/server-continuity-runner")>("@/lib/server-continuity-runner")
+      const { startServerContinuityRunner } = await import("@/lib/server-continuity-runner")
       startServerContinuityRunner()
     } catch (err) {
       console.error("[v0] [Instrumentation] continuity runner failed (continuing):", err instanceof Error ? err.message : err)
     }
   } else {
-    console.warn("[v0] [Instrumentation] in-process continuity skipped; use ENABLE_IN_PROCESS_CONTINUITY=1 only for a dedicated worker")
+    console.warn("[v0] [Instrumentation] in-process continuity disabled by DISABLE_IN_PROCESS_CONTINUITY=1")
   }
 
   console.log("[v0] [Instrumentation] ✓ Server boot complete")

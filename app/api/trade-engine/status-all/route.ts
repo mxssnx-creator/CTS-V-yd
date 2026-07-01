@@ -111,12 +111,6 @@ export async function GET() {
         isEnabledFlag(c.is_dashboard_inserted)
       return assigned && isEnabledFlag(c.is_enabled_dashboard)
     })
-    const activeConnections = connections.filter(
-      (c) =>
-        (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_assigned) || isEnabledFlag(c.is_dashboard_inserted)) &&
-        (isEnabledFlag(c.is_active_inserted) || isEnabledFlag(c.is_assigned)) &&
-        isEnabledFlag(c.is_enabled_dashboard)
-    )
 
     const engineStatuses = await Promise.all(
       activeConnections.map(async (conn) => {
@@ -149,12 +143,6 @@ export async function GET() {
             processingEnabled: isEnabledFlag(conn.is_enabled_dashboard),
             isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
             isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
-            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
-            isActive:
-              (isEnabledFlag(conn.is_assigned) ||
-                isEnabledFlag(conn.is_active_inserted) ||
-                isEnabledFlag(conn.is_dashboard_inserted)) && isEnabledFlag(conn.is_enabled_dashboard),
-            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned),
             isLiveTrading: isEnabledFlag(conn.is_live_trade),
             isEngineRunning: isRunning,
             engineStatus,
@@ -169,12 +157,6 @@ export async function GET() {
             processingEnabled: isEnabledFlag(conn.is_enabled_dashboard),
             isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
             isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned) || isEnabledFlag(conn.is_dashboard_inserted),
-            isEnabled: isEnabledFlag(conn.is_enabled_dashboard),
-            isActive:
-              (isEnabledFlag(conn.is_assigned) ||
-                isEnabledFlag(conn.is_active_inserted) ||
-                isEnabledFlag(conn.is_dashboard_inserted)) && isEnabledFlag(conn.is_enabled_dashboard),
-            isActive: isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned),
             isLiveTrading: isEnabledFlag(conn.is_live_trade),
             isEngineRunning: false,
             error: error instanceof Error ? error.message : "Unknown error",

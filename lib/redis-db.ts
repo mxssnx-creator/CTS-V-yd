@@ -3044,8 +3044,6 @@ export function getConnectionStates(connection: any): {
         isEnabledFlag(connection.is_active_inserted) ||
         isEnabledFlag(connection.is_dashboard_inserted)) &&
       isEnabledFlag(connection.is_enabled_dashboard),
-    main_assigned: isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned),
-    is_active: isEnabledFlag(connection.is_active_inserted) && isEnabledFlag(connection.is_enabled_dashboard),
   }
 }
 
@@ -3059,15 +3057,10 @@ export function isConnectionAssignedToMain(connection: any): boolean {
 
 export function isConnectionMainEnabled(connection: any): boolean {
   return isConnectionAssignedToMain(connection) && isEnabledFlag(connection.is_enabled_dashboard)
-  return isEnabledFlag(connection.is_active_inserted) || isEnabledFlag(connection.is_assigned)
 }
 
 export function isConnectionProcessingEnabled(connection: any): boolean {
   return isEnabledFlag(connection.is_enabled_dashboard)
-}
-
-export function isConnectionMainEnabled(connection: any): boolean {
-  return isConnectionProcessingEnabled(connection)
 }
 
 export function isConnectionBaseEnabled(connection: any): boolean {
@@ -3283,13 +3276,6 @@ export async function getActiveConnectionsForEngine(): Promise<any[]> {
     if (key.includes(":settings") || key.includes(":state")) continue
     const data = await client.hgetall(key)
     if (data && Object.keys(data).length > 0) {
-      // Check if connection is assigned/visible in the Main/Active panel.
-      // Processing is gated separately by is_enabled_dashboard.
-      if (isEnabledFlag(data.is_active_inserted) || isEnabledFlag(data.is_assigned) || isEnabledFlag(data.is_dashboard_inserted)) {
-        connections.push({
-          id: key.replace("connection:", ""),
-          ...data,
-        })
       const connection = {
         id: key.replace("connection:", ""),
         ...data,
