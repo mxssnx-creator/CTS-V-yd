@@ -1,4 +1,6 @@
 declare module "bingx-api" {
+  const BingXClient: any
+  export default BingXClient
   export interface BingXClientOptions {
     apiKey?: string
     secretKey?: string
