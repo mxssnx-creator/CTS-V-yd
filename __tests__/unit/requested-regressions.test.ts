@@ -437,6 +437,17 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Production must allow in-process starts from the coordinator")
     expect(source).toContain("Duplicate starts")
     expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain("Production must allow in-process starts from the coordinator")
+    expect(source).toContain("Duplicate starts")
+    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
+  test("coordinator startEngine allows explicit foreground UI starts", () => {
+    const source = read("lib/trade-engine.ts")
+
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(source).toContain('(config as any)?.allowInProcessStart === true')
+    expect(source).toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {

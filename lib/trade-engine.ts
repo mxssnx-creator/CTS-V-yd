@@ -201,6 +201,21 @@ export class GlobalTradeEngineCoordinator {
     // UI/API actions, auto-start healing sweeps, and continuity ticks all work
     // without requiring a separate dedicated worker env flag. Duplicate starts
     // are still guarded below by in-process and Redis startup locks.
+    const inProcessStartAllowed =
+      process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" ||
+      (config as any)?.allowInProcessStart === true
+    const runningUnderProdStart =
+      process.env.npm_lifecycle_event === "start" ||
+      process.env.NODE_ENV === "production" ||
+      process.env.VERCEL === "1" ||
+      process.env.CF_PAGES === "1"
+
+    if (!inProcessStartAllowed && runningUnderProdStart) {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed`,
+      )
+      return false
+    }
 
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
