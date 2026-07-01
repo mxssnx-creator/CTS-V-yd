@@ -137,10 +137,10 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // Each value is calibrated to a ~2×p99 RTT of a typical BingX API call
 // (BingX p99 ≈ 120–250 ms); the gap gives one retry margin without
 // stalling the full sync for multiple seconds on a flaky call.
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  =  4_000  // was 10 s
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS    =  5_000  // was 15 s
-const EXCHANGE_TIMEOUT_GET_POSITIONS_MS =  4_000  // was 10 s
-const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  3_000  // was 10 s
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 15_000  // 15 seconds - cancel needs time
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 20_000  // 20 seconds - stop/TP placement on slow exchanges
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 seconds - position fetch with network latency
+const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 seconds - fill detection needs time on volatility
 
 /**
  * Live position as it flows through the live-stage pipeline and is
@@ -846,13 +846,20 @@ function isMinOrderSizeError(payload: unknown): boolean {
   } else {
     text = String(payload)
   }
-  return /\bcode\s*=?\s*101400\b/.test(text) || /minimum order amount/i.test(text)
+  // Match BingX 101400, 110424, or any message with "minimum order" or "order size must"
+  return (
+    /\bcode\s*=?\s*(101400|110424)\b/.test(text) ||
+    /minimum order/i.test(text) ||
+    /order size must/i.test(text)
+  )
 }
 
 /**
- * Parse the required minimum token quantity from a BingX 101400 error message.
- * BingX message format: "The minimum order amount is 56.974 DRIFT."
- * Returns undefined when the message does not match the expected format.
+ * Parse the minimum token quantity from BingX error messages.
+ * BingX formats:
+ *   - "The minimum order amount is 56.974 DRIFT" (101400)
+ *   - "The order size must be less than the available amount of 0.0001 BTC" (110424)
+ * Returns undefined when the message does not match expected formats.
  */
 function extractMinOrderQty(payload: unknown): number | undefined {
   let text = ""
@@ -861,10 +868,22 @@ function extractMinOrderQty(payload: unknown): number | undefined {
   else if (typeof payload === "object") {
     text = String((payload as Record<string, unknown>).error ?? (payload as Record<string, unknown>).message ?? "")
   }
-  const m = /minimum order amount is ([\d.]+)/i.exec(text)
-  if (!m) return undefined
-  const qty = parseFloat(m[1])
-  return Number.isFinite(qty) && qty > 0 ? qty : undefined
+  
+  // Try "minimum order amount is X" format
+  let m = /minimum order amount is ([\d.]+)/i.exec(text)
+  if (m) {
+    const qty = parseFloat(m[1])
+    if (Number.isFinite(qty) && qty > 0) return qty
+  }
+  
+  // Try "available amount of X" format (from 110424)
+  m = /available amount of ([\d.]+)/i.exec(text)
+  if (m) {
+    const qty = parseFloat(m[1])
+    if (Number.isFinite(qty) && qty > 0) return qty * 1.5 // Use 1.5x available as safe minimum
+  }
+  
+  return undefined
 }
 
 /**
@@ -1723,7 +1742,7 @@ async function updateProtectionOrders(
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
 
-  // ── System-close-only mode (cached) ────────────────────────────��──�����
+  // ── System-close-only mode (cached) ────────────────────────────��──�������
   // Reconcile fans out across every live position on every tick, so
   // calling `getAppSettings()` here would issue one HGETALL per
   // position per tick — at 50 positions × 1 Hz that's 50 round-trips
