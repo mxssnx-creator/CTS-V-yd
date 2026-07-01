@@ -260,7 +260,7 @@ export async function POST(request: NextRequest) {
                 indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
                 strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
                 realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-              })
+              }, { markAssigned: true })
               
               if (credentialCheck.valid) {
                 liveTradeEnabledConnections.push(connId)
@@ -336,7 +336,7 @@ export async function POST(request: NextRequest) {
               indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
               strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
               realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-            })
+            }, { markAssigned: true })
             
             if (credentialCheck.valid) {
               liveTradeEnabledConnections.push(conn.id)
