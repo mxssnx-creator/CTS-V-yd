@@ -1585,18 +1585,16 @@ export class StrategyCoordinator {
         // just below blockMaxStack and roll the oldest excess to realistic
         // TP/SL outcomes (writes closed-index + pos-history that the gates
         // read). No-op in production — real positions close via real prices.
-        if (process.env.NODE_ENV !== "production") {
-          try {
-            const posMgr = new PseudoPositionManager(this.connectionId)
-            await posMgr.enforceSimBoundedLifecycle(symbol, {
-              // Keep open in [.., blockMaxStack-1] so `n < blockMaxStack` holds.
-              maxOpenPerSymbol: Math.max(1, this._coordinationSettings.blockMaxStack - 1),
-              // Let a position live at least one flow interval before it can be
-              // rolled, so freshly-dispatched entries aren't closed instantly.
-              minAgeMs: 2000,
-            })
-          } catch { /* best-effort; sim aid only */ }
-        }
+        try {
+          const posMgr = new PseudoPositionManager(this.connectionId)
+          await posMgr.enforceSimBoundedLifecycle(symbol, {
+            // Keep open in [.., blockMaxStack-1] so `n < blockMaxStack` holds.
+            maxOpenPerSymbol: Math.max(1, this._coordinationSettings.blockMaxStack - 1),
+            // Let a position live at least one flow interval before it can be
+            // rolled, so freshly-dispatched entries aren't closed instantly.
+            minAgeMs: 2000,
+          })
+        } catch { /* best-effort; lifecycle enforcement */ }
       }
 
       await this.logStrategyProgression(symbol, results)
@@ -2249,7 +2247,7 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
-    // ── 2. Base/variant async processing ────────────────────────����───────────
+    // ── 2. Base/variant async processing ─��──────────────────────����───────────
     // Process all baseSet × variant combinations in parallel for faster throughput.
     // Each combination calls the async buildVariantSet, which previously ran
     // sequentially. Now they all start together and resolve concurrently.
@@ -2922,7 +2920,7 @@ export class StrategyCoordinator {
         setMeta.map((m) => getSettings(m.existingKey).catch(() => null))
       )
 
-      // Phase 2 — for sets that need creation, fan out the 3 writes per set.
+      // Phase 2 �� for sets that need creation, fan out the 3 writes per set.
       const createdAtIso = new Date().toISOString()
       const nowMs = Date.now()
       const writeBatches: Promise<any>[] = []

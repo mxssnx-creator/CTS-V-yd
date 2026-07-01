@@ -141,9 +141,9 @@ export async function safeAsync<T>(
         }
       }
 
-      // Exponential backoff before retry
+      // Exponential backoff before retry (reduced from 1000ms base for second-trading)
       if (attempt < retries) {
-        const backoffMs = 1000 * Math.pow(backoffMultiplier, attempt)
+        const backoffMs = Math.min(100 * Math.pow(backoffMultiplier, attempt), 500)
         if (logErrors) {
           console.log(`[ASYNC] ${name} waiting ${backoffMs}ms before retry...`)
         }

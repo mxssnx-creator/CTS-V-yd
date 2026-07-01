@@ -188,9 +188,10 @@ export class BingXConnector extends BaseExchangeConnector {
       // Bound the request and tolerate a single transient network blip. The
       // Vercel→BingX link occasionally drops a connection ("fetch failed"); a
       // single quick retry avoids a failed sync without hammering the endpoint.
+      // Reduced timeout from 8s to 2s for second-trading (must complete API ops within 1s).
       const fetchTime = async () => {
         const ctrl = new AbortController()
-        const timer = setTimeout(() => ctrl.abort(), 8000)
+        const timer = setTimeout(() => ctrl.abort(), 2000)
         try {
           return await fetch(`${this.getBaseUrl()}/openApi/swap/v2/server/time`, {
             method: "GET",
@@ -822,7 +823,7 @@ export class BingXConnector extends BaseExchangeConnector {
       // Serialise without scientific notation or trailing zeros.
       const qtyStr = roundedQty.toFixed(6).replace(/\.?0+$/, "")
 
-      // ── Symbol formatting ────────────────────────────────────────────────
+      // ── Symbol formatting ────��───────────────────────────────────────────
       // BingX perpetual futures require the hyphenated form "BTC-USDT". Spot
       // accepts either. Passing "BTCUSDT" to a perp trade endpoint is the
       // single biggest cause of "this api is not exist" errors in the wild.

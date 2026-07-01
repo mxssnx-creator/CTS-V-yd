@@ -169,8 +169,8 @@ export async function build1sOhlcvFromTrades(
     } catch (err) {
       // One failed page shouldn't kill the whole aggregation —
       // backoff and retry once, then bail. Most exchange 429s
-      // recover within a second.
-      await new Promise((r) => setTimeout(r, 1000))
+      // recover quickly. Reduced from 1000ms to 200ms for second-trading.
+      await new Promise((r) => setTimeout(r, 200))
       try {
         page = await paginator(symbol, startMs, cursorEnd)
       } catch {

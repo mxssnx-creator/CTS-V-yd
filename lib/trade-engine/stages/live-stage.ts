@@ -347,19 +347,20 @@ async function batchSavePositions(positions: LivePosition[]): Promise<void> {
   }
 }
 async function incrementMetric(connectionId: string, metric: string, delta: number = 1): Promise<void> {
-  const { getRedisClient } = await import("@/lib/redis-db")
-  const client = getRedisClient()
   try {
-    // Use hincrby for atomic counters; delta may be negative for decrements
-    if (typeof (client as any).hincrby === "function") {
-      await (client as any).hincrby(`progression:${connectionId}`, metric, delta)
-    } else {
-      // Fallback for adapters without hincrby: read-modify-write (best-effort)
-      const key = `progression:${connectionId}`
-      const hash = (await client.hgetall(key).catch(() => ({} as Record<string, string>))) || {}
-      const current = parseInt(String(hash[metric] || "0"), 10) || 0
-      await client.hset(key, { [metric]: String(current + delta) })
-    }
+    // Use validated wrapper to prevent stale metric writes
+    const { getCurrentEpoch } = await import("@/lib/trade-engine/progression-lock")
+    const { hincrbyProgression } = await import("@/lib/trade-engine/progression-writes")
+    
+    const currentEpoch = await getCurrentEpoch(connectionId)
+    if (!currentEpoch) return // No active lock, skip write (stale instance)
+    
+    // Use validated wrapper for epoch-safe increments
+    await hincrbyProgression(connectionId, metric, delta, {
+      connectionId,
+      epoch: currentEpoch,
+      logStaleRejects: false,
+    })
   } catch (err) {
     // metric failures should not throw the live pipeline
   }
@@ -601,9 +602,6 @@ function resolveMaxHoldMs(connId: string): number {
   // few minutes), making positionsOpen stat nonsensical and consuming memory.
   // Cap at 2 minutes in non-production so positions roll quickly and the
   // open-book stays small. Real production runs use the configured value.
-  if (process.env.NODE_ENV !== "production") {
-    return 2 * 60 * 1000 // 2 minutes
-  }
   // Delegate to the centralised engine-timings snapshot rather than a
   // bespoke settings read. `maxPositionHoldMs` is the single source of
   // truth (Redis `settings:system`, default 4h, `0` disables). The sync
@@ -741,7 +739,7 @@ async function retry<T>(
 // stream of failed exchange API calls (~20/sec at observed cadence).
 //
 // Exponential backoff: each consecutive failure doubles the cooldown
-// (60s → 120s → 240s → 300s cap). This prevents the re-arm loop where
+// (60s ��� 120s → 240s → 300s cap). This prevents the re-arm loop where
 // a 60s cooldown expires, the next attempt fails again (same root cause),
 // and immediately re-arms for another 60s — making recovery appear stuck.
 // After the operator tops up, the next successful order resets the counter.
@@ -1223,7 +1221,7 @@ async function placeProtectionOrder(
   orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
 ): Promise<string | null> {
-  // ── Structured trace context ────────────────────────────────────────
+  // ── Structured trace context ──────────────────────���─────────────────
   // Every protection-order placement gets a single multi-field log line
   // before any exchange interaction, so when an operator reports "the
   // order didn't get created" we can immediately answer THREE questions
@@ -1856,19 +1854,58 @@ async function updateProtectionOrders(
     (armedQty <= 0 ||
       Math.abs(pos.executedQuantity - armedQty) / Math.max(armedQty, 1e-12) > 0.0025)
 
-  // ── Stop-Loss + Take-Profit legs: parallelised cancel-then-replace ──
+  // ── Stop-Loss + Take-Profit legs: parallelised cancels, then parallel places ──
   //
   // Latency contract: control orders MUST arm "instantly" — the operator
-  // explicitly called this out. The original implementation processed
-  // SL then TP sequentially, so a fresh promotion paid up to 4 venue
-  // REST round-trips on the critical path (cancel-SL → place-SL →
-  // cancel-TP → place-TP). On a 100 ms RTT venue that's ≈400 ms before
-  // either protection leg is armed. By driving both legs through a
-  // single `Promise.all` we cut that to ≈200 ms — both legs arm in
-  // parallel, and the per-leg cancel-then-replace internal sequence is
-  // preserved (so the duplicate-reduceOnly race the original guard
-  // prevents cannot reappear). Each leg only ever mutates its own
-  // position fields, so there is no cross-leg write contention.
+  // explicitly called this out. Original implementation: cancel-SL → place-SL →
+  // cancel-TP → place-TP (sequential, 4 RTTs on critical path ≈ 400ms at 100ms RTT).
+  // Previous optimization: parallel legs (2 RTTs ≈ 200ms).
+  // Current optimization: parallel cancels (SL+TP together) → parallel places (SL+TP).
+  // Result: 3 RTTs max ≈ 300ms (if one cancel fails → retry next tick, no place).
+  // If both cancels succeed: places can overlap → still ~200ms or better.
+  // Each leg only mutates its own position fields (no cross-leg contention).
+  //
+  // Strategy: Collect both cancel promises, await them in parallel,
+  // THEN proceed to parallel places only if cancels succeeded.
+  
+  // First, collect cancellation promises for both legs (if needed)
+  const slCancelPromise = (async () => {
+    if (desiredSl > 0 && pos.stopLossOrderId && 
+        (priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)) {
+      // Need to re-arm SL — cancel the old one first
+      return await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+        .catch((err) => {
+          console.warn(
+            `${LOG_PREFIX} StopLoss cancel failed for ${pos.symbol}:`,
+            err instanceof Error ? err.message : String(err)
+          )
+          return false
+        })
+    }
+    // No cancel needed for SL, or SL is being turned off (handled in leg below)
+    return true
+  })()
+
+  const tpCancelPromise = (async () => {
+    if (desiredTp > 0 && pos.takeProfitOrderId && 
+        (priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)) {
+      // Need to re-arm TP — cancel the old one first
+      return await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+        .catch((err) => {
+          console.warn(
+            `${LOG_PREFIX} TakeProfit cancel failed for ${pos.symbol}:`,
+            err instanceof Error ? err.message : String(err)
+          )
+          return false
+        })
+    }
+    // No cancel needed for TP, or TP is being turned off (handled in leg below)
+    return true
+  })()
+
+  // Await both cancels in parallel (massive latency win if both need cancel)
+  const [slCancelOk, tpCancelOk] = await Promise.all([slCancelPromise, tpCancelPromise])
+
   const slLeg = (async () => {
     if (desiredSl <= 0 && pos.stopLossOrderId) {
       // SL was turned off — yank the existing order. Hard cancel
@@ -1897,7 +1934,7 @@ async function updateProtectionOrders(
       // expression evaluate to `false` whenever NO order existed — so a
       // position with no stop-loss order was never armed at all.
       //
-      // ── Re-arm cooldown (MIN_REARM_MS) ───────────────────���──────────────
+      // ── Re-arm cooldown (MIN_REARM_MS) ────────────────────────────────────
       // When an order IS present and we're just drift-cancel-replacing, gate
       // on the cooldown to prevent oscillation storms. Missing-order paths
       // (!pos.stopLossOrderId, already cleared by liveness-verify above)
@@ -1921,10 +1958,12 @@ async function updateProtectionOrders(
       // fires both orders before the second's reduceOnly check
       // rejects it. Treat a definitive cancel failure as "skip this
       // tick, retry next tick" so reconcile can re-evaluate.
-      // NOTE: SL and TP cancellations are parallelized at Promise.all() below.
+      // NOTE: SL and TP cancellations are parallelized at the top of this
+      // block to overlap RTTs. Both cancel promises resolve before we place either leg.
       let oldGone = true
       if (pos.stopLossOrderId) {
-        oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+        // Use the pre-computed slCancelOk result from parallel cancels above
+        oldGone = slCancelOk
         if (!oldGone) {
           console.warn(
             `${LOG_PREFIX} StopLoss cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
@@ -1986,7 +2025,8 @@ async function updateProtectionOrders(
     ) {
       let oldGone = true
       if (pos.takeProfitOrderId) {
-        oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+        // Use the pre-computed tpCancelOk result from parallel cancels above
+        oldGone = tpCancelOk
         if (!oldGone) {
           console.warn(
             `${LOG_PREFIX} TakeProfit cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
@@ -2389,7 +2429,7 @@ export async function executeLivePosition(
     // This is the only writer of `live:lock:{conn}:{sym}:{dir}` on the
     // critical path, so the race window is closed at its source.
     if (isLiveTradeEnabled) {
-      // ── Variant-specific lock key ────────────────────────────────────────
+      // ── Variant-specific lock key ────────────────────────────────────��───
       // Block add-on orders MUST be able to proceed even when the default/
       // trailing position's lock is held (that lock means "default slot is
       // occupied — don't open a second default", not "all orders blocked").
@@ -5974,7 +6014,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
 
-        // ── Delayed-fill SL/TP arming ────���────────────────────���───────
+        // ── Delayed-fill SL/TP arming ────����────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
         // and the position ended up `placed` with no protection orders.

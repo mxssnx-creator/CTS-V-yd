@@ -36,8 +36,8 @@ interface RateLimitConfig {
 const DEFAULT_RATE_LIMIT_CONFIG: RateLimitConfig = {
   requestsPerSecond: 10,
   burst: 5,
-  backoffMultiplier: 2,
-  maxBackoff: 30000,
+  backoffMultiplier: 1.5, // Reduced from 2 for faster recovery
+  maxBackoff: 500, // CRITICAL: Reduced from 30000 (30s) to 500ms for second-trading
 }
 
 class BatchAPIClient {
@@ -52,8 +52,8 @@ class BatchAPIClient {
     burstUsed: 0,
   }
   private batchInterval: NodeJS.Timeout | null = null
-  private readonly BATCH_TIMEOUT = 100 // ms - collect requests for this duration
-  private readonly CACHE_TTL = 5000 // ms - cache stats responses
+  private readonly BATCH_TIMEOUT = 50 // ms - collect requests for this duration (reduced from 100 for faster processing)
+  private readonly CACHE_TTL = 500 // ms - cache stats responses (reduced from 5000 for fresher data in second-trading)
   private circuitBreakerState = {
     failures: 0,
     lastFailureTime: 0,
@@ -229,8 +229,9 @@ class BatchAPIClient {
       }
     } catch (error) {
       if (attempt <= maxRetries) {
+        // Start at 100ms instead of 1000ms, capped at maxBackoff (500ms for second-trading)
         const backoff = Math.min(
-          1000 * Math.pow(this.rateLimitConfig.backoffMultiplier, attempt - 1),
+          100 * Math.pow(this.rateLimitConfig.backoffMultiplier, attempt - 1),
           this.rateLimitConfig.maxBackoff,
         )
         await new Promise((r) => setTimeout(r, backoff))

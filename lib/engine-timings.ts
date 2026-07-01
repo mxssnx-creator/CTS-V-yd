@@ -138,6 +138,22 @@ export interface EngineTimings {
   neutralizeThresholdPct: number
   neutralizeMaxPerDirection: number
   neutralizeVolumeMode: "neutralize" | "rebalance" | "reduce"
+
+  // ── API & Exchange Operation Timeouts ──────────────────────────────────
+  // Configurable timeouts for exchange API calls and operations.
+  // Set via Settings > System > API & Exchange Timeouts.
+  // All values in milliseconds.
+  apiTimeoutMs: number // 5s - 120s, default 40s - general API call timeout
+  apiPlaceOrderTimeoutMs: number // 10s - 120s, default 40s - order placement timeout
+  apiCancelOrderTimeoutMs: number // 5s - 60s, default 20s - order cancellation timeout
+  apiPositionTimeoutMs: number // 5s - 60s, default 20s - position queries timeout
+
+  // ── Position Ceilings ─────────────────────────────────────────────────
+  // Max concurrent positions per direction. Enforced by indication processor.
+  // Set via Settings > System > Position Ceilings.
+  // Read at every cycle, changes apply within cache TTL (~10 s).
+  maxPositionsLong: number // Max concurrent long positions (default 1)
+  maxPositionsShort: number // Max concurrent short positions (default 1)
 }
 
 export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
@@ -160,6 +176,11 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
+  // ── API/Exchange operation timeout defaults ────────────────────────────
+  apiTimeoutMs:            40_000,  // 40s general timeout for BingX API
+  apiPlaceOrderTimeoutMs:  40_000,  // 40s for order placement
+  apiCancelOrderTimeoutMs: 20_000,  // 20s for order cancellation
+  apiPositionTimeoutMs:    20_000,  // 20s for position queries
   // ── Three-progression defaults ────────────────────────────────────────
   // *IntervalMs  = start-to-start cadence (skips new cycle if too soon)
   // *CyclePauseMs = post-COMPLETION breath — anti-hang protection only.
@@ -171,11 +192,14 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   realtimeIntervalMs:            200,  // Loop B: 200 ms cadence (faster signal→dispatch)
   realtimeCyclePauseMs:           50,  // Loop B: post-completion breath
   livePositionsCyclePauseMs:     150,  // Loop C: post-completion breath (interval = liveSyncIntervalMs 120 ms)
-// ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
+  // ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
    neutralizeEnabled:               false,
    neutralizeThresholdPct:          10,   // 10 % imbalance before reducing
    neutralizeMaxPerDirection:       200,  // up to 200 concurrent sets before shedding
    neutralizeVolumeMode:            "neutralize", // net-delta-only addition
+  // ── Position Ceiling defaults ──────────────────────────────────────────
+   maxPositionsLong:                1,    // Default: 1 concurrent long position
+   maxPositionsShort:               1,    // Default: 1 concurrent short position
 }
 
 // Hard min/max bounds — UI + API normalise to these to avoid pathological
@@ -197,6 +221,11 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   lockExtendIntervalMs:      { min: 1_000,       max: 60_000              },
   maxPositionHoldMs:         { min: 0 /* off */, max: 7 * 24 * 60 * 60_000 },
   progressionBufferFlushMs:  { min: 500,         max: 60_000              },
+  // ── API/Exchange operation timeouts ───────────────────────────────────
+  apiTimeoutMs:              { min: 5_000,       max: 120_000             },
+  apiPlaceOrderTimeoutMs:    { min: 5_000,       max: 120_000             },
+  apiCancelOrderTimeoutMs:   { min: 5_000,       max: 60_000              },
+  apiPositionTimeoutMs:      { min: 5_000,       max: 60_000              },
   // ── Three-progression bounds ──────────────────────────────────────────
   // Interval floors at 200 ms prevent a runaway 1 ms cadence from locking
   // the event loop. Interval ceilings at 60 s let operators "park" a loop.
@@ -213,7 +242,10 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
    neutralizeEnabled:           { min: 0,           max: 1  /* boolean */    },
    neutralizeThresholdPct:      { min: 0,           max: 50                  },
    neutralizeMaxPerDirection:   { min: 1,           max: 500                 },
-   neutralizeVolumeMode:        { min: 0,           max: 0  /* handled below */ }
+   neutralizeVolumeMode:        { min: 0,           max: 0  /* handled below */ },
+  // ── Position Ceiling bounds ───────────────────────────────────────────
+   maxPositionsLong:            { min: 1,           max: 50                  },
+   maxPositionsShort:           { min: 1,           max: 50                  },
 }
 
 // snake_case key in Redis hash → camelCase key in object. Both forms are
@@ -229,6 +261,10 @@ const REDIS_KEY_MAP: Record<keyof EngineTimings, string[]> = {
   lockExtendIntervalMs:       ["lock_extend_interval_ms",       "lockExtendIntervalMs"],
   maxPositionHoldMs:          ["max_position_hold_ms",          "maxPositionHoldMs"],
   progressionBufferFlushMs:   ["progression_buffer_flush_ms",   "progressionBufferFlushMs"],
+  apiTimeoutMs:               ["api_timeout_ms",                "apiTimeoutMs"],
+  apiPlaceOrderTimeoutMs:     ["api_place_order_timeout_ms",    "apiPlaceOrderTimeoutMs"],
+  apiCancelOrderTimeoutMs:    ["api_cancel_order_timeout_ms",   "apiCancelOrderTimeoutMs"],
+  apiPositionTimeoutMs:       ["api_position_timeout_ms",       "apiPositionTimeoutMs"],
   prehistoricIntervalMs:      ["prehistoric_interval_ms",       "prehistoricIntervalMs"],
   prehistoricCyclePauseMs:    ["prehistoric_cycle_pause_ms",    "prehistoricCyclePauseMs"],
   realtimeIntervalMs:         ["realtime_interval_ms",          "realtimeIntervalMs"],
@@ -238,6 +274,8 @@ const REDIS_KEY_MAP: Record<keyof EngineTimings, string[]> = {
   neutralizeThresholdPct:     ["neutralize_threshold_pct",    "neutralizeThresholdPct"],
   neutralizeMaxPerDirection:  ["neutralize_max_per_direction","neutralizeMaxPerDirection"],
   neutralizeVolumeMode:       ["neutralize_volume_mode",      "neutralizeVolumeMode"],
+  maxPositionsLong:           ["max_positions_long",          "maxPositionsLong"],
+  maxPositionsShort:          ["max_positions_short",         "maxPositionsShort"],
 }
 
 const CACHE_TTL_MS = 10_000
