@@ -84,7 +84,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
             strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
             realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-          })
+          }, { markAssigned: true })
           engineStatus = "starting"
           engineStartedNow = true
           console.log(`[v0] [Preset Trade] Engine started for ${connName} to service preset flag`)

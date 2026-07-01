@@ -1,7 +1,9 @@
 /**
- * Independent Strategy Sets Processor
- * Maintains separate 500-entry pools for each strategy calculation type
- * Each type evaluates independently with own set configurations
+ * Strategy Sets Processor
+ * Runs one logical intervaled strategy progression for each symbol.
+ * Evaluates candidates once, then persists Base → Main → Real → Live in order.
+ * Each stage can still use separate retention and compaction settings, but
+ * stages are not separate processing loops.
  */
 
 import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
@@ -64,7 +66,12 @@ export interface StrategySet {
 
 export class StrategySetsProcessor {
   private connectionId: string
+  private settingsReady: Promise<void>
   private limits: StrategySetLimits = { ...DEFAULT_LIMITS }
+  private lastSettingsRefreshAt = 0
+  private settingsRefreshInFlight: Promise<void> | null = null
+  private readonly SETTINGS_REFRESH_INTERVAL_MS = 5_000
+  private settingsReady: Promise<void>
   /**
    * Per-type compaction config cache. Refreshed lazily by the underlying
    * `loadCompactionConfig` helper (5s TTL). Strategy pools use the
@@ -103,32 +110,49 @@ export class StrategySetsProcessor {
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
-    this.loadSettings()
+    this.settingsReady = this.loadSettings()
   }
 
   private async loadSettings(): Promise<void> {
     try {
       const settings = await getSettings("strategy_sets_config")
+      const nextLimits: StrategySetLimits = { ...DEFAULT_LIMITS }
+
       if (settings) {
         // Load independent limits per type
-        if (settings.base) this.limits.base = Number(settings.base)
-        if (settings.main) this.limits.main = Number(settings.main)
-        if (settings.real) this.limits.real = Number(settings.real)
-        if (settings.live) this.limits.live = Number(settings.live)
+        if (settings.base) nextLimits.base = Number(settings.base)
+        if (settings.main) nextLimits.main = Number(settings.main)
+        if (settings.real) nextLimits.real = Number(settings.real)
+        if (settings.live) nextLimits.live = Number(settings.live)
         // Fallback: legacy maxEntriesPerSet applies weighted by type.
         if (settings.maxEntriesPerSet && !settings.base) {
           const limit = Number(settings.maxEntriesPerSet)
-          this.limits = {
-            base: Math.max(300, Math.round(limit * 1.8)),
-            main: Math.max(120, Math.round(limit * 0.8)),
-            real: Math.max(60, Math.round(limit * 0.35)),
-            live: Math.max(120, limit),
-          }
+          nextLimits.base = Math.max(300, Math.round(limit * 1.8))
+          nextLimits.main = Math.max(120, Math.round(limit * 0.8))
+          nextLimits.real = Math.max(60, Math.round(limit * 0.35))
+          nextLimits.live = Math.max(120, limit)
         }
       }
+
+      this.limits = nextLimits
+      this.compactionCfgs = {}
+      this.lastSettingsRefreshAt = Date.now()
     } catch (error) {
       console.error("[v0] [StrategySets] Failed to load settings:", error)
     }
+  }
+
+  private async refreshSettingsIfNeeded(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastSettingsRefreshAt < this.SETTINGS_REFRESH_INTERVAL_MS) return
+
+    if (!this.settingsRefreshInFlight) {
+      this.settingsRefreshInFlight = this.loadSettings().finally(() => {
+        this.settingsRefreshInFlight = null
+      })
+    }
+
+    await this.settingsRefreshInFlight
   }
 
   /** Get the limit for a specific strategy type */
@@ -141,6 +165,8 @@ export class StrategySetsProcessor {
    */
   async processAllStrategySets(symbol: string, indications: any[]): Promise<void> {
     try {
+      await this.settingsReady
+
       const startTime = Date.now()
 
       const [baseCfg, mainCfg, realCfg, liveCfg] = await Promise.all([
@@ -158,7 +184,15 @@ export class StrategySetsProcessor {
         this.limits.main,
         this.limits.real,
         this.limits.live,
+      await this.refreshSettingsIfNeeded()
+
+      // Sort indications by profitFactor descending so that the best-performing
+      // signals are processed first across all strategy type pools.
+      const rawTotal = indications.length
+      const sortedIndications = [...indications].sort(
+        (a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0)
       )
+      const selectedTotal = sortedIndications.length
 
       // Sort indications by profitFactor descending so that the best-performing
       // signals are processed first across all strategy type pools. Keep enough
@@ -174,6 +208,10 @@ export class StrategySetsProcessor {
         this.processMainStrategySet(symbol, sortedIndications, mainCfg),
         this.processRealStrategySet(symbol, sortedIndications, realCfg),
         this.processLiveStrategySet(symbol, sortedIndications, liveCfg),
+        this.processBaseStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
+        this.processMainStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
+        this.processRealStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
+        this.processLiveStrategySet(symbol, sortedIndications, rawTotal, selectedTotal),
       ])
 
       const duration = Date.now() - startTime
@@ -185,7 +223,7 @@ export class StrategySetsProcessor {
 
       if (totalQualified > 0) {
         console.log(
-          `[v0] [StrategySets] ${symbol}: All types evaluated in ${duration}ms | Base=${baseResults?.qualified}/${baseResults?.total} Main=${mainResults?.qualified}/${mainResults?.total} Real=${realResults?.qualified}/${realResults?.total} Live=${liveResults?.qualified}/${liveResults?.total}`
+          `[v0] [StrategySets] ${symbol}: All types evaluated in ${duration}ms | Raw=${rawTotal} Selected=${selectedTotal} | Base qualified=${baseResults?.qualified} Main qualified=${mainResults?.qualified} Real qualified=${realResults?.qualified} Live qualified=${liveResults?.qualified}`
         )
 
         await logProgressionEvent(this.connectionId, "strategies_sets", "info", `All strategy types evaluated for ${symbol}`, {
@@ -205,13 +243,26 @@ export class StrategySetsProcessor {
    * Base Strategy Set - Conservative, low-risk signals only
    */
   private async processBaseStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
+  private toStageResult(
+    type: "base" | "main" | "real" | "live",
+    rawTotal: number,
+    selectedTotal: number,
+    qualified: number,
+  ): any {
+    return { type, rawTotal, selectedTotal, qualified }
+  }
+
+  private async processBaseStrategySet(
+    symbol: string,
+    indications: any[],
+    rawTotal: number,
+    selectedTotal: number,
+  ): Promise<any> {
     const setKey = `strategy_set:${this.connectionId}:${symbol}:base`
     let qualified = 0
-    let total = 0
 
     const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      total++
       // Base: broad intake (must be much higher volume than main/real)
       if (indication.confidence > 0.45 && indication.profitFactor > 0.9) {
         const strategy = {
@@ -227,19 +278,25 @@ export class StrategySetsProcessor {
     }
     await this.saveBatchToSet(setKey, batch, "base", cfg)
     return { type: "base", total, qualified }
+    await this.saveBatchToSet(setKey, batch, "base")
+    return this.toStageResult("base", rawTotal, selectedTotal, qualified)
   }
 
   /**
    * Main Strategy Set - Balanced, medium-risk signals
    */
   private async processMainStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
+  private async processMainStrategySet(
+    symbol: string,
+    indications: any[],
+    rawTotal: number,
+    selectedTotal: number,
+  ): Promise<any> {
     const setKey = `strategy_set:${this.connectionId}:${symbol}:main`
     let qualified = 0
-    let total = 0
 
     const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      total++
       if (indication.confidence > 0.62 && indication.profitFactor > 1.2) {
         const strategy = {
           profitFactor: indication.profitFactor,
@@ -254,19 +311,25 @@ export class StrategySetsProcessor {
     }
     await this.saveBatchToSet(setKey, batch, "main", cfg)
     return { type: "main", total, qualified }
+    await this.saveBatchToSet(setKey, batch, "main")
+    return this.toStageResult("main", rawTotal, selectedTotal, qualified)
   }
 
   /**
    * Real Strategy Set - Aggressive, higher-risk signals
    */
   private async processRealStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
+  private async processRealStrategySet(
+    symbol: string,
+    indications: any[],
+    rawTotal: number,
+    selectedTotal: number,
+  ): Promise<any> {
     const setKey = `strategy_set:${this.connectionId}:${symbol}:real`
     let qualified = 0
-    let total = 0
 
     const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      total++
       if (indication.confidence > 0.78 && indication.profitFactor > 1.45) {
         const strategy = {
           profitFactor: indication.profitFactor * 1.1,
@@ -281,19 +344,25 @@ export class StrategySetsProcessor {
     }
     await this.saveBatchToSet(setKey, batch, "real", cfg)
     return { type: "real", total, qualified }
+    await this.saveBatchToSet(setKey, batch, "real")
+    return this.toStageResult("real", rawTotal, selectedTotal, qualified)
   }
 
   /**
    * Live Strategy Set - All qualifying signals, real-time only
    */
   private async processLiveStrategySet(symbol: string, indications: any[], cfg?: CompactionConfig): Promise<any> {
+  private async processLiveStrategySet(
+    symbol: string,
+    indications: any[],
+    rawTotal: number,
+    selectedTotal: number,
+  ): Promise<any> {
     const setKey = `strategy_set:${this.connectionId}:${symbol}:live`
     let qualified = 0
-    let total = 0
 
     const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      total++
       if (indication.profitFactor >= 1.0) {
         const strategy = {
           profitFactor: indication.profitFactor,
@@ -306,20 +375,18 @@ export class StrategySetsProcessor {
     }
     await this.saveBatchToSet(setKey, batch, "live", cfg)
     return { type: "live", total, qualified }
+    await this.saveBatchToSet(setKey, batch, "live")
+    return this.toStageResult("live", rawTotal, selectedTotal, qualified)
   }
 
   /**
    * Batch-save multiple qualifying strategies to the same set pool in
    * ONE read-merge-compact-write transaction.
-   *
-   * The original `saveStrategyToSet` was called once per qualifying
-   * indication in a sequential loop, paying the read-modify-write cost
-   * per entry. With ~hundreds of qualifying indications per symbol
-   * that was the dominant CPU + Redis cost of the strategy-sets stage.
-   *
-   * Parallelising the individual `saveStrategyToSet` calls would
-   * RACE because they all read-modify-write the SAME `setKey`. This
-   * batch path avoids the race AND collapses the I/O.
+   * Batch-save all qualifying strategies for a type-specific pool in one
+   * staged read-merge-compact-write transaction. The strategy-set pipeline
+   * accumulates qualifying entries in memory while evaluating indications,
+   * then writes the staged batch once per strategy type to avoid repeated
+   * Redis I/O and read-modify-write races on the same key.
    */
   private async saveBatchToSet(
     setKey: string,
@@ -388,86 +455,6 @@ export class StrategySetsProcessor {
       }
     } catch (error) {
       console.error(`[v0] [StrategySets] Failed to batch-save ${strategies.length} entries to ${setKey}:`, error)
-    }
-  }
-
-  /**
-   * Save strategy to its independent set pool (max 250 entries)
-   */
-  private async saveStrategyToSet(
-    setKey: string,
-    strategy: any,
-    strategyType: string,
-    indicationType: string
-  ): Promise<void> {
-    try {
-      const client = await getCachedClient()
-      let entries: any[] = []
-
-      const existing = await client.get(setKey)
-      if (existing) {
-        try {
-          entries = JSON.parse(existing)
-        } catch {
-          entries = []
-        }
-      }
-
-      // Newest-at-last (per spec) — use push, not unshift. The "best"
-      // compactor below sorts by PF when the buffer crosses the
-      // ceiling, so insertion order doesn't strictly matter for
-      // correctness, but staying chronological keeps the pre-compaction
-      // shape inspectable in admin tools.
-      entries.push({
-        id: `${strategyType}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: new Date().toISOString(),
-        profitFactor: strategy.profitFactor,
-        confidence: strategy.confidence,
-        indicationType,
-        strategyType,
-        metadata: strategy.metadata,
-      })
-
-      // ── Debounced threshold compaction (mode: "best") ────────────────
-      // Strategy pools care about *quality* — when the buffer overflows
-      // we want to keep the highest-PF entries, not the most recent
-      // ones. The compactor stable-sorts by PF desc, keeps the top
-      // `floor`, then re-sorts by timestamp ascending so downstream
-      // consumers preserve chronological semantics.
-      //
-      // The pre-existing "sort + slice on every call" pattern was the
-      // dominant CPU cost on the strategy pipeline; the new debounced
-      // policy only pays the sort once every (ceiling - floor) calls.
-      const cfg = await this.resolveCompaction(strategyType as keyof StrategySetLimits)
-      entries = compact(entries, cfg, "best")
-      const maxEntries = cfg.floor
-
-      // Save back
-      await client.set(setKey, JSON.stringify(entries))
-
-      // Update stats
-      const statsKey = `${setKey}:stats`
-      const prevStats = (await getSettings(statsKey)) || {}
-      const stats = {
-        maxEntries: maxEntries,
-        currentEntries: entries.length,
-        totalCalculated: (prevStats.totalCalculated || 0) + 1,
-        totalQualified: (prevStats.totalQualified || 0) + 1,
-        avgProfitFactor: entries.reduce((sum: number, e: any) => sum + e.profitFactor, 0) / entries.length,
-        lastCalculated: new Date().toISOString(),
-      }
-      await setSettings(statsKey, stats)
-
-      // Broadcast strategy update to connected clients
-      emitStrategyUpdate(this.connectionId, {
-        id: entries[0].id,
-        symbol: setKey.split(':')[2], // Extract symbol from setKey
-        profit_factor: strategy.profitFactor || 0,
-        win_rate: strategy.confidence || 0,
-        active_positions: entries.length,
-      })
-    } catch (error) {
-      console.error(`[v0] [StrategySets] Failed to save to ${setKey}:`, error)
     }
   }
 
