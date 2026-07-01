@@ -69,6 +69,16 @@ export interface ConnectionStatus {
   errorCount: number
 }
 
+export interface StopEngineOptions {
+  /**
+   * True when the request came from an explicit operator action that should
+   * stop whichever worker currently owns the connection runtime. When false,
+   * this process may only clean up runtime state for an in-memory manager it
+   * actually owns.
+   */
+  operatorRequested?: boolean
+}
+
 export interface HealthStatus {
   overall: "healthy" | "degraded" | "unhealthy"
   components: Record<string, ComponentHealth>
@@ -422,7 +432,7 @@ export class GlobalTradeEngineCoordinator {
    * Stop engine for a specific connection
    * PHASE 2 FIX: Added stop lock to prevent concurrent stop requests and race conditions
    */
-  async stopEngine(connectionId: string): Promise<void> {
+  async stopEngine(connectionId: string, options: StopEngineOptions = {}): Promise<void> {
     // Step 1: Check if already stopping
     if (this.stoppingEngines.has(connectionId)) {
       console.log(`[v0] [STOP LOCK] Engine already stopping for ${connectionId}, skipping duplicate stop request`)
@@ -439,8 +449,16 @@ export class GlobalTradeEngineCoordinator {
       const manager = this.engineManagers.get(connectionId)
 
       if (!manager) {
-        console.log(`[v0] No in-memory engine found for connection: ${connectionId}; running Redis cleanup anyway`)
-        await this.cleanupStoppedRuntimeState(connectionId)
+        if (options.operatorRequested === true) {
+          console.log(`[v0] No in-memory engine found for connection: ${connectionId}; operator stop will clean runtime state`)
+          await this.cleanupStoppedRuntimeState(connectionId)
+        } else {
+          console.log(
+            `[v0] No in-memory engine found for connection: ${connectionId}; ` +
+              "not deleting runtime state because another worker may own it",
+          )
+          await this.requestRemoteStop(connectionId, "stop_engine_no_local_manager")
+        }
         return
       }
 
@@ -458,8 +476,40 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Best-effort runtime cleanup shared by both normal stops and "no local
-   * manager" stops. This intentionally does NOT mutate Main Connections
+   * Signal a remote owner to stop without deleting runtime keys or marking the
+   * connection stopped. The owning worker is responsible for observing this
+   * flag and performing ownership-safe cleanup when it actually stops.
+   */
+  private async requestRemoteStop(connectionId: string, reason: string): Promise<void> {
+    try {
+      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
+      await initRedis().catch(() => undefined)
+      const redisClient = getRedisClient()
+      const nowIso = new Date().toISOString()
+      await Promise.all([
+        redisClient.hset(`trade_engine_state:${connectionId}`, {
+          stop_requested: "1",
+          stop_reason: reason,
+          stop_requested_at: nowIso,
+          updated_at: nowIso,
+        }).catch(() => 0),
+        redisClient.hset(`progression:${connectionId}`, {
+          stop_requested: "1",
+          stop_reason: reason,
+          stop_requested_at: nowIso,
+          last_update: nowIso,
+        }).catch(() => 0),
+      ])
+      console.log(`[v0] Requested remote engine stop for ${connectionId} without clearing runtime state`)
+    } catch (redisErr) {
+      console.warn(`[v0] [STOP LOCK] Could not request remote stop for ${connectionId}:`, redisErr)
+    }
+  }
+
+  /**
+   * Best-effort runtime cleanup for a locally-owned manager stop or an explicit
+   * operator stop that is allowed to stop any owner. This intentionally does
+   * NOT mutate Main Connections
    * assignment/enabled flags (`is_active_inserted`, `is_dashboard_inserted`,
    * `is_assigned`, `is_active`). Assignment is user intent and is only cleared
    * by explicit remove/unassign flows; a normal engine stop should only clear
