@@ -14,4 +14,7 @@ declare module "bingx-api" {
 
   const BingXClient: typeof BingxApiClient
   export default BingXClient
+  const BingXClient: any
+  export default BingXClient
+  export const BingxApiClient: any
 }
