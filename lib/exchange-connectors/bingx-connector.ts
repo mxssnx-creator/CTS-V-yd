@@ -2,7 +2,9 @@
 // in `next.config.mjs` (the runtime guard in `instrumentation.ts` makes
 // sure the stub is never executed at request time).
 import * as crypto from "crypto"
-import BingX from "bingx-api"
+// Official BingX SDK for instant order execution with connection pooling
+// Note: SDK import is wrapped in try-catch during initialization
+import type { default as BingXClient } from "bingx-api"
 import {
   BaseExchangeConnector,
   type ExchangeCredentials,
@@ -90,23 +92,40 @@ export class BingXConnector extends BaseExchangeConnector {
     super(credentials, exchange)
     
     // Initialize the official BingX SDK client with connection pooling
-    // and automatic timestamp synchronization for instant execution.
-    try {
-      this.sdkClient = new BingX({
-        apiKey: credentials.apiKey,
-        secretKey: credentials.apiSecret,
-        baseURL: this.getBaseUrl(),
-        // Enable connection pooling and keep-alive for faster subsequent requests
-        timeout: 20_000, // 20s timeout to handle BingX latency
-        recvWindow: 60_000, // 60s recvWindow for slippage
-      })
-    } catch (err) {
-      console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
+    // SDK is dynamically loaded to avoid import issues in edge environments
+    this.initializeSDKClient(credentials).catch(() => {
       // Fall back to manual REST if SDK fails to initialize
-    }
+      this.sdkClient = null
+    })
     
     // Kick off the first time-sync in the background (SDK handles this internally too)
     this.syncPromise = this.syncServerTime().catch(() => { this.syncPromise = null })
+  }
+
+  private async initializeSDKClient(credentials: ExchangeCredentials): Promise<void> {
+    try {
+      // Dynamically import SDK to avoid static edge environment issues
+      const BingXModule = await import("bingx-api")
+      const BingXClient = BingXModule.default || BingXModule.BingX || Object.values(BingXModule)[0]
+      
+      if (typeof BingXClient !== "function") {
+        console.warn("[BingX] SDK client is not a constructor")
+        return
+      }
+
+      this.sdkClient = new (BingXClient as any)({
+        apiKey: credentials.apiKey,
+        secretKey: credentials.apiSecret,
+        baseURL: this.getBaseUrl(),
+        timeout: 20_000, // 20s timeout to handle BingX latency
+        recvWindow: 60_000, // 60s recvWindow for slippage
+      })
+      
+      console.log("[BingX] SDK client initialized successfully (connection pooling enabled)")
+    } catch (err) {
+      console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
+      // Will fall back to manual REST
+    }
   }
 
   private getBaseUrl(): string {
@@ -485,10 +504,12 @@ export class BingXConnector extends BaseExchangeConnector {
           }
           
           if (balanceData && balanceData.code === 0 && balanceData.data) {
-            return {
+            // SDK response contains balance data - return in expected format
+            const result = {
               success: true,
               data: balanceData.data,
-            }
+            } as any
+            return result as ExchangeConnectorResult
           }
         } catch (sdkErr) {
           console.warn("[BingX SDK] getBalance fast-path failed, using REST fallback")

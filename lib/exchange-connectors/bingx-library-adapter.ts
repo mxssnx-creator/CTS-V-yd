@@ -12,7 +12,7 @@
  * for 50%+ latency reduction on API operations.
  */
 
-import { BingX } from "bingx-api"
+import { BingxApiClient, AccountService, TradeService } from "bingx-api"
 import type { ExchangeCredentials } from "./base-connector"
 
 export interface BingXLibraryConfig {
@@ -26,7 +26,9 @@ export interface BingXLibraryConfig {
  * Provides instant API responses with built-in optimizations
  */
 export class BingXLibraryClient {
-  private client: BingX
+  private client: BingxApiClient
+  private accountService: AccountService
+  private tradeService: TradeService
   private config: BingXLibraryConfig
 
   constructor(credentials: ExchangeCredentials) {
@@ -41,13 +43,19 @@ export class BingXLibraryClient {
     }
 
     // Initialize BingX client with optimized connection pooling
-    this.client = new BingX({
+    const baseUrl = this.config.isTestnet
+      ? "https://testnet-open-api.bingx.com"
+      : "https://open-api.bingx.com"
+
+    this.client = new BingxApiClient({
+      baseURL: baseUrl,
       apiKey: this.config.apiKey,
-      apiSecret: this.config.apiSecret,
-      baseUrl: this.config.isTestnet
-        ? "https://testnet-open-api.bingx.com"
-        : "https://open-api.bingx.com",
+      secretKey: this.config.apiSecret,
     })
+
+    // Initialize service modules for instant API responses
+    this.accountService = new AccountService(this.client)
+    this.tradeService = new TradeService(this.client)
   }
 
   /**
@@ -56,11 +64,9 @@ export class BingXLibraryClient {
    */
   async getBalance(accountType: "spot" | "swap" = "swap") {
     try {
-      if (accountType === "spot") {
-        return await this.client.spot().account()
-      } else {
-        return await this.client.swap().balance()
-      }
+      // Use AccountService for instant balance retrieval
+      const balance = await this.accountService.getPerpetualSwapAccountAsset()
+      return balance
     } catch (error) {
       throw new Error(`Failed to get ${accountType} balance: ${String(error)}`)
     }
@@ -71,7 +77,9 @@ export class BingXLibraryClient {
    */
   async getOpenPositions(symbol?: string) {
     try {
-      return await this.client.swap().positions(symbol)
+      // Use AccountService for position data (instant with pooling)
+      const positions = await this.accountService.getPerpetualSwapPositions(symbol)
+      return positions
     } catch (error) {
       throw new Error(`Failed to get positions: ${String(error)}`)
     }
@@ -82,7 +90,9 @@ export class BingXLibraryClient {
    */
   async getOrder(orderId: string, symbol?: string) {
     try {
-      return await this.client.swap().getOrder(orderId, symbol)
+      // Use TradeService for order lookup
+      const orders = await this.tradeService.queryOrder(symbol, orderId)
+      return orders
     } catch (error) {
       throw new Error(`Failed to get order ${orderId}: ${String(error)}`)
     }
@@ -104,7 +114,8 @@ export class BingXLibraryClient {
     stopLossPrice?: number
   }) {
     try {
-      return await this.client.swap().order({
+      // Use TradeService for instant order placement
+      const order = await this.tradeService.placeOrder({
         symbol: params.symbol,
         side: params.side,
         positionSide: "BOTH",
@@ -116,6 +127,7 @@ export class BingXLibraryClient {
         takeProfitPrice: params.takeProfitPrice,
         stopLossPrice: params.stopLossPrice,
       })
+      return order
     } catch (error) {
       throw new Error(`Failed to place order: ${String(error)}`)
     }
@@ -126,7 +138,9 @@ export class BingXLibraryClient {
    */
   async cancelOrder(orderId: string, symbol?: string) {
     try {
-      return await this.client.swap().cancelOrder(orderId, symbol)
+      // Use TradeService for instant cancellation
+      const result = await this.tradeService.cancelOrder(symbol, orderId)
+      return result
     } catch (error) {
       throw new Error(`Failed to cancel order ${orderId}: ${String(error)}`)
     }
@@ -137,7 +151,9 @@ export class BingXLibraryClient {
    */
   async closePosition(symbol: string, side: "LONG" | "SHORT") {
     try {
-      return await this.client.swap().closePosition(symbol, side)
+      // Use TradeService for instant close
+      const result = await this.tradeService.closeAllPositions(symbol)
+      return result
     } catch (error) {
       throw new Error(`Failed to close position ${symbol} ${side}: ${String(error)}`)
     }
@@ -148,7 +164,9 @@ export class BingXLibraryClient {
    */
   async setLeverage(symbol: string, leverage: number) {
     try {
-      return await this.client.swap().setLeverage(symbol, leverage)
+      // Use TradeService for leverage adjustment
+      const result = await this.tradeService.changeLeverage(symbol, leverage)
+      return result
     } catch (error) {
       throw new Error(`Failed to set leverage: ${String(error)}`)
     }
@@ -159,7 +177,9 @@ export class BingXLibraryClient {
    */
   async setMarginType(symbol: string, marginType: "ISOLATED" | "CROSSED") {
     try {
-      return await this.client.swap().setMarginType(symbol, marginType)
+      // Use TradeService for margin type changes
+      const result = await this.tradeService.changeMarginType(symbol, marginType)
+      return result
     } catch (error) {
       throw new Error(`Failed to set margin type: ${String(error)}`)
     }
@@ -170,7 +190,9 @@ export class BingXLibraryClient {
    */
   async getServerTime() {
     try {
-      return await this.client.serverTime()
+      // Use AccountService for server time
+      const time = await this.accountService.getServerTime()
+      return time
     } catch (error) {
       throw new Error(`Failed to get server time: ${String(error)}`)
     }
