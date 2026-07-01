@@ -106,22 +106,26 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       // Dynamically import SDK to avoid static edge environment issues
       const BingXModule = await import("bingx-api")
-      const BingXClient = BingXModule.default || BingXModule.BingX || Object.values(BingXModule)[0]
       
-      if (typeof BingXClient !== "function") {
-        console.warn("[BingX] SDK client is not a constructor")
+      // Try multiple export patterns used by bingx-api
+      const BingXClient = (BingXModule as any).BingxApiClient 
+        || (BingXModule as any).default 
+        || (BingXModule as any)
+      
+      if (!BingXClient || typeof BingXClient !== "function") {
+        console.warn("[BingX] SDK client not found or not a constructor")
         return
       }
 
-      this.sdkClient = new (BingXClient as any)({
+      // Initialize SDK client with configuration
+      this.sdkClient = new BingXClient({
         apiKey: credentials.apiKey,
         secretKey: credentials.apiSecret,
-        baseURL: this.getBaseUrl(),
-        timeout: 20_000, // 20s timeout to handle BingX latency
-        recvWindow: 60_000, // 60s recvWindow for slippage
+        baseUrl: this.getBaseUrl(),
+        recvWindow: 60_000, // 60s recvWindow for slippage tolerance
       })
       
-      console.log("[BingX] SDK client initialized successfully (connection pooling enabled)")
+      console.log("[BingX] SDK client initialized (connection pooling + keep-alive enabled)")
     } catch (err) {
       console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
       // Will fall back to manual REST
@@ -497,10 +501,11 @@ export class BingXConnector extends BaseExchangeConnector {
           let balanceData: any
           
           // SDK automatically handles signing, timestamps, and retries
+          const sdkAny = this.sdkClient as any
           if (apiType === "spot") {
-            balanceData = await this.sdkClient.balance?.query?.()
+            balanceData = await sdkAny.balance?.query?.()
           } else {
-            balanceData = await this.sdkClient.account?.balance?.()
+            balanceData = await sdkAny.account?.balance?.()
           }
           
           if (balanceData && balanceData.code === 0 && balanceData.data) {
@@ -767,7 +772,7 @@ export class BingXConnector extends BaseExchangeConnector {
           const apiType = this.credentials.apiType || "perpetual_futures"
           
           // SDK encapsulates the order placement with optimal timeout and retry
-          const orderData = await this.sdkClient.order.place({
+          const orderData = await (this.sdkClient as any).order?.place({
             symbol: bingxSymbol,
             side: side.toUpperCase(),
             type: orderType === "market" ? "MARKET" : "LIMIT",
@@ -775,7 +780,6 @@ export class BingXConnector extends BaseExchangeConnector {
             price: price || undefined,
             positionSide: options.positionSide,
             reduceOnly: options.reduceOnly,
-            timeInForce: options.timeInForce || "GTC",
           })
           
           if (orderData && orderData.code === 0 && orderData.data?.orderId) {
