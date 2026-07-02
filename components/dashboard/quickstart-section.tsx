@@ -435,6 +435,10 @@ export function QuickstartSection() {
   const pollRef       = useRef<NodeJS.Timeout | undefined>(undefined)
   const configPollRef = useRef<NodeJS.Timeout | undefined>(undefined)
   const livePollRef   = useRef<NodeJS.Timeout | undefined>(undefined)
+  // Multiple widgets/events can trigger stats loads while the 500ms
+  // prehistoric poll is already in flight. Apply only the newest response so
+  // slower old requests cannot collapse fresh counters back to stale values.
+  const statsFetchSeqRef = useRef(0)
 
   // ── fetch live stats ──────────────────────────────────────────────────────
   const fetchStats = useCallback(async (silent = false) => {
@@ -444,12 +448,14 @@ export function QuickstartSection() {
       setStats(EMPTY_STATS)
       return
     }
+    const requestSeq = ++statsFetchSeqRef.current
     if (!silent) setLoadingStats(true)
     try {
       // Primary: /stats endpoint (full breakdown)
       const res = await fetch(`/api/connections/progression/${connectionId}/stats`, { cache: "no-store" })
-      if (!res.ok) return
+      if (!res.ok || requestSeq !== statsFetchSeqRef.current) return
       const s = await res.json()
+      if (requestSeq !== statsFetchSeqRef.current) return
 
       let indCycles  = s.realtime?.indicationCycles || 0
       let stratCycles = s.realtime?.strategyCycles  || 0
@@ -652,6 +658,7 @@ export function QuickstartSection() {
         realtimeGatingStatus: s.realtimeGatingStatus || { isGated: false, reason: null, firstRealtimeCycleAt: null },
         stageEvalPercent: s.stageEvalPercent ?? null,
       }
+      if (requestSeq !== statsFetchSeqRef.current) return
       setStats(nextStats)
       // Persist stats to sessionStorage so a page reload can restore the last
       // known values instantly (before the first polling fetch returns).
@@ -695,7 +702,7 @@ export function QuickstartSection() {
       }
       if (s.metadata?.engineRunning === false && !startingRef.current && !startingGraceRef.current) setIsRunning(false)
     } catch { /* non-critical */ }
-    finally { if (!silent) setLoadingStats(false) }
+    finally { if (!silent && requestSeq === statsFetchSeqRef.current) setLoadingStats(false) }
   }, [connectionId])
 
   // ── fetch volatile symbol ──────────────────────────────────────────────────
