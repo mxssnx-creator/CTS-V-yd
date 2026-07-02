@@ -191,18 +191,24 @@ export async function completeStartup() {
   console.log(`[v0] [Startup] ========================================\n`)
 
   try {
-    // Step 1: Initialize Redis
+    // Step 1: Initialize Redis (runMigrations runs inside initRedis)
     console.log(`[v0] [Startup] Step 1/8: Initializing Redis...`)
     await initRedis()
     console.log(`[v0] [Startup] ✓ Redis initialized`)
-    const volatileCleanupMode = process.env.NODE_ENV === "production" ? "production" : "development"
-    const volatileCleanup = await cleanupVolatileRuntimeState({ mode: volatileCleanupMode, reason: "completeStartup" })
+    const volatileCleanup = await cleanupVolatileRuntimeState({ reason: "completeStartup" })
     console.log(`[v0] [Startup] ✓ Volatile runtime cleanup complete (deleted ${volatileCleanup.deleted}, preserved ${volatileCleanup.preserved})\n`)
 
-    // Step 2: Skip — migrations already ran inside initRedis() above.
-    // Keeping the sequential step numbering for log consistency.
-    console.log(`[v0] [Startup] Step 2/8: Migrations already applied by initRedis`)
-    console.log(`[v0] [Startup] ✓ Migrations complete (no duplicate run)\n`)
+    // Step 2: Migrations already ran inside initRedis() above.
+    // Seed default settings and placeholder market data — both are no-ops when
+    // data already exists, so safe to call on every boot including hot-reloads.
+    console.log(`[v0] [Startup] Step 2/8: Seeding default settings and market data...`)
+    try {
+      const { runPreStartup } = await import("@/lib/pre-startup")
+      await runPreStartup()
+    } catch (e) {
+      console.warn(`[v0] [Startup] ⚠ Pre-startup seeding warning (non-fatal): ${e instanceof Error ? e.message : e}`)
+    }
+    console.log(`[v0] [Startup] ✓ Settings + market data seed complete\n`)
 
     // Step 3: Validate database integrity
     console.log(`[v0] [Startup] Step 3/8: Validating database integrity...`)

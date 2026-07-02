@@ -133,19 +133,14 @@ export class IndicationSetsProcessor {
   //              × 5 types × 3 symbols = 7,830 keys/cycle → accumulates fast
   //   Dev  grid:  3 ranges × 2 dd × 1 lp × 2 fm = 12  keys/type/symbol
   //              × 5 types × 3 symbols = 180 keys/cycle — easily evictable
-  private readonly _isDev = process.env.NODE_ENV === "development"
-  private directionMoveRanges: number[] = this._isDev
-    ? [5, 15, 25]                                        // 3 representative dev ranges
-    : Array.from({ length: 29 }, (_, i) => i + 2)       // 2..30 prod
-  private optimalRanges: number[] = this._isDev
-    ? [5, 15, 25]
-    : Array.from({ length: 29 }, (_, i) => i + 2)
-  private drawdownRatios: number[] = this._isDev ? [0.5, 1.5]           : [0.5, 1.0, 1.5]
-  private lastPartRatios: number[] = this._isDev ? [0.5]                : [0.25, 0.5]
-  private factorMultipliers: number[] = this._isDev ? [0.9, 1.1]        : [0.9, 1.0, 1.1]
-  private activeThresholds: number[] = this._isDev ? [0.5, 2.5]         : [0.5, 1.0, 1.5, 2.0, 2.5]
-  private activeTimeRatios: number[] = this._isDev ? [1.0]              : [0.5, 1.0]
-  private activeAdvancedActivityRatios: number[] = this._isDev ? [1.0, 2.0] : [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  private directionMoveRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
+  private optimalRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2)
+  private drawdownRatios: number[] = [0.5, 1.0, 1.5]
+  private lastPartRatios: number[] = [0.25, 0.5]
+  private factorMultipliers: number[] = [0.9, 1.0, 1.1]
+  private activeThresholds: number[] = [0.5, 1.0, 1.5, 2.0, 2.5]
+  private activeTimeRatios: number[] = [0.5, 1.0]
+  private activeAdvancedActivityRatios: number[] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
   private activeAdvancedMinPositions = 3
   private activeAdvancedContinuationRatio = 0.6
   private shortPriceHistoryWarnings: Set<string> = new Set()
@@ -544,9 +539,15 @@ export class IndicationSetsProcessor {
             if (!indication) continue
             
             total++
+            // Derive direction from the actual signal — firstDir > 0 means long,
+            // firstDir < 0 means short. This MUST be computed BEFORE building the
+            // set key so long and short signals write to INDEPENDENT Redis keys.
             const direction = indication.metadata?.firstDir > 0 ? "long" : "short"
             indication.direction = direction
-            const setKey = `indication_set:${this.connectionId}:${symbol}:direction:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+            // Key includes direction so long/short never share the same Redis key.
+            // Without :dir the same config combo for both directions overwrites each
+            // other's JSON array, producing identical (wrong) values for L and S.
+            const setKey = `indication_set:${this.connectionId}:${symbol}:direction:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
             if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
               qualified++
@@ -595,9 +596,11 @@ export class IndicationSetsProcessor {
             if (!indication) continue
             
             total++
+            // movement > 0 = price went up = long signal; movement < 0 = short.
+            // Direction is embedded in the key so long/short are independent sets.
             const direction = (indication.metadata?.movement || 0) >= 0 ? "long" : "short"
             indication.direction = direction
-            const setKey = `indication_set:${this.connectionId}:${symbol}:move:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+            const setKey = `indication_set:${this.connectionId}:${symbol}:move:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
             if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
               qualified++
@@ -782,33 +785,6 @@ export class IndicationSetsProcessor {
       // The strategy-coordinator reads these keys to build Real-stage sets; it
       // only needs the most-recent entry (it re-evaluates from scratch each cycle)
       // so overwriting loses no functional data.
-      if (process.env.NODE_ENV === "development") {
-        const now = Date.now()
-        const timestamp = new Date().toISOString()
-        await Promise.all(
-          writes.map(async ({ setKey, indication, config }, idx) => {
-            const direction: "long" | "short" =
-              indication.direction === "short" ? "short"
-              : indication.direction === "long" ? "long"
-              : indication?.metadata?.firstDir < 0 ? "short"
-              : "long"
-            const entry = {
-              id: `${type}_${now}_${idx}`,
-              timestamp,
-              type,
-              direction,
-              profitFactor: indication.profitFactor,
-              signalScore: indication.signalScore,
-              rawSignalStrength: indication.rawSignalStrength,
-              confidence: indication.confidence,
-              config,
-              metadata: indication.metadata,
-            }
-            await client.set(setKey, JSON.stringify([entry]))
-          })
-        )
-        return
-      }
       const now = Date.now()
       const timestamp = new Date().toISOString()
 
@@ -1003,17 +979,38 @@ export class IndicationSetsProcessor {
     return indication.signalScore || indication.rawSignalStrength || 0
   }
 
+  /**
+   * Record a realized outcome sample and return the current profit factor.
+   *
+   * Previous impl: read entire JSON blob (up to ~300 KB for 1000 samples),
+   * push, trim, write back — O(N) parse+stringify on every indication hit.
+   *
+   * New impl: store samples as a Redis LIST (rpush + ltrim = 2 O(1) ops).
+   * Profit factor is recomputed from the list, which costs one LRANGE but
+   * avoids the full JSON round-trip on every write.  The list cap (1000)
+   * matches the previous blob cap so downstream PF values are identical.
+   */
   private async recordOutcomeSample(setKey: string, sample: any): Promise<number> {
     const client = await getCachedClient()
     const key = `${setKey}:outcomes`
-    const raw = await client.get(key)
-    const samples = raw ? JSON.parse(raw) : []
-    samples.push(sample)
-    const trimmed = samples.slice(-1000)
-    await client.set(key, JSON.stringify(trimmed))
 
-    const grossProfit = trimmed.reduce((sum: number, s: any) => sum + Number(s.profit || 0), 0)
-    const grossLoss = trimmed.reduce((sum: number, s: any) => sum + Number(s.loss || 0), 0)
+    // Append new sample and cap to 1000 entries atomically.
+    const pipe = client.multi()
+    pipe.rpush(key, JSON.stringify(sample))
+    pipe.ltrim(key, -1000, -1)
+    await pipe.exec()
+
+    // Compute PF from the full window (one LRANGE).
+    const raw: string[] = await client.lrange(key, 0, -1)
+    let grossProfit = 0
+    let grossLoss   = 0
+    for (const item of raw) {
+      try {
+        const s = JSON.parse(item)
+        grossProfit += Number(s.profit || 0)
+        grossLoss   += Number(s.loss   || 0)
+      } catch { /* skip malformed */ }
+    }
     if (grossLoss <= 0) return grossProfit > 0 ? grossProfit / 0.000001 : 0
     return grossProfit / grossLoss
   }
@@ -1036,10 +1033,7 @@ export class IndicationSetsProcessor {
       // far more than the low-RAM dev VM needs; 100 is plenty to evaluate forward
       // outcomes. Production keeps the full 1000-entry window.
       // Scale with symbol count: 30 per symbol in dev (e.g. 300 for 10 symbols).
-      const _nDevSyms = this._isDev
-        ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-        : 1
-      const pendingCap = this._isDev ? Math.max(100, _nDevSyms * 30) : 1000
+      const pendingCap = 1000
       await client.ltrim(key, -pendingCap, -1)
       await client.expire(key, 86400)
     } catch { /* non-critical */ }
@@ -1051,33 +1045,71 @@ export class IndicationSetsProcessor {
       if (this.getForwardCandles(marketData).length < 2) return
       const client = await getCachedClient()
       const key = `indication_outcomes_pending:${this.connectionId}:${symbol}`
-      const raw = await client.lrange(key, 0, -1)
+      const raw: string[] = await client.lrange(key, 0, -1)
       if (!raw?.length) return
       await client.del(key)
+
+      // Separate still-pending from newly-closed in a single synchronous pass
+      // (evaluateForwardOutcome is pure-sync — no I/O).
+      const stillPending: string[] = []
+      const closedItems: Array<{ item: string; pending: any; closed: any }> = []
       for (const item of raw) {
-        const pending = JSON.parse(item)
+        let pending: any
+        try { pending = JSON.parse(item) } catch { continue }
         const closed = this.evaluateForwardOutcome(marketData, pending.direction)
         if (!closed.completed) {
-          await client.rpush(key, item)
-          continue
+          stillPending.push(item)
+        } else {
+          closedItems.push({ item, pending, closed })
         }
-        const pf = await this.recordOutcomeSample(pending.setKey, {
-          profit: Math.max(closed.pnlPct, 0),
-          loss: Math.max(-closed.pnlPct, 0),
-          pnlPct: closed.pnlPct,
-          closedAt: new Date().toISOString(),
-        })
-        const existing = await client.get(pending.setKey)
-        const entries = existing ? JSON.parse(existing) : []
-        for (let i = entries.length - 1; i >= 0; i--) {
-          if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
-            entries[i].profitFactor = pf
-            entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
-            break
-          }
-        }
-        await client.set(pending.setKey, JSON.stringify(entries))
       }
+
+      // Re-queue still-pending items in one rpush call (was one per item).
+      if (stillPending.length > 0) {
+        await client.rpush(key, ...stillPending)
+      }
+
+      // Process closed items — fan out get+record+set per unique setKey.
+      // Group by setKey first so we do at most one get/set per key even if
+      // multiple pending items share the same set.
+      const bySetKey = new Map<string, Array<{ pending: any; closed: any }>>()
+      for (const { pending, closed } of closedItems) {
+        const arr = bySetKey.get(pending.setKey) ?? []
+        arr.push({ pending, closed })
+        bySetKey.set(pending.setKey, arr)
+      }
+
+      await Promise.all(
+        [...bySetKey.entries()].map(async ([setKey, items]) => {
+          // Record all outcome samples for this setKey before reading entries,
+          // so the final PF reflects all closed outcomes from this cycle.
+          let pf = 0
+          for (const { closed } of items) {
+            pf = await this.recordOutcomeSample(setKey, {
+              profit:   Math.max(closed.pnlPct, 0),
+              loss:     Math.max(-closed.pnlPct, 0),
+              pnlPct:   closed.pnlPct,
+              closedAt: new Date().toISOString(),
+            })
+          }
+          // Single read-modify-write per setKey regardless of how many
+          // pending items referenced it.
+          const existing = await client.get(setKey)
+          let entries: any[] = []
+          try { entries = existing ? JSON.parse(existing as string) : [] } catch { /* keep [] */ }
+          let patchCount = items.length
+          for (let i = entries.length - 1; i >= 0 && patchCount > 0; i--) {
+            if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
+              const closed = items[items.length - patchCount].closed
+              entries[i].profitFactor = pf
+              entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
+              patchCount--
+            }
+          }
+          await client.set(setKey, JSON.stringify(entries))
+        }),
+      )
+
       await client.expire(key, 86400)
     } catch { /* non-critical */ }
   }
@@ -1443,21 +1475,24 @@ export class IndicationSetsProcessor {
         }
       }
 
+      // Fan out all GETs in parallel — was N serial round-trips per stats call.
+      const rawValues = await Promise.all(keys.map((k: string) => client.get(k).catch(() => null)))
+
       let totalEntries = 0
       let totalProfitFactor = 0
       let totalConfidence = 0
       let sampleCount = 0
 
-      for (const key of keys) {
-        const raw = await client.get(key)
+      for (const raw of rawValues) {
         if (!raw) continue
-        const entries = JSON.parse(raw)
+        let entries: any[]
+        try { entries = JSON.parse(raw as string) } catch { continue }
         if (!Array.isArray(entries)) continue
 
         totalEntries += entries.length
         for (const entry of entries) {
           totalProfitFactor += Number(entry?.profitFactor || 0)
-          totalConfidence += Number(entry?.confidence || 0)
+          totalConfidence   += Number(entry?.confidence   || 0)
           sampleCount++
         }
       }

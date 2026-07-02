@@ -360,35 +360,43 @@ Example with ratio 1.5:
     }
   }
 
-  async calculatePositionCostRatio(rangeValue: number): Promise<number> {
+  /**
+   * Synchronous version — the formula is pure arithmetic, no I/O.
+   * The async wrapper is kept for backward-compat but delegates here.
+   */
+  calculatePositionCostRatioSync(rangeValue: number): number {
     return 0.1 + (rangeValue - 1) * 0.1556
   }
 
-  async validateMarketChange(priceChanges: number[], ratioFactor: number): Promise<boolean> {
-    if (priceChanges.length < 3) {
-      return false // Not enough data for validation
-    }
-
-    const totalSamples = priceChanges.length
-    const overallAverage = priceChanges.reduce((sum, change) => sum + change, 0) / totalSamples
-
-    const last20Samples = Math.max(1, Math.floor(totalSamples * 0.2))
-    const last20Average = priceChanges.slice(-last20Samples).reduce((sum, change) => sum + change, 0) / last20Samples
-
-    return last20Average >= overallAverage * ratioFactor
+  async calculatePositionCostRatio(rangeValue: number): Promise<number> {
+    return this.calculatePositionCostRatioSync(rangeValue)
   }
 
+  /**
+   * Synchronous validation — pure arithmetic, no I/O.
+   */
+  validateMarketChangeSync(priceChanges: number[], ratioFactor: number): boolean {
+    if (priceChanges.length < 3) return false
+    const total = priceChanges.length
+    const overallAvg = priceChanges.reduce((s, c) => s + c, 0) / total
+    const last20Count = Math.max(1, Math.floor(total * 0.2))
+    const last20Avg = priceChanges.slice(-last20Count).reduce((s, c) => s + c, 0) / last20Count
+    return last20Avg >= overallAvg * ratioFactor
+  }
+
+  async validateMarketChange(priceChanges: number[], ratioFactor: number): Promise<boolean> {
+    return this.validateMarketChangeSync(priceChanges, ratioFactor)
+  }
+
+  /**
+   * Pure-sync batch — all calculations are arithmetic, Promise.all
+   * over async wrappers was adding unnecessary microtask overhead.
+   */
   async calculateBatch(ranges: number[]): Promise<Map<number, number>> {
     const results = new Map<number, number>()
-
-    // Process all ranges in parallel
-    await Promise.all(
-      ranges.map(async (range) => {
-        const ratio = await this.calculatePositionCostRatio(range)
-        results.set(range, ratio)
-      }),
-    )
-
+    for (const range of ranges) {
+      results.set(range, this.calculatePositionCostRatioSync(range))
+    }
     return results
   }
 
@@ -396,15 +404,9 @@ Example with ratio 1.5:
     validations: Array<{ priceChanges: number[]; ratioFactor: number; id: string }>,
   ): Promise<Map<string, boolean>> {
     const results = new Map<string, boolean>()
-
-    // Process all validations in parallel
-    await Promise.all(
-      validations.map(async (validation) => {
-        const isValid = await this.validateMarketChange(validation.priceChanges, validation.ratioFactor)
-        results.set(validation.id, isValid)
-      }),
-    )
-
+    for (const v of validations) {
+      results.set(v.id, this.validateMarketChangeSync(v.priceChanges, v.ratioFactor))
+    }
     return results
   }
 

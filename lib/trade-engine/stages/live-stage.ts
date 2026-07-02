@@ -137,10 +137,10 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // Each value is calibrated to a ~2×p99 RTT of a typical BingX API call
 // (BingX p99 ≈ 120–250 ms); the gap gives one retry margin without
 // stalling the full sync for multiple seconds on a flaky call.
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 15_000  // 15 seconds - cancel needs time
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 20_000  // 20 seconds - stop/TP placement on slow exchanges
-const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 seconds - position fetch with network latency
-const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 seconds - fill detection needs time on volatility
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 10_000  // 10 s — cancel; fail fast and retry next tick
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 10_000  // 10 s — SL/TP placement; BingX normally <3 s
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 10_000  // 10 s — position fetch
+const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  6_000  //  6 s — fill detection; retry via next sync tick on miss
 
 /**
  * Live position as it flows through the live-stage pipeline and is
@@ -1372,7 +1372,7 @@ async function placeProtectionOrder(
         const availableQty = extract110424Available(errMsg)
         if (availableQty !== null && availableQty < effectiveQty) {
           console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} — retrying with exact available qty`,
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ������ retrying with exact available qty`,
           )
           result = await placeStop(availableQty)
           if (result?.success) {
@@ -1466,11 +1466,11 @@ async function placeProtectionOrder(
 async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
   if (!connector || typeof connector.getOpenOrders !== "function") return null
   try {
-    // 20 s upper bound — production timeout for real exchange network latency.
+    // 8 s upper bound — BingX normally responds in <3 s; 8 s is generous.
     // On timeout we degrade gracefully to drift-only reconciliation.
     const orders = (await withTimeout(
       connector.getOpenOrders() as Promise<any>,
-      20000,
+      8_000,
       "getOpenOrders(reconcile-tick)",
     )) as any[] | undefined
     if (!Array.isArray(orders)) return null
@@ -2116,7 +2116,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───�����────────────────────────────────────────────────────────
+// ── Main Pipeline ───�����──────���───��─────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2182,7 +2182,7 @@ export async function executeLivePosition(
     return cbSkipped
   }
 
-  // ── Non-recoverable-error cooldown gate ──
+  // ���─ Non-recoverable-error cooldown gate ──
   //
   // If we hit `code=101204` (Insufficient margin) within the exponential
   // backoff window (60s → 120s → 240s → 300s), skip this attempt and return
@@ -2908,10 +2908,12 @@ export async function executeLivePosition(
     // BingX's one-way-mode accounts auto-retry without positionSide if the
     // exchange rejects it (code 80014), so this is safe for both modes.
     //
-    // ── CRITICAL: Re-check is_live_trade gate RIGHT BEFORE order placement ──────
+    // ── CRITICAL: Re-check is_live_trade + is_testnet gate RIGHT BEFORE order placement ──────
     // The flag is checked once at entry (line 1959), but if the operator toggles
     // Control Orders off during preflight, we must catch it here before sending
     // the order to the exchange. This is a defensive second gate.
+    // ALSO check if the connection is pointing to a testnet exchange to prevent
+    // accidental real orders on testnet accounts (critical safety guard).
     const { getConnection: reCheckConn } = await import("@/lib/redis-db")
     const { isTruthyFlag: reCheckTruthy } = await import("@/lib/connection-state-utils")
     const freshSettings = (await reCheckConn(connectionId)) || {}
@@ -2924,6 +2926,25 @@ export async function executeLivePosition(
       !hasRealTradeBlock(freshSettings) &&
       (reCheckTruthy(freshSettings.is_live_trade) ||
         reCheckTruthy(freshSettings.live_trade_enabled))
+    
+    // CRITICAL: Prevent order placement on testnet connections
+    const isTestnetConnection = reCheckTruthy(freshSettings.is_testnet)
+    if (isTestnetConnection) {
+      livePosition.status = "rejected"
+      livePosition.statusReason =
+        `Testnet connection detected — live order placement blocked for safety. Use a production exchange connection for real trading.`
+      pushStep(livePosition, "entry", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        livePosition.statusReason,
+        { symbol: realPosition.symbol, direction: realPosition.direction, exchangeApi: freshSettings.exchange },
+      ).catch(() => {})
+      return livePosition
+    }
 
     if (!isStillLive) {
       livePosition.status = "rejected"
@@ -2986,23 +3007,24 @@ export async function executeLivePosition(
       "placeOrder"
     )
 
-    // ── Leverage auto-reduce on 101204 (Insufficient margin) ─────────
-    // When the exchange rejects with "Insufficient margin" the account
-    // likely does not have enough funds at the current leverage. Halve
-    // the leverage and retry ONCE — this is often enough to get the
-    // minimum margin requirement below the available balance.
+    // ── Volume reduction on 101204 (Insufficient margin) ────────────────
+    // Leverage is kept at its maximum value — never reduced. When the
+    // exchange rejects with "Insufficient margin" we instead halve the
+    // position volume and retry ONCE at the same leverage. Halving volume
+    // halves the required margin while keeping the leverage multiplier
+    // (and therefore the per-unit notional gain) intact. If the halved
+    // volume still fails, we fall back to the exchange minimum quantity at
+    // the same leverage, which represents the absolute smallest notional
+    // with the best leverage efficiency.
     if (!orderResult?.success && isNonRecoverableExchangeError(orderResult)) {
-      const reducedLev = Math.max(1, Math.floor(livePosition.leverage / 2))
-      if (reducedLev < livePosition.leverage) {
+      const reducedVolume = computedVolume / 2
+      // Ensure the halved volume is meaningfully smaller (> 0.1% diff) and positive.
+      const volumeDiffPct = computedVolume > 0 ? Math.abs(reducedVolume - computedVolume) / computedVolume : 0
+      if (reducedVolume > 0 && volumeDiffPct > 0.001) {
         console.warn(
-          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — retrying with halved leverage ` +
-          `${livePosition.leverage}x → ${reducedLev}x`,
+          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — retrying with halved volume ` +
+          `${computedVolume.toFixed(6)} → ${reducedVolume.toFixed(6)} (leverage kept at ${livePosition.leverage}x)`,
         )
-        try {
-          if (typeof exchangeConnector.setLeverage === "function") {
-            await exchangeConnector.setLeverage(realPosition.symbol, reducedLev)
-          }
-        } catch { /* non-critical; the order might still succeed */ }
 
         const retryResult: any = await retry(
           async () => {
@@ -3010,21 +3032,21 @@ export async function executeLivePosition(
             const { raw } = await withLiveOrderLogging(
               orderTrace,
               {
-                quantity: computedVolume,
+                quantity: reducedVolume,
                 price: currentPrice,
-                leverage: reducedLev,
+                leverage: livePosition.leverage,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
                 options: entryOrderOptions,
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
-                label: "leverage-halved",
+                label: "volume-halved",
               },
               () => exchangeConnector.placeOrder(
                 realPosition.symbol,
                 exchangeSide,
-                computedVolume,
+                reducedVolume,
                 undefined,
                 "market",
                 entryOrderOptions,
@@ -3033,27 +3055,25 @@ export async function executeLivePosition(
             return raw
           },
           (r: any) => !!r?.success && !!(r.orderId || r.id),
-          "placeOrder-reducedLev",
-          1 // single retry attempt — we already tried 3× above
+          "placeOrder-reducedVol",
+          1 // single retry — we already tried 3× above at original volume
         )
 
         if (retryResult?.success && (retryResult.orderId || retryResult.id)) {
-          // Succeeded with reduced leverage — update livePosition and continue.
-          livePosition.leverage = reducedLev
+          // Succeeded with reduced volume at max leverage — update position and continue.
+          computedVolume = reducedVolume
+          livePosition.quantity = reducedVolume
+          livePosition.remainingQuantity = reducedVolume
+          livePosition.volumeUsd = reducedVolume * currentPrice
           orderResult = retryResult
           console.log(
-            `${LOG_PREFIX} Entry succeeded after leverage reduction to ${reducedLev}x for ${realPosition.symbol}`,
+            `${LOG_PREFIX} Entry succeeded after volume reduction to ${reducedVolume.toFixed(6)} at ${livePosition.leverage}x for ${realPosition.symbol}`,
           )
         } else if (isNonRecoverableExchangeError(retryResult)) {
-          // Both the original and the halved-leverage attempt failed with
-          // 101204. Try one last time at leverage=1 with the smallest known
-          // per-symbol quantity (lowest possible margin requirement).
-          //
+          // Both the original and halved-volume attempts failed with 101204.
+          // Try one last time at the exchange minimum qty — still at max leverage.
           // Prefer the stored exchange minimum from the 101400 handler
-          // (`settings:trading_pair:{sym}` → `min_order_size`). Fall back to
-          // $5/price. At lev=1 the required margin equals the full notional,
-          // so even a tiny qty has the best chance of fitting in the available
-          // free margin.
+          // (`settings:trading_pair:{sym}` → `min_order_size`). Fall back to $5/price.
           let minQtyForSymbol = currentPrice > 0 ? 5 / currentPrice : 0
           try {
             const redisClient = getRedisClient()
@@ -3064,42 +3084,34 @@ export async function executeLivePosition(
               )
               const parsedStoredMin = storedMin ? parseFloat(storedMin) : 0
               if (parsedStoredMin > 0) {
-                // Use the stored exchange minimum — it is guaranteed to pass
-                // the exchange qty gate; only margin may still fail.
                 minQtyForSymbol = parsedStoredMin
               }
             }
           } catch { /* non-critical; fall back to $5/price */ }
 
-          // Only attempt if the quantity is meaningfully different from what
-          // we already tried (tolerance: 0.1% difference).
-          const quantityDiffPct = computedVolume > 0
-            ? Math.abs(minQtyForSymbol - computedVolume) / computedVolume
+          // Only attempt if the quantity is meaningfully different from what we already tried.
+          const minQuantityDiffPct = reducedVolume > 0
+            ? Math.abs(minQtyForSymbol - reducedVolume) / reducedVolume
             : 1
-          if (minQtyForSymbol > 0 && quantityDiffPct > 0.001) {
+          if (minQtyForSymbol > 0 && minQuantityDiffPct > 0.001) {
             console.warn(
-              `${LOG_PREFIX} 101204 at ${reducedLev}x still fails on ${realPosition.symbol} — ` +
-              `trying lev=1 with min notional qty=${minQtyForSymbol.toFixed(8)}`,
+              `${LOG_PREFIX} 101204 at half-volume still fails on ${realPosition.symbol} — ` +
+              `trying min notional qty=${minQtyForSymbol.toFixed(8)} at ${livePosition.leverage}x (max leverage kept)`,
             )
-            try {
-              if (typeof exchangeConnector.setLeverage === "function") {
-                await exchangeConnector.setLeverage(realPosition.symbol, 1)
-              }
-            } catch { /* non-critical */ }
             placeAttempt += 1
             const minResult: any = await withLiveOrderLogging(
               orderTrace,
               {
                 quantity: minQtyForSymbol,
                 price: currentPrice,
-                leverage: 1,
+                leverage: livePosition.leverage,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
                 options: entryOrderOptions,
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
-                label: "min-notional-lev1",
+                label: "min-notional-max-lev",
               },
               async () => {
                 const r = await exchangeConnector.placeOrder(
@@ -3114,15 +3126,17 @@ export async function executeLivePosition(
               },
             ).then(({ raw }) => raw).catch(() => null)
             if (minResult?.success && (minResult.orderId || minResult.id)) {
-              livePosition.leverage = 1
               computedVolume = minQtyForSymbol
+              livePosition.quantity = minQtyForSymbol
+              livePosition.remainingQuantity = minQtyForSymbol
+              livePosition.volumeUsd = minQtyForSymbol * currentPrice
               orderResult = minResult
               console.log(
-                `${LOG_PREFIX} Entry succeeded at lev=1 min-notional for ${realPosition.symbol}`,
+                `${LOG_PREFIX} Entry succeeded at min-notional ${minQtyForSymbol.toFixed(8)} at ${livePosition.leverage}x for ${realPosition.symbol}`,
               )
             } else {
               console.warn(
-                `${LOG_PREFIX} 101204 at lev=1 min-notional also failed for ${realPosition.symbol} — recording margin error`,
+                `${LOG_PREFIX} 101204 at min-notional also failed for ${realPosition.symbol} — recording margin error`,
               )
               recordMarginError(connectionId)
               orderResult = minResult ?? retryResult ?? orderResult
@@ -3133,12 +3147,12 @@ export async function executeLivePosition(
             orderResult = retryResult ?? orderResult
           }
         } else {
-          // Non-margin failure after leverage reduction — give up normally.
+          // Non-margin failure after volume reduction — give up normally.
           recordMarginError(connectionId)
           orderResult = retryResult ?? orderResult
         }
       } else {
-        // Leverage already at 1x — cannot reduce further.
+        // Volume already at minimum — cannot reduce further without going below exchange minimum.
         recordMarginError(connectionId)
       }
     }
@@ -3254,8 +3268,10 @@ export async function executeLivePosition(
         }
       }
       
-      // If no retry was attempted, or retry failed, mark as rejected
-      if (retryWasAttempted) {
+      // If no retry was attempted, or retry failed, pre-mark as rejected so
+      // the cleanup block below can run. The check below will override this
+      // if the retry actually succeeded (retryOrderId is set + orderResult.success).
+      if (!retryWasAttempted) {
         livePosition.status = "rejected"
         livePosition.statusReason = String(reason)
         pushStep(livePosition, "place_order", false, livePosition.statusReason)
@@ -5033,7 +5049,7 @@ export async function reconcileLivePositions(
             return delta
           }
 
-          // ── Ownership guard ────────────────────���──────���──────────────
+          // ── Ownership guard ────────────────────�����─────���──────────────
           // Only arm SL/TP and issue force-closes on positions that carry
           // a system orderId — proof WE placed the entry order.
           // If orderId is absent, the exchange position at this
@@ -5498,7 +5514,36 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // Previously each status filter triggered a full getLivePositions() scan,
     // meaning we fetched the same open-positions index from Redis FOUR times
     // just to bucket by status. Load once, then filter in memory.
-    const allOpen = await getLivePositions(connectionId)
+    const allOpenRaw = await getLivePositions(connectionId)
+
+    // ── Self-heal: purge terminal positions stuck in the open index ─────
+    // A historical bug in redis-db savePosition() re-added rejected/cancelled/
+    // error positions to the open index on every save, so stale terminal
+    // entries can persist indefinitely (observed: 16 "rejected" re-synced
+    // every tick). Move them to the closed archive here so the sync loop
+    // only ever processes genuinely live positions.
+    const TERMINAL_SYNC_STATUSES = new Set(["closed", "rejected", "cancelled", "canceled", "error"])
+    const stuckTerminal = allOpenRaw.filter((p) => TERMINAL_SYNC_STATUSES.has(String(p.status)))
+    if (stuckTerminal.length > 0) {
+      try {
+        const openIndexKey = `live:positions:${connectionId}`
+        const closedIndexKey = `live:positions:${connectionId}:closed`
+        await Promise.all(
+          stuckTerminal.map(async (p) => {
+            await client.lrem(openIndexKey, 0, p.id).catch(() => 0)
+            const already = await client.lpos(closedIndexKey, p.id).catch(() => null)
+            if (already === null || already === undefined) {
+              await client.lpush(closedIndexKey, p.id).catch(() => 0)
+            }
+          }),
+        )
+        console.log(
+          `${LOG_PREFIX} [sync-tick] purged ${stuckTerminal.length} terminal position(s) stuck in open index for ${connectionId}`,
+        )
+      } catch { /* best-effort self-heal */ }
+    }
+    const allOpen = allOpenRaw.filter((p) => !TERMINAL_SYNC_STATUSES.has(String(p.status)))
+
     const openPositions = allOpen.filter(
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed",
     )
@@ -5886,9 +5931,10 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const SYNC_CONCURRENCY = 12
     
     // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout for syncWithExchange.
-    // BingX can take 10-20 seconds on slow operations. Previously 6s but was
-    // causing timeouts and stalls. Increased to 20s to handle real exchange latency.
-    const SYNC_PER_POS_TIMEOUT_MS = 20_000
+    // Individual operation timeouts (getOrder=6s, placeStop=10s) mean the
+    // worst case per-position is ~16s; cap at 14s so one timed-out position
+    // can't stall the pool worker past one full tick period.
+    const SYNC_PER_POS_TIMEOUT_MS = 14_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {

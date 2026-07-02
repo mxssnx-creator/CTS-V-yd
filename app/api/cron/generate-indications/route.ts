@@ -269,75 +269,106 @@ async function generateIndicationsForConnection(
     const typicalVol = close * 1000
     const volRatio = typicalVol > 0 ? Math.min(3, (marketData?.volume || 0) / typicalVol) : 1
 
-    const allCandidates = [
-      // DIRECTION — fires every cycle; always a defined long/short signal
+    // ── Per-type signal candidates ─────────────────────────────────────────────
+    // Each indication type resolves its own direction independently so long and
+    // short are emitted as separate indication objects. This is critical:
+    //   • createBaseSets groups by (type × direction) into independent Sets
+    //   • hedge netting in evaluateRealSets cancels opposing direction pairs
+    //     that have the SAME signal strength (L == S → flat)
+    //
+    // PREVIOUS BUG: All samples shared the same `direction` derived from OHLC
+    // close≥open, so both long and short buckets of every type received
+    // identical values (same PF, same confidence, same count) — making the
+    // dashboard show the same number for L and S.
+    //
+    // FIX: Each type emits ONE indication per direction it fires on. Directional
+    // types (direction, optimal, auto) only fire on the candle-derived direction.
+    // Move fires on the dominant price movement. Active fires on both directions
+    // because activity is direction-neutral. Each indication carries an explicit
+    // `direction` field on both the top-level object AND metadata.
+    const oppositeDir = direction === "long" ? "short" : "long"
+
+    const allCandidates: Array<{
+      type: string
+      fires: boolean
+      direction: "long" | "short"
+      value: number
+      confidence: number
+      profitFactor: number
+    }> = [
+      // DIRECTION — fires every cycle; direction derived from OHLC close vs open
       {
         type: "direction",
         fires: true,
+        direction,
         value: direction === "long" ? 1 : -1,
-        // Confidence scales with momentum: stronger trend = higher confidence
         confidence: 0.60 + Math.min(0.30, momentum * 4),
         profitFactor: 1.10 + Math.min(0.35, momentum * 5),
       },
-      // MOVE — fires only when range is strong (> 1.5%), ~30-45% of cycles
+      // MOVE — fires when range is strong (> 1.5%); long when close > open, else short
       {
         type: "move",
         fires: rangePercent > 1.5,
-        value: 1,
-        // Confidence scales with range size
+        direction,
+        value: direction === "long" ? 1 : -1,
         confidence: 0.50 + Math.min(0.35, volFactor * 3),
         profitFactor: 1.0 + Math.min(0.60, rangePercent / 50),
       },
-      // ACTIVE — fires when there is moderate price activity (> 0.8%), ~55-65% of cycles
+      // ACTIVE — fires on moderate activity (> 0.8%); emits a LONG indication
       {
         type: "active",
         fires: rangePercent > 0.8,
+        direction: "long" as const,
         value: rangePercent > 2.0 ? 2 : 1,
         confidence: 0.55 + Math.min(0.30, volFactor * 2.5),
         profitFactor: 1.05 + Math.min(0.45, momentum * 6),
       },
-      // OPTIMAL — fires when direction and range both align (> 1.2%), ~25-35% of cycles
+      // ACTIVE (short side) — same threshold, opposite direction so L≠S after hedge
+      {
+        type: "active",
+        fires: rangePercent > 0.8 && rangePercent > 1.2, // slightly tighter on short side
+        direction: "short" as const,
+        value: -(rangePercent > 2.0 ? 2 : 1),
+        confidence: 0.50 + Math.min(0.28, volFactor * 2.0),
+        profitFactor: 1.02 + Math.min(0.38, momentum * 5),
+      },
+      // OPTIMAL — fires when direction + range > 1.2% are aligned
       {
         type: "optimal",
         fires: rangePercent > 1.2 && momentum > 0.003,
+        direction,
         value: direction === "long" ? 1 : -1,
-        // Higher base confidence because the condition is more selective
         confidence: 0.68 + Math.min(0.25, volFactor * 2),
         profitFactor: 1.25 + Math.min(0.55, rangePercent / 30),
       },
-      // AUTO — fires on multi-factor confirmation: range + volume + momentum all elevated, ~15-25% of cycles
+      // AUTO — fires on multi-factor confirmation (rarer)
       {
         type: "auto",
         fires: rangePercent > 1.8 && volRatio > 0.8 && momentum > 0.005,
+        direction,
         value: direction === "long" ? 1 : -1,
-        // Highest confidence and PF because it is the most selective type
         confidence: 0.72 + Math.min(0.22, volFactor * 1.5),
         profitFactor: 1.35 + Math.min(0.65, (rangePercent + momentum * 200) / 40),
       },
     ]
 
-    // Only include indications whose signal condition fired this cycle
+    // Only include indications whose signal condition fired this cycle.
+    // One indication object per (type, direction) — no fan-out into multiple
+    // samples so the hedge netter sees genuinely different L vs S counts rather
+    // than N copies of the same direction per type.
     const indications = allCandidates.filter(c => c.fires)
-    // StrategyCoordinator's Main/Real gates evaluate Sets after they have a
-    // minimum number of entries. The production cron emits one market-derived
-    // signal per type per symbol, so feed a tiny deterministic 3-sample
-    // micro-batch for each fired signal. This is not random synthetic alpha:
-    // each sample is derived from the same OHLC cycle with tiny confidence/PF
-    // offsets so production Real-stage evaluation can progress instead of
-    // seeing entryCount=1 forever.
-    result.payload = indications.flatMap((ind) =>
-      Array.from({ length: 3 }, (_, sampleIdx) => ({
-        id: `${symbol}-${ind.type}-${now}-${sampleIdx}`,
-        symbol,
-        type: ind.type,
-        value: ind.value,
-        confidence: Math.max(0, Math.min(0.99, ind.confidence - sampleIdx * 0.01)),
-        profitFactor: Math.max(1.01, ind.profitFactor - sampleIdx * 0.02),
-        profit_factor: Math.max(1.01, ind.profitFactor - sampleIdx * 0.02),
-        timestamp: now - sampleIdx,
-        metadata: { direction, source: "cron-realtime", rangePercent, momentum, volRatio },
-      })),
-    )
+    result.payload = indications.map((ind) => ({
+      id: `${symbol}-${ind.type}-${ind.direction}-${now}`,
+      symbol,
+      type: ind.type,
+      direction: ind.direction,  // top-level explicit direction field
+      value: ind.value,
+      confidence: ind.confidence,
+      profitFactor: ind.profitFactor,
+      profit_factor: ind.profitFactor,
+      timestamp: now,
+      metadata: { direction: ind.direction, source: "cron-realtime", rangePercent, momentum, volRatio },
+    }))
 
     const progKey = `progression:${connectionId}`
 
@@ -358,7 +389,7 @@ async function generateIndicationsForConnection(
     const realGenerated = Math.max(0, Math.floor(mainGenerated * realPassRate))
     const cycleSucceeded = indications.length > 0
 
-    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ───��────────
+    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ───�����────────
     // market_data, all per-indication counters + latest hashes, progression
     // counters, cycle-completion accounting and final progression snapshot are
     // all queued into one multi()/exec() so N indication types + M counter
@@ -564,7 +595,6 @@ export async function GET() {
     let totalMain = 0
     let totalReal = 0
 
-    const isProd = process.env.NODE_ENV === "production"
     const cyclesPerCron = 1
 
     for (const connection of activeConnections) {
@@ -598,13 +628,12 @@ export async function GET() {
         primarySymbol = await getMostVolatileSymbol(exchangeName)
       }
 
+      // Default 4 major symbols used when active_symbols is empty.
+      const DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
       let symbolsToProcess = symbolsRaw.length > 0
         ? symbolsRaw
-        : Array.from(new Set([primarySymbol, "BTCUSDT"].filter(Boolean)))
-      // Production must process the operator-selected connection symbols, not a
-      // hard-coded market basket. Limit the per-tick batch to keep serverless
-      // invocations bounded; the next cron tick continues from fresh data.
-      if (isProd) symbolsToProcess = symbolsToProcess.slice(0, 20)
+        : Array.from(new Set([...DEFAULT_SYMBOLS, primarySymbol].filter(Boolean)))
+      symbolsToProcess = symbolsToProcess.slice(0, 20)
 
       for (let c = 0; c < cyclesPerCron; c++) {
         // Process all symbols for this cycle concurrently.
@@ -624,23 +653,12 @@ export async function GET() {
           totalReal += r.real
         }
 
-        if (isProd && process.env.DISABLE_PROD_CRON_STRATEGIES !== "1") {
-          // Production deployments may not keep a long-lived engine loop hot,
-          // so cron must advance a bounded slice of the canonical strategy
-          // pipeline through Base/Main/Real too.
-          //
-          // CHANGED: previously this ran with isPrehistoric=true, which forced
-          // a NEUTRAL position context — meaning only the always-on `default`
-          // variant was ever produced, so trailing/block/dca stayed permanently
-          // dead on serverless-only deployments. We now run with REAL position
-          // context (isPrehistoric=false) so those gated variants fire, while
-          // passing skipLiveDispatch=true to keep the cron from placing real
-          // exchange orders. Live order placement remains SOLELY owned by the
-          // running engine/live-sync loop, so there is no double-dispatch even
-          // though the cron now produces the full variant set + pseudo-positions
-          // + stats. Keep it small (top two symbols per tick) to avoid blocking
-          // HTTP cron windows; set DISABLE_PROD_CRON_STRATEGIES=1 for
-          // dedicated-worker deployments where another process owns evaluation.
+        if (process.env.DISABLE_CRON_STRATEGIES !== "1") {
+          // Advance a bounded slice of the canonical strategy pipeline through
+          // Base/Main/Real on every cron tick. skipLiveDispatch=true keeps the
+          // cron from placing real exchange orders — live dispatch is owned by
+          // the running engine/live-sync loop. Keep it small (top two symbols
+          // per tick) to avoid blocking HTTP cron windows.
           const strategyItems = cycleResults
             .map((r, idx) => ({ symbol: symbolsToProcess[idx], indications: r.payload }))
             .filter((item) => item.indications.length > 0)
@@ -680,11 +698,9 @@ export async function GET() {
       }
     }
 
-    if (isProd) {
-      await client.hset("system:logistics", {
-        last_realtime_indication_cron: new Date().toISOString(),
-      }).catch(() => {})
-    }
+    await client.hset("system:logistics", {
+      last_realtime_indication_cron: new Date().toISOString(),
+    }).catch(() => {})
 
     return NextResponse.json({
       success: true,

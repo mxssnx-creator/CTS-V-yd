@@ -188,6 +188,12 @@ export class InlineLocalRedis implements RedisClientLike {
   private static persistenceTickStarted = false
   private static signalsAttached = false
   private static lastSaveErrorWarn = 0
+  // Per-process unique suffix so concurrent Next.js workers never collide on
+  // the same `.tmp` file, which caused the ENOENT "rename .tmp -> final" race.
+  private static readonly writeSuffix = `${process.pid ?? Math.random().toString(36).slice(2)}`
+  // In-process write mutex — prevents concurrent saveToDisk() calls from the
+  // same worker from racing each other.
+  private static saveInProgress = false
 
   /** Resolve snapshot path; honours `V0_REDIS_SNAPSHOT_PATH` env override. */
   private async resolveSnapshotPath(): Promise<{ dir: string; file: string } | null> {
@@ -334,35 +340,45 @@ export class InlineLocalRedis implements RedisClientLike {
   }
 
   async saveToDisk(): Promise<boolean> {
-    const primary = await this.resolveSnapshotPath()
-    if (!primary) return false
-    // Bare specifier — see comment in `resolveSnapshotPath`.
-    let fs: typeof import("fs/promises")
+    // In-process mutex: if a save is already in flight from this worker,
+    // skip rather than race on the .tmp file.
+    if (InlineLocalRedis.saveInProgress) return false
+    InlineLocalRedis.saveInProgress = true
     try {
-      fs = await import("fs/promises")
-    } catch {
-      return false
-    }
-    const json = this.buildSnapshot()
-    // Try primary then `/tmp` fallback so a read-only cwd doesn't lose data.
-    const candidates = [primary, await this.tmpFallbackPath()].filter(Boolean) as Array<{ dir: string; file: string }>
-    for (const c of candidates) {
+      const primary = await this.resolveSnapshotPath()
+      if (!primary) return false
+      // Bare specifier — see comment in `resolveSnapshotPath`.
+      let fs: typeof import("fs/promises")
       try {
-        await fs.mkdir(c.dir, { recursive: true })
-        const tmpPath = `${c.file}.tmp`
-        await fs.writeFile(tmpPath, json, "utf8")
-        // Atomic on POSIX — readers either see old or new, never partial.
-        await fs.rename(tmpPath, c.file)
-        return true
-      } catch (err) {
-        // Try next fallback. Only warn after we've exhausted everything.
-        if (c === candidates[candidates.length - 1]) {
-          this.warnRateLimited(`save failed (${c.file})`, err)
-        }
-        continue
+        fs = await import("fs/promises")
+      } catch {
+        return false
       }
+      const json = this.buildSnapshot()
+      // Try primary then `/tmp` fallback so a read-only cwd doesn't lose data.
+      const candidates = [primary, await this.tmpFallbackPath()].filter(Boolean) as Array<{ dir: string; file: string }>
+      for (const c of candidates) {
+        try {
+          await fs.mkdir(c.dir, { recursive: true })
+          // Use a per-PID suffix so concurrent Next.js workers never collide
+          // on the same .tmp file (previously caused ENOENT on rename).
+          const tmpPath = `${c.file}.${InlineLocalRedis.writeSuffix}.tmp`
+          await fs.writeFile(tmpPath, json, "utf8")
+          // Atomic on POSIX — readers either see old or new, never partial.
+          await fs.rename(tmpPath, c.file)
+          return true
+        } catch (err) {
+          // Try next fallback. Only warn after we've exhausted everything.
+          if (c === candidates[candidates.length - 1]) {
+            this.warnRateLimited(`save failed (${c.file})`, err)
+          }
+          continue
+        }
+      }
+      return false
+    } finally {
+      InlineLocalRedis.saveInProgress = false
     }
-    return false
   }
 
   /** Synchronous variant for SIGTERM / SIGINT / beforeExit handlers. */
@@ -389,11 +405,13 @@ export class InlineLocalRedis implements RedisClientLike {
     const primaryFile = explicit || pathMod.join(process.cwd(), ".v0-data", "redis-snapshot.json")
     const tmpFile = pathMod.join("/tmp", "v0-redis-snapshot.json")
     const json = this.buildSnapshot()
+    const suffix = InlineLocalRedis.writeSuffix
     for (const file of [primaryFile, tmpFile]) {
       try {
         const dir = pathMod.dirname(file)
         fsSync.mkdirSync(dir, { recursive: true })
-        const tmp = `${file}.tmp`
+        // PID-unique tmp file prevents cross-worker rename races (ENOENT).
+        const tmp = `${file}.${suffix}.tmp`
         fsSync.writeFileSync(tmp, json, "utf8")
         fsSync.renameSync(tmp, file)
         return true
@@ -412,13 +430,7 @@ export class InlineLocalRedis implements RedisClientLike {
     // ── Dev-mode optimization: disable periodic snapshots ──
     // In Next.js dev mode, module reloads + multiple workers independently
     // load/save snapshots, causing stale lock values to overwrite live engine
-    // lock tokens → "ownership loss" crashes every ~75s. In dev, disable
-    // periodic snapshots; in production, the 5-minute cycle is safe.
-    if (process.env.NODE_ENV === "development") {
-      console.log(`[v0] [Redis] Dev mode: periodic snapshot disabled to prevent lock churn`)
-      return true // Mark as started so we don't retry
-    }
-
+    // lock tokens → "ownership loss" crashes every ~75s. 5-minute cycle is safe.
     // 5-minute snapshot tick. unref() so this timer never holds the
     // process open during a graceful exit.
     const FIVE_MIN_MS = 5 * 60 * 1000
@@ -442,9 +454,8 @@ export class InlineLocalRedis implements RedisClientLike {
   
 
   async cleanupVolatileRuntimeState({
-    mode = process.env.NODE_ENV === "production" ? "production" : "development",
     reason = "startup",
-  }: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+  }: { mode?: string; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
     const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
     const now = Date.now()
     let deleted = 0
@@ -462,27 +473,21 @@ export class InlineLocalRedis implements RedisClientLike {
       if (Number.isFinite(timestamp) && timestamp > 0 && now - timestamp > staleMs) return true
       return !ttl && !timestamp
     }
-    const isDev = mode !== "production"
     const shouldDelete = (key: string, raw?: string | null): boolean => {
-      // Explicit volatile-state policy:
-      // live:position:* / live:positions:* / settings:live:*: dev clears all; prod preserves authoritative
-      // open-position records and only drops tracking/moved/transient indexes.
+      // Volatile-state cleanup policy — same in all modes:
+      // live:position:tracking:* and :moved: are transient indexes; always safe to drop.
       if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
-        return isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+        return key.startsWith("live:position:tracking:") || key.includes(":moved:")
       }
-      // live:lock:* is a transient gate: prod deletes only expired/old/missing-TTL locks.
-      if (key.startsWith("live:lock:")) return isDev || olderThanThreshold(key, raw)
+      // live:lock:* is a transient gate: delete only expired/old/missing-TTL locks.
+      if (key.startsWith("live:lock:")) return olderThanThreshold(key, raw)
       // Prehistoric gates/progress are boot cache gates, not authoritative data.
-      if (key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) return isDev || olderThanThreshold(key, raw)
-      // Pipeline/runtime data is rebuildable in dev, but in production it is the
-      // operator-visible in-flight state. Clearing it on every cold start makes
-      // progress collapse after deploys/serverless wakeups. Prod startup cleanup
-      // therefore preserves these families; stale/expired locks above remain the
-      // only runtime cleanup performed automatically.
-      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return isDev
-      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return isDev
-      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return isDev
-      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return isDev
+      if (key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) return olderThanThreshold(key, raw)
+      // Pipeline families are rebuilt each cycle — safe to evict on startup.
+      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return true
+      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return true
+      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return true
+      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return true
       return false
     }
 
@@ -493,7 +498,7 @@ export class InlineLocalRedis implements RedisClientLike {
     for (const key of Array.from(this.data.sorted_sets.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
 
     if (deleted > 0) {
-      console.log(`[v0] [Redis Memory] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+      console.log(`[v0] [Redis Memory] Volatile startup cleanup (${reason}): deleted ${deleted} keys, preserved ${preserved}`)
     }
     return { deleted, preserved }
   }
@@ -505,99 +510,109 @@ export class InlineLocalRedis implements RedisClientLike {
     // trading the per-cycle pipeline writes thousands of `pseudo_position:*`
     // and `config_set:*` hashes plus a growing `pseudo_positions:{conn}` set
     // every second; left unchecked this drove heapUsed past the 4GB V8 ceiling
-    // and OOM-killed next-server seconds after live trading began (verified:
-    // RSS climbing 1.5GB→7.3GB within a single ~60s window, GC unable to
-    // reduce — i.e. genuinely retained, not transient churn).
-    const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
+    // and OOM-killed next-server seconds after live trading began.
+    const globalCleanup = globalThis as unknown as {
+      __redis_cleanup_started?: boolean
+      __redis_mem_limits?: { heapMB: number; rssSoftMB: number; rssHardMB: number; maxKeys: number }
+    }
     if (globalCleanup.__redis_cleanup_started) return
     globalCleanup.__redis_cleanup_started = true
 
-    // Fire FREQUENTLY: with 20 symbols live-trading the pipeline writes ~20x
-    // more keys per second than a 5-symbol run. 2s catches bursts before they
-    // compound across multiple intervals. The handler is cheap (~ms) when
-    // heap is below threshold so the extra polling is negligible.
-    // Dev: 1 second interval to catch indication_set bursts before they compound.
-    const CLEANUP_INTERVAL_MS = process.env.NODE_ENV === "development" ? 1_000 : 2_000
-    // Trigger eviction at 400 MB heapUsed (reduced from 600).  Real Redis clients run off-heap;
-    // Very aggressive for dev mode to prevent OOM on 4GB VM with 15+ symbols.
-    // Total safe limit: 400MB heap + 1.6GB persistent = 2GB, leaving 2GB system buffer.
-    // 4 GB VM: RSS at boot is ~2.3 GB (Next.js + InlineLocalRedis migrations).
-    // Evict aggressively at 250 MB heap / 1400 MB RSS so the prehistoric
-    // burst (which adds ~300-400 MB) never pushes RSS past the kernel OOM limit.
-    // Heap eviction trigger: fire at 800 MB in dev (dev heap cap 4096 MB, engine
-    // runs ~900-1100 MB heap at peak so this fires proactively before bursts).
-    // Prod: 1200 MB (serverless invocations rarely exceed 512 MB so this is
-    // a safety net for long-lived containers).
-    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 800 : 1_200
+    // ── Dynamic memory limits ────────────────────────────────────────────────
+    // Read actual VM total RAM from /proc/meminfo once at startup so every
+    // threshold is proportional to the real machine instead of a hardcoded
+    // constant that may be wrong for the current deployment size.
+    // Fallback: 4096 MB (conservative for unknown environments).
+    const _readVmTotalMB = (): number => {
+      try {
+        const fs = require("fs") as typeof import("fs")
+        const raw = fs.readFileSync("/proc/meminfo", "utf8")
+        const match = raw.match(/MemTotal:\s+(\d+)\s+kB/)
+        return match ? Math.round(parseInt(match[1], 10) / 1024) : 4_096
+      } catch {
+        return 4_096
+      }
+    }
+    if (!globalCleanup.__redis_mem_limits) {
+      const vmTotalMB   = _readVmTotalMB()
+      // Reserve 2 GB for OS, other processes, and headroom before kernel OOM.
+      // V8 heap cap (--max-old-space-size) is set to 5632 in package.json for
+      // the actual 8606 MB VM, leaving ~3 GB of OS+slack buffer.
+      const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
+      // Heap trigger: fire at 45% of usable. On 8.6 GB VM → ~4.3 GB usable → ~1.9 GB heap trigger.
+      const heapMB      = Math.round(usableMB * 0.45)
+      // RSS soft: 50% of usable — force GC above this. Keeps us well clear of OOM.
+      const rssSoftMB   = Math.round(usableMB * 0.50)
+      // RSS hard: 65% of usable — critical eviction + sleep above this.
+      const rssHardMB   = Math.round(usableMB * 0.65)
+      const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
+      // Key count: scale with both symbol count and VM size.
+      const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))
+      globalCleanup.__redis_mem_limits = { heapMB, rssSoftMB, rssHardMB, maxKeys }
+      console.log(
+        `[v0] [Redis Memory] VM=${vmTotalMB}MB usable=${usableMB}MB ` +
+        `→ heapTrigger=${heapMB}MB rssSoft=${rssSoftMB}MB rssHard=${rssHardMB}MB maxKeys=${maxKeys}`
+      )
+    }
+    const MEM = globalCleanup.__redis_mem_limits
 
-    // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
-    // to clear volatile key families that accumulate across hot-reload cycles
-    // (the globalThis Map persists between Next.js hot-reloads without a full
-    // process restart). This MUST run in dev BEFORE migrations are called, not
-    // after, to ensure migrations see a clean state. This runs UNCONDITIONALLY
-    // in dev — even if totalKeys is low — because the OOM-causing families
-    // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
-    // 20+ MB each while only occupying a few hundred key slots.
-    void this.cleanupVolatileRuntimeState({ mode: process.env.NODE_ENV === "production" ? "production" : "development", reason: "inline-startup" })
+    // Run an immediate targeted flush at startup to clear volatile key families
+    // that accumulate across hot-reload cycles.
+    void this.cleanupVolatileRuntimeState({ reason: "inline-startup" })
 
     // Throttle eviction log output: only print once per 60 s when stuck above
-    // the key limit so the server log stays readable.
+    // the threshold so the server log stays readable.
     let _lastEvictionLogMs = 0
+
     const ttlCleanupTimer = setInterval(() => {
       try {
         // First, clean up expired keys
         this.cleanupExpiredKeys()
 
-        // Check memory pressure: evict if heap, RSS, or key count is too high.
-        // heapUsed alone is insufficient — after a heavy live-trading session the GC
-        // reduces heapUsed to ~600 MB (below the 800 MB trigger) while RSS stays at
-        // 4+ GB because V8 holds committed pages for future allocation. RSS is a better
-        // proxy for true process-level memory pressure, especially on the 6 GB VM where
-        // total system RAM (RSS_all_processes) matters more than individual heap metrics.
-        const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
+        const mem        = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
-        // RSS trigger: in dev, Next.js + engine idle RSS is ~1.8–2.4 GB.
-        // Trigger at 2200 MB so eviction runs before the engine prehistoric burst
-        // (which adds 300-400 MB) pushes RSS past 2.5 GB and routes start timing out.
-        // Prod: 3000 MB (serverless containers rarely hit this; safety net only).
-        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 2_200 : 3_000
-        const totalKeys = this.data.strings.size + this.data.hashes.size +
-                          this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        // Scale the key-count eviction trigger with symbol count so the threshold
-        // fires proportionally rather than immediately at 10 symbols.
-        // Baseline: 1000 protected keys + N × 800 pipeline keys ≈ max active window.
-        const _nSymsForKeys = process.env.NODE_ENV === "development"
-          ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-          : 1
-        const MAX_TOTAL_KEYS = process.env.NODE_ENV === "development"
-          ? 1_000 + _nSymsForKeys * 800
-          : 15_000
-        const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
-        if (shouldEvict) {
-          const now = Date.now()
-          // Only log once per 60 s to avoid flooding the server log when stuck
-          // above the threshold (e.g. a large snapshot with mostly-protected keys).
-          if (now - _lastEvictionLogMs > 60_000) {
-            _lastEvictionLogMs = now
-            if (rssMB > RSS_PRESSURE_MB) {
-              console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
-            } else if (heapUsedMB > HEAP_PRESSURE_MB) {
-              console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
-            } else {
-              console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
-            }
-            console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
-          }
+        const totalKeys  = this.data.strings.size + this.data.hashes.size +
+                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
+
+        // Three-tier pressure response:
+        //   NORMAL  → no action
+        //   WARM    → evict + GC
+        //   CRITICAL → volatile cleanup + 3× evict passes + GC + throttle sleep
+        const isCritical = rssMB > MEM.rssHardMB
+        const isWarm     = isCritical || heapUsedMB > MEM.heapMB || rssMB > MEM.rssSoftMB || totalKeys > MEM.maxKeys
+
+        if (!isWarm) return
+
+        const now = Date.now()
+        if (now - _lastEvictionLogMs > 60_000) {
+          _lastEvictionLogMs = now
+          const reason = isCritical
+            ? `CRITICAL RSS=${rssMB.toFixed(0)}MB >hard ${MEM.rssHardMB}MB`
+            : rssMB > MEM.rssSoftMB
+              ? `RSS=${rssMB.toFixed(0)}MB >soft ${MEM.rssSoftMB}MB`
+              : heapUsedMB > MEM.heapMB
+                ? `Heap=${heapUsedMB.toFixed(0)}MB >${MEM.heapMB}MB`
+                : `Keys=${totalKeys} >${MEM.maxKeys}`
+          console.log(`[v0] [Redis Memory] ${reason} — evicting. Families: ${this.describeKeyFamilies()}`)
+        }
+
+        if (isCritical) {
+          // CRITICAL: purge volatile families first, then run 3 eviction passes
+          // to maximally reclaim before the engine's next cycle can add more.
+          void this.cleanupVolatileRuntimeState({ reason: "critical-rss" })
           this.evictOldRecords()
-          // Nudge GC if exposed (dev runs with --expose-gc sometimes); the
-          // emulator frees Map references above, this returns them to the OS.
+          this.evictOldRecords()
+          this.evictOldRecords()
+          ;(globalThis as any).gc?.()
+        } else {
+          this.evictOldRecords()
           ;(globalThis as any).gc?.()
         }
-      } catch (err) {
-        // Swallow errors so the cleanup timer doesn't die
+      } catch {
+        // Swallow errors so the cleanup timer never dies
       }
-    }, CLEANUP_INTERVAL_MS)
+    }, 1_000)
     ttlCleanupTimer.unref?.()
   }
   
@@ -657,15 +672,6 @@ export class InlineLocalRedis implements RedisClientLike {
   }
   
   private evictOldRecords(): number {
-    if (process.env.NODE_ENV === "production" && process.env.ENABLE_INLINE_REDIS_PROD_EVICTION !== "1") {
-      // Production correctness beats inline-emulator memory trimming: these
-      // families are active progression state, and evicting them causes the
-      // exact prod-only progress collapses/stalls operators reported. Real
-      // Redis deployments are off-heap and do not need this dev safety valve;
-      // inline production can opt in explicitly if memory pressure is worse
-      // than preserving in-flight progress.
-      return 0
-    }
     // LRU/FIFO eviction of the key families that accumulate unboundedly on the
     // Node heap in the dev emulator. In production these live in real Redis
     // (off-heap) so this is a dev-only safety net, but it is essential: during
@@ -722,49 +728,39 @@ export class InlineLocalRedis implements RedisClientLike {
     // with ~8× fewer comparisons per key (average 3 prefix checks vs 24).
     //
     // Bucket names mirror the old family rules, so the cap values are unchanged.
-    const isDev = process.env.NODE_ENV === "development"
+    // ── Dynamic per-symbol eviction caps ──────────────────────────────────
+    // Scale linearly with symbol count only — do NOT scale with RAM because
+    // larger machines don't need more indication/strategy keys, they just have
+    // more headroom before OOM. Scaling caps with RAM was the root cause of
+    // the 5+ GB RSS on the 8 GB VM (indication_set floor was 5000 × large hashes).
+    const _N = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
 
-    // ── Per-symbol-aware eviction caps ────────────────────────────────────
-    // All dev caps scale linearly with V0_DEV_SYMBOL_COUNT so a 10-symbol
-    // run gets 10× more key slots for the hot pipeline families without
-    // raising prod numbers (prod uses real Redis, off-heap — caps are just
-    // safety nets there, not memory limiters).
-    const _N = isDev
-      ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-      : 1  // prod caps don't scale (real Redis is off-heap)
-
-    // Caps indexed by bucket name (shared between hash and string passes).
-    // Dev caps are deliberately tight to keep RSS below 2.2 GB so the eviction
-    // interval fires before routes start timing out. Prod caps are generous
-    // because real Redis is off-heap and these are only safety-net guards.
     const CAPS: Record<string, number> = {
-      // Pseudo-positions: reduced from N*200 → N*80. A single-symbol engine
-      // realistically holds ≤ 50 open pseudo positions at any time; the extra
-      // capacity was just hot waste in the Map.
-      pseudo_position:              isDev ? _N * 80   : 2000,
-      s_pseudo_position:            isDev ? _N * 60   : 1500,
-      strategies:                   isDev ? _N * 30   : 100,
-      s_strategies:                 isDev ? _N * 15   : 20,
-      config_set:                   isDev ? _N * 40   : 1500,
-      strategy_positions:           isDev ? _N * 20   : 1000,
-      strategy_detail:              isDev ? _N * 20   : 1000,
-      real_stage:                   isDev ? _N * 20   : 1000,
-      indication:                   isDev ? _N * 60   : 500,
-      indications:                  isDev ? _N * 15   : 100,
-      // indication_set: reduced from N*150 → N*80. The pipeline reads the most
-      // recent 50-80 sets per symbol; keeping 150 was unnecessary headroom.
-      indication_set:               isDev ? _N * 80   : 5000,
-      // indication_outcomes_pending: reduced from N*15 → N*10 (tight list).
-      indication_outcomes_pending:  isDev ? _N * 10   : 200,
-      // axis_pos_acc: one per connection.
+      // Pseudo-positions: hard cap independent of RAM — 200 per symbol is plenty
+      pseudo_position:              _N * 200,
+      s_pseudo_position:            _N * 100,
+      // Strategy sets: tight cap; these are rebuilt every cycle
+      strategies:                   Math.max(50, _N * 20),
+      s_strategies:                 Math.max(10, _N * 8),
+      config_set:                   Math.max(400, _N * 25),
+      strategy_positions:           Math.max(200, _N * 15),
+      strategy_detail:              Math.max(200, _N * 15),
+      real_stage:                   Math.max(200, _N * 15),
+      // Indication families — drastically reduced to prevent OOM
+      indication:                   Math.max(100, _N * 25),
+      indications:                  Math.max(50,  _N * 10),
+      // indication_set: was 5000 floor, now tight — only need N_symbols × N_types × 2dirs
+      // With 4 symbols × 6 types × 2 dirs = 48 max, keep 200 for headroom
+      indication_set:               Math.max(200, _N * 50),
+      indication_outcomes_pending:  Math.max(50,  _N * 5),
       axis_pos_acc:                 5,
       prehistoric:                  20,
-      live_history:                 isDev ? _N * 20   : 500,
+      live_history:                 Math.max(200, _N * 15),
       // string-only
-      indications_str:              isDev ? _N * 15   : 50,
-      dedup:                        isDev ? _N * 60   : 3000,
-      candle_cache:                 isDev ? _N * 4    : 20,
-      candles:                      isDev ? _N * 4    : 20,
+      indications_str:              Math.max(30,  _N * 8),
+      dedup:                        Math.max(500, _N * 30),
+      candle_cache:                 Math.max(10,  _N * 3),
+      candles:                      Math.max(10,  _N * 3),
     }
 
     // Classify a key into a bucket name; returns null for protected/untracked keys.
@@ -817,7 +813,7 @@ export class InlineLocalRedis implements RedisClientLike {
       return drop
     }
 
-    // ── HASH single-pass ──────────────────────────────────────────────────
+    // ── HASH single-pass ─────────────────��────────────────────────────────
     const hashBuckets = new Map<string, string[]>()
     for (const [key] of this.data.hashes.entries()) {
       const bucket = classify(key)
@@ -852,7 +848,7 @@ export class InlineLocalRedis implements RedisClientLike {
     // ── LIST single-pass ────────────��────────���──────────────────────────��─�����
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
-      const listCap = isDev ? 0 : 50
+      const listCap = 50
       const listKeys: string[] = []
       for (const [key] of this.data.lists.entries()) {
         if (!isProtected(key) && key.startsWith("strategies:")) listKeys.push(key)
@@ -860,8 +856,49 @@ export class InlineLocalRedis implements RedisClientLike {
       evicted += trimBucket(listKeys, listCap)
     }
 
+    // ── Terminal live:position purge ─────────────────────────────────────
+    // live:position:* hashes are globally protected (they must survive eviction
+    // so open positions are never accidentally dropped). But this means terminal
+    // (closed, rejected, cancelled) positions accumulate unboundedly. We trim
+    // them here: keep the most-recent MAX_TERMINAL_POSITIONS per connection by
+    // inspecting the "status" field of each hash. Open/placed positions are
+    // NEVER touched.
+    {
+      const MAX_TERMINAL_POSITIONS = 200
+      const TERMINAL_STATUSES = new Set(["closed","rejected","cancelled","expired","error"])
+      // Group terminal position keys by connection id (first segment of the id field
+      // or the key itself). Key format: live:position:<id> where id is like
+      // "live:bingx-x01:BTCUSDT:long:123456".
+      const terminalByConn = new Map<string, Array<[string, number]>>()
+      for (const [key, fields] of this.data.hashes.entries()) {
+        if (!key.startsWith("live:position:")) continue
+        if (key.startsWith("live:position:tracking:")) continue
+        // `fields` is a plain Record<string, string> — direct property access.
+        const status = fields["status"] ?? ""
+        if (!TERMINAL_STATUSES.has(status)) continue
+        // Extract connection id from the position id embedded in the hash
+        const posId: string = fields["id"] ?? key
+        const connMatch = posId.match(/^live:([^:]+:[^:]+):/)
+        const connKey = connMatch ? connMatch[1] : "unknown"
+        const ts = Number(fields["closedAt"] ?? fields["updatedAt"] ?? 0)
+        let arr = terminalByConn.get(connKey)
+        if (!arr) { arr = []; terminalByConn.set(connKey, arr) }
+        arr.push([key, ts])
+      }
+      for (const [, positions] of terminalByConn) {
+        if (positions.length <= MAX_TERMINAL_POSITIONS) continue
+        // Sort oldest-first, drop the excess old ones
+        positions.sort((a, b) => a[1] - b[1])
+        const drop = positions.length - MAX_TERMINAL_POSITIONS
+        for (let i = 0; i < drop; i++) {
+          this.data.hashes.delete(positions[i][0])
+          evicted++
+        }
+      }
+    }
+
     // ── Membership sets — prune oversized pseudo-position id sets ─────────
-    const SET_MEMBER_CAP = 4000
+    const SET_MEMBER_CAP = 800   // was 4000 — 800 is plenty for 4 symbols
     for (const [key, members] of this.data.sets.entries()) {
       if (
         (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) &&
@@ -1907,17 +1944,15 @@ export async function ensureCoreRedis(): Promise<void> {
 
 
 export async function cleanupVolatileRuntimeState({
-  mode = process.env.NODE_ENV === "production" ? "production" : "development",
   reason = "startup",
-}: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+}: { mode?: string; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
   const client = getRedisClient()
   if (typeof (client as any).cleanupVolatileRuntimeState === "function") {
-    return (client as any).cleanupVolatileRuntimeState({ mode, reason })
+    return (client as any).cleanupVolatileRuntimeState({ reason })
   }
 
   const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
   const now = Date.now()
-  const isDev = mode !== "production"
   const allKeys = await client.keys("*").catch(() => [] as string[])
   const toDelete: string[] = []
   let preserved = 0
@@ -1934,16 +1969,16 @@ export async function cleanupVolatileRuntimeState({
   for (const key of allKeys) {
     let del = false
     if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
-      del = isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+      del = key.startsWith("live:position:tracking:") || key.includes(":moved:")
     } else if (key.startsWith("live:lock:") || key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) {
-      del = isDev || await staleStringKey(key)
+      del = await staleStringKey(key)
     } else if (
       key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:") ||
       key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:") ||
       key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
       key.startsWith("strategies:") || key.startsWith("settings:strategies")
     ) {
-      del = isDev
+      del = true
     }
     if (del) toDelete.push(key)
     else preserved++
@@ -1953,7 +1988,7 @@ export async function cleanupVolatileRuntimeState({
   for (let i = 0; i < toDelete.length; i += 500) {
     deleted += await client.del(...toDelete.slice(i, i + 500)).catch(() => 0)
   }
-  if (deleted > 0) console.log(`[v0] [Redis] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+  if (deleted > 0) console.log(`[v0] [Redis] Volatile startup cleanup (${reason}): deleted ${deleted} keys, preserved ${preserved}`)
   return { deleted, preserved }
 }
 
@@ -2022,13 +2057,9 @@ export async function initRedis(): Promise<void> {
   }
   if (isConnected) return
 
-  // Startup volatile cleanup is environment-aware: development clears stale
-  // hot-reload runtime state aggressively, while production preserves
-  // authoritative live positions and removes only stale gates/locks/caches.
-  await cleanupVolatileRuntimeState({
-    mode: process.env.NODE_ENV === "production" ? "production" : "development",
-    reason: "initRedis",
-  }).catch(() => null)
+  // Startup volatile cleanup: clear stale locks, transient indexes, and
+  // rebuildable pipeline families so the engine starts with a clean baseline.
+  await cleanupVolatileRuntimeState({ reason: "initRedis" }).catch(() => null)
 
   if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
 
@@ -2493,7 +2524,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
   return settings
 }
 
-// ───────────────────────────────────────��─────────────────────────────
+// ─────────────────────��─────────────────��─────────────────────────────
 // Canonical app-settings helpers
 //
 // The project historically drifted between two Redis hashes:
@@ -2604,7 +2635,7 @@ export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
 }
 
-// ──────────���────────────────────────���──────────────���─���────────────���───
+// ──────────���──��─────────────────────���──────────────���─���────────────���───
 // Live-settings version counter
 //
 // When an operator hits Save in the Settings UI, the server updates the
@@ -2751,10 +2782,11 @@ export async function getMarketData(symbol: string, interval: string): Promise<a
   }
 }
 
-export async function setMarketData(symbol: string, interval: string, data: any, ttlSeconds: number = 300): Promise<void> {
+export async function setMarketData(symbol: string, interval: string, data: any, ttlSeconds?: number): Promise<void> {
   await initRedis()
   const client = getClient()
-  await client.set(`market_data:${symbol}:${interval}`, JSON.stringify(data), { EX: ttlSeconds })
+  const finalTtl = ttlSeconds ?? 300
+  await client.set(`market_data:${symbol}:${interval}`, JSON.stringify(data), { EX: finalTtl })
 }
 
 // ========== Position Operations ==========
@@ -2847,8 +2879,14 @@ export async function savePosition(position: any): Promise<void> {
 	      // best-effort diagnostics/reconciliation index
 	    }
 
-	    // Terminal => move from open index -> closed archive idempotently
-    if (position.status === "closed") {
+	    // Terminal => move from open index -> closed archive idempotently.
+	    // ALL terminal statuses must leave the open index — previously only
+	    // "closed" was handled, so "rejected"/"cancelled"/"error" positions fell
+	    // into the else-branch below which RE-ADDED them to the open index on
+	    // every save. That kept dead positions in the sync loop forever
+	    // (observed: tracked=16 statuses={"rejected":16} re-synced every tick).
+    const TERMINAL_LIVE_STATUSES = new Set(["closed", "rejected", "cancelled", "canceled", "error"])
+    if (TERMINAL_LIVE_STATUSES.has(String(position.status))) {
       try {
         // Remove any existing entries from open list
         await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
