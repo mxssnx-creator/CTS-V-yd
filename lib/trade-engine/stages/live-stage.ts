@@ -3267,8 +3267,10 @@ export async function executeLivePosition(
         }
       }
       
-      // If no retry was attempted, or retry failed, mark as rejected
-      if (retryWasAttempted) {
+      // If no retry was attempted, or retry failed, pre-mark as rejected so
+      // the cleanup block below can run. The check below will override this
+      // if the retry actually succeeded (retryOrderId is set + orderResult.success).
+      if (!retryWasAttempted) {
         livePosition.status = "rejected"
         livePosition.statusReason = String(reason)
         pushStep(livePosition, "place_order", false, livePosition.statusReason)

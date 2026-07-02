@@ -929,6 +929,9 @@ export class StrategyCoordinator {
    * fire once every 500 cycles instead of on every cycle.
    */
   private _stratCycleCount = 0
+  // Bootstrap log throttle — suppress repeated bootstrap relaxation logs after
+  // the first emission. Each key logs at most once per 60 s per coordinator instance.
+  private _bootstrapLoggedAt: Record<string, number> = {}
   // Dev-mode real:sets write throttle — only persists every 5th cycle to keep
   // the InlineLocalRedis heap bounded. Initialised lazily in createRealSets.
 
@@ -2192,10 +2195,15 @@ export class StrategyCoordinator {
       if (liveQuickstartOn) {
         const relaxed = Math.min(mainMinPF, 0.75)
         if (relaxed !== mainMinPF) {
-          console.log(
-            `[v0] [StrategyCoordinator] ${this.connectionId} MAIN bootstrap (live quickstart): ` +
-            `relaxed minProfitFactor ${mainMinPF} → ${relaxed} to allow first Base→Main→Real flow.`
-          )
+          const logKey = `main:${this.connectionId}`
+          const now = Date.now()
+          if (!this._bootstrapLoggedAt[logKey] || now - this._bootstrapLoggedAt[logKey] > 60_000) {
+            this._bootstrapLoggedAt[logKey] = now
+            console.log(
+              `[v0] [StrategyCoordinator] ${this.connectionId} MAIN bootstrap (live quickstart): ` +
+              `relaxed minProfitFactor ${mainMinPF} → ${relaxed} to allow first Base→Main→Real flow.`
+            )
+          }
           mainMinPF = relaxed
         }
       }
@@ -3133,11 +3141,16 @@ export class StrategyCoordinator {
           // cycles to promote sets when live trading is explicitly enabled.
           const relaxed = Math.min(realMinPF, 0.75)
           if (relaxed !== realMinPF) {
-            console.log(
-              `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
-              `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount=${realMinPos} ` +
-              `to allow first Real→Live escalation while history builds.`
-            )
+            const logKey = `real:${this.connectionId}`
+            const now = Date.now()
+            if (!this._bootstrapLoggedAt[logKey] || now - this._bootstrapLoggedAt[logKey] > 60_000) {
+              this._bootstrapLoggedAt[logKey] = now
+              console.log(
+                `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
+                `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount=${realMinPos} ` +
+                `to allow first Real→Live escalation while history builds.`
+              )
+            }
             realMinPF = relaxed
           }
         }
