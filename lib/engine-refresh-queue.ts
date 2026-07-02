@@ -62,6 +62,19 @@ async function triggerImmediateEngineRefresh(request: EngineRefreshRequest): Pro
   } catch (error) {
     console.warn(
       `[v0] [EngineRefreshQueue] Immediate targeted refresh failed (${request.reason || request.action}):`,
+async function triggerImmediateEngineRefresh(reason: string): Promise<void> {
+  // Event-state fast path: explicit UI/API state changes should be acted on
+  // immediately by the current process instead of waiting for the 30s healing
+  // sweep. This is best-effort and intentionally no-ops in Edge/serverless
+  // runtimes where a different worker may own the long-lived engine.
+  if (process.env.NEXT_RUNTIME === "edge") return
+
+  try {
+    const { runTradeEngineHealingSweep } = await import("./trade-engine-auto-start")
+    await runTradeEngineHealingSweep({ isStartup: false })
+  } catch (error) {
+    console.warn(
+      `[v0] [EngineRefreshQueue] Immediate refresh trigger failed (${reason}):`,
       error instanceof Error ? error.message : String(error),
     )
   }
@@ -70,6 +83,7 @@ async function triggerImmediateEngineRefresh(request: EngineRefreshRequest): Pro
 export async function queueEngineRefreshRequest(request: EngineRefreshRequest): Promise<void> {
   await setSettings(`${ENGINE_REFRESH_REQUEST_PREFIX}${request.connectionId}`, request)
   await triggerImmediateEngineRefresh(request)
+  await triggerImmediateEngineRefresh(request.reason || request.action || "queued_refresh")
 }
 
 export async function getQueuedEngineRefreshRequests(): Promise<Array<{ key: string; request: EngineRefreshRequest }>> {
