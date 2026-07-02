@@ -521,12 +521,12 @@ export class InlineLocalRedis implements RedisClientLike {
       // V8 heap cap (--max-old-space-size) is set to 5632 in package.json for
       // the actual 8606 MB VM, leaving ~3 GB of OS+slack buffer.
       const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
-      // Heap trigger: fire at 65% of usable. On 8.6 GB VM → ~4.3 GB usable → ~2.8 GB heap trigger.
-      const heapMB      = Math.round(usableMB * 0.65)
-      // RSS soft: 75% of usable — force GC above this.
-      const rssSoftMB   = Math.round(usableMB * 0.75)
-      // RSS hard: 88% of usable — critical eviction + sleep above this.
-      const rssHardMB   = Math.round(usableMB * 0.88)
+      // Heap trigger: fire at 45% of usable. On 8.6 GB VM → ~4.3 GB usable → ~1.9 GB heap trigger.
+      const heapMB      = Math.round(usableMB * 0.45)
+      // RSS soft: 50% of usable — force GC above this. Keeps us well clear of OOM.
+      const rssSoftMB   = Math.round(usableMB * 0.50)
+      // RSS hard: 65% of usable — critical eviction + sleep above this.
+      const rssHardMB   = Math.round(usableMB * 0.65)
       const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
       // Key count: scale with both symbol count and VM size.
       const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))
@@ -711,36 +711,38 @@ export class InlineLocalRedis implements RedisClientLike {
     //
     // Bucket names mirror the old family rules, so the cap values are unchanged.
     // ── Dynamic per-symbol eviction caps ──────────────────────────────────
-    // Scale linearly with symbol count AND with available VM RAM so that a
-    // larger machine automatically allows more key headroom without hitting
-    // the caps too aggressively.
+    // Scale linearly with symbol count only — do NOT scale with RAM because
+    // larger machines don't need more indication/strategy keys, they just have
+    // more headroom before OOM. Scaling caps with RAM was the root cause of
+    // the 5+ GB RSS on the 8 GB VM (indication_set floor was 5000 × large hashes).
     const _N = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
-    // memScale: 1.0 on a 4 GB VM, ~2.0 on 8 GB, ~3.0 on 12 GB.
-    // Use the cached limits computed at startup; fall back to 1.0 if not yet set.
-    const _gl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
-    const _memScale = _gl ? Math.max(1, _gl.heapMB / 2_048) : 1
 
     const CAPS: Record<string, number> = {
-      pseudo_position:              Math.round(_N * 80  * _memScale),
-      s_pseudo_position:            Math.round(_N * 60  * _memScale),
-      strategies:                   Math.max(100, Math.round(_N * 30  * _memScale)),
-      s_strategies:                 Math.max(20,  Math.round(_N * 15  * _memScale)),
-      config_set:                   Math.max(1500,Math.round(_N * 40  * _memScale)),
-      strategy_positions:           Math.max(1000,Math.round(_N * 20  * _memScale)),
-      strategy_detail:              Math.max(1000,Math.round(_N * 20  * _memScale)),
-      real_stage:                   Math.max(1000,Math.round(_N * 20  * _memScale)),
-      indication:                   Math.max(500, Math.round(_N * 60  * _memScale)),
-      indications:                  Math.max(100, Math.round(_N * 15  * _memScale)),
-      indication_set:               Math.max(5000,Math.round(_N * 80  * _memScale)),
-      indication_outcomes_pending:  Math.max(200, Math.round(_N * 10  * _memScale)),
+      // Pseudo-positions: hard cap independent of RAM — 200 per symbol is plenty
+      pseudo_position:              _N * 200,
+      s_pseudo_position:            _N * 100,
+      // Strategy sets: tight cap; these are rebuilt every cycle
+      strategies:                   Math.max(50, _N * 20),
+      s_strategies:                 Math.max(10, _N * 8),
+      config_set:                   Math.max(400, _N * 25),
+      strategy_positions:           Math.max(200, _N * 15),
+      strategy_detail:              Math.max(200, _N * 15),
+      real_stage:                   Math.max(200, _N * 15),
+      // Indication families — drastically reduced to prevent OOM
+      indication:                   Math.max(100, _N * 25),
+      indications:                  Math.max(50,  _N * 10),
+      // indication_set: was 5000 floor, now tight — only need N_symbols × N_types × 2dirs
+      // With 4 symbols × 6 types × 2 dirs = 48 max, keep 200 for headroom
+      indication_set:               Math.max(200, _N * 50),
+      indication_outcomes_pending:  Math.max(50,  _N * 5),
       axis_pos_acc:                 5,
       prehistoric:                  20,
-      live_history:                 Math.max(500, Math.round(_N * 20  * _memScale)),
+      live_history:                 Math.max(200, _N * 15),
       // string-only
-      indications_str:              Math.max(50,  Math.round(_N * 15  * _memScale)),
-      dedup:                        Math.max(3000,Math.round(_N * 60  * _memScale)),
-      candle_cache:                 Math.max(20,  Math.round(_N * 4   * _memScale)),
-      candles:                      Math.max(20,  Math.round(_N * 4   * _memScale)),
+      indications_str:              Math.max(30,  _N * 8),
+      dedup:                        Math.max(500, _N * 30),
+      candle_cache:                 Math.max(10,  _N * 3),
+      candles:                      Math.max(10,  _N * 3),
     }
 
     // Classify a key into a bucket name; returns null for protected/untracked keys.
