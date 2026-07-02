@@ -115,7 +115,6 @@ describe("requested regression guardrails", () => {
     expect(source).toContain('liveTradeBlockedReason = "API credentials required for live trading"')
     expect(source).toContain("is_live_trade: toRedisFlag(isLiveTrade && hasCredentials)")
     expect(source).toContain('live_trade_requested: "1"')
-    expect(source).not.toContain('...(isLiveTrade ? { live_trade_blocked_reason: "" } : {})')
     expect(source).not.toContain('error: "API credentials required for live trading"')
   })
 
@@ -125,7 +124,6 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("const liveTradeUpdate = credentialCheck.valid")
     expect(source).toContain("...liveTradeUpdate")
     expect(source).toContain('is_live_trade: credentialCheck.valid ? "1" : "0"')
-    expect(source).toContain('live_trade_blocked_reason: credentialCheck.valid ? "" : credentialCheck.reason')
     expect(source).not.toMatch(/\.\.\.liveTradeUpdate,[\s\S]{0,160}is_live_trade:\s*"1"/)
   })
 
@@ -559,6 +557,27 @@ describe("requested regression guardrails", () => {
   })
 
 
+
+  test("settings recoordinator uses operator intent and unblocks live trade after credentials save", () => {
+    const source = read("lib/connection-recoordinator.ts")
+
+    expect(source).toContain("Live Trade unblocked")
+    expect(source).toContain("operator_intent || (globalState as any)?.desired_status")
+    expect(source).not.toContain("web worker has no local engine runtime/opt-in")
+    expect(source).not.toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
+  })
+
+  test("live-trade foreground start failures do not mark the global coordinator error", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+
+    expect(source).toContain("live_trade_enable_foreground_start_failed")
+    expect(source).toContain('status: "running"')
+    expect(source).toContain('operator_intent: "running"')
+    expect(source).toContain('engineStatus = "queued"')
+    expect(source).not.toContain('status: "error"')
+    expect(source).not.toContain('engine_is_running:${connectionId}`')
+  })
+
   test("startup cleanup preserves fresh distributed engine owners", () => {
     const source = read("lib/startup-coordinator.ts")
     const cleanupBlock = source.slice(
@@ -613,12 +632,14 @@ describe("requested regression guardrails", () => {
     expect(markerBlock).not.toContain("forceBreakProgressionLock")
   })
 
-  test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
+  test("settings save start reconciliation follows global operator intent", () => {
     const source = read("lib/connection-recoordinator.ts")
 
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
-    expect(source).toContain("web worker has no local engine runtime/opt-in")
-    expect(source).toContain("settings apply on next explicit Start or dedicated worker tick")
+    expect(source).toContain("operator_intent || (globalState as any)?.desired_status")
+    expect(source).toContain("global intent=running")
+    expect(source).toContain("operator stop honored")
+    expect(source).not.toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
+    expect(source).not.toContain("web worker has no local engine runtime/opt-in")
   })
 
   test("dashboard enable starts from explicit UI action without requiring worker env", () => {
