@@ -1989,14 +1989,35 @@ export async function initRedis(): Promise<void> {
   // keeping the InlineLocalRedis data on globalThis. In that case the
   // module-scoped `isConnected` / `migrationsRan` flags reset to false even
   // though another module instance has already completed core init +
-  // migrations. Honour the global ready marker so route compilation does not
-  // re-run all migrations and overwrite operator-saved state (symbols,
-  // connection mode, progression snapshots) back to migration defaults.
+  // migrations. Honour the global ready marker only when the persisted schema
+  // is at the current migration bundle. This keeps dev hot-reload and long-lived
+  // production workers from trusting a stale in-memory readiness flag after a
+  // code deploy adds new migrations.
   if (globalForRedis.__redis_fully_connected) {
     isConnected = true
     coreInitialized = true
     connectionsInitialized = true
     migrationsRan = true
+    try {
+      await ensureCoreRedis()
+      const { getLatestMigrationVersion, runMigrations } = await import("@/lib/redis-migrations")
+      const latestVersion = getLatestMigrationVersion()
+      const currentVersion = Number((await redisInstance!.get("_schema_version").catch(() => "0")) || "0")
+      if (!Number.isFinite(currentVersion) || currentVersion < latestVersion) {
+        console.log(
+          `[v0] [Redis] Global ready marker is stale: schema v${currentVersion || 0} < code v${latestVersion}; running pending migrations`,
+        )
+        globalForRedis.__redis_fully_connected = false
+        migrationsRan = false
+        await runMigrations()
+        globalForRedis.__redis_fully_connected = true
+      }
+    } catch (error) {
+      isConnected = false
+      migrationsRan = false
+      globalForRedis.__redis_fully_connected = false
+      throw error
+    }
     return
   }
   if (isConnected) return

@@ -3441,7 +3441,46 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "63")
     },
   },
+  {
+    version: 65,
+    name: "065-dev-prod-database-health-metadata",
+    up: async (client: any) => {
+      const mode = process.env.NODE_ENV === "production" ? "production" : "development"
+      const now = new Date().toISOString()
+      const finalVersion = Math.max(...migrations.map((m) => m.version))
+
+      // This migration is intentionally environment-neutral. Development and
+      // production both need a single lightweight, queryable health record so
+      // startup/status routes can verify that the Redis schema on disk matches
+      // the migration bundle that booted the process. Keep this metadata small:
+      // no key scans, no progression resets, no strategy rewrites.
+      await client.hset("system:database:health", {
+        mode,
+        schema_version: String(finalVersion),
+        migrations_bundle_version: String(finalVersion),
+        migrations_sequential: "1",
+        last_verified_at: now,
+      })
+      await client.set("_migrations_run", "true")
+      console.log(`[v0] Migration 065: recorded ${mode} database health metadata at schema v${finalVersion}`)
+    },
+    down: async (client: any) => {
+      await client.hdel(
+        "system:database:health",
+        "mode",
+        "schema_version",
+        "migrations_bundle_version",
+        "migrations_sequential",
+        "last_verified_at",
+      ).catch(() => 0)
+      await client.set("_schema_version", "64")
+    },
+  },
 ]
+
+export function getLatestMigrationVersion(): number {
+  return Math.max(...migrations.map((m) => m.version))
+}
 
 const BASE_CONNECTION_CONFIG: Array<{
   id: string
