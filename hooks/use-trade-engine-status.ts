@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react"
 import { CONNECTION_STATE_CHANGED_EVENT, TRADE_ENGINE_STATUS_INVALIDATE_EVENT } from "@/lib/connection-events"
+import { usePoll } from "./use-poll"
 
 export interface TradeEngineStatusData {
   id: string
@@ -25,11 +26,23 @@ export interface TradeEngineStatusData {
   }
 }
 
+export const TRADE_ENGINE_STATUS_INVALIDATE_EVENT = "trade-engine-status:invalidate"
+
 interface UseTradeEngineStatusOptions {
   connectionId?: string
   refreshInterval?: number // milliseconds
   autoRefresh?: boolean
 }
+
+/**
+ * Browser event that invalidates trade-engine status caches/read models.
+ * Dashboard toggles and progression pages should dispatch this event after
+ * enable/disable/progression mutations so status refreshes immediately:
+ *
+ * window.dispatchEvent(new CustomEvent(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, {
+ *   detail: { action, connectionId },
+ * }))
+ */
 
 /**
  * Hook for fetching and auto-updating trade engine status
@@ -76,9 +89,12 @@ export function useTradeEngineStatus(options: UseTradeEngineStatusOptions = {}) 
     }
   }, [connectionId])
 
+  usePoll(fetchStatus, { intervalMs: refreshInterval, enabled: autoRefresh })
+
   useEffect(() => {
-    // Initial fetch
-    fetchStatus()
+    const handleInvalidate = () => {
+      void fetchStatus()
+    }
 
     const handleInvalidation = (event: Event) => {
       const detail = (event as CustomEvent<{ connectionId?: string }>).detail
@@ -105,6 +121,11 @@ export function useTradeEngineStatus(options: UseTradeEngineStatusOptions = {}) 
       window.removeEventListener(CONNECTION_STATE_CHANGED_EVENT, handleInvalidation)
     }
   }, [fetchStatus, refreshInterval, autoRefresh, connectionId])
+    window.addEventListener(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, handleInvalidate)
+    return () => {
+      window.removeEventListener(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, handleInvalidate)
+    }
+  }, [fetchStatus])
 
   return {
     statuses,
@@ -144,6 +165,12 @@ export function useTradeEngineControl() {
 
         const result = await response.json()
         console.log(`[v0] Trade engine ${action} successful:`, result)
+
+        window.dispatchEvent(
+          new CustomEvent(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, {
+            detail: { action, connectionId },
+          })
+        )
 
         setIsLoading(false)
         return result
