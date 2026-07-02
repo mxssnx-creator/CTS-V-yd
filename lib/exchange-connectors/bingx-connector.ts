@@ -792,6 +792,12 @@ export class BingXConnector extends BaseExchangeConnector {
         !!this.sdkClient &&
         !!this.sdkAccount
       if (sdkOrderAllowed) {
+      // Prefer the audited REST path for real order placement unless explicitly
+      // enabled. The SDK fast-path has different position-mode semantics across
+      // versions and was a prod/dev mismatch source for live orders; REST below
+      // carries our recvWindow, timestamp-resync, hedge/one-way fallback, and
+      // signed-query diagnostics.
+      if (process.env.ENABLE_BINGX_SDK_ORDERS === "1" && this.sdkClient) {
         try {
           const bingxSymbol = this.toBingXSymbol(symbol)
           const apiType = this.credentials.apiType || "perpetual_futures"
