@@ -26,40 +26,14 @@ async function triggerImmediateEngineRefresh(request: EngineRefreshRequest): Pro
   // Event-state fast path: act on the changed connection only. Running a full
   // healing sweep from every toggle was fast but too memory-heavy because it
   // loaded all eligible connections and could fan out multiple engine starts.
-  // This targeted path keeps the timer as a safety net while explicit actions
+  // This targeted drain keeps the timer as a safety net while explicit actions
   // (enable/disable/progression/state changes) converge immediately.
   if (process.env.NEXT_RUNTIME === "edge") return
 
   try {
     const { getGlobalTradeEngineCoordinator } = await import("./trade-engine")
-    const { getConnection, getRedisClient } = await import("./redis-db")
     const coordinator = getGlobalTradeEngineCoordinator()
-    const action = request.action
-
-    if (action === "stop") {
-      if (coordinator.isEngineRunning(request.connectionId)) {
-        await coordinator.stopEngine(request.connectionId, { operatorRequested: true })
-      }
-      return
-    }
-
-    const connection = await getConnection(request.connectionId).catch(() => null)
-    if (!connection) return
-
-    if (String(connection.state_switch_version ?? 0) !== String(request.state_switch_version ?? "")) {
-      return
-    }
-
-    if (action === "start") {
-      const globalState = await getRedisClient().hgetall("trade_engine:global").catch(() => ({} as Record<string, string>))
-      const intent = globalState?.operator_intent || globalState?.desired_status || globalState?.status || ""
-      if (intent === "running" && !coordinator.isEngineRunning(request.connectionId)) {
-        await coordinator.startMissingEngines([connection])
-      }
-      return
-    }
-
-    await coordinator.applyPendingChangesNow?.(request.connectionId)
+    await coordinator.drainQueuedRefreshRequestsNow?.(request.connectionId)
   } catch (error) {
     console.warn(
       `[v0] [EngineRefreshQueue] Immediate targeted refresh failed (${request.reason || request.action}):`,
