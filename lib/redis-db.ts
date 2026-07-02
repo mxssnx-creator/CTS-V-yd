@@ -2858,8 +2858,14 @@ export async function savePosition(position: any): Promise<void> {
 	      // best-effort diagnostics/reconciliation index
 	    }
 
-	    // Terminal => move from open index -> closed archive idempotently
-    if (position.status === "closed") {
+	    // Terminal => move from open index -> closed archive idempotently.
+	    // ALL terminal statuses must leave the open index — previously only
+	    // "closed" was handled, so "rejected"/"cancelled"/"error" positions fell
+	    // into the else-branch below which RE-ADDED them to the open index on
+	    // every save. That kept dead positions in the sync loop forever
+	    // (observed: tracked=16 statuses={"rejected":16} re-synced every tick).
+    const TERMINAL_LIVE_STATUSES = new Set(["closed", "rejected", "cancelled", "canceled", "error"])
+    if (TERMINAL_LIVE_STATUSES.has(String(position.status))) {
       try {
         // Remove any existing entries from open list
         await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)

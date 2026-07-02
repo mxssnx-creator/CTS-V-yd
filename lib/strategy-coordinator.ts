@@ -4295,7 +4295,17 @@ export class StrategyCoordinator {
 
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
     // avgProfitFactor and take top N). Confidence is advisory metadata.
-    let qualifying = realSets
+    //
+    // LIVE EXCHANGE DISPATCH CAP: exactly ONE set per direction per symbol.
+    // The Real stage evaluates hundreds of profile variants (default, blocks
+    // 1-8, dca, axis, trailing…) — that breadth is for STATISTICS, not for
+    // placing hundreds of live orders. Hedge netting already reduced the
+    // direction exposure; the live stage places at most 1 long + 1 short
+    // (the top-PF variant of each). Previously all qualifying variants (up
+    // to maxLive=90) were dispatched as real exchange orders every cycle,
+    // producing 90 order placements/rejections per tick and hundreds of
+    // stuck positions.
+    const allQualifying = realSets
       .filter(
         (s) =>
           s.avgProfitFactor >= metrics.minProfitFactor &&
@@ -4303,6 +4313,14 @@ export class StrategyCoordinator {
       )
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
+
+    // Keep only the single best set per direction for actual dispatch.
+    const bestPerDirection = new Map<string, StrategySet>()
+    for (const s of allQualifying) {
+      const dir = s.direction === "short" ? "short" : "long"
+      if (!bestPerDirection.has(dir)) bestPerDirection.set(dir, s)
+    }
+    let qualifying = [...bestPerDirection.values()]
 
     // Testnet fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
     // CRITICAL: Always verify actual is_testnet on connection record.
@@ -4668,23 +4686,32 @@ export class StrategyCoordinator {
               let sawNewShort = false
               let sawDcaLong    = false
               let sawDcaShort   = false
+              // Block overlays are capped to ONE per direction per cycle.
+              // Previously every block size [1..maxStack] was pushed
+              // unconditionally, so with maxStack=8 each direction dispatched
+              // 8 REAL exchange orders per cycle (observed: 18 order attempts
+              // per symbol per tick → request queue backlog → BingX 100421
+              // timestamp-mismatch rejections on everything). The block-size
+              // ladder remains fully tracked at the pseudo/stats level; live
+              // exchange dispatch only carries the top-ranked (highest-PF)
+              // block size for each direction per cycle.
+              let sawBlockLong  = false
+              let sawBlockShort = false
               for (const s of dispatchCandidates) {
                 const isBlock = s.variant === "block"
                 const isDca   = s.variant === "dca"
                 const isNew   = !isBlock && !isDca // default / trailing / pause
                 if (s.direction === "long") {
                   if (isNew   && !sawNewLong)   { dispatchSets.push(s); sawNewLong   = true }
-                  if (isBlock)                   { dispatchSets.push(s) }
+                  if (isBlock && !sawBlockLong)  { dispatchSets.push(s); sawBlockLong  = true }
                   if (isDca   && !sawDcaLong)    { dispatchSets.push(s); sawDcaLong    = true }
                 } else {
                   if (isNew   && !sawNewShort)  { dispatchSets.push(s); sawNewShort  = true }
-                  if (isBlock)                   { dispatchSets.push(s) }
+                  if (isBlock && !sawBlockShort) { dispatchSets.push(s); sawBlockShort = true }
                   if (isDca   && !sawDcaShort)   { dispatchSets.push(s); sawDcaShort   = true }
                 }
-                if (sawNewLong && sawNewShort && sawDcaLong && sawDcaShort) {
-                  // Do not early-break for Block overlays: every block size is
-                  // intentionally processed independently and in parallel.
-                  continue
+                if (sawNewLong && sawNewShort && sawDcaLong && sawDcaShort && sawBlockLong && sawBlockShort) {
+                  break
                 }
               }
             }

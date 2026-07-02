@@ -1372,7 +1372,7 @@ async function placeProtectionOrder(
         const availableQty = extract110424Available(errMsg)
         if (availableQty !== null && availableQty < effectiveQty) {
           console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ����� retrying with exact available qty`,
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ������ retrying with exact available qty`,
           )
           result = await placeStop(availableQty)
           if (result?.success) {
@@ -5513,7 +5513,36 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // Previously each status filter triggered a full getLivePositions() scan,
     // meaning we fetched the same open-positions index from Redis FOUR times
     // just to bucket by status. Load once, then filter in memory.
-    const allOpen = await getLivePositions(connectionId)
+    const allOpenRaw = await getLivePositions(connectionId)
+
+    // ── Self-heal: purge terminal positions stuck in the open index ─────
+    // A historical bug in redis-db savePosition() re-added rejected/cancelled/
+    // error positions to the open index on every save, so stale terminal
+    // entries can persist indefinitely (observed: 16 "rejected" re-synced
+    // every tick). Move them to the closed archive here so the sync loop
+    // only ever processes genuinely live positions.
+    const TERMINAL_SYNC_STATUSES = new Set(["closed", "rejected", "cancelled", "canceled", "error"])
+    const stuckTerminal = allOpenRaw.filter((p) => TERMINAL_SYNC_STATUSES.has(String(p.status)))
+    if (stuckTerminal.length > 0) {
+      try {
+        const openIndexKey = `live:positions:${connectionId}`
+        const closedIndexKey = `live:positions:${connectionId}:closed`
+        await Promise.all(
+          stuckTerminal.map(async (p) => {
+            await client.lrem(openIndexKey, 0, p.id).catch(() => 0)
+            const already = await client.lpos(closedIndexKey, p.id).catch(() => null)
+            if (already === null || already === undefined) {
+              await client.lpush(closedIndexKey, p.id).catch(() => 0)
+            }
+          }),
+        )
+        console.log(
+          `${LOG_PREFIX} [sync-tick] purged ${stuckTerminal.length} terminal position(s) stuck in open index for ${connectionId}`,
+        )
+      } catch { /* best-effort self-heal */ }
+    }
+    const allOpen = allOpenRaw.filter((p) => !TERMINAL_SYNC_STATUSES.has(String(p.status)))
+
     const openPositions = allOpen.filter(
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed" || p.status === "pending_fill" || p.status === "placed_unconfirmed",
     )

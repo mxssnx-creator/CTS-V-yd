@@ -344,13 +344,17 @@ async function _createExchangeConnectorLazy() {
  * to settle in the background — they just no longer block subsequent
  * ticks.
  */
-// Dev gets 55 s (same budget as prod) — the deadline is a stuck-await safety
-// net, not a performance target.
+// The deadline is a stuck-await safety net, not a performance target.
 // Per-op timeouts: getOrder=6s, placeStop=10s, getOpenOrders=8s,
 // getPositions=10s, SYNC_PER_POS=14s. Worst realistic cycle is
 // prefetch (10s parallel) + sync pool (14s per pos, 12-wide) + reconcile (8s)
-// = ~32s. Allow 40s so VM pressure doesn't cause false fires.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 50_000 : 40_000
+// = ~32s of pure I/O — but the dev VM also suffers event-loop starvation
+// when cron indication requests (13-17s each) run concurrently. A 40s
+// deadline was observed aborting cycles that WOULD have completed
+// (attemptedCycles=2 successfulCycles=0), wasting all their work and
+// amplifying load. 75s dev / 60s prod gives slow-but-progressing cycles
+// room to finish while still catching genuinely hung awaits.
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 75_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
