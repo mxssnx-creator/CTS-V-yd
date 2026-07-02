@@ -39,6 +39,13 @@ const strategyCounts = (stats) => {
 const configuredSymbolCount = (stats) => {
   const metadataSymbols = Number(stats.metadata?.symbols ?? 0);
   if (metadataSymbols > 0) return metadataSymbols;
+  const activeSymbols = [
+    stats.prehistoricMeta?.currentSymbol,
+    ...(Array.isArray(stats.realtime?.symbols) ? stats.realtime.symbols : []),
+    ...(Array.isArray(stats.metadata?.activeSymbols) ? stats.metadata.activeSymbols : []),
+  ].filter((symbol) => typeof symbol === 'string' && symbol.length > 0);
+  if (activeSymbols.length > 0) return new Set(activeSymbols).size;
+  const activeIndications = stats.activeCounts?.indications || {};
   const activeIndications = stats.activeCounts?.indications || {};
   const activeStrategies = stats.activeCounts?.strategies || {};
   const activeIndicationSets = Number(stats.activeProgressing?.indications?.total ?? 0);

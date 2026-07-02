@@ -53,6 +53,17 @@ function percent(numerator, denominator) {
   return ((numerator / denominator) * 100).toFixed(1)
 }
 
+function realtimeProgressMarkers(stats) {
+  return {
+    liveCycles: Number(stats.realtime?.liveRealtimeCycles ?? stats.realtime?.cycleCounters?.realtimeLive ?? 0),
+    liveTotal: Number(stats.realtime?.realtimeLiveTotal ?? stats.realtime?.setsCreated?.live ?? 0),
+    realtimeCycles: Number(stats.realtime?.realtimeCycles ?? stats.realtime?.cycleCounters?.realtime ?? 0),
+    framesProcessed: Number(stats.realtime?.framesProcessed ?? 0),
+    pseudoPositionUpdateCycles: Number(stats.realtime?.pseudoPositionUpdates?.updateCycles ?? 0),
+    positionsOpen: Number(stats.realtime?.positionsOpen ?? 0),
+  }
+}
+
 async function engineIsRunning() {
   try {
     const status = await request('/trade-engine/status-all')
@@ -135,8 +146,12 @@ async function testRealtimeProgress() {
     const initial = state1.data
 
     console.log(`\nInitial state:`)
-    console.log(`  - Real time live cycles: ${initial.realtime?.liveRealtimeCycles || 0}`)
-    console.log(`  - Real time live count: ${initial.realtime?.realtimeLiveTotal || 0}`)
+    const initialMarkers = realtimeProgressMarkers(initial)
+    console.log(`  - Real time live cycles: ${initialMarkers.liveCycles}`)
+    console.log(`  - Real time live count: ${initialMarkers.liveTotal}`)
+    console.log(`  - Real time cycles: ${initialMarkers.realtimeCycles}`)
+    console.log(`  - Frames processed: ${initialMarkers.framesProcessed}`)
+    console.log(`  - Pseudo-position update cycles: ${initialMarkers.pseudoPositionUpdateCycles}`)
 
     // Wait for realtime processing
     console.log('\nWaiting 30s for realtime cycle updates...')
@@ -147,12 +162,20 @@ async function testRealtimeProgress() {
     const updated = state2.data
 
     console.log(`\nUpdated state after 30s:`)
-    console.log(`  - Real time live cycles: ${updated.realtime?.liveRealtimeCycles || 0}`)
-    console.log(`  - Real time live count: ${updated.realtime?.realtimeLiveTotal || 0}`)
+    const updatedMarkers = realtimeProgressMarkers(updated)
+    console.log(`  - Real time live cycles: ${updatedMarkers.liveCycles}`)
+    console.log(`  - Real time live count: ${updatedMarkers.liveTotal}`)
+    console.log(`  - Real time cycles: ${updatedMarkers.realtimeCycles}`)
+    console.log(`  - Frames processed: ${updatedMarkers.framesProcessed}`)
+    console.log(`  - Pseudo-position update cycles: ${updatedMarkers.pseudoPositionUpdateCycles}`)
 
     // Check progression
-    const cyclesProgressed = (updated.realtime?.liveRealtimeCycles || 0) > (initial.realtime?.liveRealtimeCycles || 0)
-    const livesProgressed = (updated.realtime?.realtimeLiveTotal || 0) > (initial.realtime?.realtimeLiveTotal || 0)
+    const cyclesProgressed = updatedMarkers.liveCycles > initialMarkers.liveCycles
+      || updatedMarkers.realtimeCycles > initialMarkers.realtimeCycles
+    const livesProgressed = updatedMarkers.liveTotal > initialMarkers.liveTotal
+      || updatedMarkers.framesProcessed > initialMarkers.framesProcessed
+      || updatedMarkers.pseudoPositionUpdateCycles > initialMarkers.pseudoPositionUpdateCycles
+      || updatedMarkers.positionsOpen > initialMarkers.positionsOpen
 
     if (!cyclesProgressed && !livesProgressed) {
       console.warn('[WARN] No realtime cycle progression detected')
