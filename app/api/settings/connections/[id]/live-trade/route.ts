@@ -245,22 +245,29 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             console.warn(`[v0] [LiveTrade] Engine start queued for ${connName}; foreground start was unavailable`)
           }
         } catch (err) {
-          console.error(`[v0] [LiveTrade] Failed to start engine for ${connName}:`, err)
+          console.error(`[v0] [LiveTrade] Foreground engine start failed for ${connName}; queuing coordinator reconciliation:`, err)
+          await queueEngineRefreshRequest({
+            timestamp: new Date().toISOString(),
+            connectionId,
+            action: "start",
+            state_switch_version: stateSwitchVersion,
+            reason: "live_trade_enable_foreground_start_failed",
+          }).catch((queueErr: unknown) => {
+            console.warn(
+              `[v0] [LiveTrade] Failed to queue fallback start for ${connName}:`,
+              queueErr instanceof Error ? queueErr.message : String(queueErr),
+            )
+          })
           await getRedisClient().hset("trade_engine:global", {
-            status: "error",
-            error_message: err instanceof Error ? err.message : String(err),
+            status: "running",
+            desired_status: "running",
+            operator_intent: "running",
+            last_start_warning: err instanceof Error ? err.message : String(err),
             updated_at: new Date().toISOString(),
           }).catch(() => {})
-          await getRedisClient().set(`engine_is_running:${connectionId}`, "0").catch(() => {})
-          await SystemLogger.logError(err, "api", `Start engine for ${connName}`)
-          return NextResponse.json(
-            {
-              success: false,
-              error: "Failed to start engine",
-              details: err instanceof Error ? err.message : String(err),
-            },
-            { status: 500 },
-          )
+          await SystemLogger.logError(err, "api", `Foreground start queued for ${connName}`)
+          engineStatus = "queued"
+          engineStartedNow = false
         }
       }
     } else {

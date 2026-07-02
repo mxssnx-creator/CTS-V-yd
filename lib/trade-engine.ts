@@ -146,13 +146,18 @@ export class GlobalTradeEngineCoordinator {
       await initRedis()
       const client = getRedisClient()
       const globalState = (await client.hgetall("trade_engine:global").catch(() => null)) as Record<string, string> | null
-      const status = globalState?.status || ""
-      const enabled = status === "running"
-      this.isPaused = status === "paused"
+      const operatorStopped =
+        globalState?.operator_stopped === "1" || globalState?.operator_stopped === "true"
+      const intent = operatorStopped
+        ? "stopped"
+        : globalState?.operator_intent || globalState?.desired_status || globalState?.status || ""
+      const enabled = intent === "running"
+      this.isPaused = intent === "paused"
       this.isGloballyRunning = enabled && Array.from(this.engineManagers.values()).some((manager) => manager.isEngineRunning)
       if (!enabled) {
         console.warn(
-          `[v0] [Coordinator] ${context} skipped — global coordinator is not enabled (status="${status || "empty"}")`,
+          `[v0] [Coordinator] ${context} skipped — global coordinator is not enabled ` +
+            `(intent="${intent || "empty"}", legacy_status="${globalState?.status || "empty"}")`,
         )
       }
       return enabled
@@ -201,22 +206,6 @@ export class GlobalTradeEngineCoordinator {
     // UI/API actions, auto-start healing sweeps, and continuity ticks all work
     // without requiring a separate dedicated worker env flag. Duplicate starts
     // are still guarded below by in-process and Redis startup locks.
-    const inProcessStartAllowed =
-      process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" ||
-      (config as any)?.allowInProcessStart === true
-    const runningUnderProdStart =
-      process.env.npm_lifecycle_event === "start" ||
-      process.env.NODE_ENV === "production" ||
-      process.env.VERCEL === "1" ||
-      process.env.CF_PAGES === "1"
-
-    if (!inProcessStartAllowed && runningUnderProdStart) {
-      console.warn(
-        `[v0] [Coordinator] startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed`,
-      )
-      return false
-    }
-
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
@@ -693,6 +682,7 @@ export class GlobalTradeEngineCoordinator {
       const settings = await loadSettingsAsync()
       const config: EngineConfig = {
         connectionId,
+        allowInProcessStart: true,
         indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
         strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
         realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
@@ -1007,6 +997,7 @@ export class GlobalTradeEngineCoordinator {
             
             const config: EngineConfig = {
               connectionId: connection.id,
+              allowInProcessStart: true,
               engine_type: "main", // Main Trade Engine for indications, strategies, pseudo positions
               indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
@@ -1135,6 +1126,7 @@ export class GlobalTradeEngineCoordinator {
             
             const config: EngineConfig = {
               connectionId: connection.id,
+              allowInProcessStart: true,
               engine_type: "main", // Main Trade Engine for indications, strategies, pseudo positions
               indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
@@ -1330,6 +1322,7 @@ export class GlobalTradeEngineCoordinator {
           if (wasRunningBeforePause !== false) {
             const config: EngineConfig = {
               connectionId,
+              allowInProcessStart: true,
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
