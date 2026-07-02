@@ -8,38 +8,84 @@ interface LogEntry {
   metadata?: Record<string, any>
 }
 
+type LoggerGlobals = {
+  queue?: LogEntry[]
+  flushing?: boolean
+}
+const loggerGlobals = globalThis as unknown as { __v0_system_logger?: LoggerGlobals }
+if (!loggerGlobals.__v0_system_logger) loggerGlobals.__v0_system_logger = {}
+const LOGGER = loggerGlobals.__v0_system_logger
+const logQueue: LogEntry[] = LOGGER.queue ?? (LOGGER.queue = [])
+const MAX_PENDING_LOGS = 1000
+const LOG_FLUSH_BATCH_SIZE = 50
+
+function scheduleLogFlush(): void {
+  if (LOGGER.flushing) return
+  LOGGER.flushing = true
+  const run = async () => {
+    try {
+      await SystemLogger.flushQueuedLogs()
+    } finally {
+      LOGGER.flushing = false
+      if (logQueue.length > 0) scheduleLogFlush()
+    }
+  }
+  if (typeof setImmediate === "function") {
+    setImmediate(() => void run())
+  } else {
+    queueMicrotask(() => void run())
+  }
+}
+
 export class SystemLogger {
   static async logToDatabase(entry: LogEntry): Promise<void> {
+    // Logging must never stall trading/API actions. Enqueue and let a
+    // microtask/setImmediate drain a small batch in the background; cap memory
+    // by dropping oldest pending entries when Redis is slow/unavailable.
+    if (logQueue.length >= MAX_PENDING_LOGS) {
+      logQueue.splice(0, logQueue.length - MAX_PENDING_LOGS + 1)
+    }
+    logQueue.push(entry)
+    scheduleLogFlush()
+  }
+
+  static async flushQueuedLogs(): Promise<void> {
+    const batch = logQueue.splice(0, LOG_FLUSH_BATCH_SIZE)
+    if (batch.length === 0) return
+
     try {
       const client = getRedisClient()
-      const logId = `log:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`
-      const logKey = logId
+      for (const entry of batch) {
+        const logId = `log:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`
+        const logKey = logId
+        const logEntry = {
+          id: logId,
+          timestamp: entry.timestamp,
+          level: entry.level,
+          category: entry.category,
+          message: entry.message,
+          metadata: entry.metadata ? JSON.stringify(entry.metadata).slice(0, 4000) : "",
+        }
 
-      const logEntry = {
-        id: logId,
-        timestamp: entry.timestamp,
-        level: entry.level,
-        category: entry.category,
-        message: entry.message,
-        metadata: entry.metadata ? JSON.stringify(entry.metadata) : "",
+        await client.hset(logKey, logEntry)
+        await client.lpush("logs:all:list", logId)
+        await client.lpush(`logs:${entry.category}:list`, logId)
+        await client.expire(logKey, 604800)
       }
 
-      // Store log entry using lowercase hset (pass object directly)
-      await client.hset(logKey, logEntry)
-
-      // Use bounded lists (not unbounded sets) for log indexes with automatic trimming
-      await client.lpush("logs:all:list", logId)
-      await client.ltrim("logs:all:list", 0, 4999) // Keep max 5000 entries
-      await client.expire("logs:all:list", 604800) // 7 day TTL
-
-      await client.lpush(`logs:${entry.category}:list`, logId)
-      await client.ltrim(`logs:${entry.category}:list`, 0, 999) // Keep max 1000 per category
-      await client.expire(`logs:${entry.category}:list`, 604800)
-
-      // Set TTL for individual log entries (7 days = 604800 seconds)
-      await client.expire(logKey, 604800)
+      await Promise.all([
+        client.ltrim("logs:all:list", 0, 4999),
+        client.expire("logs:all:list", 604800),
+        ...Array.from(new Set(batch.map((entry) => entry.category))).flatMap((category) => [
+          client.ltrim(`logs:${category}:list`, 0, 999),
+          client.expire(`logs:${category}:list`, 604800),
+        ]),
+      ])
     } catch (error) {
-      console.error("[SystemLogger] Failed to log to database:", error)
+      // Drop this batch when logging storage is stuck. Logs are diagnostic only;
+      // retry loops here previously caused high memory/CPU and made trading
+      // actions appear frozen behind logging.
+      console.error("[SystemLogger] Failed to flush queued logs:", error)
     }
   }
 

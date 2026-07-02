@@ -173,6 +173,28 @@ export async function notifySettingsChanged(
     }
   }
 
+  // Event-state fast path: wake the owning in-process coordinator immediately
+  // for reload/progression/coordination changes instead of waiting for the
+  // engine settings watcher timer. This only targets the affected connection;
+  // the durable settings_change envelope above remains the cross-worker source
+  // of truth.
+  try {
+    const connection = await getConnection(connectionId).catch(() => null)
+    const { queueEngineRefreshRequest } = await import("@/lib/engine-refresh-queue")
+    await queueEngineRefreshRequest({
+      connectionId,
+      action: changeType === "restart" ? "refresh" : "refresh",
+      state_switch_version: String((connection as any)?.state_switch_version ?? 0),
+      reason: `settings_${changeType}:${changedFields.slice(0, 6).join(",")}`,
+      timestamp: new Date().toISOString(),
+    })
+  } catch (eventErr) {
+    console.warn(
+      `[v0] [SettingsCoordinator] Immediate event-state refresh failed for ${connectionId}:`,
+      eventErr instanceof Error ? eventErr.message : String(eventErr),
+    )
+  }
+
   return event
 }
 
