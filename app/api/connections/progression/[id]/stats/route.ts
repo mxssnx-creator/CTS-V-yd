@@ -1088,7 +1088,7 @@ export async function GET(
     const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
     // Pipeline-aware total: only count REAL stage (final filtered output), not sum of BASE+MAIN+REAL
     // Each strategy survives through the cascade filter, not added at each stage.
-    const activeStratTotal = activeStratByStage.real || strategiesTotal
+    let activeStratTotal = activeStratByStage.real || strategiesTotal
     const activeSetsIndTotal   = Object.values(activeSetsIndByType).reduce((s, v) => s + v, 0)
     // Only count distinct REAL-stage sets progressing, not sum across stages
     const activeSetsStratTotal = activeSetsStratByStage.real || 0
@@ -1139,6 +1139,31 @@ export async function GET(
         stratEvaluated[type] = fromActiveEval > 0 ? fromActiveEval : 0
       })
     )
+    // Enforce cascade invariants for all public progression counters:
+    // BASE expands into MAIN variants, REAL is a filtered subset of MAIN, and
+    // LIVE is a dispatch subset of REAL. During live runs, per-stage writers can
+    // briefly update different fields in separate Redis calls, so a stats read
+    // may observe `real > main` (or `live > real`) for one request. Normalize the
+    // snapshot here instead of exposing an impossible state to the dashboard,
+    // validation scripts, and operators watching long-running progressions.
+    if (stratCounts.main > 0 && stratCounts.real > stratCounts.main) {
+      console.warn(
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > main (${stratCounts.main}). ` +
+        `Clamping real to main for cascade consistency.`,
+      )
+      stratCounts.real = stratCounts.main
+      activeStratByStage.real = Math.min(activeStratByStage.real || 0, stratCounts.real)
+      activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
+    }
+    if (stratCounts.real > 0 && stratCounts.live > stratCounts.real) {
+      console.warn(
+        `[STATS-VALIDATION] ${connectionId}: live (${stratCounts.live}) > real (${stratCounts.real}). ` +
+        `Clamping live to real for cascade consistency.`,
+      )
+      stratCounts.live = stratCounts.real
+      activeStratByStage.live = Math.min(activeStratByStage.live || 0, stratCounts.live)
+      activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
+    }
     // ── Pipeline-aware "total strategies" ────────────────────────────────
     // Base → Main → Real → Live is a CASCADE FILTER (eval → filter → adjust).
     // Each stage operates on the output of the previous stage, so the SAME

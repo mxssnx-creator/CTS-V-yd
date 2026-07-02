@@ -220,11 +220,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
         }
         
-        // Update global engine state. A real explicit enable action is allowed
-        // to start the coordinator because `startEngine()` refuses to start
-        // when `trade_engine:global.status` is not "running". No-op dashboard
-        // reads/repeats still never reach this branch because engineAction is
-        // only set for an explicit enable state transition/re-enable request.
+        // Update global engine intent first. A real explicit enable action
+        // clears any stale operator stop latch and then either queues the
+        // dedicated coordinator worker or (only in dev/opt-in environments)
+        // starts the local in-process runtime below.
         const toggleClient = getRedisClient()
         const globalState: Record<string, string> = await toggleClient.hgetall("trade_engine:global").catch(() => ({})) || {}
         const allConnections = await getAllConnections()
@@ -238,6 +237,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           desired_status: "running",
           operator_intent: "running",
           coordinator_ready: "true",
+          operator_stopped: "0",
+          operator_stopped_at: "",
+          stopped_at: "",
           started_at: globalState.started_at || new Date().toISOString(),
           updated_at: new Date().toISOString(),
           active_connections: String(activeDashboardCount),
@@ -251,7 +253,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // request handler and starve subsequent status/UI requests.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          const localStartAllowed = true // explicit UI action: start foreground even without a dedicated worker env flag
+          const localStartAllowed =
+            process.env.NODE_ENV !== "production" ||
+            process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
+            process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -369,6 +374,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent,
           operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent,
           coordinator_ready: disableGlobalState?.coordinator_ready || "true",
+          operator_stopped:
+            (disableGlobalState?.operator_intent || disableGlobalState?.desired_status || disableGlobalState?.status) === "running"
+              ? "0"
+              : disableGlobalState?.operator_stopped || "0",
         })
         
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling
