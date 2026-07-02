@@ -26,8 +26,6 @@ export interface TradeEngineStatusData {
   }
 }
 
-export const TRADE_ENGINE_STATUS_INVALIDATE_EVENT = "trade-engine-status:invalidate"
-
 interface UseTradeEngineStatusOptions {
   connectionId?: string
   refreshInterval?: number // milliseconds
@@ -92,14 +90,10 @@ export function useTradeEngineStatus(options: UseTradeEngineStatusOptions = {}) 
   usePoll(fetchStatus, { intervalMs: refreshInterval, enabled: autoRefresh })
 
   useEffect(() => {
-    const handleInvalidate = () => {
-      void fetchStatus()
-    }
-
     const handleInvalidation = (event: Event) => {
       const detail = (event as CustomEvent<{ connectionId?: string }>).detail
       if (!connectionId || !detail?.connectionId || detail.connectionId === connectionId) {
-        fetchStatus()
+        void fetchStatus()
       }
     }
 
@@ -121,11 +115,6 @@ export function useTradeEngineStatus(options: UseTradeEngineStatusOptions = {}) 
       window.removeEventListener(CONNECTION_STATE_CHANGED_EVENT, handleInvalidation)
     }
   }, [fetchStatus, refreshInterval, autoRefresh, connectionId])
-    window.addEventListener(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, handleInvalidate)
-    return () => {
-      window.removeEventListener(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, handleInvalidate)
-    }
-  }, [fetchStatus])
 
   return {
     statuses,
