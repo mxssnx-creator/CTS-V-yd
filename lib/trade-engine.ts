@@ -50,7 +50,7 @@ import {
   forceBreakProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
-import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests } from "./engine-refresh-queue"
+import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests, recordEngineRefreshRequestFailure } from "./engine-refresh-queue"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -684,19 +684,29 @@ export class GlobalTradeEngineCoordinator {
         `[v0] [Coordinator] Refresh requested for ${request.connectionId}: ${request.action} ` +
           `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
       )
-      await clearEngineRefreshRequest(request.connectionId)
-      if (request.action === "stop") {
-        await this.stopEngine(request.connectionId, { operatorRequested: true })
-      } else if (request.action === "start") {
-        if (!this.isEngineRunning(request.connectionId)) {
-          await this.startEngineFromConnectionConfig(request.connectionId)
+
+      try {
+        if (request.action === "stop") {
+          await this.stopEngine(request.connectionId, { operatorRequested: true })
+        } else if (request.action === "start") {
+          if (!this.isEngineRunning(request.connectionId)) {
+            await this.startEngineFromConnectionConfig(request.connectionId)
+          }
+        } else {
+          // Settings/progression refresh requests must be hot-applied to the
+          // target connection only. Calling refreshEngines() here performed
+          // a full eligible-connection reconciliation every 10s and caused
+          // repeated reinitializations right after progress started.
+          await this.applyPendingChangesNow(request.connectionId)
         }
-      } else {
-        // Settings/progression refresh requests must be hot-applied to the
-        // target connection only. Calling refreshEngines() here performed
-        // a full eligible-connection reconciliation every 10s and caused
-        // repeated reinitializations right after progress started.
-        await this.applyPendingChangesNow(request.connectionId)
+        await clearEngineRefreshRequest(request.connectionId)
+      } catch (error) {
+        console.warn(
+          `[v0] [Coordinator] Refresh request failed for ${request.connectionId}; ` +
+            `leaving queued for retry until expiry (attempt=${Number(request.retryCount ?? 0) + 1}):`,
+          error instanceof Error ? error.message : String(error),
+        )
+        await recordEngineRefreshRequestFailure(request, error)
       }
     }
   }
