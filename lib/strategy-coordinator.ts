@@ -3403,23 +3403,40 @@ export class StrategyCoordinator {
     // `axisPassthrough` contains axis Sets that skip hedging entirely.
     // Together they form realPostHedge: (netted hedge survivors) + (axis pass-through)
     //
-    // Bootstrap fallback: on fresh sessions every indication produces symmetric
-    // long+short pairs (same prev/last/cont/outcome context, just different direction)
-    // → every bucket is L=1,S=1 → all cancelled ��� netted=[]. When this happens and
-    // there are no axis sets either, keep the top-PF set per direction so the live
-    // pipeline can start building position history. Future cycles will develop
-    // asymmetric signals and netting will work as intended.
+    // Bootstrap fallback: when ALL profile-variant Sets are in OPPOSING direction
+    // pairs that cancel each other AND there are no axis sets, the netting
+    // produces netted=[]. We only activate the bootstrap when this happens due
+    // to a genuine one-sided signal asymmetry (e.g. the very first cycle when no
+    // history exists). We do NOT bootstrap when L==S cancellation is the correct
+    // hedge outcome — that is the intended behaviour and should not be overridden.
+    //
+    // PREVIOUS BUG: the bootstrap fired every cycle on symmetric inputs, keeping
+    // 1 long + 1 short regardless — bypassing hedge logic and producing 2
+    // pseudo-positions per symbol per cycle on every fresh boot.
+    //
+    // FIX: Only bootstrap when there is EXACTLY one direction present across all
+    // realSorted sets (pure one-sided signal with no opposing pairs). When both
+    // directions exist and cancel, respect the hedge — return empty. The engine
+    // will build asymmetric history over subsequent cycles naturally.
     let effectiveNetted = netted
     if (netted.length === 0 && axisPassthrough.length === 0 && realSorted.length > 0) {
-      const topLong  = realSorted.find((s) => (s.direction ?? "long") === "long")
-      const topShort = realSorted.find((s) => s.direction === "short")
-      effectiveNetted = [topLong, topShort].filter(Boolean) as StrategySet[]
-      if (effectiveNetted.length > 0) {
-        console.log(
-          `[v0] [StrategyCoordinator] ${this.connectionId}:${symbol} hedge-bootstrap: ` +
-          `all ${passthrough.length} profile pairs symmetric — keeping top-PF per direction (${effectiveNetted.length})`
-        )
+      const hasLong  = realSorted.some((s) => (s.direction ?? "long") === "long")
+      const hasShort = realSorted.some((s) => s.direction === "short")
+      // Bootstrap ONLY when signal is purely one-directional (no opposing pairs)
+      if (hasLong !== hasShort) {
+        const topLong  = hasLong  ? realSorted.find((s) => (s.direction ?? "long") === "long")  : undefined
+        const topShort = hasShort ? realSorted.find((s) => s.direction === "short") : undefined
+        effectiveNetted = [topLong, topShort].filter(Boolean) as StrategySet[]
+        if (effectiveNetted.length > 0) {
+          console.log(
+            `[v0] [StrategyCoordinator] ${this.connectionId}:${symbol} hedge-bootstrap: ` +
+            `pure-${hasLong ? "long" : "short"} signal — keeping top-PF set (${effectiveNetted.length})`
+          )
+        }
       }
+      // When hasLong === hasShort === true: symmetric cancel is correct — no bootstrap.
+      // When hasLong === hasShort === false: no sets at all — nothing to bootstrap.
+    }
     }
     let realPostHedge = [...effectiveNetted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
