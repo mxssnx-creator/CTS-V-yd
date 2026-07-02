@@ -220,11 +220,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
         }
         
-        // Update global engine state. A real explicit enable action is allowed
-        // to start the coordinator because `startEngine()` refuses to start
-        // when `trade_engine:global.status` is not "running". No-op dashboard
-        // reads/repeats still never reach this branch because engineAction is
-        // only set for an explicit enable state transition/re-enable request.
+        // Update global engine intent first. A real explicit enable action
+        // clears any stale operator stop latch and starts/reconciles the
+        // process-level coordinator below.
         const toggleClient = getRedisClient()
         const globalState: Record<string, string> = await toggleClient.hgetall("trade_engine:global").catch(() => ({})) || {}
         const allConnections = await getAllConnections()
@@ -238,20 +236,20 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           desired_status: "running",
           operator_intent: "running",
           coordinator_ready: "true",
+          operator_stopped: "0",
+          operator_stopped_at: "",
+          stopped_at: "",
           started_at: globalState.started_at || new Date().toISOString(),
           updated_at: new Date().toISOString(),
           active_connections: String(activeDashboardCount),
         })
         
-        // Start in-process only when this worker is explicitly allowed to own
-        // engine loops or it already has a local coordinator running. In
-        // production/OpenNext the UI/API worker must stay responsive: enabling a
-        // connection should persist operator intent and request the dedicated
-        // coordinator to reconcile, not spin a heavy trade loop inside the
-        // request handler and starve subsequent status/UI requests.
+        // Start/reconcile in-process immediately. The coordinator owns the
+        // runtime locks and health timers; enable actions must not leave the
+        // global engine stuck in a queued-only state in production.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          const localStartAllowed = true // explicit UI action: start foreground even without a dedicated worker env flag
+          const localStartAllowed = true
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -265,7 +263,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true })
+            const started = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
             if (!started && !coordinator.isEngineRunning(resolvedId)) {
               throw new Error("Coordinator did not start the engine after enable; startup lock may be held by another worker")
             }
@@ -369,6 +367,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent,
           operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent,
           coordinator_ready: disableGlobalState?.coordinator_ready || "true",
+          operator_stopped:
+            (disableGlobalState?.operator_intent || disableGlobalState?.desired_status || disableGlobalState?.status) === "running"
+              ? "0"
+              : disableGlobalState?.operator_stopped || "0",
         })
         
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling

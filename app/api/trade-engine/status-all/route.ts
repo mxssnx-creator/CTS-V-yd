@@ -7,6 +7,19 @@ function isEnabledFlag(value: unknown): boolean {
   return value === true || value === 1 || value === "1" || value === "true"
 }
 
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), timeoutMs)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
 function parseSymbols(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.filter((item): item is string => typeof item === "string" && item.length > 0)
@@ -27,7 +40,11 @@ async function stripConsumedRuntimeFlags(
   connectionId: string,
   status: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const pending = (await client.hgetall(`settings:settings_change:${connectionId}`).catch(() => ({}))) as Record<string, string>
+  const pending = (await withTimeout(
+    client.hgetall(`settings:settings_change:${connectionId}`).catch(() => ({} as Record<string, string>)),
+    750,
+    {} as Record<string, string>,
+  )) as Record<string, string>
   if (pending && typeof pending.connectionId === "string" && pending.connectionId.length > 0) return status
 
   const cleaned = { ...status }
@@ -38,7 +55,7 @@ async function stripConsumedRuntimeFlags(
   delete cleaned.reload_fields
   delete cleaned.reload_requested_at
 
-  await Promise.all([
+  await withTimeout(Promise.all([
     client
       .hdel(
         `settings:trade_engine_state:${connectionId}`,
@@ -61,7 +78,7 @@ async function stripConsumedRuntimeFlags(
         "reload_requested_at",
       )
       .catch(() => 0),
-  ])
+  ]), 750, [0, 0])
 
   return cleaned
 }
@@ -72,7 +89,11 @@ export async function GET() {
     console.log("[v0] Fetching all trade engine statuses")
     await initRedis()
     const client = getRedisClient()
-    const globalState = await client.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>))
+    const globalState = await withTimeout(
+      client.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)),
+      1000,
+      {} as Record<string, string>,
+    )
     const globallyRunning = globalState.status === "running"
     const globallyPaused = globalState.status === "paused"
 
@@ -90,7 +111,7 @@ export async function GET() {
       }, { status: 503 })
     }
 
-    const connections = await getActiveConnectionsForEngine()
+    const connections = await withTimeout(getActiveConnectionsForEngine(), 2000, [])
     
     // Ensure connections is an array
     if (!Array.isArray(connections)) {
@@ -115,13 +136,19 @@ export async function GET() {
     const engineStatuses = await Promise.all(
       activeConnections.map(async (conn) => {
         try {
-          const status = await coordinator.getEngineStatus(conn.id)
+          const redisStatePromise = client.hgetall(`trade_engine_state:${conn.id}`).catch(() => ({} as Record<string, string>))
+          const settingsStatePromise = client.hgetall(`settings:trade_engine_state:${conn.id}`).catch(() => ({} as Record<string, string>))
+          const status = await withTimeout(coordinator.getEngineStatus(conn.id), 1200, null)
+          const redisStatus = status ?? {
+            ...(await withTimeout(redisStatePromise, 750, {} as Record<string, string>)),
+            ...(await withTimeout(settingsStatePromise, 750, {} as Record<string, string>)),
+          }
           const isRunning = globallyRunning && !globallyPaused
           const configuredSymbols = parseSymbols(conn.active_symbols || conn.symbols)
-          const statusSymbols = parseSymbols(status?.symbols || status?.active_symbols)
+          const statusSymbols = parseSymbols(redisStatus?.symbols || redisStatus?.active_symbols)
           const effectiveSymbols = configuredSymbols.length > 0 ? configuredSymbols : statusSymbols
           const rawEngineStatus = {
-            ...((status ?? {
+            ...((redisStatus ?? {
               status: globallyPaused ? "paused" : (isRunning ? "running" : "stopped"),
               source: "trade_engine:global",
             }) as Record<string, unknown>),
