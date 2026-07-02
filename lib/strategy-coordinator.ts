@@ -1749,7 +1749,27 @@ export class StrategyCoordinator {
     const setMap = new Map<string, { indicationType: string; direction: "long" | "short"; indications: any[] }>()
 
     for (const ind of indications) {
-      const direction: "long" | "short" = ind.metadata?.direction === "short" ? "short" : "long"
+      // Direction resolution — check all sources in priority order:
+      //   1. `ind.direction`          set by batchSaveIndications (IndicationSetsProcessor path)
+      //   2. `ind.metadata.direction` set by cron route
+      //   3. `ind.metadata.firstDir`  numeric sign from calculateDirectionIndication
+      //   4. `ind.value`              negative value = short (legacy cron path)
+      // Without this multi-source check, ALL indications from the
+      // IndicationSetsProcessor path (which stores direction on ind.direction,
+      // not ind.metadata.direction) defaulted to "long", making L and S Sets
+      // identical (same content, same PF).
+      let direction: "long" | "short"
+      if (ind.direction === "short" || ind.direction === "long") {
+        direction = ind.direction
+      } else if (ind.metadata?.direction === "short") {
+        direction = "short"
+      } else if (typeof ind.metadata?.firstDir === "number") {
+        direction = ind.metadata.firstDir < 0 ? "short" : "long"
+      } else if (typeof ind.value === "number" && ind.value < 0) {
+        direction = "short"
+      } else {
+        direction = "long"
+      }
       const key = `${ind.type || "direction"}:${direction}`
       if (!setMap.has(key)) {
         setMap.set(key, { indicationType: ind.type || "direction", direction, indications: [] })

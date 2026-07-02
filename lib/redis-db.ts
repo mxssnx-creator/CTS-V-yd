@@ -188,6 +188,12 @@ export class InlineLocalRedis implements RedisClientLike {
   private static persistenceTickStarted = false
   private static signalsAttached = false
   private static lastSaveErrorWarn = 0
+  // Per-process unique suffix so concurrent Next.js workers never collide on
+  // the same `.tmp` file, which caused the ENOENT "rename .tmp -> final" race.
+  private static readonly writeSuffix = `${process.pid ?? Math.random().toString(36).slice(2)}`
+  // In-process write mutex — prevents concurrent saveToDisk() calls from the
+  // same worker from racing each other.
+  private static saveInProgress = false
 
   /** Resolve snapshot path; honours `V0_REDIS_SNAPSHOT_PATH` env override. */
   private async resolveSnapshotPath(): Promise<{ dir: string; file: string } | null> {
@@ -334,35 +340,45 @@ export class InlineLocalRedis implements RedisClientLike {
   }
 
   async saveToDisk(): Promise<boolean> {
-    const primary = await this.resolveSnapshotPath()
-    if (!primary) return false
-    // Bare specifier — see comment in `resolveSnapshotPath`.
-    let fs: typeof import("fs/promises")
+    // In-process mutex: if a save is already in flight from this worker,
+    // skip rather than race on the .tmp file.
+    if (InlineLocalRedis.saveInProgress) return false
+    InlineLocalRedis.saveInProgress = true
     try {
-      fs = await import("fs/promises")
-    } catch {
-      return false
-    }
-    const json = this.buildSnapshot()
-    // Try primary then `/tmp` fallback so a read-only cwd doesn't lose data.
-    const candidates = [primary, await this.tmpFallbackPath()].filter(Boolean) as Array<{ dir: string; file: string }>
-    for (const c of candidates) {
+      const primary = await this.resolveSnapshotPath()
+      if (!primary) return false
+      // Bare specifier — see comment in `resolveSnapshotPath`.
+      let fs: typeof import("fs/promises")
       try {
-        await fs.mkdir(c.dir, { recursive: true })
-        const tmpPath = `${c.file}.tmp`
-        await fs.writeFile(tmpPath, json, "utf8")
-        // Atomic on POSIX — readers either see old or new, never partial.
-        await fs.rename(tmpPath, c.file)
-        return true
-      } catch (err) {
-        // Try next fallback. Only warn after we've exhausted everything.
-        if (c === candidates[candidates.length - 1]) {
-          this.warnRateLimited(`save failed (${c.file})`, err)
-        }
-        continue
+        fs = await import("fs/promises")
+      } catch {
+        return false
       }
+      const json = this.buildSnapshot()
+      // Try primary then `/tmp` fallback so a read-only cwd doesn't lose data.
+      const candidates = [primary, await this.tmpFallbackPath()].filter(Boolean) as Array<{ dir: string; file: string }>
+      for (const c of candidates) {
+        try {
+          await fs.mkdir(c.dir, { recursive: true })
+          // Use a per-PID suffix so concurrent Next.js workers never collide
+          // on the same .tmp file (previously caused ENOENT on rename).
+          const tmpPath = `${c.file}.${InlineLocalRedis.writeSuffix}.tmp`
+          await fs.writeFile(tmpPath, json, "utf8")
+          // Atomic on POSIX — readers either see old or new, never partial.
+          await fs.rename(tmpPath, c.file)
+          return true
+        } catch (err) {
+          // Try next fallback. Only warn after we've exhausted everything.
+          if (c === candidates[candidates.length - 1]) {
+            this.warnRateLimited(`save failed (${c.file})`, err)
+          }
+          continue
+        }
+      }
+      return false
+    } finally {
+      InlineLocalRedis.saveInProgress = false
     }
-    return false
   }
 
   /** Synchronous variant for SIGTERM / SIGINT / beforeExit handlers. */
@@ -389,11 +405,13 @@ export class InlineLocalRedis implements RedisClientLike {
     const primaryFile = explicit || pathMod.join(process.cwd(), ".v0-data", "redis-snapshot.json")
     const tmpFile = pathMod.join("/tmp", "v0-redis-snapshot.json")
     const json = this.buildSnapshot()
+    const suffix = InlineLocalRedis.writeSuffix
     for (const file of [primaryFile, tmpFile]) {
       try {
         const dir = pathMod.dirname(file)
         fsSync.mkdirSync(dir, { recursive: true })
-        const tmp = `${file}.tmp`
+        // PID-unique tmp file prevents cross-worker rename races (ENOENT).
+        const tmp = `${file}.${suffix}.tmp`
         fsSync.writeFileSync(tmp, json, "utf8")
         fsSync.renameSync(tmp, file)
         return true

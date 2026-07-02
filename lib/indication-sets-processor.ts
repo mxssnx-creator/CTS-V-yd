@@ -522,9 +522,15 @@ export class IndicationSetsProcessor {
             if (!indication) continue
             
             total++
+            // Derive direction from the actual signal — firstDir > 0 means long,
+            // firstDir < 0 means short. This MUST be computed BEFORE building the
+            // set key so long and short signals write to INDEPENDENT Redis keys.
             const direction = indication.metadata?.firstDir > 0 ? "long" : "short"
             indication.direction = direction
-            const setKey = `indication_set:${this.connectionId}:${symbol}:direction:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+            // Key includes direction so long/short never share the same Redis key.
+            // Without :dir the same config combo for both directions overwrites each
+            // other's JSON array, producing identical (wrong) values for L and S.
+            const setKey = `indication_set:${this.connectionId}:${symbol}:direction:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
             if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
               qualified++
@@ -573,9 +579,11 @@ export class IndicationSetsProcessor {
             if (!indication) continue
             
             total++
+            // movement > 0 = price went up = long signal; movement < 0 = short.
+            // Direction is embedded in the key so long/short are independent sets.
             const direction = (indication.metadata?.movement || 0) >= 0 ? "long" : "short"
             indication.direction = direction
-            const setKey = `indication_set:${this.connectionId}:${symbol}:move:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+            const setKey = `indication_set:${this.connectionId}:${symbol}:move:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
             if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
               qualified++

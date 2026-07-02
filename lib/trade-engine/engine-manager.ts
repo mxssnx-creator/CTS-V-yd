@@ -345,11 +345,12 @@ async function _createExchangeConnectorLazy() {
  * ticks.
  */
 // Dev gets 55 s (same budget as prod) — the deadline is a stuck-await safety
-// net, not a performance target. With the dev 1-symbol cap (migration 057)
-// the indication cycle finishes well under 10 s normally; the extra headroom
-// prevents false deadline fires when the VM is under memory pressure or
-// the strategy flow is unusually large on a cold start.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 55_000
+// net, not a performance target.
+// Per-op timeouts: getOrder=6s, placeStop=10s, getOpenOrders=8s,
+// getPositions=10s, SYNC_PER_POS=14s. Worst realistic cycle is
+// prefetch (10s parallel) + sync pool (14s per pos, 12-wide) + reconcile (8s)
+// = ~32s. Allow 40s so VM pressure doesn't cause false fires.
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 50_000 : 40_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {

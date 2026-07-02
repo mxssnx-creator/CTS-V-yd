@@ -1278,10 +1278,26 @@ export class BingXConnector extends BaseExchangeConnector {
           const retryResponse = await doRequest(buildUrl())
           if (!retryResponse.ok) throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`)
           data = await this.safeJson(retryResponse)
+
+          // Second consecutive 100421 after a fresh resync means the order is
+          // already gone on BingX (some API versions return 100421 for "order
+          // not found" rather than a proper order-not-found code). Treat this
+          // as a successful cancellation — the order no longer exists either way.
+          if (String(data.code) === "100421") {
+            this.log(`Order ${orderId} already gone (double 100421 after resync — treating as cancelled)`)
+            return { success: true }
+          }
         }
       }
 
       if (!this.isBingXSuccess(data.code)) {
+        // "Order does not exist" codes — order was already filled/cancelled.
+        const code = String(data.code)
+        if (code === "100410" || code === "101400" || code === "80012" ||
+            (data.msg && String(data.msg).toLowerCase().includes("order does not exist"))) {
+          this.log(`Order ${orderId} already gone (code=${code}) — treating as cancelled`)
+          return { success: true }
+        }
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
