@@ -893,12 +893,17 @@ export class BingXConnector extends BaseExchangeConnector {
         params.price = priceRounded.toFixed(8).replace(/\.?0+$/, "")
       }
 
-      // Sign and build URL from the SAME sorted query string so BingX's
-      // signature check succeeds (see `signParams` comment for context).
-      const { signature, queryString: signedQs } = this.signParams(params)
-      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
+      // LAZY URL BUILD: timestamp is refreshed and the request re-signed
+      // INSIDE the rate-limit slot at actual send time. Under queue backlog
+      // a URL signed at call time carried a stale timestamp when it finally
+      // hit the wire → BingX 100421 rejections on every queued order.
+      const buildOrderUrl = (): string => {
+        params.timestamp = this.getTimestamp()
+        const { signature, queryString: signedQs } = this.signParams(params)
+        return `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
+      }
 
-      const response = await this.rateLimitedFetch(url, {
+      const response = await this.rateLimitedFetch(buildOrderUrl, {
         method: "POST",
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
@@ -916,10 +921,7 @@ export class BingXConnector extends BaseExchangeConnector {
         // the message text. If we recovered, fall through to success
         // path with the retry response.
         if (await this.resyncOnTimestampError(data)) {
-          params.timestamp = this.getTimestamp()
-          const { signature: tsRetrySig, queryString: tsRetryQs } = this.signParams(params)
-          const tsRetryUrl = `${this.getBaseUrl()}${endpoint}?${tsRetryQs}&signature=${tsRetrySig}`
-          const tsRetryResp = await this.rateLimitedFetch(tsRetryUrl, {
+          const tsRetryResp = await this.rateLimitedFetch(buildOrderUrl, {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
@@ -1247,13 +1249,15 @@ export class BingXConnector extends BaseExchangeConnector {
         return `${baseUrl}${endpoint}?${signedQs}&signature=${signature}`
       }
 
-      const doRequest = (url: string) =>
-        this.rateLimitedFetch(url, {
+      // LAZY URL BUILD: pass the builder itself so timestamp + signature are
+      // computed inside the rate-limit slot at send time, not at queue time.
+      const doRequest = () =>
+        this.rateLimitedFetch(buildUrl, {
           method,
           headers: { "X-BX-APIKEY": this.credentials.apiKey },
         })
 
-      let response = await doRequest(buildUrl())
+      let response = await doRequest()
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
@@ -1275,7 +1279,7 @@ export class BingXConnector extends BaseExchangeConnector {
           this.lastTimeSync = 0
           this.syncPromise = null
           await this.syncServerTime()
-          const retryResponse = await doRequest(buildUrl())
+          const retryResponse = await doRequest()
           if (!retryResponse.ok) throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`)
           data = await this.safeJson(retryResponse)
 
@@ -1783,22 +1787,28 @@ export class BingXConnector extends BaseExchangeConnector {
       // leverage-mismatch. Fire both LONG and SHORT side updates in parallel
       // so hedge-mode accounts have matching leverage on both sides.
       const updateForSide = async (side: "LONG" | "SHORT") => {
-        const buildParams = (): Record<string, string> => ({
-          symbol: bingxSymbol,
-          side,
-          leverage: String(leverage),
-          timestamp: String(this.getTimestamp()),
-        })
-        const sendOnce = async (params: Record<string, string>) => {
+        // LAZY URL BUILD: timestamp + signature are computed inside the
+        // rate-limit slot at actual send time. Under queue backlog a URL
+        // built at call time carried a stale timestamp by the time it was
+        // sent, causing BingX 100421 rejections even after resync.
+        const buildUrl = (): string => {
+          const params: Record<string, string> = {
+            symbol: bingxSymbol,
+            side,
+            leverage: String(leverage),
+            timestamp: String(this.getTimestamp()),
+          }
           const { signature, queryString: signedQs } = this.signParams(params)
-          const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
-          const response = await this.rateLimitedFetch(url, {
+          return `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
+        }
+        const sendOnce = async () => {
+          const response = await this.rateLimitedFetch(buildUrl, {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
           return this.safeJson(response)
         }
-        let data = await sendOnce(buildParams())
+        let data = await sendOnce()
         // One-shot resync-and-retry on cached-offset drift. The
         // first sync we do at the top of setLeverage is fine, but
         // when the engine fires many setLeverage calls in parallel
@@ -1806,7 +1816,7 @@ export class BingXConnector extends BaseExchangeConnector {
         // stale offset until the first response lands. The retry
         // recovers without making the engine reschedule.
         if (!this.isBingXSuccess(data?.code) && (await this.resyncOnTimestampError(data))) {
-          data = await sendOnce(buildParams())
+          data = await sendOnce()
         }
         return { side, ok: this.isBingXSuccess(data.code), data }
       }
@@ -1845,24 +1855,28 @@ export class BingXConnector extends BaseExchangeConnector {
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting margin type to ${marginType} for ${bingxSymbol}`)
 
-      const buildParams = (): Record<string, string> => ({
-        symbol: bingxSymbol,
-        marginType: marginType === "cross" ? "CROSSED" : "ISOLATED",
-        timestamp: String(this.getTimestamp()),
-      })
-      const sendOnce = async (params: Record<string, string>) => {
+      // LAZY URL BUILD — timestamp/signature computed at send time inside
+      // the rate-limit slot (see setLeverage for full rationale).
+      const buildUrl = (): string => {
+        const params: Record<string, string> = {
+          symbol: bingxSymbol,
+          marginType: marginType === "cross" ? "CROSSED" : "ISOLATED",
+          timestamp: String(this.getTimestamp()),
+        }
         const { signature, queryString: signedQs } = this.signParams(params)
-        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
-        const response = await this.rateLimitedFetch(url, {
+        return `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
+      }
+      const sendOnce = async () => {
+        const response = await this.rateLimitedFetch(buildUrl, {
           method: "POST",
           headers: { "X-BX-APIKEY": this.credentials.apiKey },
         })
         return this.safeJson(response)
       }
-      let data = await sendOnce(buildParams())
+      let data = await sendOnce()
       // Retry-once on cached-offset drift, same rationale as setLeverage.
       if (!this.isBingXSuccess(data?.code) && (await this.resyncOnTimestampError(data))) {
-        data = await sendOnce(buildParams())
+        data = await sendOnce()
       }
 
       if (!this.isBingXSuccess(data.code)) {
