@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 import { useState, useEffect, useCallback, useRef } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -864,6 +865,12 @@ export function ActiveConnectionCard({
             ? (effectiveState ? `Live Trading starting on ${connName}...` : `Live Trading requested on ${connName}; waiting for valid credentials`)
             : `Live Trading stopped on ${connName}`,
         )
+        dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(data, {
+          connectionId: connection.connectionId,
+          connection: { id: connection.connectionId, name: connection.exchangeName },
+          engine: { action: requestedState ? "start" : "stop", status: data.engineStatus },
+          source: "active-connection-card.liveTrade",
+        }))
         if (typeof window !== "undefined") {
           window.dispatchEvent(new CustomEvent("live-trade-toggled", {
             detail: { connectionId: connection.connectionId, newState: requestedState, effectiveState }

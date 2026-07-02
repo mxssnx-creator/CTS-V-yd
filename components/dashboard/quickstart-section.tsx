@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 import { useState, useEffect, useRef, useCallback } from "react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -988,6 +989,11 @@ export function QuickstartSection() {
           : "LIVE exchange trading disabled",
         requestedState ? (effectiveState ? "success" : "warning") : "info",
       )
+      dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(body, {
+        connectionId: id,
+        engine: { action: requestedState ? "start" : "stop", status: body?.engineStatus },
+        source: "quickstart-section.liveTrade",
+      }))
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("live-trade-toggled", {
           detail: { connectionId: id, newState: requestedState, effectiveState },

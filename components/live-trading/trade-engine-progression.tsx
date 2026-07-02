@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Activity, TrendingUp, Clock, Zap } from "lucide-react"
 import { useEffect, useState } from "react"
+import { CONNECTION_STATE_CHANGED_EVENT, PROGRESSION_STATE_INVALIDATE_EVENT } from "@/lib/connection-events"
 
 interface ProgressionData {
   connectionId: string
@@ -50,9 +51,20 @@ export function TradeEngineProgression() {
 
     fetchProgression()
 
+    const handleInvalidation = () => {
+      fetchProgression()
+    }
+
+    window.addEventListener(PROGRESSION_STATE_INVALIDATE_EVENT, handleInvalidation)
+    window.addEventListener(CONNECTION_STATE_CHANGED_EVENT, handleInvalidation)
+
     // Poll every 10 seconds
     const interval = setInterval(fetchProgression, 10000)
-    return () => clearInterval(interval)
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener(PROGRESSION_STATE_INVALIDATE_EVENT, handleInvalidation)
+      window.removeEventListener(CONNECTION_STATE_CHANGED_EVENT, handleInvalidation)
+    }
   }, [])
 
   const getStateColor = (state: string) => {
