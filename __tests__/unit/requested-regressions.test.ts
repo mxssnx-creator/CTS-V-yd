@@ -698,4 +698,68 @@ describe("requested regression guardrails", () => {
     expect(statusRoute).toContain("last_heartbeat_at")
   })
 
+  test.each([
+    ["0", false],
+    ["1", true],
+  ])("testing place-order forwards Redis is_testnet %s as connector isTestnet=%s", async (isTestnetFlag, expectedIsTestnet) => {
+    jest.resetModules()
+
+    const hgetall = jest.fn().mockResolvedValue({
+      name: "Test Connection",
+      exchange: "bingx",
+      api_key: "test-api-key",
+      api_secret: "test-api-secret",
+      api_passphrase: "test-passphrase",
+      api_type: "swap",
+      contract_type: "perpetual",
+      is_testnet: isTestnetFlag,
+      margin_type: "cross",
+      position_mode: "one_way",
+      connection_method: "api",
+      connection_library: "ccxt",
+    })
+    const hget = jest.fn().mockResolvedValue(null)
+    const hincrby = jest.fn().mockResolvedValue(1)
+    const hincrbyfloat = jest.fn().mockResolvedValue(1)
+    const createExchangeConnector = jest.fn().mockResolvedValue({
+      placeOrder: jest.fn().mockResolvedValue({ success: true, orderId: "order-1" }),
+    })
+
+    jest.doMock("@/lib/redis-db", () => ({
+      initRedis: jest.fn().mockResolvedValue(undefined),
+      getRedisClient: jest.fn(() => ({ hgetall, hget, hincrby, hincrbyfloat })),
+      savePosition: jest.fn().mockResolvedValue(undefined),
+      getMarketData: jest.fn().mockResolvedValue(null),
+    }))
+    jest.doMock("@/lib/exchange-connectors/factory", () => ({
+      createExchangeConnector,
+    }))
+    jest.doMock("@/lib/live-order-safety", () => ({
+      getLiveOrderSafetyFailure: jest.fn(() => null),
+    }))
+
+    const { POST } = await import("../../app/api/testing/place-order/route")
+
+    const response = await POST({
+      json: async () => ({
+        connectionId: "conn-1",
+        symbol: "BTCUSDT",
+        side: "buy",
+        quantity: 0.001,
+        leverage: 1,
+      }),
+    } as any)
+    const payload = await response.json()
+
+    expect(payload.success).toBe(true)
+    expect(createExchangeConnector).toHaveBeenCalledWith(
+      "bingx",
+      expect.objectContaining({
+        isTestnet: expectedIsTestnet,
+        apiType: "swap",
+        contractType: "perpetual",
+      }),
+    )
+  })
+
 })
