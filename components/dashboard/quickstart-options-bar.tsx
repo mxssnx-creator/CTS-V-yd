@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 /**
  * QuickStart Options Bar — compact, collapsible strip mounted at the very
  * top of the QuickStart card (directly under `QuickstartConnectionControls`).
@@ -414,8 +415,9 @@ export function QuickstartOptionsBar() {
         // keeps `is_live_trade=false`). Apply the truth so the switch doesn't
         // stay ON when the server couldn't honour the toggle.
         let actualState = next
+        let data: any = {}
         try {
-          const data = await res.json()
+          data = await res.json()
           if (typeof data?.live_trade_requested === "boolean") {
             // The server echoes back `live_trade_requested` as the intended state
             // and `is_live_trade` as the effective state (may be false if blocked).
@@ -432,6 +434,11 @@ export function QuickstartOptionsBar() {
 
         // Broadcast so ActiveConnectionCard's Live Trade switch syncs
         // immediately instead of waiting for its 3–8 s engine-states poll.
+        dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(data, {
+          connectionId: cid,
+          engine: { action: actualState ? "start" : "stop", status: data?.engineStatus },
+          source: "quickstart-options-bar.liveTrade",
+        }))
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("live-trade-toggled", {

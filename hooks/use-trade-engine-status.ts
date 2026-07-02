@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect, useCallback } from "react"
+import { CONNECTION_STATE_CHANGED_EVENT, TRADE_ENGINE_STATUS_INVALIDATE_EVENT } from "@/lib/connection-events"
 
 export interface TradeEngineStatusData {
   id: string
@@ -79,12 +80,31 @@ export function useTradeEngineStatus(options: UseTradeEngineStatusOptions = {}) 
     // Initial fetch
     fetchStatus()
 
+    const handleInvalidation = (event: Event) => {
+      const detail = (event as CustomEvent<{ connectionId?: string }>).detail
+      if (!connectionId || !detail?.connectionId || detail.connectionId === connectionId) {
+        fetchStatus()
+      }
+    }
+
+    window.addEventListener(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, handleInvalidation)
+    window.addEventListener(CONNECTION_STATE_CHANGED_EVENT, handleInvalidation)
+
     // Set up auto-refresh if enabled
     if (autoRefresh) {
       const interval = setInterval(fetchStatus, refreshInterval)
-      return () => clearInterval(interval)
+      return () => {
+        clearInterval(interval)
+        window.removeEventListener(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, handleInvalidation)
+        window.removeEventListener(CONNECTION_STATE_CHANGED_EVENT, handleInvalidation)
+      }
     }
-  }, [fetchStatus, refreshInterval, autoRefresh])
+
+    return () => {
+      window.removeEventListener(TRADE_ENGINE_STATUS_INVALIDATE_EVENT, handleInvalidation)
+      window.removeEventListener(CONNECTION_STATE_CHANGED_EVENT, handleInvalidation)
+    }
+  }, [fetchStatus, refreshInterval, autoRefresh, connectionId])
 
   return {
     statuses,
