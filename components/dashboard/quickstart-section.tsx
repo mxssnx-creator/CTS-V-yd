@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 import { useState, useEffect, useRef, useCallback } from "react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -27,8 +28,12 @@ import { useExchange } from "@/lib/exchange-context"
 
 const toBooleanFlag = (value: unknown): boolean =>
   value === true || value === 1 || value === "1" || value === "true" || value === "yes" || value === "on"
+// QuickStart's Live button controls effective exchange order placement.
+// `live_trade_requested=1` can be true while credentials are missing and
+// `is_live_trade=0`; treating requested as active makes the next click send
+// `false`, which looks inverted when the operator is trying to enable live.
 const liveTradeUiFlag = (conn: any): boolean =>
-  toBooleanFlag(conn?.live_trade_requested) || toBooleanFlag(conn?.is_live_trade)
+  toBooleanFlag(conn?.is_live_trade)
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -434,6 +439,10 @@ export function QuickstartSection() {
   const pollRef       = useRef<NodeJS.Timeout | undefined>(undefined)
   const configPollRef = useRef<NodeJS.Timeout | undefined>(undefined)
   const livePollRef   = useRef<NodeJS.Timeout | undefined>(undefined)
+  // Multiple widgets/events can trigger stats loads while the 500ms
+  // prehistoric poll is already in flight. Apply only the newest response so
+  // slower old requests cannot collapse fresh counters back to stale values.
+  const statsFetchSeqRef = useRef(0)
 
   // ── fetch live stats ──────────────────────────────────────────────────────
   const fetchStats = useCallback(async (silent = false) => {
@@ -443,12 +452,14 @@ export function QuickstartSection() {
       setStats(EMPTY_STATS)
       return
     }
+    const requestSeq = ++statsFetchSeqRef.current
     if (!silent) setLoadingStats(true)
     try {
       // Primary: /stats endpoint (full breakdown)
       const res = await fetch(`/api/connections/progression/${connectionId}/stats`, { cache: "no-store" })
-      if (!res.ok) return
+      if (!res.ok || requestSeq !== statsFetchSeqRef.current) return
       const s = await res.json()
+      if (requestSeq !== statsFetchSeqRef.current) return
 
       let indCycles  = s.realtime?.indicationCycles || 0
       let stratCycles = s.realtime?.strategyCycles  || 0
@@ -651,6 +662,7 @@ export function QuickstartSection() {
         realtimeGatingStatus: s.realtimeGatingStatus || { isGated: false, reason: null, firstRealtimeCycleAt: null },
         stageEvalPercent: s.stageEvalPercent ?? null,
       }
+      if (requestSeq !== statsFetchSeqRef.current) return
       setStats(nextStats)
       // Persist stats to sessionStorage so a page reload can restore the last
       // known values instantly (before the first polling fetch returns).
@@ -694,7 +706,7 @@ export function QuickstartSection() {
       }
       if (s.metadata?.engineRunning === false && !startingRef.current && !startingGraceRef.current) setIsRunning(false)
     } catch { /* non-critical */ }
-    finally { if (!silent) setLoadingStats(false) }
+    finally { if (!silent && requestSeq === statsFetchSeqRef.current) setLoadingStats(false) }
   }, [connectionId])
 
   // ── fetch volatile symbol ──────────────────────────────────────────────────
@@ -959,7 +971,9 @@ export function QuickstartSection() {
       addLog("No connection selected — start the engine first", "warning")
       return
     }
-    const nextState = !liveTradeActive
+    const previousState = liveTradeActive
+    const nextState = !previousState
+    setLiveTradeActive(nextState)
     setLiveTradeLoading(true)
     addLog(`${nextState ? "Enabling" : "Disabling"} LIVE exchange trading...`, "info")
     try {
@@ -971,12 +985,13 @@ export function QuickstartSection() {
       const body = await res.json().catch(() => ({} as any))
       if (!res.ok || body?.success === false) {
         const hint = body?.hint ? ` — ${body.hint}` : ""
+        setLiveTradeActive(previousState)
         addLog(`Live toggle failed: ${body?.error || res.statusText}${hint}`, "error")
         return
       }
       const requestedState = typeof body?.live_trade_requested === "boolean" ? body.live_trade_requested : nextState
       const effectiveState = typeof body?.is_live_trade === "boolean" ? body.is_live_trade : requestedState
-      setLiveTradeActive(requestedState)
+      setLiveTradeActive(effectiveState)
       addLog(
         requestedState
           ? (effectiveState
@@ -985,9 +1000,20 @@ export function QuickstartSection() {
           : "LIVE exchange trading disabled",
         requestedState ? (effectiveState ? "success" : "warning") : "info",
       )
+      dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(body, {
+        connectionId: id,
+        engine: { action: requestedState ? "start" : "stop", status: body?.engineStatus },
+        source: "quickstart-section.liveTrade",
+      }))
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("live-trade-toggled", {
+          detail: { connectionId: id, newState: requestedState, effectiveState },
+        }))
+      }
       // Refresh stats immediately so the Live counter reflects the new engine
       setTimeout(() => fetchStats(true), 1000)
     } catch (err) {
+      setLiveTradeActive(previousState)
       addLog(`Live toggle error: ${err instanceof Error ? err.message : String(err)}`, "error")
     } finally {
       setLiveTradeLoading(false)

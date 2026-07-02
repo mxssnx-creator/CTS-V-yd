@@ -167,11 +167,11 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   // outrun the exchange price tick and just burn REST quota). This is the
   // start-to-start cadence for syncWithExchange (Loop C); raising above
   // 1000 ms risks stale position state and double-close.
-  liveSyncIntervalMs:          120,
-  liveSyncPauseMs:              30,
+  liveSyncIntervalMs:        1_000,
+  liveSyncPauseMs:             250,
   heartbeatIntervalMs:       1_000,
-  strategyFlowMinIntervalMs: 1_500,
-  strategyFlowHardThrottleMs:  750,
+  strategyFlowMinIntervalMs: 5_000,
+  strategyFlowHardThrottleMs: 2_500,
   strategyFlowMaxIntervalMs: 15_000,
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
@@ -189,9 +189,9 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   //   and let pending microtasks/I-O callbacks drain. Not a pacing timer.
   prehistoricIntervalMs:       1_000,  // Loop A: 1 s cadence
   prehistoricCyclePauseMs:        50,  // Loop A: post-completion breath
-  realtimeIntervalMs:            200,  // Loop B: 200 ms cadence (faster signal→dispatch)
-  realtimeCyclePauseMs:           50,  // Loop B: post-completion breath
-  livePositionsCyclePauseMs:     150,  // Loop C: post-completion breath (interval = liveSyncIntervalMs 120 ms)
+  realtimeIntervalMs:          1_000,  // Loop B: 200 ms cadence (faster signal→dispatch)
+  realtimeCyclePauseMs:          250,  // Loop B: post-completion breath
+  livePositionsCyclePauseMs:     500,  // Loop C: post-completion breath (interval = liveSyncIntervalMs 120 ms)
   // ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
    neutralizeEnabled:               false,
    neutralizeThresholdPct:          10,   // 10 % imbalance before reducing
@@ -212,8 +212,8 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   // — raising above this causes fill/close detection to lag by >1 tick,
   // producing stale position state and double-close races.
   // Default 200 ms = 5 sweeps/sec. Do not raise without explicit intent.
-  liveSyncIntervalMs:        { min: 100,         max: 1_000               },
-  liveSyncPauseMs:           { min: 10,          max: 200                 },
+  liveSyncIntervalMs:        { min: 500,         max: 5_000               },
+  liveSyncPauseMs:           { min: 100,         max: 1_000                 },
   heartbeatIntervalMs:       { min: 250,         max: 30_000              },
   strategyFlowMinIntervalMs: { min: 250,         max: 60_000              },
   strategyFlowHardThrottleMs:{ min: 100,         max: 30_000              },
@@ -235,9 +235,9 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   // loop feel unresponsive; < 10 ms would give no meaningful yield.
   prehistoricIntervalMs:     { min: 200,         max: 60_000              },
   prehistoricCyclePauseMs:   { min: 10,          max: 500                 },  // breath, not cadence
-  realtimeIntervalMs:        { min: 200,         max: 60_000              },
-  realtimeCyclePauseMs:      { min: 10,          max: 500                 },  // breath, not cadence
-  livePositionsCyclePauseMs: { min: 10,          max: 500                 },  // breath, not cadence
+  realtimeIntervalMs:        { min: 500,         max: 60_000              },
+  realtimeCyclePauseMs:      { min: 100,         max: 2_000                 },  // breath, not cadence
+  livePositionsCyclePauseMs: { min: 100,         max: 2_000                 },  // breath, not cadence
 // ── Hedge Accumulation bounds ─────────────────────────────────────────────
    neutralizeEnabled:           { min: 0,           max: 1  /* boolean */    },
    neutralizeThresholdPct:      { min: 0,           max: 50                  },

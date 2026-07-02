@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 import React, { useState, useEffect } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -228,8 +229,10 @@ export function DashboardActiveConnectionsManager() {
     }
   }, [])
 
-  const handleToggle = async (connectionId: string, currentState: boolean) => {
-    const newState = !currentState
+  const handleToggle = async (connectionId: string, desiredState: boolean) => {
+    const currentState = activeConnectionsRef.current.find(ac => ac.connectionId === connectionId)?.isActive ?? false
+    const newState = desiredState
+    if (newState === currentState) return
 
     setTogglingIds(prev => new Set(prev).add(connectionId))
 
@@ -254,13 +257,28 @@ export function DashboardActiveConnectionsManager() {
       ))
 
       const toggleData = await toggleRes.json().catch(() => ({} as any))
+      dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(toggleData, {
+        connectionId,
+        connection: { id: connectionId, name: connInfo?.exchangeName },
+        engine: { action: newState ? "start" : "stop", status: toggleData.engine?.status },
+        source: "dashboard-active-connections-manager.toggleDashboard",
+      }))
       if (!newState) {
-        await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
+        const liveTradeRes = await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ is_live_trade: false }),
           cache: "no-store"
-        }).catch(() => {})
+        }).catch(() => null)
+        if (liveTradeRes?.ok) {
+          const liveTradeData = await liveTradeRes.json().catch(() => ({} as any))
+          dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(liveTradeData, {
+            connectionId,
+            connection: { id: connectionId, name: connInfo?.exchangeName },
+            engine: { action: "stop", status: liveTradeData.engineStatus },
+            source: "dashboard-active-connections-manager.liveTradeOff",
+          }))
+        }
         toast.success("Connection deactivated", { description: "Engine stopped" })
       } else if (toggleData.changed) {
         toast.success("Connection added to Main Connections", {
@@ -307,12 +325,21 @@ export function DashboardActiveConnectionsManager() {
       setRemovingIds(prev => new Set(prev).add(connectionId))
 
       // Stop engine first (non-critical)
-      await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
+      const liveTradeRes = await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ is_live_trade: false }),
         cache: "no-store"
-      }).catch(() => { /* non-critical */ })
+      }).catch(() => null)
+      if (liveTradeRes?.ok) {
+        const liveTradeData = await liveTradeRes.json().catch(() => ({} as any))
+        dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(liveTradeData, {
+          connectionId,
+          connection: { id: connectionId, name: connectionName },
+          engine: { action: "stop", status: liveTradeData.engineStatus },
+          source: "dashboard-active-connections-manager.remove.liveTradeOff",
+        }))
+      }
 
       // Remove from active panel
       const removeRes = await fetch(`/api/settings/connections/${connectionId}/active`, {

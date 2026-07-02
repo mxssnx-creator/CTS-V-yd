@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 import React, { useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -189,6 +190,11 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
         if (d.overallStats) {
           setOverallStats(d.overallStats)
         }
+        dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(d, {
+          connectionId: enabledConnectionId ?? undefined,
+          engine: { action: "enable", status: d.engine?.status ?? d.engineStatus },
+          source: "quick-start-button.enable",
+        }))
         const syms = Array.isArray(d.connection?.symbols)
           ? d.connection.symbols.join(", ")
           : "BTCUSDT"
@@ -205,7 +211,14 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
           body: JSON.stringify({ is_live_trade: true }),
         }, 30000)
         const d = await res.json().catch(() => ({}))
-        if (res.ok && d.success) return `Engine running | Status: ${d.engineStatus}`
+        if (res.ok && d.success) {
+          dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(d, {
+            connectionId: connId,
+            engine: { action: "start", status: d.engineStatus },
+            source: "quick-start-button.liveTrade",
+          }))
+          return `Engine running | Status: ${d.engineStatus}`
+        }
         return `Queued (${d.error ?? d.message ?? "coordinator processing"})`
       })
 

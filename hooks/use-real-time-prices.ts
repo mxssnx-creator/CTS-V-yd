@@ -36,11 +36,26 @@ export function useRealTimePrices(symbols: string[]) {
 
   // Fallback: Poll API if WebSocket is not connected
   useEffect(() => {
-    if (!isConnected) {
-      const interval = setInterval(async () => {
+    if (isConnected) {
+      return
+    }
+
+    let isFallbackFetchInFlight = false
+    const abortController = new AbortController()
+
+    const loadFallbackPrices = async () => {
+      if (isFallbackFetchInFlight) {
+        return
+      }
+
+      isFallbackFetchInFlight = true
+
+      try {
         for (const symbol of symbols) {
           try {
-            const response = await fetch(`/api/market-data?symbol=${symbol}&limit=1`)
+            const response = await fetch(`/api/market-data?symbol=${encodeURIComponent(symbol)}&limit=1`, {
+              signal: abortController.signal,
+            })
             const data = await response.json()
             if (data.success && data.data.length > 0) {
               const latest = data.data[0]
@@ -57,12 +72,27 @@ export function useRealTimePrices(symbols: string[]) {
               })
             }
           } catch (error) {
+            if (abortController.signal.aborted) {
+              return
+            }
+
             console.error(`[v0] Error fetching price for ${symbol}:`, error)
           }
         }
-      }, 5000)
+      } finally {
+        isFallbackFetchInFlight = false
+      }
+    }
 
-      return () => clearInterval(interval)
+    void loadFallbackPrices()
+
+    const interval = setInterval(() => {
+      void loadFallbackPrices()
+    }, 5000)
+
+    return () => {
+      abortController.abort()
+      clearInterval(interval)
     }
   }, [isConnected, symbols])
 

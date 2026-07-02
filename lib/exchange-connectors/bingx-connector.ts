@@ -43,7 +43,9 @@ export class BingXConnector extends BaseExchangeConnector {
   // ── Official BingX SDK Client (with connection pooling & keep-alive) ──────
   // The SDK handles all signature generation, retry logic, and connection pooling
   // for significantly faster execution compared to manual REST calls.
-  private sdkClient: any // BingX SDK client instance (supports spot and futures)
+  private sdkClient: any // BingX SDK client instance (supports swap mainnet)
+  private sdkAccount: any
+  private sdkInitPromise: Promise<void> | null = null
 
   // ── Static (process-wide) time-sync state ────────────────────────────────
   //
@@ -93,9 +95,10 @@ export class BingXConnector extends BaseExchangeConnector {
     
     // Initialize the official BingX SDK client with connection pooling
     // SDK is dynamically loaded to avoid import issues in edge environments
-    this.initializeSDKClient(credentials).catch(() => {
+    this.sdkInitPromise = this.initializeSDKClient(credentials).catch(() => {
       // Fall back to manual REST if SDK fails to initialize
       this.sdkClient = null
+      this.sdkAccount = null
     })
     
     // Kick off the first time-sync in the background (SDK handles this internally too)
@@ -117,15 +120,24 @@ export class BingXConnector extends BaseExchangeConnector {
         return
       }
 
-      // Initialize SDK client with configuration
-      this.sdkClient = new BingXClient({
-        apiKey: credentials.apiKey,
-        secretKey: credentials.apiSecret,
-        baseUrl: this.getBaseUrl(),
-        recvWindow: 60_000, // 60s recvWindow for slippage tolerance
-      })
+      const requestExecutor = (BingXModule as any).HttpRequestExecutor
+        ? new (BingXModule as any).HttpRequestExecutor()
+        : undefined
+      const ApiAccount = (BingXModule as any).ApiAccount
+
+      if (!requestExecutor || !ApiAccount) {
+        console.warn("[BingX] SDK executor/account exports not found")
+        return
+      }
+
+      // bingx-api@1.21 expects a request executor in the client constructor,
+      // and credentials are passed per service call as ApiAccount. The previous
+      // config-object constructor silently produced a client without usable
+      // order services, forcing slow REST fallback in production.
+      this.sdkClient = new BingXClient(requestExecutor)
+      this.sdkAccount = new ApiAccount(credentials.apiKey, credentials.apiSecret)
       
-      console.log("[BingX] SDK client initialized (connection pooling + keep-alive enabled)")
+      console.log("[BingX] SDK client initialized (trade service + account enabled)")
     } catch (err) {
       console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
       // Will fall back to manual REST
@@ -765,32 +777,60 @@ export class BingXConnector extends BaseExchangeConnector {
     options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string; filledPrice?: number; avgPrice?: number; price?: number; filledQty?: number; executedQty?: number; status?: string }> {
     try {
-      // CRITICAL: Use official SDK for instant order placement
-      // SDK handles all signing, timestamp sync, and connection pooling
-      if (this.sdkClient) {
+      // Use the official SDK for fast mainnet swap entry orders when safe. Keep
+      // REST for testnet/spot/reduce-only because the SDK is hard-wired to the
+      // mainnet swap endpoint and does not expose every close/protection option.
+      if (this.sdkInitPromise) {
+        await this.sdkInitPromise.catch(() => {})
+        this.sdkInitPromise = null
+      }
+      const sdkOrderAllowed =
+        process.env.DISABLE_BINGX_SDK_ORDERS !== "1" &&
+        !this.credentials.isTestnet &&
+        this.credentials.apiType !== "spot" &&
+        !options.reduceOnly &&
+        !!this.sdkClient &&
+        !!this.sdkAccount
+      // Prefer the audited REST path for real order placement unless explicitly
+      // enabled. The SDK fast-path has different position-mode semantics across
+      // versions and was a prod/dev mismatch source for live orders; REST below
+      // carries our recvWindow, timestamp-resync, hedge/one-way fallback, and
+      // signed-query diagnostics.
+      if (sdkOrderAllowed && process.env.ENABLE_BINGX_SDK_ORDERS === "1") {
         try {
           const bingxSymbol = this.toBingXSymbol(symbol)
           const apiType = this.credentials.apiType || "perpetual_futures"
           
           // SDK encapsulates the order placement with optimal timeout and retry
-          const orderData = await (this.sdkClient as any).order?.place({
+          const tradeService = (this.sdkClient as any).getTradeService?.() || (this.sdkClient as any).services?.TradeService
+          if (!tradeService?.tradeOrder) throw new Error("BingX SDK tradeOrder service unavailable")
+          const orderPayload: Record<string, string> = {
             symbol: bingxSymbol,
             side: side.toUpperCase(),
             type: orderType === "market" ? "MARKET" : "LIMIT",
-            quantity,
-            price: price || undefined,
-            positionSide: options.positionSide,
-            reduceOnly: options.reduceOnly,
-          })
-          
-          if (orderData && orderData.code === 0 && orderData.data?.orderId) {
+            quantity: String(quantity),
+            recvWindow: String(this.recvWindowMs),
+            timestamp: String(this.getTimestamp()),
+          }
+          if (price && orderType === "limit") orderPayload.price = String(price)
+          if (options.hedgeMode !== false && options.positionSide) {
+            orderPayload.positionSide = options.positionSide
+          }
+
+          const orderData = await tradeService.tradeOrder(orderPayload, this.sdkAccount)
+          const info = orderData?.data?.order || orderData?.data || {}
+          const id = info.orderId || info.id || orderData?.orderId
+          if (this.isBingXSuccess(orderData?.code) && id) {
             return {
               success: true,
-              orderId: orderData.data.orderId,
-              status: orderData.data.status,
-              filledQty: orderData.data.executedQty || 0,
-              executedQty: orderData.data.executedQty || 0,
+              orderId: String(id),
+              status: info.status,
+              filledQty: Number(info.executedQty ?? info.filledQty ?? 0) || 0,
+              executedQty: Number(info.executedQty ?? 0) || 0,
             }
+          }
+          if (orderData && !this.isBingXSuccess(orderData.code)) {
+            throw new Error(`${orderData.code}: ${orderData.msg || orderData.message || "SDK order rejected"}`)
           }
         } catch (sdkErr) {
           console.warn("[BingX SDK] placeOrder fast-path failed, using REST fallback:", sdkErr instanceof Error ? sdkErr.message : String(sdkErr))

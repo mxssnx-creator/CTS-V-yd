@@ -1,6 +1,7 @@
 import type { BaseExchangeConnector, ExchangeCredentials } from "./base-connector"
 import { createExchangeConnector } from "./index"
 import { getConnection } from "@/lib/redis-db"
+import { isTruthyFlag } from "@/lib/connection-state-utils"
 import type { Connection } from "@/lib/db-types"
 
 export { createExchangeConnector }
@@ -30,7 +31,7 @@ export class ExchangeConnectorFactory {
         apiKey: connection.api_key || "",
         apiSecret: connection.api_secret || "",
         apiPassphrase: connection.api_passphrase,
-        isTestnet: Boolean(connection.is_testnet),
+        isTestnet: isTruthyFlag(connection.is_testnet),
         apiType: connection.api_type,
         contractType: connection.contract_type,
         marginType: connection.margin_type,

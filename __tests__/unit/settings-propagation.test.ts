@@ -67,4 +67,45 @@ describe("settings propagation", () => {
     })
     expect(hsets.find((w) => w.key === "progression:conn-main")?.value).toHaveProperty("settings_changed_at")
   })
+
+  test("in-process settings event fires after durable reload state is written", async () => {
+    const { notifySettingsChanged, onSettingsChanged } = await import("@/lib/settings-coordinator")
+    const observed: Array<{ hasReloadState: boolean; pendingExists: boolean }> = []
+    const unsubscribe = onSettingsChanged("conn-main", () => {
+      observed.push({
+        hasReloadState: writes.some(
+          (w) => w.key === "trade_engine_state:conn-main" && (w.value as any)?.reload_required === true,
+        ),
+        pendingExists: writes.some((w) => w.key === "settings_change:conn-main"),
+      })
+    })
+
+    try {
+      await notifySettingsChanged("conn-main", ["strategies"])
+      await Promise.resolve()
+    } finally {
+      unsubscribe()
+    }
+
+    expect(observed).toEqual([{ hasReloadState: true, pendingExists: true }])
+  })
+
+  test("in-process settings event handler failures do not fail durable settings save", async () => {
+    const { notifySettingsChanged, onSettingsChanged } = await import("@/lib/settings-coordinator")
+    const unsubscribe = onSettingsChanged("conn-main", () => {
+      throw new Error("subscriber failed")
+    })
+
+    try {
+      await expect(notifySettingsChanged("conn-main", ["strategies"])).resolves.toMatchObject({
+        connectionId: "conn-main",
+        changeType: "reload",
+      })
+    } finally {
+      unsubscribe()
+    }
+
+    expect(writes.some((w) => w.key === "settings_change:conn-main")).toBe(true)
+    expect(writes.some((w) => w.key === "trade_engine_state:conn-main")).toBe(true)
+  })
 })

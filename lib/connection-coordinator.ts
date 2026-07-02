@@ -9,6 +9,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { BatchProcessor } from "@/lib/batch-processor"
 import { getRateLimiter } from "@/lib/rate-limiter"
+import { isTruthyFlag } from "@/lib/connection-state-utils"
 
 export type ConnectionApiType = "rest" | "websocket" | "unified" | "perpetual_futures" | "spot" | "margin"
 export type ConnectionStatus = "active" | "inactive" | "error" | "testing" | "paused"
@@ -243,7 +244,7 @@ export class ConnectionCoordinator {
         apiPassphrase: connection.api_passphrase,
         apiType: connection.api_type,
         contractType: connection.contract_type,
-        isTestnet: connection.is_testnet,
+        isTestnet: isTruthyFlag(connection.is_testnet),
       })
 
       const result = await connector.testConnection()

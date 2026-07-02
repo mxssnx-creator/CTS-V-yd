@@ -146,61 +146,61 @@ export async function updateConnectionSettings(
       // Get current settings
       const current = await getConnectionSettings(connectionId)
 
-    // Deep-merge to preserve nested sub-objects when partial updates arrive
-    const updated = deepMergeSettings(current, settings)
-    
-    // Save to Redis
-    await client.set(key, JSON.stringify(updated))
-    // Unify: write settings_change envelope so the engine-manager's 3s
-    // watcher picks up hot-reload or restart flags (previously only the
-    // dirty flag was set here — the envelope was written by a different
-    // code path leaving disjoint coverage).
-    const changed: string[] = []
-    for (const k of Object.keys(settings) as Array<keyof typeof settings>) {
-      if (settings[k] !== undefined) changed.push(k as string)
-    }
-    if (changed.length > 0) {
-      notifySettingsChanged(connectionId, changed, current as any, updated as any).catch(() => {})
-    }
-    
-    // ── CRITICAL: Invalidate all related caches ──────────────────────────────
-    // When settings change, we need to:
-    // 1. Clear any cached config in strategy processors
-    // 2. Notify the engine to reload settings
-    // 3. Force a config refresh on next tick
-    
-    try {
-      // Mark settings as dirty - processors should reload on next cycle
-      await client.set(`settings:dirty:${connectionId}`, "1", { EX: 300 }) // 5 min TTL
-      
-      // Clear any cached advanced configs for this connection
-      await client.del(`cached_config:${connectionId}`)
-      
-      // Invalidate strategy processor cache
-      await client.del(`strategy_processor_cache:${connectionId}`)
-      
-      // Force engine to reload connection state
-      const connKey = `connection:${connectionId}`
-      const connData = await client.hgetall(connKey)
-      if (connData && Object.keys(connData).length > 0) {
-        // Update last_settings_update timestamp to trigger engine refresh
-        await client.hset(connKey, {
-          last_settings_update: new Date().toISOString(),
-        })
+      // Deep-merge to preserve nested sub-objects when partial updates arrive
+      const updated = deepMergeSettings(current, settings)
+
+      // Save to Redis
+      await client.set(key, JSON.stringify(updated))
+      // Unify: write settings_change envelope so the engine-manager's 3s
+      // watcher picks up hot-reload or restart flags (previously only the
+      // dirty flag was set here — the envelope was written by a different
+      // code path leaving disjoint coverage).
+      const changed: string[] = []
+      for (const k of Object.keys(settings) as Array<keyof typeof settings>) {
+        if (settings[k] !== undefined) changed.push(k as string)
       }
-      
-      console.log(
-        `[v0] [Settings] Invalidated caches and marked dirty for ${connectionId} - processors will reload on next cycle`
-      )
-    } catch (cacheErr) {
-      console.warn(
-        `[v0] [Settings] Cache invalidation warning for ${connectionId}:`,
-        cacheErr instanceof Error ? cacheErr.message : String(cacheErr)
-      )
-      // Non-fatal - settings are saved even if cache invalidation fails
-    }
-    
-    return updated
+      if (changed.length > 0) {
+        await notifySettingsChanged(connectionId, changed, current as any, updated as any)
+      }
+
+      // ── CRITICAL: Invalidate all related caches ──────────────────────────────
+      // When settings change, we need to:
+      // 1. Clear any cached config in strategy processors
+      // 2. Notify the engine to reload settings
+      // 3. Force a config refresh on next tick
+
+      try {
+        // Mark settings as dirty - processors should reload on next cycle
+        await client.set(`settings:dirty:${connectionId}`, "1", { EX: 300 }) // 5 min TTL
+
+        // Clear any cached advanced configs for this connection
+        await client.del(`cached_config:${connectionId}`)
+
+        // Invalidate strategy processor cache
+        await client.del(`strategy_processor_cache:${connectionId}`)
+
+        // Force engine to reload connection state
+        const connKey = `connection:${connectionId}`
+        const connData = await client.hgetall(connKey)
+        if (connData && Object.keys(connData).length > 0) {
+          // Update last_settings_update timestamp to trigger engine refresh
+          await client.hset(connKey, {
+            last_settings_update: new Date().toISOString(),
+          })
+        }
+
+        console.log(
+          `[v0] [Settings] Invalidated caches and marked dirty for ${connectionId} - processors will reload on next cycle`
+        )
+      } catch (cacheErr) {
+        console.warn(
+          `[v0] [Settings] Cache invalidation warning for ${connectionId}:`,
+          cacheErr instanceof Error ? cacheErr.message : String(cacheErr)
+        )
+        // Non-fatal - settings are saved even if cache invalidation fails
+      }
+
+      return updated
     } finally {
       await client.del(lockKey).catch(() => {})
     }
@@ -238,6 +238,8 @@ export async function getConnectionTradingSettings(connectionId: string) {
  * Reset connection settings to defaults
  */
 export async function resetConnectionSettings(connectionId: string): Promise<ConnectionSettings> {
+  const lockKey = `settings:lock:${connectionId}`
+  const LOCK_TTL = 5
   const newSettings: ConnectionSettings = {
     connectionId,
     ...DEFAULT_SETTINGS,
@@ -245,12 +247,25 @@ export async function resetConnectionSettings(connectionId: string): Promise<Con
   try {
     const client = await getRedisClient()
     const key = `settings:connection:${connectionId}`
-    await client.set(key, JSON.stringify(newSettings))
-    // Notify running engines — reset is a full config change
-    await client.set(`settings:dirty:${connectionId}`, "1", { EX: 300 }).catch(() => {})
-    notifySettingsChanged(connectionId, ["strategy", "indication", "trading", "advanced"]).catch(() => {})
+    const locked = await client.set(lockKey, String(Date.now()), { NX: true, EX: LOCK_TTL })
+    if (!locked) {
+      await new Promise(r => setTimeout(r, 100))
+      const retryLocked = await client.set(lockKey, String(Date.now()), { NX: true, EX: LOCK_TTL })
+      if (!retryLocked) throw new Error("Another settings save is in progress")
+    }
+
+    try {
+      await client.set(key, JSON.stringify(newSettings))
+      // Notify running engines — reset is a full config change. Await this
+      // before releasing the settings lock so API success means the durable
+      // settings_change and dirty signals have also been written.
+      await notifySettingsChanged(connectionId, ["strategy", "indication", "trading", "advanced"])
+    } finally {
+      await client.del(lockKey).catch(() => {})
+    }
   } catch (error) {
     console.error(`Failed to reset connection settings for ${connectionId}:`, error)
+    throw error
   }
   return newSettings
 }

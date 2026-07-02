@@ -600,68 +600,25 @@ export async function GET(
       }
     } catch { /* non-critical */ }
 
-    // ── Running-avg of active validated Real positions ────────────────
-    // The dashboard "Avg Real Pos" tile previously sourced its value from
-    // `stageReal.avgPosPerSet` = entriesCount / createdSets. That ratio
-    // is mathematically bounded by the per-set 250-entry DB capacity:
-    // each Set holds at most 250 entries, so `entries/sets ≤ 250`. The
-    // operator wants the average count of CURRENTLY-ACTIVE validated
-    // Real positions, which has no such cap (it's bounded only by the
-    // 500-key safety ceiling on the realOpen scan above and is realistic
-    // many-hundreds-deep).
-    //
-    // We accumulate a true running average across stats fetches into the
-    // `progression:{connectionId}` hash:
-    //   * real_active_pos_sum_x100   — Σ(realOpen) × 100 (precision-preserving)
-    //   * real_active_pos_samples    — # of /stats fetches contributing
-    //   * real_active_pos_current    — last-observed snapshot for debug
-    //
-    // The UI tile reads `realActivePositions.average` below. Reset DB
-    // wipes the entire `progression:{id}` hash so these accumulators
-    // restart cleanly per run.
-    // ── Running average of active validated Real positions ───────────────
-    // We ONLY accumulate a sample when realOpen > 0 (i.e. there are
-    // actually open real positions right now). Accumulating zero-samples
-    // during prehistoric processing — when real positions don't exist yet
-    // — would dilute the average toward zero and make the "Avg Real Pos"
-    // tile show near-zero even after many real positions have been opened.
-    //
-    // This means the average represents "mean open real positions across
-    // all polls where at least one position was open" which is the
-    // operationally useful metric (not "mean over all time including idle").
-    let realActivePosAverage = 0
-    let realActivePosSamples = 0
-    try {
-      const progKey = `progression:${connectionId}`
-      if (realOpen > 0) {
-        // Atomic increment-and-read: hincrby returns the new value
-        // post-increment so we get a consistent sample count and sum.
-        const [newSumX100, newSamples] = await Promise.all([
-          client.hincrby(progKey, "real_active_pos_sum_x100", Math.round(realOpen * 100)),
-          client.hincrby(progKey, "real_active_pos_samples", 1),
-        ])
-        await client.hset(progKey, {
-          real_active_pos_current: String(realOpen),
-          real_active_pos_avg: (Number(newSamples) > 0 ? (Number(newSumX100) / 100) / Number(newSamples) : 0).toFixed(2),
-        })
-        realActivePosSamples = Number(newSamples) || 0
-        realActivePosAverage = realActivePosSamples > 0
-          ? (Number(newSumX100) / 100) / realActivePosSamples
-          : 0
-      } else {
-        // No open real positions right now — read the existing running
-        // average so the tile keeps showing the last meaningful value
-        // instead of going blank during idle/prehistoric periods.
-        const existing = await client.hget(progKey, "real_active_pos_avg")
-          .catch(() => null) as string | null
-        const existingSamples = await client.hget(progKey, "real_active_pos_samples")
-          .catch(() => null) as string | null
-        realActivePosAverage = parseFloat(existing || "0") || 0
-        realActivePosSamples = parseInt(existingSamples || "0", 10) || 0
-      }
-    } catch { /* non-critical */ }
+    // ── Active validated Real positions snapshot ───────────────────────
+    // IMPORTANT: /stats is a GET/read endpoint and must not mutate Redis.
+    // Older code incremented `real_active_pos_*` counters on every stats
+    // poll, so multiple dashboard widgets polling at different cadences
+    // changed the numbers simply by observing them. That made stats appear
+    // to collapse/stall with different results after progression start.
+    // The engine-owned `real_samples:{id}` ring remains the canonical rolling
+    // average source; this block only exposes the current snapshot plus any
+    // previously materialised average without adding poll-dependent samples.
+    const existingRealActiveAvg = n(progHash.real_active_pos_avg)
+    const existingRealActiveSamples = n(progHash.real_active_pos_samples)
+    const realActivePosAverage = realOpen > 0
+      ? (existingRealActiveSamples > 0 ? existingRealActiveAvg : realOpen)
+      : existingRealActiveAvg
+    const realActivePosSamples = realOpen > 0
+      ? Math.max(1, existingRealActiveSamples)
+      : existingRealActiveSamples
 
-    // ── Live-stage OPEN positions + Set-relation join ────────────────
+    // ── Live-stage OPEN positions + Set-relation join ─────────────────
     //
     // The operator asked for a coordination view that identifies which
     // Set each live exchange position came from. The live-stage
@@ -1131,7 +1088,7 @@ export async function GET(
     const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
     // Pipeline-aware total: only count REAL stage (final filtered output), not sum of BASE+MAIN+REAL
     // Each strategy survives through the cascade filter, not added at each stage.
-    const activeStratTotal = activeStratByStage.real || strategiesTotal
+    let activeStratTotal = activeStratByStage.real || strategiesTotal
     const activeSetsIndTotal   = Object.values(activeSetsIndByType).reduce((s, v) => s + v, 0)
     // Only count distinct REAL-stage sets progressing, not sum across stages
     const activeSetsStratTotal = activeSetsStratByStage.real || 0
@@ -1182,6 +1139,31 @@ export async function GET(
         stratEvaluated[type] = fromActiveEval > 0 ? fromActiveEval : 0
       })
     )
+    // Enforce cascade invariants for all public progression counters:
+    // BASE expands into MAIN variants, REAL is a filtered subset of MAIN, and
+    // LIVE is a dispatch subset of REAL. During live runs, per-stage writers can
+    // briefly update different fields in separate Redis calls, so a stats read
+    // may observe `real > main` (or `live > real`) for one request. Normalize the
+    // snapshot here instead of exposing an impossible state to the dashboard,
+    // validation scripts, and operators watching long-running progressions.
+    if (stratCounts.main > 0 && stratCounts.real > stratCounts.main) {
+      console.warn(
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > main (${stratCounts.main}). ` +
+        `Clamping real to main for cascade consistency.`,
+      )
+      stratCounts.real = stratCounts.main
+      activeStratByStage.real = Math.min(activeStratByStage.real || 0, stratCounts.real)
+      activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
+    }
+    if (stratCounts.real > 0 && stratCounts.live > stratCounts.real) {
+      console.warn(
+        `[STATS-VALIDATION] ${connectionId}: live (${stratCounts.live}) > real (${stratCounts.real}). ` +
+        `Clamping live to real for cascade consistency.`,
+      )
+      stratCounts.live = stratCounts.real
+      activeStratByStage.live = Math.min(activeStratByStage.live || 0, stratCounts.live)
+      activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
+    }
     // ── Pipeline-aware "total strategies" ────────────────────────────────
     // Base → Main → Real → Live is a CASCADE FILTER (eval → filter → adjust).
     // Each stage operates on the output of the previous stage, so the SAME
@@ -2811,6 +2793,17 @@ export async function GET(
                 : Math.round(liveAggTotalMarginUsd * 100) / 100
             })()
 
+        // Real-stage active validated positions can be represented either by
+        // persisted RealPosition rows (`realOpen`) or, for coordinator-only
+        // strategy validation cycles, by Real detail's setsRunningNow. Use the
+        // validated Real-stage snapshot as fallback so the UI does not show 0
+        // active Real positions while Real Sets are actively coordinating.
+        const realDetailRunning = n(stratDetail.real?.setsRunningNow)
+        const realValidatedActivePositions = realOpen || realDetailRunning || 0
+        const realActiveAvgDisplay = realValidatedActivePositions > 0 && realActivePosSamples === 0
+          ? realValidatedActivePositions
+          : realActivePosAverage
+
         // Full Exchange Position Details per live position. Contains
         // everything the operator needs to evaluate trade health
         // (leverage, margin at risk, liquidation distance, SL/TP,
@@ -2868,14 +2861,14 @@ export async function GET(
             topSets:      pseudoTopSets,             // { setKey, count }
           },
           real: {
-            open:         realOpen,                  // count only
+            open:         realValidatedActivePositions, // active validated Real-stage position count
             // Running average of currently-active validated Real
             // positions, accumulated across all /stats fetches for this
             // connection. UNBOUNDED — does not share the per-set 250
             // entry cap. See "Running-avg of active validated Real
             // positions" block above for the storage layout. Resets
             // when ResetDB clears `progression:{id}`.
-            activeAvg:    Math.round(realActivePosAverage * 100) / 100,
+            activeAvg:    Math.round(realActiveAvgDisplay * 100) / 100,
             activeSamples: realActivePosSamples,
           },
           live: {

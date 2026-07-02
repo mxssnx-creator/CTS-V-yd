@@ -338,7 +338,7 @@ async function _createExchangeConnectorLazy() {
  * silently dead.
  *
  * `withCycleDeadline` wraps each tick's primary work in a `Promise.race`
- * against a bounded timeout (30s dev, 60s production). When the deadline fires, the wrapper rejects,
+ * against a bounded timeout (55s dev, 5s production). When the deadline fires, the wrapper rejects,
  * the rejection is caught by the tick's outer try/catch, `finally` runs,
  * and `scheduleNext` re-arms the loop. Any in-flight promises continue
  * to settle in the background — they just no longer block subsequent
@@ -355,6 +355,12 @@ async function _createExchangeConnectorLazy() {
 // amplifying load. 75s dev / 60s prod gives slow-but-progressing cycles
 // room to finish while still catching genuinely hung awaits.
 const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 75_000
+// Dev gets 55 s (same budget as prod) — the deadline is a stuck-await safety
+// net, not a performance target. With the dev 1-symbol cap (migration 057)
+// the indication cycle finishes well under 10 s normally; the extra headroom
+// prevents false deadline fires when the VM is under memory pressure or
+// the strategy flow is unusually large on a cold start.
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 5_000 : 55_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -611,9 +617,9 @@ export class TradeEngineManager {
    * When connection settings change (e.g. operator edits indication
    * thresholds, volume factor, presets, etc.) the API handler writes
    * a change event + bumps `settings_change_counter:{id}` in Redis.
-   * The `settingsWatcherTimer` below polls that counter every 3s and,
-   * on a bump, calls `applyPendingSettingsChange()` to dispatch the
-   * event:
+   * The settings watcher subscribes to the in-process settings event bus
+   * and calls `applyPendingSettingsChange()` as soon as the API emits the
+   * durable Redis event:
    *
    *   • `reload` → in-place: bump `settingsVersion`, re-read the
    *     connection snapshot, refresh config-set processor caches. No
@@ -625,7 +631,7 @@ export class TradeEngineManager {
    * a generational settings flip and bust any local memoization (e.g.
    * "did the indication thresholds change since I last computed?").
    */
-  private settingsWatcherTimer?: NodeJS.Timeout
+  private unsubscribeSettingsWatcher?: () => void
   private lastSettingsCounter = 0
   private settingsVersion = 0
   /** Set true while a settings apply is in flight to prevent overlap. */
@@ -1199,6 +1205,7 @@ export class TradeEngineManager {
       if (this.prehistoricTimer) { clearTimeout(this.prehistoricTimer); this.prehistoricTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
       if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
+      if (this.unsubscribeSettingsWatcher) { this.unsubscribeSettingsWatcher(); this.unsubscribeSettingsWatcher = undefined }
 
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
@@ -1391,11 +1398,11 @@ export class TradeEngineManager {
       this.lockExtendTimer = undefined
     }
     // Settings watcher must die alongside the engine — otherwise a
-    // stopped manager would keep polling and could re-apply a change
+    // stopped manager would keep an event subscription and could re-apply a change
     // it has no business touching.
-    if (this.settingsWatcherTimer) {
-      clearInterval(this.settingsWatcherTimer)
-      this.settingsWatcherTimer = undefined
+    if (this.unsubscribeSettingsWatcher) {
+      this.unsubscribeSettingsWatcher()
+      this.unsubscribeSettingsWatcher = undefined
     }
 
     this.isRunning = false
@@ -2049,6 +2056,29 @@ export class TradeEngineManager {
         }
 
         attemptedCycles++
+
+        const apiRealtimeProgressionEnabled =
+          process.env.NODE_ENV !== "production" ||
+          process.env.ENABLE_API_REALTIME_PROGRESSION === "1" ||
+          process.env.ENABLE_API_REALTIME_PROGRESSION === "true"
+        if (!apiRealtimeProgressionEnabled) {
+          cycleCount++
+          producedIndications = false
+          try {
+            const client = getRedisClient()
+            const nowMs = Date.now()
+            await Promise.all([
+              client.hincrby(`progression:${this.connectionId}`, "realtime_cycle_count", 1),
+              client.hincrby(`progression:${this.connectionId}`, "frames_processed", 1),
+              client.hset(`settings:trade_engine_state:${this.connectionId}`, {
+                status: "running",
+                last_processor_heartbeat: String(nowMs),
+                last_indication_run: new Date(nowMs).toISOString(),
+              }),
+            ])
+          } catch { /* non-critical */ }
+          return
+        }
 
         // Batch-prefetch all symbols' market data in one Redis pipeline pass
         await prefetchMarketDataBatch(symbols).catch(() => { /* non-critical */ })
@@ -2873,6 +2903,19 @@ export class TradeEngineManager {
 
       liveSyncInFlight = true
       try {
+        // Production API workers must remain responsive. Exchange-side live
+        // position sync can be CPU/REST heavy and is opt-in for API-owned
+        // coordinators; the realtime indication/strategy progression still
+        // runs, and dedicated engine workers may enable the sync explicitly.
+        const apiLiveSyncEnabled =
+          process.env.NODE_ENV !== "production" ||
+          process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "1" ||
+          process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "true"
+        if (!apiLiveSyncEnabled) {
+          cycleCount++
+          return
+        }
+
         // syncWithExchange handles simulated positions internally (always-runs
         // guard) and real exchange operations when a connector is available.
         // Calling it here (instead of a separate _processSimulatedPositionsLazy
@@ -4282,42 +4325,49 @@ export class TradeEngineManager {
   // ────��───────────���───────────────────────────────────────────────────
 
   /**
-   * Starts the per-connection settings watcher (3s poll). Cheap: a
-   * single HGETALL on `settings:settings_change_counter:{id}` per
-   * tick, branchless when the counter hasn't moved.
+   * Starts the per-connection settings watcher. This is event-based:
+   * settings writes emit through settings-coordinator's in-process bus,
+   * so an owning manager applies the durable pending change immediately
+   * instead of waking on a timer. Cross-process/serverless durability is
+   * still provided by the Redis `settings_change:{id}` envelope and the
+   * engine refresh queue.
    */
   private startSettingsWatcher(): void {
-    if (this.settingsWatcherTimer) {
-      clearInterval(this.settingsWatcherTimer)
-      this.settingsWatcherTimer = undefined
+    if (this.unsubscribeSettingsWatcher) {
+      this.unsubscribeSettingsWatcher()
+      this.unsubscribeSettingsWatcher = undefined
     }
     // Seed the counter so we don't immediately re-apply a change that
     // happened BEFORE the engine started.
     void this.seedSettingsCounter()
-    this.settingsWatcherTimer = setInterval(async () => {
-      if (!this.isRunning) {
-        if (this.settingsWatcherTimer) {
-          clearInterval(this.settingsWatcherTimer)
-          this.settingsWatcherTimer = undefined
+    void import("@/lib/settings-coordinator").then(({ onSettingsChanged }) => {
+      if (!this.isRunning) return
+      this.unsubscribeSettingsWatcher = onSettingsChanged(this.connectionId, async (event) => {
+        if (!this.isRunning) {
+          if (this.unsubscribeSettingsWatcher) this.unsubscribeSettingsWatcher()
+          this.unsubscribeSettingsWatcher = undefined
+          return
         }
-        return
-      }
-      if (this.settingsApplying) return
-      try {
-        const { getChangeCounter } = await import("@/lib/settings-coordinator")
-        const counter = await getChangeCounter(this.connectionId)
-        if (counter > this.lastSettingsCounter) {
-          this.lastSettingsCounter = counter
-          await this.applyPendingSettingsChange()
+        if (this.settingsApplying) return
+        try {
+          const { getChangeCounter } = await import("@/lib/settings-coordinator")
+          const counter = await getChangeCounter(this.connectionId)
+          if (counter > this.lastSettingsCounter) this.lastSettingsCounter = counter
+          if (event.connectionId === this.connectionId) await this.applyPendingSettingsChange()
+        } catch (err) {
+          // Watcher failures must never kill the engine; just log once.
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] settings watcher event failed:`,
+            err instanceof Error ? err.message : String(err),
+          )
         }
-      } catch (err) {
-        // Watcher failures must never kill the engine; just log once.
-        console.warn(
-          `[v0] [Engine ${this.connectionId}] settings watcher poll failed:`,
-          err instanceof Error ? err.message : String(err),
-        )
-      }
-    }, 3000)
+      })
+    }).catch((err) => {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] settings watcher subscription failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    })
   }
 
   private async seedSettingsCounter(): Promise<void> {

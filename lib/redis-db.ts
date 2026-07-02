@@ -2024,14 +2024,35 @@ export async function initRedis(): Promise<void> {
   // keeping the InlineLocalRedis data on globalThis. In that case the
   // module-scoped `isConnected` / `migrationsRan` flags reset to false even
   // though another module instance has already completed core init +
-  // migrations. Honour the global ready marker so route compilation does not
-  // re-run all migrations and overwrite operator-saved state (symbols,
-  // connection mode, progression snapshots) back to migration defaults.
+  // migrations. Honour the global ready marker only when the persisted schema
+  // is at the current migration bundle. This keeps dev hot-reload and long-lived
+  // production workers from trusting a stale in-memory readiness flag after a
+  // code deploy adds new migrations.
   if (globalForRedis.__redis_fully_connected) {
     isConnected = true
     coreInitialized = true
     connectionsInitialized = true
     migrationsRan = true
+    try {
+      await ensureCoreRedis()
+      const { getLatestMigrationVersion, runMigrations } = await import("@/lib/redis-migrations")
+      const latestVersion = getLatestMigrationVersion()
+      const currentVersion = Number((await redisInstance!.get("_schema_version").catch(() => "0")) || "0")
+      if (!Number.isFinite(currentVersion) || currentVersion < latestVersion) {
+        console.log(
+          `[v0] [Redis] Global ready marker is stale: schema v${currentVersion || 0} < code v${latestVersion}; running pending migrations`,
+        )
+        globalForRedis.__redis_fully_connected = false
+        migrationsRan = false
+        await runMigrations()
+        globalForRedis.__redis_fully_connected = true
+      }
+    } catch (error) {
+      isConnected = false
+      migrationsRan = false
+      globalForRedis.__redis_fully_connected = false
+      throw error
+    }
     return
   }
   if (isConnected) return
@@ -3721,33 +3742,14 @@ export async function getEnabledConnections(): Promise<any[]> {
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
   return allConnections.filter(conn => {
-    // A connection is eligible for the engine when it is both:
-    // 1. Assigned/inserted into the active panel  
-    // 2. Processing-enabled via the dashboard toggle. Settings-level
-    //    `is_enabled` only means the base connection exists/is available; it
-    //    must not start engine processing by itself.
-    // A connection is eligible for engine processing only when it is both:
-    // 1. Assigned/visible in the Main/Active panel. Assignment remains based
-    //    on the assignment/visibility fields so cards do not disappear when
-    //    processing is disabled.
-    // 2. Processing-enabled via the dashboard toggle. Base `is_enabled` /
-    //    legacy `enabled` are settings-availability flags only and must not
-    //    start engine processing.
-    // A connection is eligible for engine processing only when it is assigned
-    // to Main Connections and the dashboard processing toggle is enabled. Base
-    // Settings flags and active-panel visibility alone are not enable signals.
+    // Canonical engine eligibility: assigned to Main Connections and
+    // enabled via is_enabled_dashboard.
     return isConnectionMainEnabled(conn)
-    // A connection is eligible for engine processing only when it is both:
-    // 1. Assigned/inserted into the Main Connections panel, and
-    // 2. Explicitly enabled via the dashboard processing switch.
-    // Base is_enabled/enabled and is_active_inserted/is_assigned are not
-    // processing switches and must not cause auto-start by themselves.
-    const isAssigned =
-      isEnabledFlag(conn.is_active_inserted) ||
-      isEnabledFlag(conn.is_assigned) ||
-      isEnabledFlag(conn.is_dashboard_inserted)
-    const isEnabled = isEnabledFlag(conn.is_enabled_dashboard)
-    return isAssigned && isEnabled
+    // Keep this eligibility in sync with isConnectionReadyForEngine(), which
+    // startEngine() re-checks immediately before acquiring startup locks.
+    // Live-trade intent is deliberately not part of engine-processing
+    // eligibility; it only controls whether live orders may be placed.
+    return isConnectionMainEnabled(conn) && !!conn?.exchange && !!conn?.api_type
   })
 }
 

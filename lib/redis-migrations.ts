@@ -2600,10 +2600,32 @@ const migrations: Migration[] = [
     },
   },
 
-  // ── Migration 042 ──────────────────────────────────────────────────────────
-  // Reconcile operator volume settings across raw + settings hashes without
-  // clobbering low-but-valid stress-test factors, and clear stale prehistoric
-  // gates once more for installations that already ran the old 041.
+  {
+    version: 43,
+    name: "043-reserved-schema-continuity",
+    description: "No-op continuity marker preserving sequential schema upgrades",
+    up: async (_client: any) => {
+      console.log("[v0] Migration 043: no-op schema continuity marker")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "42")
+    },
+  },
+  {
+    version: 44,
+    name: "044-reserved-schema-continuity",
+    description: "No-op continuity marker preserving sequential schema upgrades before connection cache rebuild",
+    up: async (_client: any) => {
+      console.log("[v0] Migration 044: no-op schema continuity marker")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "43")
+    },
+  },
+
+  // ── Migration 045 ──────────────────────────────────────────────────────────
+  // Rebuild the connection list cache from canonical connection hashes without
+  // clobbering live operator state or progressions.
   {
     version: 45,
     name: "045-rebuild-connection-list-cache",
@@ -3395,7 +3417,46 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "63")
     },
   },
+  {
+    version: 65,
+    name: "065-dev-prod-database-health-metadata",
+    up: async (client: any) => {
+      const mode = process.env.NODE_ENV === "production" ? "production" : "development"
+      const now = new Date().toISOString()
+      const finalVersion = Math.max(...migrations.map((m) => m.version))
+
+      // This migration is intentionally environment-neutral. Development and
+      // production both need a single lightweight, queryable health record so
+      // startup/status routes can verify that the Redis schema on disk matches
+      // the migration bundle that booted the process. Keep this metadata small:
+      // no key scans, no progression resets, no strategy rewrites.
+      await client.hset("system:database:health", {
+        mode,
+        schema_version: String(finalVersion),
+        migrations_bundle_version: String(finalVersion),
+        migrations_sequential: "1",
+        last_verified_at: now,
+      })
+      await client.set("_migrations_run", "true")
+      console.log(`[v0] Migration 065: recorded ${mode} database health metadata at schema v${finalVersion}`)
+    },
+    down: async (client: any) => {
+      await client.hdel(
+        "system:database:health",
+        "mode",
+        "schema_version",
+        "migrations_bundle_version",
+        "migrations_sequential",
+        "last_verified_at",
+      ).catch(() => 0)
+      await client.set("_schema_version", "64")
+    },
+  },
 ]
+
+export function getLatestMigrationVersion(): number {
+  return Math.max(...migrations.map((m) => m.version))
+}
 
 const BASE_CONNECTION_CONFIG: Array<{
   id: string

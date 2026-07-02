@@ -43,6 +43,7 @@ closeSync(out)
 
 let exitCode = 0
 try {
+  let serverReady = false
   for (let i = 0; i < 90; i++) {
     if (existsSync('.next/routes-manifest.json')) {
       try {
@@ -50,12 +51,18 @@ try {
           cache: 'no-store',
           signal: AbortSignal.timeout(5000),
         })
-        if (response.ok || response.status === 307) break
+        if (response.ok || response.status === 307) {
+          serverReady = true
+          break
+        }
       } catch {
         // dev server not ready yet
       }
     }
     await sleep(1000)
+  }
+  if (!serverReady) {
+    throw new Error(`FAIL:dev-server-startup-timeout=${base}`)
   }
 
   for (const path of ['/', '/main', '/strategies', '/settings', '/monitoring']) {

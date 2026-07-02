@@ -2917,6 +2917,11 @@ export async function executeLivePosition(
     const { getConnection: reCheckConn } = await import("@/lib/redis-db")
     const { isTruthyFlag: reCheckTruthy } = await import("@/lib/connection-state-utils")
     const freshSettings = (await reCheckConn(connectionId)) || {}
+    const positionMode = String((freshSettings as any).position_mode || (freshSettings as any).positionMode || "").toLowerCase()
+    const hedgeMode = positionMode.includes("hedge") || positionMode.includes("dual")
+    const entryOrderOptions = hedgeMode
+      ? { hedgeMode: true, positionSide: (realPosition.direction === "long" ? "LONG" : "SHORT") as "LONG" | "SHORT" }
+      : { hedgeMode: false }
     const isStillLive =
       !hasRealTradeBlock(freshSettings) &&
       (reCheckTruthy(freshSettings.is_live_trade) ||
@@ -2981,7 +2986,7 @@ export async function executeLivePosition(
             leverage: livePosition.leverage,
             marginType: livePosition.marginType ?? "unknown",
             orderType: "market",
-            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+            options: entryOrderOptions,
             strategySetKey: livePosition.setKey,
             realPositionId: realPosition.id,
             attempt: placeAttempt,
@@ -2993,9 +2998,7 @@ export async function executeLivePosition(
             computedVolume,
             undefined,
             "market",
-            {
-              positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
-            },
+            entryOrderOptions,
           ),
         )
         return raw
@@ -3034,7 +3037,7 @@ export async function executeLivePosition(
                 leverage: livePosition.leverage,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
-                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                options: entryOrderOptions,
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
@@ -3046,7 +3049,7 @@ export async function executeLivePosition(
                 reducedVolume,
                 undefined,
                 "market",
-                { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                entryOrderOptions,
               ),
             )
             return raw
@@ -3104,7 +3107,7 @@ export async function executeLivePosition(
                 leverage: livePosition.leverage,
                 marginType: livePosition.marginType ?? "unknown",
                 orderType: "market",
-                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                options: entryOrderOptions,
                 strategySetKey: livePosition.setKey,
                 realPositionId: realPosition.id,
                 attempt: placeAttempt,
@@ -3117,7 +3120,7 @@ export async function executeLivePosition(
                   minQtyForSymbol,
                   undefined,
                   "market",
-                  { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                  entryOrderOptions,
                 )
                 return r
               },
@@ -3236,9 +3239,7 @@ export async function executeLivePosition(
               retryQty,
               undefined,
               "market",
-              {
-                positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
-              },
+              entryOrderOptions,
             )
             
             if (retryOrderResult?.success && (retryOrderResult?.orderId || retryOrderResult?.id)) {

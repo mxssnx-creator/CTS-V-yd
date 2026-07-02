@@ -110,8 +110,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       api_secret: apiSecret,
       is_live_trade: toRedisFlag(isLiveTrade && hasCredentials),
       live_trade_blocked_reason: liveTradeBlockedReason,
+      // If Live is turned on while the main engine is not already running,
+      // make the connection engine-eligible before coordinator.startEngine().
+      // Otherwise startEngine refuses the foreground start as "not assigned /
+      // disabled", which looks like a coordinator crash from the UI.
       ...(isLiveTrade
         ? {
+            is_assigned: "1",
+            is_active_inserted: "1",
+            is_enabled_dashboard: "1",
+            is_active: "1",
             live_trade_requested: "1",
             ...(hasCredentials ? { last_test_status: "success" } : {}),
           }
@@ -171,6 +179,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         status: "running",
         desired_status: "running",
         operator_intent: "running",
+        operator_stopped: "0",
+        operator_stopped_at: "",
+        stopped_at: "",
         mode: hasCredentials ? "live" : "live_requested",
         updated_at: new Date().toISOString(),
       }).catch((stateErr: unknown) => {
@@ -198,14 +209,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         engineStatus = "running"
         console.log(`[v0] [LiveTrade] Engine already running for ${connName} — flag updated, no restart`)
       } else {
-        // Engine is not running — start it so the flag has an effect. In
-        // production/serverless workers, fire-and-forget work scheduled after
-        // the response is not reliable; the worker can be frozen before the
-        // background start runs. Await the coordinator start and return a clear
-        // status to the UI instead of reporting "starting" for work that may
-        // never begin.
+        // Engine is not running. In production/OpenNext, the API worker must
+        // not become the long-lived trade-loop owner after a settings click:
+        // that starves health/status routes and looks like a coordinator crash.
+        // Queue the durable start for the coordinator worker by default; allow
+        // foreground starts only in dev or explicit opt-in diagnostics.
         try {
-          const localStartAllowed = true // explicit UI action: start foreground even without a dedicated worker env flag
+          const localStartAllowed =
+            process.env.NODE_ENV !== "production" ||
+            process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
+            process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -219,7 +232,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
               realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(connectionId, engineConfig, { markAssigned: true })
+            const started = await coordinator.startEngine(connectionId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
             if (!started && !coordinator.isEngineRunning(connectionId)) {
               throw new Error("Coordinator did not start the engine; startup lock may still be owned by another worker")
             }
@@ -262,6 +275,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             status: "running",
             desired_status: "running",
             operator_intent: "running",
+            operator_stopped: "0",
+            operator_stopped_at: "",
+            stopped_at: "",
             last_start_warning: err instanceof Error ? err.message : String(err),
             updated_at: new Date().toISOString(),
           }).catch(() => {})

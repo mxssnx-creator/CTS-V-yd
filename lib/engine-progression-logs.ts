@@ -35,8 +35,10 @@ const PG = g.__v0_progression
 
 const logBuffer: Map<string, string[]> =
   PG.logBuffer ?? (PG.logBuffer = new Map<string, string[]>())
-const BUFFER_FLUSH_SIZE = 10 // Flush every 10 logs (reduced for more responsive logging)
-const BUFFER_FLUSH_INTERVAL = 3000 // Or every 3 seconds (reduced for more responsive logging)
+const BUFFER_FLUSH_SIZE = 25 // Flush every 25 logs to reduce Redis write pressure
+const BUFFER_FLUSH_INTERVAL = 3000 // Or every 3 seconds
+const MAX_BUFFER_PER_KEY = 250
+const LOG_FLUSH_TIMEOUT_MS = 300
 
 // Important phases that should flush immediately
 const IMMEDIATE_FLUSH_PHASES = [
@@ -69,6 +71,9 @@ export async function logProgressionEvent(
     }
     const buffer = logBuffer.get(logKey)!
     buffer.push(logEntry)
+    if (buffer.length > MAX_BUFFER_PER_KEY) {
+      buffer.splice(0, buffer.length - MAX_BUFFER_PER_KEY)
+    }
     
     // Start flush timer if not started. The `PG.flushTimerStarted`
     // flag is keyed on globalThis so HMR module reloads don't spawn
@@ -87,7 +92,9 @@ export async function logProgressionEvent(
     // Immediate flush for important phases or errors
     const isImportant = IMMEDIATE_FLUSH_PHASES.some(p => phase.includes(p)) || level === "error" || level === "warning"
     if (isImportant || buffer.length >= BUFFER_FLUSH_SIZE) {
-      await flushLogBuffer(logKey)
+      // Never let Redis logging latency block live trading/progression. The
+      // periodic flush remains the durability safety net.
+      void flushLogBuffer(logKey)
     }
 
     // Console log for important events (info for important phases, always for errors/warnings)
@@ -125,14 +132,18 @@ async function flushLogBuffer(logKey: string): Promise<void> {
     // 158 does NOT reverse, so logs appeared in reverse chronological
     // order. Removing the .reverse() here fixes the bug — logs now
     // display oldest first.
-    await client.lpush(logKey, ...toFlush)
-    
-    // Trim to max size
-    await client.ltrim(logKey, 0, MAX_LOGS_PER_CONNECTION - 1)
+    await Promise.race([
+      (async () => {
+        await client.lpush(logKey, ...toFlush)
+        await client.ltrim(logKey, 0, MAX_LOGS_PER_CONNECTION - 1)
+      })(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("progression log flush timeout")), LOG_FLUSH_TIMEOUT_MS)),
+    ])
   } catch (error) {
     // Put entries back if flush failed
     const currentBuffer = logBuffer.get(logKey) || []
-    logBuffer.set(logKey, [...toFlush, ...currentBuffer])
+    const merged = [...toFlush.slice(-100), ...currentBuffer]
+    logBuffer.set(logKey, merged.slice(-MAX_BUFFER_PER_KEY))
   }
 }
 
