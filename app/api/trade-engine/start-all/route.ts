@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
-import { initRedis, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getAssignedAndEnabledConnections, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
 async function handleStartAll() {
@@ -38,14 +38,8 @@ async function handleStartAll() {
       }, { status: 500 })
     }
 
-    // Filter for ONLY connections that are BOTH inserted AND enabled
-    // These are the ones displayed in "Active Connections"
-    const activeConnections = connections.filter((c: any) => {
-      const isInserted = c.is_inserted === "1" || c.is_inserted === true
-      const isEnabled = c.is_enabled === "1" || c.is_enabled === true
-      const hasLiveTrade = c.is_live_trade === "1" || c.is_live_trade === true
-      return isInserted && isEnabled && hasLiveTrade
-    })
+    // Reuse the canonical Main Connections eligibility rule.
+    const activeConnections = await getAssignedAndEnabledConnections()
 
     if (activeConnections.length === 0) {
       return NextResponse.json({
