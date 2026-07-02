@@ -1342,22 +1342,41 @@ export class GlobalTradeEngineCoordinator {
   /**
    * Resume all engines
    */
-  async resume(): Promise<void> {
+  async resume(options: { force?: boolean } = {}): Promise<void> {
     console.log("[v0] [Coordinator] RESUMING global trade engine - restarting all engines...")
-
-    if (!this.isPaused) {
-      console.log("[v0] [Coordinator] TradeEngines are not paused, nothing to resume")
-      return
-    }
-
-    this.isPaused = false
-    this.isGloballyRunning = true
 
     try {
       const { initRedis, getAllConnections, getRedisClient } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
 
       await initRedis()
+      const client = getRedisClient()
+      const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+      const redisPaused = globalState?.status === "paused" || globalState?.operator_intent === "paused"
+
+      if (!options.force && !this.isPaused && !redisPaused) {
+        console.log("[v0] [Coordinator] TradeEngines are not paused, nothing to resume")
+        return
+      }
+
+      const restoredStatus =
+        globalState.previous_status && globalState.previous_status !== "paused"
+          ? globalState.previous_status
+          : "running"
+
+      // Restore the complete operator-intent hash before any startEngine()
+      // calls. startEngine() intentionally refuses to start unless Redis says
+      // the global coordinator intent is running/enabled.
+      await client.hset("trade_engine:global", {
+        status: restoredStatus,
+        desired_status: restoredStatus,
+        operator_intent: restoredStatus,
+        resumed_at: new Date().toISOString(),
+      })
+
+      this.isPaused = false
+      this.isGloballyRunning = true
+
       const connections = await getAllConnections()
       
       if (!Array.isArray(connections)) {
@@ -1376,8 +1395,6 @@ export class GlobalTradeEngineCoordinator {
       // Retrieve engine state snapshot from pause to respect individual states
       let stateSnapshot: Record<string, boolean> = {}
       try {
-        const client = getRedisClient()
-        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
         if (globalState && globalState.engine_state_snapshot) {
           stateSnapshot = JSON.parse(globalState.engine_state_snapshot)
           console.log("[v0] [Coordinator] Restored engine state snapshot from pause")
@@ -1417,6 +1434,8 @@ export class GlobalTradeEngineCoordinator {
           console.error(`[v0] [Coordinator] Failed to resume engine for connection ${connection.id}:`, error)
         }
       }
+
+      await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")
 
       console.log(`[v0] [Coordinator] ✓ Global trade engine RESUMED: ${resumedCount} engines restarted`)
     } catch (error) {
