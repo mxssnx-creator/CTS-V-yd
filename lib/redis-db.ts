@@ -436,9 +436,8 @@ export class InlineLocalRedis implements RedisClientLike {
   
 
   async cleanupVolatileRuntimeState({
-    mode = process.env.NODE_ENV === "production" ? "production" : "development",
     reason = "startup",
-  }: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+  }: { mode?: string; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
     const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
     const now = Date.now()
     let deleted = 0
@@ -481,7 +480,7 @@ export class InlineLocalRedis implements RedisClientLike {
     for (const key of Array.from(this.data.sorted_sets.keys())) shouldDelete(key) ? deleteKey(key) : preserved++
 
     if (deleted > 0) {
-      console.log(`[v0] [Redis Memory] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+      console.log(`[v0] [Redis Memory] Volatile startup cleanup (${reason}): deleted ${deleted} keys, preserved ${preserved}`)
     }
     return { deleted, preserved }
   }
@@ -504,8 +503,8 @@ export class InlineLocalRedis implements RedisClientLike {
     // more keys per second than a 5-symbol run. 2s catches bursts before they
     // compound across multiple intervals. The handler is cheap (~ms) when
     // heap is below threshold so the extra polling is negligible.
-    // Dev: 1 second interval to catch indication_set bursts before they compound.
-    const CLEANUP_INTERVAL_MS = process.env.NODE_ENV === "development" ? 1_000 : 2_000
+    // 1 second interval to catch indication_set bursts before they compound.
+    const CLEANUP_INTERVAL_MS = 1_000
     // Trigger eviction at 400 MB heapUsed (reduced from 600).  Real Redis clients run off-heap;
     // Very aggressive for dev mode to prevent OOM on 4GB VM with 15+ symbols.
     // Total safe limit: 400MB heap + 1.6GB persistent = 2GB, leaving 2GB system buffer.
@@ -516,17 +515,14 @@ export class InlineLocalRedis implements RedisClientLike {
     // runs ~900-1100 MB heap at peak so this fires proactively before bursts).
     // Prod: 1200 MB (serverless invocations rarely exceed 512 MB so this is
     // a safety net for long-lived containers).
-    const HEAP_PRESSURE_MB = process.env.NODE_ENV === "development" ? 800 : 1_200
+    const HEAP_PRESSURE_MB = 800
 
-    // Run an immediate targeted flush SYNCHRONOUSLY before migrations at startup
-    // to clear volatile key families that accumulate across hot-reload cycles
-    // (the globalThis Map persists between Next.js hot-reloads without a full
-    // process restart). This MUST run in dev BEFORE migrations are called, not
-    // after, to ensure migrations see a clean state. This runs UNCONDITIONALLY
-    // in dev — even if totalKeys is low — because the OOM-causing families
-    // (strategies: lists, indication: strings, pseudo_position: hashes) can hold
-    // 20+ MB each while only occupying a few hundred key slots.
-    void this.cleanupVolatileRuntimeState({ mode: process.env.NODE_ENV === "production" ? "production" : "development", reason: "inline-startup" })
+    // Run an immediate targeted flush at startup to clear volatile key families
+    // that accumulate across hot-reload cycles (the globalThis Map persists between
+    // Next.js hot-reloads without a full process restart). Runs unconditionally
+    // because OOM-causing families (strategies:, indication:, pseudo_position:) can
+    // hold 20+ MB while only occupying a few hundred key slots.
+    void this.cleanupVolatileRuntimeState({ mode: "unified", reason: "inline-startup" })
 
     // Throttle eviction log output: only print once per 60 s when stuck above
     // the key limit so the server log stays readable.
@@ -545,22 +541,14 @@ export class InlineLocalRedis implements RedisClientLike {
         const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
-        // RSS trigger: in dev, Next.js + engine idle RSS is ~1.8–2.4 GB.
-        // CRITICAL: Market data accumulation causes OOM even with 4GB limit. Reduce trigger.
-        // Trigger at 1800 MB (200 MB lower) to catch burst EARLIER before RSS explodes 2.0→5.0GB.
-        // Prod: 2500 MB (more aggressive than before since market data kills dev fast).
-        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 1_800 : 2_500
+        // RSS trigger: 1800 MB — catches burst before RSS explodes to OOM territory.
+        const RSS_PRESSURE_MB = 1_800
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        // Scale the key-count eviction trigger with symbol count so the threshold
-        // fires proportionally rather than immediately at 10 symbols.
-        // Baseline: 1000 protected keys + N × 800 pipeline keys ≈ max active window.
-        const _nSymsForKeys = process.env.NODE_ENV === "development"
-          ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-          : 1
-        const MAX_TOTAL_KEYS = process.env.NODE_ENV === "development"
-          ? 1_000 + _nSymsForKeys * 800
-          : 15_000
+        // Scale the key-count eviction trigger with symbol count.
+        // Baseline: 1000 protected keys + N × 800 pipeline keys.
+        const _nSymsForKeys = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
+        const MAX_TOTAL_KEYS = 1_000 + _nSymsForKeys * 800
         const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
         if (shouldEvict) {
           const now = Date.now()
@@ -779,7 +767,7 @@ export class InlineLocalRedis implements RedisClientLike {
       return drop
     }
 
-    // ── HASH single-pass ──────────────────────────────────────────────────
+    // ── HASH single-pass ─────────────────��────────────────────────────────
     const hashBuckets = new Map<string, string[]>()
     for (const [key] of this.data.hashes.entries()) {
       const bucket = classify(key)
@@ -1869,17 +1857,15 @@ export async function ensureCoreRedis(): Promise<void> {
 
 
 export async function cleanupVolatileRuntimeState({
-  mode = process.env.NODE_ENV === "production" ? "production" : "development",
   reason = "startup",
-}: { mode?: "development" | "production" | "test"; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
+}: { mode?: string; reason?: string } = {}): Promise<{ deleted: number; preserved: number }> {
   const client = getRedisClient()
   if (typeof (client as any).cleanupVolatileRuntimeState === "function") {
-    return (client as any).cleanupVolatileRuntimeState({ mode, reason })
+    return (client as any).cleanupVolatileRuntimeState({ reason })
   }
 
   const staleMs = Number(process.env.VOLATILE_STATE_STALE_MS || process.env.REDIS_VOLATILE_STALE_MS || 6 * 60 * 60 * 1000)
   const now = Date.now()
-  const isDev = mode !== "production"
   const allKeys = await client.keys("*").catch(() => [] as string[])
   const toDelete: string[] = []
   let preserved = 0
@@ -1896,16 +1882,16 @@ export async function cleanupVolatileRuntimeState({
   for (const key of allKeys) {
     let del = false
     if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
-      del = isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+      del = key.startsWith("live:position:tracking:") || key.includes(":moved:")
     } else if (key.startsWith("live:lock:") || key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) {
-      del = isDev || await staleStringKey(key)
+      del = await staleStringKey(key)
     } else if (
       key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:") ||
       key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:") ||
       key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
       key.startsWith("strategies:") || key.startsWith("settings:strategies")
     ) {
-      del = isDev
+      del = true
     }
     if (del) toDelete.push(key)
     else preserved++
@@ -1915,7 +1901,7 @@ export async function cleanupVolatileRuntimeState({
   for (let i = 0; i < toDelete.length; i += 500) {
     deleted += await client.del(...toDelete.slice(i, i + 500)).catch(() => 0)
   }
-  if (deleted > 0) console.log(`[v0] [Redis] Volatile startup cleanup (${mode}/${reason}): deleted ${deleted} keys, preserved ${preserved}`)
+  if (deleted > 0) console.log(`[v0] [Redis] Volatile startup cleanup (${reason}): deleted ${deleted} keys, preserved ${preserved}`)
   return { deleted, preserved }
 }
 
@@ -1963,13 +1949,9 @@ export async function initRedis(): Promise<void> {
   }
   if (isConnected) return
 
-  // Startup volatile cleanup is environment-aware: development clears stale
-  // hot-reload runtime state aggressively, while production preserves
-  // authoritative live positions and removes only stale gates/locks/caches.
-  await cleanupVolatileRuntimeState({
-    mode: process.env.NODE_ENV === "production" ? "production" : "development",
-    reason: "initRedis",
-  }).catch(() => null)
+  // Startup volatile cleanup: clear stale locks, transient indexes, and
+  // rebuildable pipeline families so the engine starts with a clean baseline.
+  await cleanupVolatileRuntimeState({ reason: "initRedis" }).catch(() => null)
 
   if (globalForRedis.__redis_init_promise) return globalForRedis.__redis_init_promise
 
@@ -2545,7 +2527,7 @@ export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
 }
 
-// ──────────���────────────────────────���──────────────���─���────────────���───
+// ──────────���──��─────────────────────���──────────────���─���────────────���───
 // Live-settings version counter
 //
 // When an operator hits Save in the Settings UI, the server updates the

@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ������������
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ��������������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -2864,7 +2864,7 @@ const migrations: Migration[] = [
     // One symbol cuts the peak StrategySet allocation to ~1/3 and lets the
     // engine reach live_trading and stay there, which is what we need to
     // verify trade-history correctness and live-order placement (placed>0).
-    // Production is untouched (guarded on NODE_ENV) and keeps all 20 symbols.
+    // Symbol pinning now applies in all modes (guarded by V0_DEV_SYMBOL_COUNT).
     version: 53,
     name: "053-1-symbol-btcusdt-pin",
     up: async (client: any) => {
