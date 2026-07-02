@@ -214,6 +214,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // startup and distributed ownership locks prevent duplicate runtimes.
         try {
           const localStartAllowed = true
+        // Engine is not running. In production/OpenNext, the API worker must
+        // not become the long-lived trade-loop owner after a settings click:
+        // that starves health/status routes and looks like a coordinator crash.
+        // Queue the durable start for the coordinator worker by default; allow
+        // foreground starts only in dev or explicit opt-in diagnostics.
+        try {
+          const localStartAllowed =
+            process.env.NODE_ENV !== "production" ||
+            process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
+            process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()

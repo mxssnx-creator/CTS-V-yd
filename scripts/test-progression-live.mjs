@@ -46,10 +46,13 @@ const configuredSymbolCount = (stats) => {
   ].filter((symbol) => typeof symbol === 'string' && symbol.length > 0);
   if (activeSymbols.length > 0) return new Set(activeSymbols).size;
   const activeIndications = stats.activeCounts?.indications || {};
+  const activeIndications = stats.activeCounts?.indications || {};
+  const activeStrategies = stats.activeCounts?.strategies || {};
   const activeIndicationSets = Number(stats.activeProgressing?.indications?.total ?? 0);
   const numericValues = [
     activeIndicationSets,
     ...Object.values(activeIndications),
+    ...Object.values(activeStrategies),
   ]
     .map((value) => Number(value))
     .filter((value) => Number.isFinite(value));
