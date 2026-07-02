@@ -50,7 +50,7 @@ import {
   forceBreakProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
-import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests } from "./engine-refresh-queue"
+import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests, recordEngineRefreshRequestFailure } from "./engine-refresh-queue"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -684,19 +684,29 @@ export class GlobalTradeEngineCoordinator {
         `[v0] [Coordinator] Refresh requested for ${request.connectionId}: ${request.action} ` +
           `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
       )
-      await clearEngineRefreshRequest(request.connectionId)
-      if (request.action === "stop") {
-        await this.stopEngine(request.connectionId, { operatorRequested: true })
-      } else if (request.action === "start") {
-        if (!this.isEngineRunning(request.connectionId)) {
-          await this.startEngineFromConnectionConfig(request.connectionId)
+
+      try {
+        if (request.action === "stop") {
+          await this.stopEngine(request.connectionId, { operatorRequested: true })
+        } else if (request.action === "start") {
+          if (!this.isEngineRunning(request.connectionId)) {
+            await this.startEngineFromConnectionConfig(request.connectionId)
+          }
+        } else {
+          // Settings/progression refresh requests must be hot-applied to the
+          // target connection only. Calling refreshEngines() here performed
+          // a full eligible-connection reconciliation every 10s and caused
+          // repeated reinitializations right after progress started.
+          await this.applyPendingChangesNow(request.connectionId)
         }
-      } else {
-        // Settings/progression refresh requests must be hot-applied to the
-        // target connection only. Calling refreshEngines() here performed
-        // a full eligible-connection reconciliation every 10s and caused
-        // repeated reinitializations right after progress started.
-        await this.applyPendingChangesNow(request.connectionId)
+        await clearEngineRefreshRequest(request.connectionId)
+      } catch (error) {
+        console.warn(
+          `[v0] [Coordinator] Refresh request failed for ${request.connectionId}; ` +
+            `leaving queued for retry until expiry (attempt=${Number(request.retryCount ?? 0) + 1}):`,
+          error instanceof Error ? error.message : String(error),
+        )
+        await recordEngineRefreshRequestFailure(request, error)
       }
     }
   }
@@ -1382,6 +1392,8 @@ export class GlobalTradeEngineCoordinator {
    */
   async resume(): Promise<void> {
     console.log("[v0] [Coordinator] RESUMING global trade engine - publishing running intent...")
+  async resume(options: { force?: boolean } = {}): Promise<void> {
+    console.log("[v0] [Coordinator] RESUMING global trade engine - restarting all engines...")
 
     try {
       const { initRedis, getAssignedAndEnabledConnections, getRedisClient } = await import("@/lib/redis-db")
@@ -1393,6 +1405,36 @@ export class GlobalTradeEngineCoordinator {
       const currentIntent = globalState.operator_intent || globalState.desired_status || globalState.status || ""
       if (currentIntent !== "paused" && currentIntent !== "running") {
         console.log(`[v0] [Coordinator] Resume requested while global intent is "${currentIntent || "empty"}"; continuing as explicit operator resume`)
+      const redisPaused = globalState?.status === "paused" || globalState?.operator_intent === "paused"
+
+      if (!options.force && !this.isPaused && !redisPaused) {
+        console.log("[v0] [Coordinator] TradeEngines are not paused, nothing to resume")
+        return
+      }
+
+      const restoredStatus =
+        globalState.previous_status && globalState.previous_status !== "paused"
+          ? globalState.previous_status
+          : "running"
+
+      // Restore the complete operator-intent hash before any startEngine()
+      // calls. startEngine() intentionally refuses to start unless Redis says
+      // the global coordinator intent is running/enabled.
+      await client.hset("trade_engine:global", {
+        status: restoredStatus,
+        desired_status: restoredStatus,
+        operator_intent: restoredStatus,
+        resumed_at: new Date().toISOString(),
+      })
+
+      this.isPaused = false
+      this.isGloballyRunning = true
+
+      const connections = await getAllConnections()
+      
+      if (!Array.isArray(connections)) {
+        console.error("[v0] [Coordinator] ERROR: connections is not an array during resume")
+        return
       }
 
       const nowIso = new Date().toISOString()
@@ -1416,6 +1458,7 @@ export class GlobalTradeEngineCoordinator {
       let stateSnapshot: Record<string, boolean> = {}
       try {
         if (globalState.engine_state_snapshot) {
+        if (globalState && globalState.engine_state_snapshot) {
           stateSnapshot = JSON.parse(globalState.engine_state_snapshot)
           console.log("[v0] [Coordinator] Restored engine state snapshot from pause")
         }
@@ -1456,6 +1499,8 @@ export class GlobalTradeEngineCoordinator {
           console.error(`[v0] [Coordinator] Failed to resume engine for connection ${connection.id}:`, error)
         }
       }
+
+      await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")
 
       console.log(`[v0] [Coordinator] ✓ Global trade engine RESUMED: ${resumedCount} engines restarted`)
     } catch (error) {
