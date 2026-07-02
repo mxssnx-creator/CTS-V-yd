@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ��������������
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ���������������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -3250,16 +3250,9 @@ const migrations: Migration[] = [
     //   real:sets:bingx-x01:*    — stale set evaluations for non-BTCUSDT symbols
     //   strategy:bingx-x01:*     — stale strategy variant data
     //
-    // In production (VERCEL=1) this migration is a no-op.
     version: 61,
     name: "061-purge-multi-symbol-stale-state",
     up: async (client: any) => {
-      const isLocal = process.env.NODE_ENV === "development" ||
-        (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")
-      if (!isLocal) {
-        console.log("[v0] Migration 061: skipped (Vercel production — no purge needed)")
-        return
-      }
       const KEEP_SYMBOL = "BTCUSDT"
       let purged = 0
       // Helper: delete all keys in a family that do NOT contain KEEP_SYMBOL
@@ -3827,9 +3820,7 @@ const ensureBootstrapDiag = new Set<string>()
  * Dev mode intentionally skips the heavy parts (see startPersistence comments).
  */
 async function ensureCompleteProductionCoverage(client: any): Promise<void> {
-  const isProd = (await import("@/lib/redis-db")).isProductionEnvironment?.() ?? false
-
-  // ── Essential progression repair (runs in BOTH dev and prod) ────────
+  // ── Essential progression repair (runs in all modes) ────────────────
   try {
     const allConns = (await client.smembers("connections")) || []
     const connSet = new Set(allConns)
@@ -3898,11 +3889,7 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
     console.warn("[v0] [Migrations] Essential progression repair warning:", err)
   }
 
-  if (!isProd) {
-    return // Dev: essential repair is enough; production does full coverage below
-  }
-
-  console.log("[v0] [Migrations] PRODUCTION MODE — INTENSIVE COMPLETE COVERAGE (making Prod identical to long-running Dev)")
+  console.log("[v0] [Migrations] Running full coverage repair (containers, indexes, global zeros)")
 
   // Ensure the entire Site/Project has ONE unique instance (independent of connections).
   // IMPORTANT: do not call redis-db.ensureUniqueSiteInstance() from inside

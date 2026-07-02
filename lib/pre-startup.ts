@@ -10,12 +10,6 @@ function shouldRunPreStartup(): boolean {
   return true
 }
 
-function shouldRunDevOnlyPreStartup(): boolean {
-  if (process.env.NEXT_RUNTIME !== "nodejs") return false
-  if (process.env.NODE_ENV === "production") return false
-  return true
-}
-
 async function initializeDefaultSettings() {
   // Check canonical first; if empty, check legacy before giving up so we
   // don't stomp a migration-in-progress state where only `all_settings`
@@ -139,14 +133,16 @@ export async function runPreStartup() {
   try {
     await initRedis()
     await runMigrations()
-    
-    // Only run dev-specific seeding and testing in development
-    if (shouldRunDevOnlyPreStartup()) {
-      await initializeDefaultSettings()
-      await seedPredefinedConnections()
-      await seedMarketData()
-      await testAllExchangeConnections()
-    }
+
+    // Settings seeding and market data placeholder seeding must run in ALL modes.
+    // On a production cold-start with empty Redis the engine would boot with no
+    // settings and no market data at all — both are no-ops when data already exists.
+    await initializeDefaultSettings()
+    await seedPredefinedConnections()
+    await seedMarketData()
+
+    // Connection testing is skipped in safe bootstrap mode (both dev and prod).
+    // The engine tests connections lazily when it first ticks.
 
     // Engine start is intentionally skipped in safe bootstrap mode.
   } catch (error) {
