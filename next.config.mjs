@@ -15,7 +15,17 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  serverExternalPackages: ["redis", "@redis/client"],
+  serverExternalPackages: [
+    "redis",
+    "@redis/client",
+    // bingx-api ships a NestJS module tree (@nestjs/common) whose optional
+    // deps (class-validator/class-transformer) break webpack bundling.
+    // Keep it external so Node resolves it at runtime instead.
+    "bingx-api",
+    "@nestjs/common",
+    "class-validator",
+    "class-transformer",
+  ],
   // ── Tier-3 perf: prod-only console removal ───────────────────────
   // Strips `console.log` / `console.debug` / `console.info` from
   // production client + server bundles, keeping `console.error` and
