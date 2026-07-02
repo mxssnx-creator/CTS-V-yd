@@ -639,6 +639,68 @@ export class GlobalTradeEngineCoordinator {
     }
   }
 
+
+  /**
+   * Public event-state drain for queued engine refresh requests.
+   *
+   * Explicit connection switch actions enqueue a durable refresh request and
+   * then call this targeted fast path so the local coordinator can process the
+   * changed connection immediately instead of waiting for the 10-second health
+   * monitor tick. The health monitor still calls this without a connection id
+   * as a safety net for requests written by other processes/serverless calls.
+   */
+  public async drainQueuedRefreshRequestsNow(connectionId?: string): Promise<void> {
+    const refreshRequests = await getQueuedEngineRefreshRequests()
+    const targetedRequests = connectionId
+      ? refreshRequests.filter(({ request }) => request.connectionId === connectionId)
+      : refreshRequests
+
+    if (targetedRequests.length === 0) return
+
+    const { getConnection } = await import("@/lib/redis-db")
+    const now = Date.now()
+
+    for (const { request } of targetedRequests) {
+      const requestTime = new Date(request.timestamp).getTime()
+      if (!Number.isFinite(requestTime) || now - requestTime >= 30000) {
+        console.log(`[v0] [Coordinator] Dropping expired refresh request for ${request.connectionId}`)
+        await clearEngineRefreshRequest(request.connectionId)
+        continue
+      }
+
+      const connection = await getConnection(request.connectionId)
+      const currentVersion = String(connection?.state_switch_version ?? 0)
+      const requestedVersion = String(request.state_switch_version ?? "")
+      if (!connection || currentVersion !== requestedVersion) {
+        console.log(
+          `[v0] [Coordinator] Ignoring stale refresh request for ${request.connectionId}: ` +
+            `requested state_switch_version=${requestedVersion}, current=${currentVersion}`,
+        )
+        await clearEngineRefreshRequest(request.connectionId)
+        continue
+      }
+
+      console.log(
+        `[v0] [Coordinator] Refresh requested for ${request.connectionId}: ${request.action} ` +
+          `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
+      )
+      await clearEngineRefreshRequest(request.connectionId)
+      if (request.action === "stop") {
+        await this.stopEngine(request.connectionId, { operatorRequested: true })
+      } else if (request.action === "start") {
+        if (!this.isEngineRunning(request.connectionId)) {
+          await this.startEngineFromConnectionConfig(request.connectionId)
+        }
+      } else {
+        // Settings/progression refresh requests must be hot-applied to the
+        // target connection only. Calling refreshEngines() here performed
+        // a full eligible-connection reconciliation every 10s and caused
+        // repeated reinitializations right after progress started.
+        await this.applyPendingChangesNow(request.connectionId)
+      }
+    }
+  }
+
   /**
    * Invalidate the symbol cache on a running engine so it re-reads
    * force_symbols / active_symbols from Redis on the next cycle.
@@ -1526,51 +1588,7 @@ export class GlobalTradeEngineCoordinator {
     this.healthCheckTimer = setInterval(async () => {
       try {
         // -- 1. Refresh-request handling ----------------------------------
-        const refreshRequests = await getQueuedEngineRefreshRequests()
-        if (refreshRequests.length > 0) {
-          const { getConnection } = await import("@/lib/redis-db")
-          const now = Date.now()
-
-          for (const { request } of refreshRequests) {
-            const requestTime = new Date(request.timestamp).getTime()
-            if (!Number.isFinite(requestTime) || now - requestTime >= 30000) {
-              console.log(`[v0] [Coordinator] Dropping expired refresh request for ${request.connectionId}`)
-              await clearEngineRefreshRequest(request.connectionId)
-              continue
-            }
-
-            const connection = await getConnection(request.connectionId)
-            const currentVersion = String(connection?.state_switch_version ?? 0)
-            const requestedVersion = String(request.state_switch_version ?? "")
-            if (!connection || currentVersion !== requestedVersion) {
-              console.log(
-                `[v0] [Coordinator] Ignoring stale refresh request for ${request.connectionId}: ` +
-                  `requested state_switch_version=${requestedVersion}, current=${currentVersion}`,
-              )
-              await clearEngineRefreshRequest(request.connectionId)
-              continue
-            }
-
-            console.log(
-              `[v0] [Coordinator] Refresh requested for ${request.connectionId}: ${request.action} ` +
-                `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
-            )
-            await clearEngineRefreshRequest(request.connectionId)
-            if (request.action === "stop") {
-              await this.stopEngine(request.connectionId, { operatorRequested: true })
-            } else if (request.action === "start") {
-              if (!this.isEngineRunning(request.connectionId)) {
-                await this.startEngineFromConnectionConfig(request.connectionId)
-              }
-            } else {
-              // Settings/progression refresh requests must be hot-applied to the
-              // target connection only. Calling refreshEngines() here performed
-              // a full eligible-connection reconciliation every 10s and caused
-              // repeated reinitializations right after progress started.
-              await this.applyPendingChangesNow(request.connectionId)
-            }
-          }
-        }
+        await this.drainQueuedRefreshRequestsNow()
 
         // -- 2. Per-engine stall watchdog (in-place re-arm) ---------------
         //
