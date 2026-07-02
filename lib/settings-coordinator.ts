@@ -62,11 +62,20 @@ export function onSettingsChanged(
 ): () => void {
   const listener = (event: SettingsChangeEvent) => {
     if (event.connectionId !== connectionId) return
+    try {
+      void Promise.resolve(handler(event)).catch((error) => {
+        console.warn(
+          `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
+          error instanceof Error ? error.message : String(error),
+        )
+      })
+    } catch (error) {
     void Promise.resolve(handler(event)).catch((error) => {
       console.warn(
         `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
         error instanceof Error ? error.message : String(error),
       )
+    }
     })
   }
   settingsChangeBus.on(SETTINGS_CHANGED_EVENT, listener)
@@ -199,7 +208,7 @@ export async function notifySettingsChanged(
 
   // Event-state fast path: wake the owning in-process coordinator immediately
   // for reload/progression/coordination changes instead of waiting for the
-  // engine settings watcher timer. This only targets the affected connection;
+  // durable queue drain or a continuity sweep. This only targets the affected connection;
   // the durable settings_change envelope above remains the cross-worker source
   // of truth.
   try {
@@ -218,6 +227,12 @@ export async function notifySettingsChanged(
       eventErr instanceof Error ? eventErr.message : String(eventErr),
     )
   }
+
+  // Emit only after all durable state writes above have completed. The
+  // in-process engine subscriber may immediately consume and clear the pending
+  // settings_change envelope; emitting earlier can race with reload_required /
+  // restart_required state writes and leave stale flags behind.
+  settingsChangeBus.emit(SETTINGS_CHANGED_EVENT, event)
 
   return event
 }

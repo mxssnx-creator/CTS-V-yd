@@ -918,4 +918,33 @@ describe("requested regression guardrails", () => {
     expect(helper).toContain('memory.rss')
   })
 
+  test("Redis migrations remain sequential for production schema upgrades", () => {
+    const source = read("lib/redis-migrations.ts")
+    const versions = Array.from(source.matchAll(/version:\s*(\d+)/g), (match) => Number(match[1]))
+    const gaps: Array<[number, number]> = []
+    for (let i = 1; i < versions.length; i++) {
+      if (versions[i] !== versions[i - 1] + 1) gaps.push([versions[i - 1], versions[i]])
+    }
+
+    expect(gaps).toEqual([])
+    expect(source).toContain('name: "043-reserved-schema-continuity"')
+    expect(source).toContain('name: "044-reserved-schema-continuity"')
+  })
+
+  test("QuickStart re-entry preserves running progressions instead of forced restarts", () => {
+    const quickStart = read("app/api/trade-engine/quick-start/route.ts")
+    const coordinator = read("lib/trade-engine.ts")
+
+    expect(quickStart).toContain("quickstartEngineAlreadyRunning")
+    expect(quickStart).toContain("quickstart_engine_reused")
+    expect(quickStart).toContain("Running engine reused; QuickStart symbols/settings applied without stop/restart")
+    expect(quickStart).toContain("Engine already running — QuickStart settings applied without restart")
+    expect(quickStart).toContain("config_set_symbols_processed: quickstartEngineAlreadyRunning ? symbols.length : 0")
+    expect(quickStart).toContain("coordinator.invalidateSymbolsCacheForConnection(connectionId)")
+    expect(quickStart).not.toContain("quickstart_engine_restart")
+
+    expect(coordinator).toContain("FULL_RESTART_ESCALATION_ENABLED = false")
+    expect(coordinator).toContain("restart escalation disabled")
+  })
+
 })
