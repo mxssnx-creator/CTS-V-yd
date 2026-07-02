@@ -929,6 +929,24 @@ describe("requested regression guardrails", () => {
     expect(gaps).toEqual([])
     expect(source).toContain('name: "043-reserved-schema-continuity"')
     expect(source).toContain('name: "044-reserved-schema-continuity"')
+    expect(source).toContain('name: "065-dev-prod-database-health-metadata"')
+    expect(source).toContain("export function getLatestMigrationVersion")
+    expect(source).toContain('"system:database:health"')
+    expect(source).toContain('migrations_bundle_version: String(finalVersion)')
+  })
+
+  test("Redis init rechecks stale global readiness before skipping migrations", () => {
+    const source = read("lib/redis-db.ts")
+    const globalReadyBlock = source.slice(
+      source.indexOf("if (globalForRedis.__redis_fully_connected)"),
+      source.indexOf("if (isConnected) return", source.indexOf("if (globalForRedis.__redis_fully_connected)")),
+    )
+
+    expect(globalReadyBlock).toContain("getLatestMigrationVersion")
+    expect(globalReadyBlock).toContain('redisInstance!.get("_schema_version")')
+    expect(globalReadyBlock).toContain("currentVersion < latestVersion")
+    expect(globalReadyBlock).toContain("await runMigrations()")
+    expect(globalReadyBlock).toContain("Global ready marker is stale")
   })
 
   test("QuickStart re-entry preserves running progressions instead of forced restarts", () => {

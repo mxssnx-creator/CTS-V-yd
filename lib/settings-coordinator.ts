@@ -70,13 +70,11 @@ export function onSettingsChanged(
         )
       })
     } catch (error) {
-    void Promise.resolve(handler(event)).catch((error) => {
       console.warn(
         `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
         error instanceof Error ? error.message : String(error),
       )
     }
-    })
   }
   settingsChangeBus.on(SETTINGS_CHANGED_EVENT, listener)
   return () => settingsChangeBus.off(SETTINGS_CHANGED_EVENT, listener)
@@ -158,8 +156,6 @@ export async function notifySettingsChanged(
   await setSettings(`settings_change_counter:${connectionId}`, String(newCounter))
 
   console.log(`[v0] [SettingsCoordinator] Change event for ${connectionId}: type=${changeType}, fields=[${changedFields.join(",")}]`)
-
-  settingsChangeBus.emit(SETTINGS_CHANGED_EVENT, event)
 
   // If restart required, update engine state to signal restart needed
   if (changeType === "restart") {
