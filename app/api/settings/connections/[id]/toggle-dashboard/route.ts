@@ -247,12 +247,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           active_connections: String(activeDashboardCount),
         })
         
-        // Start/reconcile in-process immediately. The coordinator owns the
-        // runtime locks and health timers; enable actions must not leave the
-        // global engine stuck in a queued-only state in production.
+        // Start/reconcile in-process only in dev or explicit diagnostics.
+        // Production API workers queue the durable start for the coordinator worker.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          const localStartAllowed = true
           const localStartAllowed =
             process.env.NODE_ENV !== "production" ||
             process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||

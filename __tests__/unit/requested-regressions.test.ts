@@ -441,7 +441,6 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("queued-only in this production API worker")
     expect(source).toContain("Leaving start request queued")
     expect(source).not.toContain("runningUnderProdStart")
-    expect(source).not.toContain("queued-only in this production API worker")
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {
@@ -669,7 +668,8 @@ describe("requested regression guardrails", () => {
     expect(enableRoute).toContain('operator_intent: "running"')
     expect(enableRoute).toContain('coordinator_ready: "true"')
     expect(enableRoute).toContain('operator_stopped: "0"')
-    expect(enableRoute).toContain('const localStartAllowed = true')
+    expect(enableRoute).toContain('const localStartAllowed =')
+    expect(enableRoute).toContain('process.env.NODE_ENV !== "production"')
     expect(enableRoute).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
     expect(enableRoute.indexOf('operator_intent: "running"')).toBeLessThan(enableRoute.indexOf("await coordinator.startMissingEngines"))
 
