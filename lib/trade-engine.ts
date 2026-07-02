@@ -1601,13 +1601,12 @@ export class GlobalTradeEngineCoordinator {
    * reassignments / restarts" complaint.
    */
   /**
-   * Per-connection stall escalation counters. When the watchdog detects
-   * a stall it calls `manager.rearmIfStalled()` (cheap, in-place). If
-   * the engine remains stalled on the NEXT pass, we escalate: force
-   * break the progression lock (so the worker that took over later
-   * sees a fresh slot), stop the manager, and restart it from scratch
-   * with a new generation epoch. Resets to 0 once the engine reports
-   * a fresh heartbeat.
+   * Per-connection stall counters. When the watchdog detects a stall it calls
+   * `manager.rearmIfStalled()` (cheap, in-place). We intentionally avoid
+   * automatic full stop/start escalation because QuickStart's prehistoric
+   * phase can run long enough to trip heartbeat checks; forced restarts reset
+   * progress, create duplicate epochs, and were the source of repeated
+   * QuickStart crashes. Resets to 0 once the engine reports a fresh heartbeat.
    *
    * Map<connectionId, consecutiveStallCount>
    */
@@ -1636,12 +1635,14 @@ export class GlobalTradeEngineCoordinator {
     // back. New values give the engine generous recovery room:
     //
     //   • 90 s without heartbeat before we even *consider* stall.
-    //   • 4 consecutive stalls (≈ 40 s extra) before we escalate from
-    //     in-place re-arm to a full stop+restart.
+    //   • Automatic full stop+restart escalation is disabled by default;
+    //     repeated stalls keep re-arming in-place and preserving the active
+    //     progression/session so QuickStart stats remain continuous.
     //
-    // Combined that's ~2 minutes of grace before any restart fires.
+    // Result: the watchdog can heal dropped timers without resetting UI progress.
     const STALL_THRESHOLD_MS = 90_000
     const ESCALATION_THRESHOLD = 4
+    const FULL_RESTART_ESCALATION_ENABLED = false
 
     console.log("[v0] Starting global trade engine health monitoring (refresh detection + stall watchdog)")
 
@@ -1701,14 +1702,14 @@ export class GlobalTradeEngineCoordinator {
               const consecutiveStalls = (this.stallEscalation.get(connectionId) ?? 0) + 1
               this.stallEscalation.set(connectionId, consecutiveStalls)
 
-              if (consecutiveStalls < ESCALATION_THRESHOLD) {
+              if (!FULL_RESTART_ESCALATION_ENABLED || consecutiveStalls < ESCALATION_THRESHOLD) {
                 // ── Tier 1: in-place re-arm ──────────────────────────
                 // Cheapest recovery — re-attaches missing processor
                 // timers without rebuilding the manager. Most stalls
                 // are just a dropped timer (HMR race / unhandled
                 // rejection / Redis pause) and this fixes them.
                 console.warn(
-                  `[v0] [Watchdog] Engine ${connectionId} stalled (last heartbeat ${age}ms ago, attempt ${consecutiveStalls}/${ESCALATION_THRESHOLD}) — re-arming in place`,
+                  `[v0] [Watchdog] Engine ${connectionId} stalled (last heartbeat ${age}ms ago, attempt ${consecutiveStalls}${FULL_RESTART_ESCALATION_ENABLED ? `/${ESCALATION_THRESHOLD}` : ", restart escalation disabled"}) — re-arming in place`,
                 )
                 try {
                   const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
@@ -1716,8 +1717,8 @@ export class GlobalTradeEngineCoordinator {
                     connectionId,
                     "engine_stall_recovered",
                     "warning",
-                    `Engine stalled for ${Math.round(age / 1000)}s — watchdog re-arming in place (attempt ${consecutiveStalls})`,
-                    { ageMs: age, connectionId, attempt: consecutiveStalls },
+                    `Engine stalled for ${Math.round(age / 1000)}s — watchdog re-arming in place (attempt ${consecutiveStalls}${FULL_RESTART_ESCALATION_ENABLED ? `/${ESCALATION_THRESHOLD}` : ", restart escalation disabled"})`,
+                    { ageMs: age, connectionId, attempt: consecutiveStalls, fullRestartEscalationEnabled: FULL_RESTART_ESCALATION_ENABLED },
                   )
                 } catch {
                   // Logging is best-effort; never block recovery on it.
