@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors/factory"
 import { getLiveOrderSafetyFailure } from "@/lib/live-order-safety"
+import { isTruthyFlag } from "@/lib/connection-state-utils"
 import type { ExchangeConnection } from "@/lib/types"
 
 export const dynamic = "force-dynamic"
@@ -38,6 +39,11 @@ export async function POST(req: NextRequest) {
       api_passphrase: connData.api_passphrase || "",
       api_type: connData.api_type || "",
       contract_type: connData.contract_type || "",
+      is_testnet: connData.is_testnet || "0",
+      margin_type: connData.margin_type || "",
+      position_mode: connData.position_mode || "",
+      connection_method: connData.connection_method || "",
+      connection_library: connData.connection_library || "",
     } as any as ExchangeConnection
 
     const sideKey = String(side).trim().toLowerCase()
@@ -71,7 +77,7 @@ export async function POST(req: NextRequest) {
     if (forceSim || !connection.api_key || !connection.api_secret) {
       try {
         const { SimulatedConnector } = await import("@/lib/exchange-connectors/simulated-connector")
-        connector = new SimulatedConnector({ apiKey: connection.api_key, apiSecret: connection.api_secret, isTestnet: false }, "simulated")
+        connector = new SimulatedConnector({ apiKey: connection.api_key, apiSecret: connection.api_secret, isTestnet: isTruthyFlag(connection.is_testnet) }, "simulated")
         console.log(`[PlaceOrder] Using SimulatedConnector for ${connectionId} (forceSim=${forceSim})`)
       } catch (simErr) {
         console.warn(`[PlaceOrder] Failed to create SimulatedConnector fallback:`, simErr)
@@ -83,7 +89,7 @@ export async function POST(req: NextRequest) {
         apiKey: connection.api_key,
         apiSecret: connection.api_secret,
         apiPassphrase: connection.api_passphrase || "",
-        isTestnet: false,
+        isTestnet: isTruthyFlag(connection.is_testnet),
         apiType: connection.api_type,
         contractType: connection.contract_type,
       })
