@@ -1444,28 +1444,42 @@ export class StrategyCoordinator {
    */
   private async memoryCircuitBreaker(symbol: string): Promise<void> {
     try {
-      // Match the memory thresholds from the multi-symbol dev fix (redis-db.ts):
-      // dev heap = 4 GB, RSS_PRESSURE = 5000 MB, kernel OOM at ~8.4 GB VM.
-      // Soft/hard thresholds are a fraction of that envelope — GC at 2.0 GB,
-      // throttle at 3.0 GB (leaving ~2+ GB buffer before RSS_PRESSURE fires).
-      const SOFT_RSS_MB = 2_000 // force GC above this
-      const HARD_RSS_MB = 3_000 // throttle above this
+      // Use the same dynamic limits computed at Redis startup from /proc/meminfo.
+      // Falls back to conservative 4 GB VM constants when limits not yet set.
+      const gl = (globalThis as any).__redis_mem_limits as
+        | { heapMB: number; rssSoftMB: number; rssHardMB: number }
+        | undefined
+      const SOFT_RSS_MB = gl?.rssSoftMB ?? 2_000
+      const HARD_RSS_MB = gl?.rssHardMB ?? 3_000
+      // Emergency: 95% of hard — pause the engine entirely for a full GC cycle
+      // before the OS kills the process. No swap means SIGKILL happens in <1s
+      // once anon-RSS exceeds total RAM.
+      const EMERGENCY_RSS_MB = Math.round(HARD_RSS_MB * 1.07)
+
       let rssMB = process.memoryUsage().rss / 1024 / 1024
       if (rssMB < SOFT_RSS_MB) return
 
       const gc = (globalThis as any).gc
+      // SOFT: force GC and yield so the eviction timer can reclaim keys
       if (typeof gc === "function") {
         gc()
-        // Yield so eviction/finalizers run, then re-measure.
         await new Promise((r) => setTimeout(r, 0))
         rssMB = process.memoryUsage().rss / 1024 / 1024
       }
 
-      if (rssMB >= HARD_RSS_MB) {
-        console.warn(
-          `[v0] [MemGuard] ${symbol}: RSS=${rssMB.toFixed(0)}MB >= ${HARD_RSS_MB}MB after GC — throttling 250ms to avoid kernel OOM`,
+      if (rssMB >= EMERGENCY_RSS_MB) {
+        console.error(
+          `[v0] [MemGuard] ${symbol}: RSS=${rssMB.toFixed(0)}MB >= EMERGENCY ${EMERGENCY_RSS_MB}MB — ` +
+          `pausing engine 1500ms to avoid kernel OOM SIGKILL`,
         )
-        await new Promise((r) => setTimeout(r, 250))
+        if (typeof gc === "function") gc()
+        await new Promise((r) => setTimeout(r, 1_500))
+        if (typeof gc === "function") gc()
+      } else if (rssMB >= HARD_RSS_MB) {
+        console.warn(
+          `[v0] [MemGuard] ${symbol}: RSS=${rssMB.toFixed(0)}MB >= hard ${HARD_RSS_MB}MB — throttling 400ms`,
+        )
+        await new Promise((r) => setTimeout(r, 400))
         if (typeof gc === "function") gc()
       }
     } catch {
@@ -2497,7 +2511,12 @@ export class StrategyCoordinator {
         Number.isFinite(rawAxisCeiling) && rawAxisCeiling > 0
           ? Math.floor(rawAxisCeiling)
           : null
-      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? 5000
+      // Scale the default ceiling with VM memory so large machines can afford
+      // more axis fan-out while small machines stay safe. memScale ≈ 1 on 4 GB,
+      // ≈ 2 on 8 GB. 5000 × 2 = 10000 on the actual 8.6 GB VM.
+      const _axGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
+      const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
+      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? Math.round(5_000 * _axMemScale)
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3449,7 +3468,10 @@ export class StrategyCoordinator {
       Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
         ? Math.floor(rawRealCeiling)
         : null
-    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? 5000
+    // Default scales with VM RAM just like the axis ceiling.
+    const _rsGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
+    const _rsMemScale = _rsGl ? Math.max(1, _rsGl.heapMB / 2_048) : 1
+    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? Math.round(5_000 * _rsMemScale)
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
@@ -5420,7 +5442,7 @@ export class StrategyCoordinator {
               const credited = Math.min(cont, Math.max(0, dirLiveCont))
               const ec = baseEC + credited
 
-              // ── Synthetic representative entry ─────────────────────
+              // ── Synthetic representative entry ─────���───────────────
               // One entry per axis Set so:
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate

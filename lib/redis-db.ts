@@ -492,88 +492,109 @@ export class InlineLocalRedis implements RedisClientLike {
     // trading the per-cycle pipeline writes thousands of `pseudo_position:*`
     // and `config_set:*` hashes plus a growing `pseudo_positions:{conn}` set
     // every second; left unchecked this drove heapUsed past the 4GB V8 ceiling
-    // and OOM-killed next-server seconds after live trading began (verified:
-    // RSS climbing 1.5GB→7.3GB within a single ~60s window, GC unable to
-    // reduce — i.e. genuinely retained, not transient churn).
-    const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
+    // and OOM-killed next-server seconds after live trading began.
+    const globalCleanup = globalThis as unknown as {
+      __redis_cleanup_started?: boolean
+      __redis_mem_limits?: { heapMB: number; rssSoftMB: number; rssHardMB: number; maxKeys: number }
+    }
     if (globalCleanup.__redis_cleanup_started) return
     globalCleanup.__redis_cleanup_started = true
 
-    // Fire FREQUENTLY: with 20 symbols live-trading the pipeline writes ~20x
-    // more keys per second than a 5-symbol run. 2s catches bursts before they
-    // compound across multiple intervals. The handler is cheap (~ms) when
-    // heap is below threshold so the extra polling is negligible.
-    // 1 second interval to catch indication_set bursts before they compound.
-    const CLEANUP_INTERVAL_MS = 1_000
-    // Trigger eviction at 400 MB heapUsed (reduced from 600).  Real Redis clients run off-heap;
-    // Very aggressive for dev mode to prevent OOM on 4GB VM with 15+ symbols.
-    // Total safe limit: 400MB heap + 1.6GB persistent = 2GB, leaving 2GB system buffer.
-    // 4 GB VM: RSS at boot is ~2.3 GB (Next.js + InlineLocalRedis migrations).
-    // Evict aggressively at 250 MB heap / 1400 MB RSS so the prehistoric
-    // burst (which adds ~300-400 MB) never pushes RSS past the kernel OOM limit.
-    // Heap eviction trigger: fire at 800 MB in dev (dev heap cap 4096 MB, engine
-    // runs ~900-1100 MB heap at peak so this fires proactively before bursts).
-    // Prod: 1200 MB (serverless invocations rarely exceed 512 MB so this is
-    // a safety net for long-lived containers).
-    const HEAP_PRESSURE_MB = 800
+    // ── Dynamic memory limits ────────────────────────────────────────────────
+    // Read actual VM total RAM from /proc/meminfo once at startup so every
+    // threshold is proportional to the real machine instead of a hardcoded
+    // constant that may be wrong for the current deployment size.
+    // Fallback: 4096 MB (conservative for unknown environments).
+    const _readVmTotalMB = (): number => {
+      try {
+        const fs = require("fs") as typeof import("fs")
+        const raw = fs.readFileSync("/proc/meminfo", "utf8")
+        const match = raw.match(/MemTotal:\s+(\d+)\s+kB/)
+        return match ? Math.round(parseInt(match[1], 10) / 1024) : 4_096
+      } catch {
+        return 4_096
+      }
+    }
+    if (!globalCleanup.__redis_mem_limits) {
+      const vmTotalMB   = _readVmTotalMB()
+      // Reserve 2 GB for OS, other processes, and headroom before kernel OOM.
+      // V8 heap cap (--max-old-space-size) is set to 5632 in package.json for
+      // the actual 8606 MB VM, leaving ~3 GB of OS+slack buffer.
+      const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
+      // Heap trigger: fire at 65% of usable. On 8.6 GB VM → ~4.3 GB usable → ~2.8 GB heap trigger.
+      const heapMB      = Math.round(usableMB * 0.65)
+      // RSS soft: 75% of usable — force GC above this.
+      const rssSoftMB   = Math.round(usableMB * 0.75)
+      // RSS hard: 88% of usable — critical eviction + sleep above this.
+      const rssHardMB   = Math.round(usableMB * 0.88)
+      const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
+      // Key count: scale with both symbol count and VM size.
+      const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))
+      globalCleanup.__redis_mem_limits = { heapMB, rssSoftMB, rssHardMB, maxKeys }
+      console.log(
+        `[v0] [Redis Memory] VM=${vmTotalMB}MB usable=${usableMB}MB ` +
+        `→ heapTrigger=${heapMB}MB rssSoft=${rssSoftMB}MB rssHard=${rssHardMB}MB maxKeys=${maxKeys}`
+      )
+    }
+    const MEM = globalCleanup.__redis_mem_limits
 
     // Run an immediate targeted flush at startup to clear volatile key families
-    // that accumulate across hot-reload cycles (the globalThis Map persists between
-    // Next.js hot-reloads without a full process restart). Runs unconditionally
-    // because OOM-causing families (strategies:, indication:, pseudo_position:) can
-    // hold 20+ MB while only occupying a few hundred key slots.
-    void this.cleanupVolatileRuntimeState({ mode: "unified", reason: "inline-startup" })
+    // that accumulate across hot-reload cycles.
+    void this.cleanupVolatileRuntimeState({ reason: "inline-startup" })
 
     // Throttle eviction log output: only print once per 60 s when stuck above
-    // the key limit so the server log stays readable.
+    // the threshold so the server log stays readable.
     let _lastEvictionLogMs = 0
+
     const ttlCleanupTimer = setInterval(() => {
       try {
         // First, clean up expired keys
         this.cleanupExpiredKeys()
 
-        // Check memory pressure: evict if heap, RSS, or key count is too high.
-        // heapUsed alone is insufficient — after a heavy live-trading session the GC
-        // reduces heapUsed to ~600 MB (below the 800 MB trigger) while RSS stays at
-        // 4+ GB because V8 holds committed pages for future allocation. RSS is a better
-        // proxy for true process-level memory pressure, especially on the 6 GB VM where
-        // total system RAM (RSS_all_processes) matters more than individual heap metrics.
-        const mem = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
+        const mem        = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
-        // RSS trigger: 1800 MB — catches burst before RSS explodes to OOM territory.
-        const RSS_PRESSURE_MB = 1_800
-        const totalKeys = this.data.strings.size + this.data.hashes.size +
-                          this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
-        // Scale the key-count eviction trigger with symbol count.
-        // Baseline: 1000 protected keys + N × 800 pipeline keys.
-        const _nSymsForKeys = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
-        const MAX_TOTAL_KEYS = 1_000 + _nSymsForKeys * 800
-        const shouldEvict = heapUsedMB > HEAP_PRESSURE_MB || rssMB > RSS_PRESSURE_MB || totalKeys > MAX_TOTAL_KEYS
-        if (shouldEvict) {
-          const now = Date.now()
-          // Only log once per 60 s to avoid flooding the server log when stuck
-          // above the threshold (e.g. a large snapshot with mostly-protected keys).
-          if (now - _lastEvictionLogMs > 60_000) {
-            _lastEvictionLogMs = now
-            if (rssMB > RSS_PRESSURE_MB) {
-              console.log(`[v0] [Redis Memory] RSS at ${rssMB.toFixed(0)}MB (>${RSS_PRESSURE_MB}MB), evicting old records...`)
-            } else if (heapUsedMB > HEAP_PRESSURE_MB) {
-              console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
-            } else {
-              console.log(`[v0] [Redis Memory] Key count at ${totalKeys} (>${MAX_TOTAL_KEYS}), evicting old records...`)
-            }
-            console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
-          }
+        const totalKeys  = this.data.strings.size + this.data.hashes.size +
+                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
+
+        // Three-tier pressure response:
+        //   NORMAL  → no action
+        //   WARM    → evict + GC
+        //   CRITICAL → volatile cleanup + 3× evict passes + GC + throttle sleep
+        const isCritical = rssMB > MEM.rssHardMB
+        const isWarm     = isCritical || heapUsedMB > MEM.heapMB || rssMB > MEM.rssSoftMB || totalKeys > MEM.maxKeys
+
+        if (!isWarm) return
+
+        const now = Date.now()
+        if (now - _lastEvictionLogMs > 60_000) {
+          _lastEvictionLogMs = now
+          const reason = isCritical
+            ? `CRITICAL RSS=${rssMB.toFixed(0)}MB >hard ${MEM.rssHardMB}MB`
+            : rssMB > MEM.rssSoftMB
+              ? `RSS=${rssMB.toFixed(0)}MB >soft ${MEM.rssSoftMB}MB`
+              : heapUsedMB > MEM.heapMB
+                ? `Heap=${heapUsedMB.toFixed(0)}MB >${MEM.heapMB}MB`
+                : `Keys=${totalKeys} >${MEM.maxKeys}`
+          console.log(`[v0] [Redis Memory] ${reason} — evicting. Families: ${this.describeKeyFamilies()}`)
+        }
+
+        if (isCritical) {
+          // CRITICAL: purge volatile families first, then run 3 eviction passes
+          // to maximally reclaim before the engine's next cycle can add more.
+          void this.cleanupVolatileRuntimeState({ reason: "critical-rss" })
           this.evictOldRecords()
-          // Nudge GC if exposed (dev runs with --expose-gc sometimes); the
-          // emulator frees Map references above, this returns them to the OS.
+          this.evictOldRecords()
+          this.evictOldRecords()
+          ;(globalThis as any).gc?.()
+        } else {
+          this.evictOldRecords()
           ;(globalThis as any).gc?.()
         }
-      } catch (err) {
-        // Swallow errors so the cleanup timer doesn't die
+      } catch {
+        // Swallow errors so the cleanup timer never dies
       }
-    }, CLEANUP_INTERVAL_MS)
+    }, 1_000)
     ttlCleanupTimer.unref?.()
   }
   
@@ -689,32 +710,37 @@ export class InlineLocalRedis implements RedisClientLike {
     // with ~8× fewer comparisons per key (average 3 prefix checks vs 24).
     //
     // Bucket names mirror the old family rules, so the cap values are unchanged.
-    // ── Per-symbol-aware eviction caps ────────────────────────────────────
-    // Scale linearly with symbol count so a 4-symbol run gets 4× more key
-    // slots. Same values used in all modes — no dev/prod split.
+    // ── Dynamic per-symbol eviction caps ──────────────────────────────────
+    // Scale linearly with symbol count AND with available VM RAM so that a
+    // larger machine automatically allows more key headroom without hitting
+    // the caps too aggressively.
     const _N = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
+    // memScale: 1.0 on a 4 GB VM, ~2.0 on 8 GB, ~3.0 on 12 GB.
+    // Use the cached limits computed at startup; fall back to 1.0 if not yet set.
+    const _gl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
+    const _memScale = _gl ? Math.max(1, _gl.heapMB / 2_048) : 1
 
     const CAPS: Record<string, number> = {
-      pseudo_position:              _N * 80,
-      s_pseudo_position:            _N * 60,
-      strategies:                   Math.max(100, _N * 30),
-      s_strategies:                 Math.max(20,  _N * 15),
-      config_set:                   Math.max(1500, _N * 40),
-      strategy_positions:           Math.max(1000, _N * 20),
-      strategy_detail:              Math.max(1000, _N * 20),
-      real_stage:                   Math.max(1000, _N * 20),
-      indication:                   Math.max(500,  _N * 60),
-      indications:                  Math.max(100,  _N * 15),
-      indication_set:               Math.max(5000, _N * 80),
-      indication_outcomes_pending:  Math.max(200,  _N * 10),
+      pseudo_position:              Math.round(_N * 80  * _memScale),
+      s_pseudo_position:            Math.round(_N * 60  * _memScale),
+      strategies:                   Math.max(100, Math.round(_N * 30  * _memScale)),
+      s_strategies:                 Math.max(20,  Math.round(_N * 15  * _memScale)),
+      config_set:                   Math.max(1500,Math.round(_N * 40  * _memScale)),
+      strategy_positions:           Math.max(1000,Math.round(_N * 20  * _memScale)),
+      strategy_detail:              Math.max(1000,Math.round(_N * 20  * _memScale)),
+      real_stage:                   Math.max(1000,Math.round(_N * 20  * _memScale)),
+      indication:                   Math.max(500, Math.round(_N * 60  * _memScale)),
+      indications:                  Math.max(100, Math.round(_N * 15  * _memScale)),
+      indication_set:               Math.max(5000,Math.round(_N * 80  * _memScale)),
+      indication_outcomes_pending:  Math.max(200, Math.round(_N * 10  * _memScale)),
       axis_pos_acc:                 5,
       prehistoric:                  20,
-      live_history:                 Math.max(500,  _N * 20),
+      live_history:                 Math.max(500, Math.round(_N * 20  * _memScale)),
       // string-only
-      indications_str:              Math.max(50,   _N * 15),
-      dedup:                        Math.max(3000, _N * 60),
-      candle_cache:                 Math.max(20,   _N * 4),
-      candles:                      Math.max(20,   _N * 4),
+      indications_str:              Math.max(50,  Math.round(_N * 15  * _memScale)),
+      dedup:                        Math.max(3000,Math.round(_N * 60  * _memScale)),
+      candle_cache:                 Math.max(20,  Math.round(_N * 4   * _memScale)),
+      candles:                      Math.max(20,  Math.round(_N * 4   * _memScale)),
     }
 
     // Classify a key into a bucket name; returns null for protected/untracked keys.
