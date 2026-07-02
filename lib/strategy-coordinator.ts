@@ -3437,7 +3437,6 @@ export class StrategyCoordinator {
       // When hasLong === hasShort === true: symmetric cancel is correct — no bootstrap.
       // When hasLong === hasShort === false: no sets at all — nothing to bootstrap.
     }
-    }
     let realPostHedge = [...effectiveNetted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )

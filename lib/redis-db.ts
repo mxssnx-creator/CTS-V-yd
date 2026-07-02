@@ -873,13 +873,14 @@ export class InlineLocalRedis implements RedisClientLike {
       for (const [key, fields] of this.data.hashes.entries()) {
         if (!key.startsWith("live:position:")) continue
         if (key.startsWith("live:position:tracking:")) continue
-        const status = fields.get?.("status") ?? fields["status"] ?? ""
+        // `fields` is a plain Record<string, string> — direct property access.
+        const status = fields["status"] ?? ""
         if (!TERMINAL_STATUSES.has(status)) continue
         // Extract connection id from the position id embedded in the hash
-        const posId: string = fields.get?.("id") ?? fields["id"] ?? key
+        const posId: string = fields["id"] ?? key
         const connMatch = posId.match(/^live:([^:]+:[^:]+):/)
         const connKey = connMatch ? connMatch[1] : "unknown"
-        const ts = Number(fields.get?.("closedAt") ?? fields["closedAt"] ?? fields.get?.("updatedAt") ?? fields["updatedAt"] ?? 0)
+        const ts = Number(fields["closedAt"] ?? fields["updatedAt"] ?? 0)
         let arr = terminalByConn.get(connKey)
         if (!arr) { arr = []; terminalByConn.set(connKey, arr) }
         arr.push([key, ts])
