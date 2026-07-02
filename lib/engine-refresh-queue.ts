@@ -11,6 +11,9 @@ export interface EngineRefreshRequest {
   state_switch_version: string | number
   reason: string
   timestamp: string
+  retryCount?: number
+  lastError?: string
+  lastErrorAt?: string
 }
 
 export function nextStateSwitchVersion(connection: any): string {
@@ -79,4 +82,19 @@ export async function clearEngineRefreshRequest(connectionId: string): Promise<v
     client.del(`settings:${ENGINE_REFRESH_REQUEST_PREFIX}${connectionId}`).catch(() => 0),
     (client.srem?.(`settings:${ENGINE_REFRESH_REQUEST_INDEX}`, connectionId) ?? Promise.resolve(0)).catch(() => 0),
   ])
+}
+
+export async function recordEngineRefreshRequestFailure(
+  request: EngineRefreshRequest,
+  error: unknown,
+): Promise<void> {
+  const retryCount = Number(request.retryCount ?? 0)
+  const lastError = error instanceof Error ? error.message : String(error)
+  await setSettings(`${ENGINE_REFRESH_REQUEST_PREFIX}${request.connectionId}`, {
+    ...request,
+    retryCount: Number.isFinite(retryCount) ? retryCount + 1 : 1,
+    lastError,
+    lastErrorAt: new Date().toISOString(),
+  })
+  await (getRedisClient().sadd?.(`settings:${ENGINE_REFRESH_REQUEST_INDEX}`, request.connectionId) ?? Promise.resolve(0)).catch(() => 0)
 }
