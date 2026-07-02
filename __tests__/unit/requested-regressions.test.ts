@@ -378,18 +378,20 @@ describe("requested regression guardrails", () => {
 
   test("block overlays completed-position counts and active-position exposure at Real stage", () => {
     const source = read("lib/strategy-coordinator.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
 
     expect(source).toContain("Block is not materialized as its own Main/Real Set")
     expect(source).toContain('activeVariants.filter((p) => p.name !== "block")')
     expect(source).toContain("EVERY block size [1..blockMaxStack]")
     expect(source).toContain("blockMaxStack:    10")
-    expect(source).toContain("Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))")
+    expect(source).toContain("Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))")
     expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
     expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
     expect(source).toContain("Active Real/Live-position Block handling belongs to REAL")
     expect(source).toContain("buildActiveRealBlockOverlaysForReal")
     expect(source).toContain("blockActiveRealEnabled && !this._coordinationSettings.blockActiveLiveEnabled")
     expect(source).toContain("setKey: `${source.setKey}#block:active:${boundedCount}`")
+    expect(statsRoute).toContain("const realValidatedActivePositions = realOpen || realDetailRunning || 0")
     expect(source).toContain("variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6))")
     expect(source).toContain("variant: \"block\"")
   })

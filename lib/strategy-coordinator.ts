@@ -3017,7 +3017,7 @@ export class StrategyCoordinator {
       activeByDir[dir]++
     }
 
-    const maxStack = Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))
+    const maxStack = Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))
     const ratio = this._coordinationSettings.blockVolumeRatio
     const pauseRatio = this._coordinationSettings.blockPauseCountRatio
     const overlays: StrategySet[] = []
@@ -4599,8 +4599,7 @@ export class StrategyCoordinator {
             // from previous completed-position recovery logic (not active open
             // positions) and each count receives its own setKey/pause window so
             // performance and cooldown can be tracked independently. If the
-            // operator enables Active Real Position Block, Real stage already
-            // operator enables Active Live Position Block, Real stage already
+            // operator enables Active Real/Live Position Block, Real stage already
             // materializes the running-exposure overlay before caps/stats/tuning;
             // Live consumes that Real Set instead of creating it here. DCA remains a materialized
             // Adjust Set because its reduce/close state has separate evaluation
@@ -4608,7 +4607,7 @@ export class StrategyCoordinator {
             let dispatchCandidates = qualifying
             if (this._coordinationSettings.variants.block) {
               try {
-                const maxStack = Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))
+                const maxStack = Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))
                 const ratio = this._coordinationSettings.blockVolumeRatio
                 const pauseRatio = this._coordinationSettings.blockPauseCountRatio
                 const blockProfile = this.variantProfiles().find((p) => p.name === "block")

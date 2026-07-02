@@ -2793,6 +2793,17 @@ export async function GET(
                 : Math.round(liveAggTotalMarginUsd * 100) / 100
             })()
 
+        // Real-stage active validated positions can be represented either by
+        // persisted RealPosition rows (`realOpen`) or, for coordinator-only
+        // strategy validation cycles, by Real detail's setsRunningNow. Use the
+        // validated Real-stage snapshot as fallback so the UI does not show 0
+        // active Real positions while Real Sets are actively coordinating.
+        const realDetailRunning = n(stratDetail.real?.setsRunningNow)
+        const realValidatedActivePositions = realOpen || realDetailRunning || 0
+        const realActiveAvgDisplay = realValidatedActivePositions > 0 && realActivePosSamples === 0
+          ? realValidatedActivePositions
+          : realActivePosAverage
+
         // Full Exchange Position Details per live position. Contains
         // everything the operator needs to evaluate trade health
         // (leverage, margin at risk, liquidation distance, SL/TP,
@@ -2850,14 +2861,14 @@ export async function GET(
             topSets:      pseudoTopSets,             // { setKey, count }
           },
           real: {
-            open:         realOpen,                  // count only
+            open:         realValidatedActivePositions, // active validated Real-stage position count
             // Running average of currently-active validated Real
             // positions, accumulated across all /stats fetches for this
             // connection. UNBOUNDED — does not share the per-set 250
             // entry cap. See "Running-avg of active validated Real
             // positions" block above for the storage layout. Resets
             // when ResetDB clears `progression:{id}`.
-            activeAvg:    Math.round(realActivePosAverage * 100) / 100,
+            activeAvg:    Math.round(realActiveAvgDisplay * 100) / 100,
             activeSamples: realActivePosSamples,
           },
           live: {
