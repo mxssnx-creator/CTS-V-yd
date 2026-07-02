@@ -755,10 +755,11 @@ export async function POST(request: Request) {
               connection_name: connection.name,
               exchange: exchangeName,
               engine_type: "main",
+              allowInProcessStart: true,
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-            }, { markAssigned: true })
+            }, { markAssigned: true, forceLocalTakeover: true })
 
             // Re-persist the current QuickStart symbol/live gate after engine confirms start.
             // Do not spread the stale pre-QuickStart connection object here; it can

@@ -81,12 +81,13 @@ async function handleStartAll() {
 
         const engineConfig = {
           connectionId: connection.id,
+          allowInProcessStart: true,
           indicationInterval,
           strategyInterval,
           realtimeInterval,
         }
         setImmediate(() => {
-          coordinator.startEngine(connection.id, engineConfig, { markAssigned: true }).catch(async (error: unknown) => {
+          coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true }).catch(async (error: unknown) => {
             console.error(`[START-ALL] Background start failed for ${connection.id}:`, error)
             await client.set(`engine_is_running:${connection.id}`, "0").catch(() => {})
             await SystemLogger.logError(error, "api", `Background start-all engine ${connection.id}`).catch(() => {})
@@ -98,7 +99,7 @@ async function handleStartAll() {
           connectionName: connection.name,
           exchange: connection.exchange,
           success: true,
-          message: "Engine start queued",
+          message: "Engine start dispatched",
         })
 
         successCount++
