@@ -15,7 +15,11 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  serverExternalPackages: ["redis", "@redis/client"],
+  // bingx-api is externalized because it transitively requires @nestjs/common,
+  // whose ValidationPipe lazily requires optional peers (class-validator,
+  // class-transformer). Webpack bundling fails on those optional requires;
+  // loading via Node require at runtime handles them gracefully.
+  serverExternalPackages: ["redis", "@redis/client", "bingx-api"],
   // ── Tier-3 perf: prod-only console removal ───────────────────────
   // Strips `console.log` / `console.debug` / `console.info` from
   // production client + server bundles, keeping `console.error` and
