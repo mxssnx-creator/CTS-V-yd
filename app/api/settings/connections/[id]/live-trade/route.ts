@@ -110,8 +110,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       api_secret: apiSecret,
       is_live_trade: toRedisFlag(isLiveTrade && hasCredentials),
       live_trade_blocked_reason: liveTradeBlockedReason,
+      // If Live is turned on while the main engine is not already running,
+      // make the connection engine-eligible before coordinator.startEngine().
+      // Otherwise startEngine refuses the foreground start as "not assigned /
+      // disabled", which looks like a coordinator crash from the UI.
       ...(isLiveTrade
         ? {
+            is_assigned: "1",
+            is_active_inserted: "1",
+            is_enabled_dashboard: "1",
+            is_active: "1",
             live_trade_requested: "1",
             ...(hasCredentials ? { last_test_status: "success" } : {}),
           }

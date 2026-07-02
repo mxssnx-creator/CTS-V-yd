@@ -28,8 +28,12 @@ import { useExchange } from "@/lib/exchange-context"
 
 const toBooleanFlag = (value: unknown): boolean =>
   value === true || value === 1 || value === "1" || value === "true" || value === "yes" || value === "on"
+// QuickStart's Live button controls effective exchange order placement.
+// `live_trade_requested=1` can be true while credentials are missing and
+// `is_live_trade=0`; treating requested as active makes the next click send
+// `false`, which looks inverted when the operator is trying to enable live.
 const liveTradeUiFlag = (conn: any): boolean =>
-  toBooleanFlag(conn?.live_trade_requested) || toBooleanFlag(conn?.is_live_trade)
+  toBooleanFlag(conn?.is_live_trade)
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -987,7 +991,7 @@ export function QuickstartSection() {
       }
       const requestedState = typeof body?.live_trade_requested === "boolean" ? body.live_trade_requested : nextState
       const effectiveState = typeof body?.is_live_trade === "boolean" ? body.is_live_trade : requestedState
-      setLiveTradeActive(requestedState)
+      setLiveTradeActive(effectiveState)
       addLog(
         requestedState
           ? (effectiveState

@@ -893,6 +893,26 @@ describe("requested regression guardrails", () => {
     expect(overview).toContain("requestSeq !== statsFetchSeqRef.current")
   })
 
+
+  test("QuickStart live button uses effective live state and live-trade enable makes engine eligible", () => {
+    const quickstart = read("components/dashboard/quickstart-section.tsx")
+    const liveRoute = read("app/api/settings/connections/[id]/live-trade/route.ts")
+
+    const quickstartHelper = quickstart.slice(
+      quickstart.indexOf("QuickStart's Live button controls effective exchange order placement"),
+      quickstart.indexOf("// ─── types", quickstart.indexOf("QuickStart's Live button controls effective exchange order placement")),
+    )
+    expect(quickstartHelper).toContain("toBooleanFlag(conn?.is_live_trade)")
+    expect(quickstartHelper).not.toContain("live_trade_requested) ||")
+    expect(quickstart).toContain("setLiveTradeActive(effectiveState)")
+
+    const liveEnableBlock = liveRoute.slice(
+      liveRoute.indexOf("If Live is turned on while the main engine is not already running"),
+      liveRoute.indexOf('live_trade_requested: "1"', liveRoute.indexOf("If Live is turned on while the main engine is not already running")) + 40,
+    )
+    expect(liveEnableBlock).toContain('is_assigned: "1"')
+    expect(liveEnableBlock).toContain('is_enabled_dashboard: "1"')
+    expect(liveEnableBlock).toContain('is_active: "1"')
     expect(helper).toContain('os.totalmem')
     expect(helper).toContain('memory.rss')
   })
