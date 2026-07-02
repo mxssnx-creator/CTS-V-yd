@@ -3683,6 +3683,9 @@ export async function getEnabledConnections(): Promise<any[]> {
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
   return allConnections.filter(conn => {
+    // Canonical engine eligibility: assigned to Main Connections and
+    // enabled via is_enabled_dashboard.
+    return isConnectionMainEnabled(conn)
     // Keep this eligibility in sync with isConnectionReadyForEngine(), which
     // startEngine() re-checks immediately before acquiring startup locks.
     // Live-trade intent is deliberately not part of engine-processing

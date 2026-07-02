@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
+import { initRedis, getAssignedAndEnabledConnections, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
 import { initRedis, getAllConnections, getSettings, getRedisClient, getAssignedAndEnabledConnections } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
@@ -38,6 +39,7 @@ async function handleStartAll() {
       }, { status: 500 })
     }
 
+    // Reuse the canonical Main Connections eligibility rule.
     // Use the same assignment + dashboard-enabled eligibility as the global
     // coordinator. `is_live_trade` controls live order execution, not whether
     // an assigned connection should receive general engine processing.
