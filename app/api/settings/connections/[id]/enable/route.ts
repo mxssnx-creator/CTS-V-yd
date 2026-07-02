@@ -127,6 +127,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             desired_status: "running",
             operator_intent: "running",
             coordinator_ready: "true",
+            operator_stopped: "0",
+            operator_stopped_at: "",
+            stopped_at: "",
             started_at: globalState.started_at || new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
@@ -138,7 +141,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             state_switch_version: stateSwitchVersion,
             reason: "connection_enable",
           })
-          if (!coordinator.isEngineRunning(id)) {
+          const localStartAllowed = true
+          if (localStartAllowed && !coordinator.isEngineRunning(id)) {
             await coordinator.startMissingEngines([updatedConnection])
           }
         }

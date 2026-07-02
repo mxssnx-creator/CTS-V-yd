@@ -354,8 +354,17 @@ export class IndicationSetsProcessor {
         return
       }
 
-      this.normalizePriceHistory(marketData)
-      await this.warnIfPriceHistoryTooShort(symbol, marketData)
+      const priceHistory = this.normalizePriceHistory(marketData)
+      const hasEnoughHistory = await this.warnIfPriceHistoryTooShort(symbol, marketData, priceHistory.length)
+      if (!hasEnoughHistory) {
+        // Warm-up ticks can arrive every few hundred milliseconds while the
+        // rolling history is still below the largest configured range. Running
+        // all Set calculators during that period produces no complete Sets and
+        // can monopolize the API worker in production. Return after the
+        // throttled warning so status/health endpoints remain responsive while
+        // history fills naturally.
+        return
+      }
 
       // Process all 5 set-backed types in parallel with independent logic.
       // Use per-type isolation so an Optimal/Auto calculation failure never
@@ -1345,13 +1354,13 @@ export class IndicationSetsProcessor {
     )
   }
 
-  private async warnIfPriceHistoryTooShort(symbol: string, marketData: any): Promise<void> {
-    const availablePrices = this.normalizePriceHistory(marketData).length
+  private async warnIfPriceHistoryTooShort(symbol: string, marketData: any, normalizedPriceCount?: number): Promise<boolean> {
+    const availablePrices = normalizedPriceCount ?? this.normalizePriceHistory(marketData).length
     const requiredPrices = this.getLargestConfiguredRange()
-    if (availablePrices >= requiredPrices) return
+    if (availablePrices >= requiredPrices) return true
 
     const warningKey = `${symbol}:${availablePrices}:${requiredPrices}`
-    if (this.shortPriceHistoryWarnings.has(warningKey)) return
+    if (this.shortPriceHistoryWarnings.has(warningKey)) return false
     this.shortPriceHistoryWarnings.add(warningKey)
 
     console.warn(
@@ -1363,6 +1372,7 @@ export class IndicationSetsProcessor {
       requiredPrices,
       reason: "insufficient_price_history",
     }).catch(() => {})
+    return false
   }
 
   private getDirection(prices: number[]): number {

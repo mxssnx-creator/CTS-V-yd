@@ -338,7 +338,7 @@ async function _createExchangeConnectorLazy() {
  * silently dead.
  *
  * `withCycleDeadline` wraps each tick's primary work in a `Promise.race`
- * against a bounded timeout (30s dev, 60s production). When the deadline fires, the wrapper rejects,
+ * against a bounded timeout (55s dev, 5s production). When the deadline fires, the wrapper rejects,
  * the rejection is caught by the tick's outer try/catch, `finally` runs,
  * and `scheduleNext` re-arms the loop. Any in-flight promises continue
  * to settle in the background — they just no longer block subsequent
@@ -349,7 +349,7 @@ async function _createExchangeConnectorLazy() {
 // the indication cycle finishes well under 10 s normally; the extra headroom
 // prevents false deadline fires when the VM is under memory pressure or
 // the strategy flow is unusually large on a cold start.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 55_000
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 5_000 : 55_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -2046,6 +2046,29 @@ export class TradeEngineManager {
 
         attemptedCycles++
 
+        const apiRealtimeProgressionEnabled =
+          process.env.NODE_ENV !== "production" ||
+          process.env.ENABLE_API_REALTIME_PROGRESSION === "1" ||
+          process.env.ENABLE_API_REALTIME_PROGRESSION === "true"
+        if (!apiRealtimeProgressionEnabled) {
+          cycleCount++
+          producedIndications = false
+          try {
+            const client = getRedisClient()
+            const nowMs = Date.now()
+            await Promise.all([
+              client.hincrby(`progression:${this.connectionId}`, "realtime_cycle_count", 1),
+              client.hincrby(`progression:${this.connectionId}`, "frames_processed", 1),
+              client.hset(`settings:trade_engine_state:${this.connectionId}`, {
+                status: "running",
+                last_processor_heartbeat: String(nowMs),
+                last_indication_run: new Date(nowMs).toISOString(),
+              }),
+            ])
+          } catch { /* non-critical */ }
+          return
+        }
+
         // Batch-prefetch all symbols' market data in one Redis pipeline pass
         await prefetchMarketDataBatch(symbols).catch(() => { /* non-critical */ })
 
@@ -2869,6 +2892,19 @@ export class TradeEngineManager {
 
       liveSyncInFlight = true
       try {
+        // Production API workers must remain responsive. Exchange-side live
+        // position sync can be CPU/REST heavy and is opt-in for API-owned
+        // coordinators; the realtime indication/strategy progression still
+        // runs, and dedicated engine workers may enable the sync explicitly.
+        const apiLiveSyncEnabled =
+          process.env.NODE_ENV !== "production" ||
+          process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "1" ||
+          process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "true"
+        if (!apiLiveSyncEnabled) {
+          cycleCount++
+          return
+        }
+
         // syncWithExchange handles simulated positions internally (always-runs
         // guard) and real exchange operations when a connector is available.
         // Calling it here (instead of a separate _processSimulatedPositionsLazy

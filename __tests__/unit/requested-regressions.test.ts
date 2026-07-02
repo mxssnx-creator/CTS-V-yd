@@ -435,7 +435,7 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Production must allow in-process starts from the coordinator")
     expect(source).toContain("Duplicate starts")
     expect(source).not.toContain("runningUnderProdStart")
-    expect(source).not.toContain('startEngine(${connectionId}) queued/skipped because in-process start was not explicitly allowed')
+    expect(source).not.toContain("queued-only in this production API worker")
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {
@@ -660,12 +660,28 @@ describe("requested regression guardrails", () => {
     expect(enableRoute).toContain('desired_status: "running"')
     expect(enableRoute).toContain('operator_intent: "running"')
     expect(enableRoute).toContain('coordinator_ready: "true"')
+    expect(enableRoute).toContain('operator_stopped: "0"')
+    expect(enableRoute).toContain('const localStartAllowed = true')
     expect(enableRoute.indexOf('operator_intent: "running"')).toBeLessThan(enableRoute.indexOf("await coordinator.startMissingEngines"))
 
     expect(dashboardRoute).toContain("const preservedCoordinatorIntent")
     expect(dashboardRoute).toContain("desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent")
     expect(dashboardRoute).toContain("operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain('operator_stopped: "0"')
     expect(dashboardRoute).toContain("Only /api/trade-engine/stop owns global shutdown")
+  })
+
+  test("live-trade enable clears stale global operator stop latch", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+    const enableBlock = source.slice(
+      source.indexOf("if (isLiveTrade)"),
+      source.indexOf("await persistNow()", source.indexOf("if (isLiveTrade)")),
+    )
+
+    expect(enableBlock).toContain('operator_intent: "running"')
+    expect(enableBlock).toContain('operator_stopped: "0"')
+    expect(enableBlock).toContain('operator_stopped_at: ""')
+    expect(enableBlock).toContain('stopped_at: ""')
   })
 
 

@@ -179,6 +179,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         status: "running",
         desired_status: "running",
         operator_intent: "running",
+        operator_stopped: "0",
+        operator_stopped_at: "",
+        stopped_at: "",
         mode: hasCredentials ? "live" : "live_requested",
         updated_at: new Date().toISOString(),
       }).catch((stateErr: unknown) => {
@@ -206,14 +209,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         engineStatus = "running"
         console.log(`[v0] [LiveTrade] Engine already running for ${connName} — flag updated, no restart`)
       } else {
-        // Engine is not running — start it so the flag has an effect. In
-        // production/serverless workers, fire-and-forget work scheduled after
-        // the response is not reliable; the worker can be frozen before the
-        // background start runs. Await the coordinator start and return a clear
-        // status to the UI instead of reporting "starting" for work that may
-        // never begin.
+        // Engine is not running — start/reconcile it immediately so enabling
+        // Live Trade has an observable effect in production. The coordinator's
+        // startup and distributed ownership locks prevent duplicate runtimes.
         try {
-          const localStartAllowed = true // explicit UI action: start foreground even without a dedicated worker env flag
+          const localStartAllowed = true
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -270,6 +270,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             status: "running",
             desired_status: "running",
             operator_intent: "running",
+            operator_stopped: "0",
+            operator_stopped_at: "",
+            stopped_at: "",
             last_start_warning: err instanceof Error ? err.message : String(err),
             updated_at: new Date().toISOString(),
           }).catch(() => {})
