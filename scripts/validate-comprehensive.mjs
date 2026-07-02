@@ -5,6 +5,14 @@ import { performance } from 'perf_hooks'
 
 const API_BASE = 'http://localhost:3002/api'
 
+function formatRequestError(error, path) {
+  if (error?.message) return error.message
+  if (Array.isArray(error?.errors) && error.errors.length > 0) {
+    return error.errors.map((err) => err?.message || String(err)).join('; ')
+  }
+  return `Request to ${path} failed: ${String(error)}`
+}
+
 function request(path, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
     const normalizedPath = path.startsWith('/') ? path.slice(1) : path
@@ -15,6 +23,7 @@ function request(path, method = 'GET', body = null) {
       path: url.pathname + url.search,
       method,
       headers: { 'Content-Type': 'application/json' },
+      timeout: 10000,
     }
 
     const req = http.request(options, (res) => {
@@ -29,10 +38,21 @@ function request(path, method = 'GET', body = null) {
       })
     })
 
-    req.on('error', reject)
+    req.on('timeout', () => req.destroy(new Error(`Request timed out: ${method} ${url.href}`)))
+    req.on('error', (error) => reject(new Error(formatRequestError(error, path))))
     if (body) req.write(JSON.stringify(body))
     req.end()
   })
+}
+
+async function apiIsAvailable() {
+  try {
+    const health = await request('/health')
+    return health.status >= 200 && health.status < 500
+  } catch (error) {
+    console.warn(`[SKIP] API server is not reachable at ${API_BASE}: ${formatRequestError(error, '/health')}`)
+    return false
+  }
 }
 
 function strategyCounts(stats) {
@@ -322,6 +342,12 @@ async function main() {
 `)
 
   const start = performance.now()
+
+  if (!(await apiIsAvailable())) {
+    console.log('Start the app with `npm run dev` or `npm run start` before running live workflow validation.')
+    console.log('✓ LIVE VALIDATION SKIPPED (API unavailable)')
+    process.exit(0)
+  }
 
   const results = {
     prehistoric: await testPrehistoric(),

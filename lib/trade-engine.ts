@@ -221,11 +221,6 @@ export class GlobalTradeEngineCoordinator {
   async startEngine(connectionId: string, config: EngineConfig, options: StartEngineOptions = {}): Promise<boolean> {
     const forceLocalTakeover = options.forceLocalTakeover === true || config.allowInProcessStart === true
 
-    // Production must allow in-process starts from the coordinator so explicit
-    // UI/API actions, auto-start healing sweeps, and continuity ticks all work
-    // without requiring a separate dedicated worker env flag. Duplicate starts
-    // are still guarded below by in-process and Redis startup locks.
-  async startEngine(connectionId: string, config: EngineConfig, _options: StartEngineOptions = {}): Promise<boolean> {
     if (!this.canOwnEngineRuntime()) {
       console.warn(
         `[v0] [Coordinator] startEngine(${connectionId}) queued-only in this production API worker; ` +

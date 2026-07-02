@@ -378,18 +378,20 @@ describe("requested regression guardrails", () => {
 
   test("block overlays completed-position counts and active-position exposure at Real stage", () => {
     const source = read("lib/strategy-coordinator.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
 
     expect(source).toContain("Block is not materialized as its own Main/Real Set")
     expect(source).toContain('activeVariants.filter((p) => p.name !== "block")')
     expect(source).toContain("EVERY block size [1..blockMaxStack]")
     expect(source).toContain("blockMaxStack:    10")
-    expect(source).toContain("Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))")
+    expect(source).toContain("Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))")
     expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
     expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
     expect(source).toContain("Active Real/Live-position Block handling belongs to REAL")
     expect(source).toContain("buildActiveRealBlockOverlaysForReal")
     expect(source).toContain("blockActiveRealEnabled && !this._coordinationSettings.blockActiveLiveEnabled")
     expect(source).toContain("setKey: `${source.setKey}#block:active:${boundedCount}`")
+    expect(statsRoute).toContain("const realValidatedActivePositions = realOpen || realDetailRunning || 0")
     expect(source).toContain("variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6))")
     expect(source).toContain("variant: \"block\"")
   })
@@ -441,7 +443,6 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("queued-only in this production API worker")
     expect(source).toContain("Leaving start request queued")
     expect(source).not.toContain("runningUnderProdStart")
-    expect(source).not.toContain("queued-only in this production API worker")
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {
@@ -669,7 +670,8 @@ describe("requested regression guardrails", () => {
     expect(enableRoute).toContain('operator_intent: "running"')
     expect(enableRoute).toContain('coordinator_ready: "true"')
     expect(enableRoute).toContain('operator_stopped: "0"')
-    expect(enableRoute).toContain('const localStartAllowed = true')
+    expect(enableRoute).toContain('const localStartAllowed =')
+    expect(enableRoute).toContain('process.env.NODE_ENV !== "production"')
     expect(enableRoute).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
     expect(enableRoute.indexOf('operator_intent: "running"')).toBeLessThan(enableRoute.indexOf("await coordinator.startMissingEngines"))
 
