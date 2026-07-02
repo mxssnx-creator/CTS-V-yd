@@ -60,6 +60,11 @@ function shouldArmInProcessMonitor(): boolean {
   return true
 }
 
+async function getQueuedRefreshRequestList() {
+  const { getQueuedEngineRefreshRequests } = await import("./engine-refresh-queue")
+  return getQueuedEngineRefreshRequests().catch(() => [] as Awaited<ReturnType<typeof getQueuedEngineRefreshRequests>>)
+}
+
 async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnType<typeof loadTradeEngineCoordinator>>): Promise<number> {
   const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest } = await import("./engine-refresh-queue")
   const { getConnection } = await loadRedisDb()
@@ -181,9 +186,8 @@ export async function runTradeEngineHealingSweep(
 
 async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOptions): Promise<HealingSweepResult> {
   try {
-    const { initRedis, getRedisClient, getAssignedAndEnabledConnections } = await loadRedisDb()
+    const { initRedis, getRedisClient, getAssignedAndEnabledConnections, getConnection } = await loadRedisDb()
     const { loadSettingsAsync } = await import("./settings-storage")
-    const { isConnectionEligibleForEngine } = await import("./connection-state-utils")
     const { writeTradeEngineWorkerHeartbeat } = await import("./trade-engine-worker-heartbeat")
 
     await initRedis()
@@ -208,7 +212,26 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent || "not_running" }
     }
 
+    const coordinator = await loadTradeEngineCoordinator()
+    const queuedRefreshRequests = await getQueuedRefreshRequestList()
+    const stopRequests = queuedRefreshRequests.filter(({ request }) => request.action === "stop")
+    for (const { request } of stopRequests) {
+      await coordinator.stopEngine(request.connectionId, { operatorRequested: true }).catch((stopErr: unknown) => {
+        console.warn(
+          `[v0] [AutoStart] Immediate stop failed for ${request.connectionId}:`,
+          stopErr instanceof Error ? stopErr.message : String(stopErr),
+        )
+      })
+    }
+
     const eligibleConnections = await getAssignedAndEnabledConnections()
+    for (const { request } of queuedRefreshRequests) {
+      if (request.action !== "start") continue
+      if (eligibleConnections.some((connection: any) => connection.id === request.connectionId)) continue
+      const connection = await getConnection(request.connectionId).catch(() => null)
+      if (connection) eligibleConnections.push(connection)
+    }
+
     if (!Array.isArray(eligibleConnections)) {
       console.warn("[v0] [AutoStart] Eligible connections not array, skipping sweep")
       return { startedCount: 0, eligibleCount: 0, skipped: "connections_not_array" }
@@ -217,7 +240,6 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
     // Best-effort warm load. Engines still read Redis settings while ticking.
     await loadSettingsAsync().catch(() => {})
 
-    const coordinator = await loadTradeEngineCoordinator()
     const queuedRefreshProcessedCount = await processQueuedEngineRefreshRequests(coordinator)
     const startedCount = await coordinator.startMissingEngines(eligibleConnections)
 
