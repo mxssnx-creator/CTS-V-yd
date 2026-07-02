@@ -474,11 +474,15 @@ export class InlineLocalRedis implements RedisClientLike {
       if (key.startsWith("live:lock:")) return isDev || olderThanThreshold(key, raw)
       // Prehistoric gates/progress are boot cache gates, not authoritative data.
       if (key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) return isDev || olderThanThreshold(key, raw)
-      // Pipeline/runtime caches are non-authoritative and can be rebuilt.
-      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return true
-      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return true
-      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return true
-      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return true
+      // Pipeline/runtime data is rebuildable in dev, but in production it is the
+      // operator-visible in-flight state. Clearing it on every cold start makes
+      // progress collapse after deploys/serverless wakeups. Prod startup cleanup
+      // therefore preserves these families; stale/expired locks above remain the
+      // only runtime cleanup performed automatically.
+      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return isDev
+      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return isDev
+      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return isDev
+      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return isDev
       return false
     }
 
@@ -653,6 +657,15 @@ export class InlineLocalRedis implements RedisClientLike {
   }
   
   private evictOldRecords(): number {
+    if (process.env.NODE_ENV === "production" && process.env.ENABLE_INLINE_REDIS_PROD_EVICTION !== "1") {
+      // Production correctness beats inline-emulator memory trimming: these
+      // families are active progression state, and evicting them causes the
+      // exact prod-only progress collapses/stalls operators reported. Real
+      // Redis deployments are off-heap and do not need this dev safety valve;
+      // inline production can opt in explicitly if memory pressure is worse
+      // than preserving in-flight progress.
+      return 0
+    }
     // LRU/FIFO eviction of the key families that accumulate unboundedly on the
     // Node heap in the dev emulator. In production these live in real Redis
     // (off-heap) so this is a dev-only safety net, but it is essential: during
@@ -1930,7 +1943,7 @@ export async function cleanupVolatileRuntimeState({
       key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:") ||
       key.startsWith("strategies:") || key.startsWith("settings:strategies")
     ) {
-      del = true
+      del = isDev
     }
     if (del) toDelete.push(key)
     else preserved++
