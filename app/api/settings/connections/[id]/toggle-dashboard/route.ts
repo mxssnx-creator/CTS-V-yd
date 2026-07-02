@@ -223,6 +223,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         // Update global engine intent first. A real explicit enable action
         // clears any stale operator stop latch and starts/reconciles the
         // process-level coordinator below.
+        // clears any stale operator stop latch and then either queues the
+        // dedicated coordinator worker or (only in dev/opt-in environments)
+        // starts the local in-process runtime below.
         const toggleClient = getRedisClient()
         const globalState: Record<string, string> = await toggleClient.hgetall("trade_engine:global").catch(() => ({})) || {}
         const allConnections = await getAllConnections()
@@ -250,6 +253,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           const localStartAllowed = true
+          const localStartAllowed =
+            process.env.NODE_ENV !== "production" ||
+            process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
+            process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()

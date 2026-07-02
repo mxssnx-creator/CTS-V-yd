@@ -119,6 +119,21 @@ export class GlobalTradeEngineCoordinator {
     lastMetricsUpdate: new Date(),
   }
 
+  /**
+   * Whether this Node process is allowed to own long-running trade loops.
+   * Production UI/API workers must default to "queue only": starting the
+   * realtime coordinator in the request worker can starve health/settings
+   * routes after enable/disable or settings saves. Dedicated workers (or
+   * explicit diagnostics) opt in with one of these env flags.
+   */
+  private canOwnEngineRuntime(): boolean {
+    return (
+      process.env.NODE_ENV !== "production" ||
+      process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
+      process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+    )
+  }
+
   constructor() {
     console.log("[v0] GlobalTradeEngineCoordinator initialized with advanced coordination")
     // The coordinator is a long-lived overall state holder. Its background
@@ -210,6 +225,15 @@ export class GlobalTradeEngineCoordinator {
     // UI/API actions, auto-start healing sweeps, and continuity ticks all work
     // without requiring a separate dedicated worker env flag. Duplicate starts
     // are still guarded below by in-process and Redis startup locks.
+  async startEngine(connectionId: string, config: EngineConfig, _options: StartEngineOptions = {}): Promise<boolean> {
+    if (!this.canOwnEngineRuntime()) {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) queued-only in this production API worker; ` +
+          "set ENABLE_TRADE_ENGINE_IN_PROCESS=1 on the coordinator worker to own runtime loops.",
+      )
+      return false
+    }
+
     // Self-heal background timers on every public entry-point — see
     // `ensureBackgroundTimers` doc-block. No-op if already armed.
     this.ensureBackgroundTimers()
@@ -703,6 +727,13 @@ export class GlobalTradeEngineCoordinator {
         if (request.action === "stop") {
           await this.stopEngine(request.connectionId, { operatorRequested: true })
         } else if (request.action === "start") {
+          if (!this.canOwnEngineRuntime()) {
+            console.log(
+              `[v0] [Coordinator] Leaving start request queued for ${request.connectionId}; ` +
+                "this production API worker is not allowed to own engine loops.",
+            )
+            continue
+          }
           if (!this.isEngineRunning(request.connectionId)) {
             await this.startEngineFromConnectionConfig(request.connectionId)
           }

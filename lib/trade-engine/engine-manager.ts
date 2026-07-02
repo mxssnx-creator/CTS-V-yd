@@ -2047,6 +2047,7 @@ export class TradeEngineManager {
         attemptedCycles++
 
         const apiRealtimeProgressionEnabled =
+          process.env.NODE_ENV !== "production" ||
           process.env.ENABLE_API_REALTIME_PROGRESSION === "1" ||
           process.env.ENABLE_API_REALTIME_PROGRESSION === "true"
         if (!apiRealtimeProgressionEnabled) {
@@ -2896,6 +2897,7 @@ export class TradeEngineManager {
         // coordinators; the realtime indication/strategy progression still
         // runs, and dedicated engine workers may enable the sync explicitly.
         const apiLiveSyncEnabled =
+          process.env.NODE_ENV !== "production" ||
           process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "1" ||
           process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "true"
         if (!apiLiveSyncEnabled) {

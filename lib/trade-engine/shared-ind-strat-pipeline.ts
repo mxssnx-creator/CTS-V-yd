@@ -386,6 +386,7 @@ export async function runIndStratCycle(
     // passes its backdated indication array), and let the next productive tick
     // advance the strategy/live stages.
     const apiStrategyFlowEnabled =
+      process.env.NODE_ENV !== "production" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "1" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "true"
     if (result.indicationCount > 0 && apiStrategyFlowEnabled) {
