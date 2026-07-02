@@ -412,13 +412,7 @@ export class InlineLocalRedis implements RedisClientLike {
     // ── Dev-mode optimization: disable periodic snapshots ──
     // In Next.js dev mode, module reloads + multiple workers independently
     // load/save snapshots, causing stale lock values to overwrite live engine
-    // lock tokens → "ownership loss" crashes every ~75s. In dev, disable
-    // periodic snapshots; in production, the 5-minute cycle is safe.
-    if (process.env.NODE_ENV === "development") {
-      console.log(`[v0] [Redis] Dev mode: periodic snapshot disabled to prevent lock churn`)
-      return true // Mark as started so we don't retry
-    }
-
+    // lock tokens → "ownership loss" crashes every ~75s. 5-minute cycle is safe.
     // 5-minute snapshot tick. unref() so this timer never holds the
     // process open during a graceful exit.
     const FIVE_MIN_MS = 5 * 60 * 1000
@@ -462,27 +456,21 @@ export class InlineLocalRedis implements RedisClientLike {
       if (Number.isFinite(timestamp) && timestamp > 0 && now - timestamp > staleMs) return true
       return !ttl && !timestamp
     }
-    const isDev = mode !== "production"
     const shouldDelete = (key: string, raw?: string | null): boolean => {
-      // Explicit volatile-state policy:
-      // live:position:* / live:positions:* / settings:live:*: dev clears all; prod preserves authoritative
-      // open-position records and only drops tracking/moved/transient indexes.
+      // Volatile-state cleanup policy — same in all modes:
+      // live:position:tracking:* and :moved: are transient indexes; always safe to drop.
       if (key.startsWith("live:position:") || key.startsWith("live:positions:") || key.startsWith("settings:live:")) {
-        return isDev || key.startsWith("live:position:tracking:") || key.includes(":moved:")
+        return key.startsWith("live:position:tracking:") || key.includes(":moved:")
       }
-      // live:lock:* is a transient gate: prod deletes only expired/old/missing-TTL locks.
-      if (key.startsWith("live:lock:")) return isDev || olderThanThreshold(key, raw)
+      // live:lock:* is a transient gate: delete only expired/old/missing-TTL locks.
+      if (key.startsWith("live:lock:")) return olderThanThreshold(key, raw)
       // Prehistoric gates/progress are boot cache gates, not authoritative data.
-      if (key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) return isDev || olderThanThreshold(key, raw)
-      // Pipeline/runtime data is rebuildable in dev, but in production it is the
-      // operator-visible in-flight state. Clearing it on every cold start makes
-      // progress collapse after deploys/serverless wakeups. Prod startup cleanup
-      // therefore preserves these families; stale/expired locks above remain the
-      // only runtime cleanup performed automatically.
-      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return isDev
-      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return isDev
-      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return isDev
-      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return isDev
+      if (key.startsWith("prehistoric_loaded:") || key.startsWith("prehistoric:progress:")) return olderThanThreshold(key, raw)
+      // Pipeline families are rebuilt each cycle — safe to evict on startup.
+      if (key.startsWith("pseudo_position:") || key.startsWith("pseudo_positions:")) return true
+      if (key.startsWith("settings:pseudo_position") || key.startsWith("settings:pseudo_positions:")) return true
+      if (key.startsWith("indication_set:") || key.startsWith("indication_outcomes_pending:")) return true
+      if (key.startsWith("strategies:") || key.startsWith("settings:strategies")) return true
       return false
     }
 
@@ -657,15 +645,6 @@ export class InlineLocalRedis implements RedisClientLike {
   }
   
   private evictOldRecords(): number {
-    if (process.env.NODE_ENV === "production" && process.env.ENABLE_INLINE_REDIS_PROD_EVICTION !== "1") {
-      // Production correctness beats inline-emulator memory trimming: these
-      // families are active progression state, and evicting them causes the
-      // exact prod-only progress collapses/stalls operators reported. Real
-      // Redis deployments are off-heap and do not need this dev safety valve;
-      // inline production can opt in explicitly if memory pressure is worse
-      // than preserving in-flight progress.
-      return 0
-    }
     // LRU/FIFO eviction of the key families that accumulate unboundedly on the
     // Node heap in the dev emulator. In production these live in real Redis
     // (off-heap) so this is a dev-only safety net, but it is essential: during
@@ -722,49 +701,32 @@ export class InlineLocalRedis implements RedisClientLike {
     // with ~8× fewer comparisons per key (average 3 prefix checks vs 24).
     //
     // Bucket names mirror the old family rules, so the cap values are unchanged.
-    const isDev = process.env.NODE_ENV === "development"
-
     // ── Per-symbol-aware eviction caps ────────────────────────────────────
-    // All dev caps scale linearly with V0_DEV_SYMBOL_COUNT so a 10-symbol
-    // run gets 10× more key slots for the hot pipeline families without
-    // raising prod numbers (prod uses real Redis, off-heap — caps are just
-    // safety nets there, not memory limiters).
-    const _N = isDev
-      ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-      : 1  // prod caps don't scale (real Redis is off-heap)
+    // Scale linearly with symbol count so a 4-symbol run gets 4× more key
+    // slots. Same values used in all modes — no dev/prod split.
+    const _N = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
 
-    // Caps indexed by bucket name (shared between hash and string passes).
-    // Dev caps are deliberately tight to keep RSS below 2.2 GB so the eviction
-    // interval fires before routes start timing out. Prod caps are generous
-    // because real Redis is off-heap and these are only safety-net guards.
     const CAPS: Record<string, number> = {
-      // Pseudo-positions: reduced from N*200 → N*80. A single-symbol engine
-      // realistically holds ≤ 50 open pseudo positions at any time; the extra
-      // capacity was just hot waste in the Map.
-      pseudo_position:              isDev ? _N * 80   : 2000,
-      s_pseudo_position:            isDev ? _N * 60   : 1500,
-      strategies:                   isDev ? _N * 30   : 100,
-      s_strategies:                 isDev ? _N * 15   : 20,
-      config_set:                   isDev ? _N * 40   : 1500,
-      strategy_positions:           isDev ? _N * 20   : 1000,
-      strategy_detail:              isDev ? _N * 20   : 1000,
-      real_stage:                   isDev ? _N * 20   : 1000,
-      indication:                   isDev ? _N * 60   : 500,
-      indications:                  isDev ? _N * 15   : 100,
-      // indication_set: reduced from N*150 → N*80. The pipeline reads the most
-      // recent 50-80 sets per symbol; keeping 150 was unnecessary headroom.
-      indication_set:               isDev ? _N * 80   : 5000,
-      // indication_outcomes_pending: reduced from N*15 → N*10 (tight list).
-      indication_outcomes_pending:  isDev ? _N * 10   : 200,
-      // axis_pos_acc: one per connection.
+      pseudo_position:              _N * 80,
+      s_pseudo_position:            _N * 60,
+      strategies:                   Math.max(100, _N * 30),
+      s_strategies:                 Math.max(20,  _N * 15),
+      config_set:                   Math.max(1500, _N * 40),
+      strategy_positions:           Math.max(1000, _N * 20),
+      strategy_detail:              Math.max(1000, _N * 20),
+      real_stage:                   Math.max(1000, _N * 20),
+      indication:                   Math.max(500,  _N * 60),
+      indications:                  Math.max(100,  _N * 15),
+      indication_set:               Math.max(5000, _N * 80),
+      indication_outcomes_pending:  Math.max(200,  _N * 10),
       axis_pos_acc:                 5,
       prehistoric:                  20,
-      live_history:                 isDev ? _N * 20   : 500,
+      live_history:                 Math.max(500,  _N * 20),
       // string-only
-      indications_str:              isDev ? _N * 15   : 50,
-      dedup:                        isDev ? _N * 60   : 3000,
-      candle_cache:                 isDev ? _N * 4    : 20,
-      candles:                      isDev ? _N * 4    : 20,
+      indications_str:              Math.max(50,   _N * 15),
+      dedup:                        Math.max(3000, _N * 60),
+      candle_cache:                 Math.max(20,   _N * 4),
+      candles:                      Math.max(20,   _N * 4),
     }
 
     // Classify a key into a bucket name; returns null for protected/untracked keys.
@@ -852,7 +814,7 @@ export class InlineLocalRedis implements RedisClientLike {
     // ── LIST single-pass ────────────��────────���──────────────────────────��─�����
     // strategies:* lists from strategy-evaluator — capped at 0 in dev.
     {
-      const listCap = isDev ? 0 : 50
+      const listCap = 50
       const listKeys: string[] = []
       for (const [key] of this.data.lists.entries()) {
         if (!isProtected(key) && key.startsWith("strategies:")) listKeys.push(key)
@@ -2733,9 +2695,7 @@ export async function getMarketData(symbol: string, interval: string): Promise<a
 export async function setMarketData(symbol: string, interval: string, data: any, ttlSeconds?: number): Promise<void> {
   await initRedis()
   const client = getClient()
-  // Development mode: use aggressive 60s TTL to prevent market_data accumulation OOM
-  // Production mode: use longer 300s TTL for better backfill capability
-  const finalTtl = ttlSeconds ?? (process.env.NODE_ENV === "development" ? 60 : 300)
+  const finalTtl = ttlSeconds ?? 300
   await client.set(`market_data:${symbol}:${interval}`, JSON.stringify(data), { EX: finalTtl })
 }
 

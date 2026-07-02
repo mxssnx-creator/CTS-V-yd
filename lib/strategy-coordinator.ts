@@ -931,7 +931,7 @@ export class StrategyCoordinator {
   private _stratCycleCount = 0
   // Dev-mode real:sets write throttle — only persists every 5th cycle to keep
   // the InlineLocalRedis heap bounded. Initialised lazily in createRealSets.
-  private _realSetWriteCounter = 0
+
 
   /**
    * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
@@ -959,10 +959,7 @@ export class StrategyCoordinator {
   // Scale LRU with symbol count so a single-symbol dev run keeps ~300 slots
   // while a 10-symbol prod run keeps up to 1024. Each slot holds a StrategySet
   // reference (~2-5 KB) so capping tightly saves 8-40 MB of heap in practice.
-  private static readonly _FP_LRU_MAX = (() => {
-    const n = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-    return process.env.NODE_ENV === "development" ? Math.min(512, n * 128) : 1_024
-  })()
+  private static readonly _FP_LRU_MAX = 1_024
   private static _fpLru: Map<string, StrategySet> = new Map()
   private static _fpLruGet(fp: string): StrategySet | undefined {
     const hit = StrategyCoordinator._fpLru.get(fp)
@@ -990,10 +987,7 @@ export class StrategyCoordinator {
   // warmup cycles caused OOM kills before health probes could complete.
   // Scale with symbol count: 1 symbol → 600 slots; 10 symbols → 2000 slots.
   // Each slot ~2-5 KB → 600 slots ≈ 1.2-3 MB (was 16-40 MB at 8000).
-  private static readonly _AXIS_LRU_MAX = (() => {
-    const n = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-    return process.env.NODE_ENV === "development" ? Math.min(1_000, n * 600) : 2_000
-  })()
+  private static readonly _AXIS_LRU_MAX = 2_000
   private static readonly _axisLruMap: Map<string, StrategySet> = new Map()
   private static _axisLruGet(key: string): StrategySet | undefined {
     const hit = StrategyCoordinator._axisLruMap.get(key)
@@ -1449,7 +1443,6 @@ export class StrategyCoordinator {
    * prehistoric pass for a process that stays alive instead of being killed.
    */
   private async memoryCircuitBreaker(symbol: string): Promise<void> {
-    if (process.env.NODE_ENV !== "development") return
     try {
       // Match the memory thresholds from the multi-symbol dev fix (redis-db.ts):
       // dev heap = 4 GB, RSS_PRESSURE = 5000 MB, kernel OOM at ~8.4 GB VM.
@@ -1639,7 +1632,7 @@ export class StrategyCoordinator {
     // graphs; running all N symbols in parallel multiplies peak live heap by N.
     // SYMBOL_CONCURRENCY=3 (dev) / 6 (prod) keeps the in-flight set count
     // proportional to what was previously tested at 5 symbols.
-    const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 3 : 6
+    const SYMBOL_CONCURRENCY = 6
     const queue = [...items]
     const workers = Array.from({ length: Math.min(SYMBOL_CONCURRENCY, queue.length) }, async () => {
       while (queue.length > 0) {
@@ -1946,13 +1939,8 @@ export class StrategyCoordinator {
 
     // Persist BASE sets — skipped in dev mode.
     // Each baseSets blob contains full StrategySet objects (~10 KB each).
-    // Writing these to InlineLocalRedis on every cycle causes rapid heap growth
-    // that OOM-kills the dev server with 20 symbols. In prod this write is kept
-    // for cross-restart recovery; in dev the coordIndex holds the live state.
-    if (process.env.NODE_ENV !== "development") {
-      const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
-      await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
-    }
+    const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
+    await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
 
     // Write Base counts to progression hash so stats API and dashboard read accurate per-stage counts.
     // CRITICAL: Use hincrby (cumulative) not hset (snapshot). Previously each cycle overwrote the
@@ -2247,7 +2235,7 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
-    // ── 2. Base/variant async processing ─��──────────────────────�����───────────
+    // ── 2. Base/variant async processing ─��──────────────────────������───────────
     // Process all baseSet × variant combinations in parallel for faster throughput.
     // Each combination calls the async buildVariantSet, which previously ran
     // sequentially. Now they all start together and resolve concurrently.
@@ -2504,24 +2492,12 @@ export class StrategyCoordinator {
       // V0_DEV_SYMBOL_COUNT controls the dev symbol count (default 1).
       // At 10 symbols: 10 × 300 = 3000 ceiling (well within 4GB heap with
       // the new per-symbol eviction caps in redis-db).
-      const _devSyms = process.env.NODE_ENV === "development"
-        ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-        : 1
       const rawAxisCeiling = Number(process.env.STRATEGY_MAIN_AXIS_SETS_CEILING ?? "")
       const configuredAxisCeiling =
         Number.isFinite(rawAxisCeiling) && rawAxisCeiling > 0
           ? Math.floor(rawAxisCeiling)
           : null
-      // Dev: 150 per symbol keeps the pipeline fed without the memory spike
-      // that 300/sym caused (300 × ~2 KB entries × 2 variants = ~1.2 MB/sym
-      // in-flight; at 1 sym the cycle footprint drops from ~600 KB to ~300 KB).
-      // Prod: 5000 (system generates up to ~2000+ Main sets per cycle; ceiling
-      // ensures no truncation while memory stays bounded at ~3.5GB production heap).
-      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (
-        process.env.NODE_ENV === "development"
-          ? Math.max(150, _devSyms * 150)
-          : 5000
-      )
+      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? 5000
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -2535,7 +2511,7 @@ export class StrategyCoordinator {
           mainSets.push(axisSet)
           axisSetsAdded++
 
-          // ── Register axis SetCoordRecord ───────────��─────────────────
+          // ── Register axis SetCoordRecord ──────────����─────────────────
           // Axis sets carry a synthetic entry but their quality data lives
           // on the parent Base Set. Recording the parentKey here enables
           // createLiveSets to do a O(1) base lookup instead of O(N) find().
@@ -2691,31 +2667,20 @@ export class StrategyCoordinator {
     // Full Base Set blobs are already in base:sets; Main sets are re-derivable from
     // coordIndex in the pipeline. Slim key-list cuts the per-symbol write from
     // ~500 KB (full mainSets blob with entries:[]) to ~N×30 bytes — 16× smaller.
-    // Skipped in dev mode entirely (coordIndex is the in-memory source of truth).
-    if (process.env.NODE_ENV !== "development") {
-      const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-      await setSettings(mainKey, {
-        setKeys: mainSets.map((s) => s.setKey),
-        count:   mainSets.length,
-        created: new Date(),
-        _slim:   true,
-      })
-    }
-    // DEV-MODE BYPASS: fpCache writes create 20 hash keys (one per symbol) every
-    // createMainSets call and replace them fully each time (del + hset). In dev the
-    // in-memory coordIndex is the source of truth; the fpCache is only used on cold
-    // restart to avoid re-processing identical fingerprints. Skip in dev.
-    if (process.env.NODE_ENV !== "development") {
-      try {
-        if (Object.keys(nextFpCache).length > 0) {
-          // Replace the cache atomically so deletions take effect (a Set that
-          // no longer qualifies simply isn't re-written and falls out on TTL).
-          await client.del(fpCacheKey).catch(() => {})
-          await client.hset(fpCacheKey, nextFpCache)
-          await client.expire(fpCacheKey, 300) // 5 min TTL
-        }
-      } catch { /* non-critical */ }
-    }
+    const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
+    await setSettings(mainKey, {
+      setKeys: mainSets.map((s) => s.setKey),
+      count:   mainSets.length,
+      created: new Date(),
+      _slim:   true,
+    })
+    try {
+      if (Object.keys(nextFpCache).length > 0) {
+        await client.del(fpCacheKey).catch(() => {})
+        await client.hset(fpCacheKey, nextFpCache)
+        await client.expire(fpCacheKey, 300) // 5 min TTL
+      }
+    } catch { /* non-critical */ }
 
     const mainDetailKey = `strategy_detail:${this.connectionId}:main`
     // BASE->MAIN pass rate = fraction of Base Sets that produced ≥1 variant.
@@ -2890,14 +2855,7 @@ export class StrategyCoordinator {
       // That gives the gates real sampled positions + populates the dashboard tile
       // while keeping the write volume bounded (N×3 ops, not 3000×3). Prod is
       // uncapped. Sorting is cheap relative to the avoided write amplification.
-      const isDev = process.env.NODE_ENV === "development"
-      const DEV_PSEUDO_CAP = 25
-      let workingSets = realSets
-      if (isDev && realSets.length > DEV_PSEUDO_CAP) {
-        workingSets = [...realSets]
-          .sort((a, b) => (b.avgProfitFactor || 0) - (a.avgProfitFactor || 0))
-          .slice(0, DEV_PSEUDO_CAP)
-      }
+      const workingSets = realSets
 
       const client = getRedisClient()
       // PERFORMANCE: previous implementation looped serially with one GET
@@ -3486,19 +3444,12 @@ export class StrategyCoordinator {
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
     // candidates for the live dispatch to find qualifying PF-positive sets.
     // Scale with dev symbol count: 60 real sets per symbol in dev, 100 in prod.
-    const _devSymsReal = process.env.NODE_ENV === "development"
-      ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-      : 1
     const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_SAFETY_CEILING ?? "")
     const configuredRealCeiling =
       Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
         ? Math.floor(rawRealCeiling)
         : null
-    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (
-      process.env.NODE_ENV === "development"
-        ? Math.max(200, _devSymsReal * 60)
-        : 5000  // Production: no truncation; system generates 2000+, all pass through
-    )
+    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? 5000
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
@@ -3724,10 +3675,7 @@ export class StrategyCoordinator {
     // unchanged & magnitude shrunk → partial CLOSE lowest-PF; direction
     // flipped or flat:0 ��� close all in bucket then optionally re-open.
     // live_net_target tracks hedge-direction net positions for the live dispatch.
-    // Skip in dev: this hset fires for every qualifying Real set on every cycle.
-    // The live dispatch reads coordIndex directly; live_net_target is a prod-only
-    // cross-cycle fallback for the Phase 4 pipeline.
-    if (process.env.NODE_ENV !== "development" && Object.keys(netTargetWrites).length > 0) {
+    if (Object.keys(netTargetWrites).length > 0) {
       try {
         const netClient = getRedisClient()
         const targetKey = `live_net_target:${this.connectionId}`
@@ -3749,17 +3697,12 @@ export class StrategyCoordinator {
     // Dashboard stats read from in-memory progression counters for the live count;
     // the key list is only needed for structural queries which tolerate stale data.
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
-    const shouldWriteRealSets =
-      process.env.NODE_ENV !== "development" ||
-      (this._realSetWriteCounter = ((this._realSetWriteCounter ?? 0) + 1)) % 50 === 1
-    if (shouldWriteRealSets) {
-      await setSettings(realKey, {
-        setKeys: realSets.map((s) => s.setKey),
-        count:   realSets.length,
-        created: new Date(),
-        _slim:   true,
-      })
-    }
+    await setSettings(realKey, {
+      setKeys: realSets.map((s) => s.setKey),
+      count:   realSets.length,
+      created: new Date(),
+      _slim:   true,
+    })
 
     // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
     // pre-gated sets). Used for correct passRatioReal and evaluated counters.
@@ -4214,12 +4157,10 @@ export class StrategyCoordinator {
       // exercised in test environments. Guard by testnet flag ONLY.
       // CRITICAL: FORCE_LIVE is NEVER a testnet override — it's a debug flag for dev.
       // Always verify actual is_testnet on the connection record (async read required).
-      // In dev we short-circuit the getConnection() call since NODE_ENV==="development"
-      // already covers the dev-mode fallback below (line 4297).
+      // Always check actual is_testnet on the connection record.
       try {
-        const isDevEnv = process.env.NODE_ENV === "development"
-        const conn = isDevEnv ? null : (await (await import("@/lib/redis-db")).getConnection(this.connectionId)) || {}
-        const isTestConn = isDevEnv || conn?.is_testnet === true || conn?.is_testnet === "1"
+        const conn = (await (await import("@/lib/redis-db")).getConnection(this.connectionId)) || {}
+        const isTestConn = conn?.is_testnet === true || conn?.is_testnet === "1"
         if (realSets.length === 0 && isTestConn) {
           const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
           const mainStored = await getSettings(mainKey)
@@ -4290,13 +4231,11 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    // DEV/TEST fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
-    // Short-circuit getConnection() in dev — NODE_ENV check is free vs async Redis read per cycle.
-    // CRITICAL: FORCE_SIMULATED/FORCE_LIVE are debug flags; ALWAYS verify actual is_testnet on connection record.
+    // Testnet fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
+    // CRITICAL: Always verify actual is_testnet on connection record.
     try {
-      const isDevMode = process.env.NODE_ENV === "development"
-      const conn = isDevMode ? null : await (await import("@/lib/redis-db")).getConnection(this.connectionId)
-      const isTestOrDev = isDevMode || conn?.is_testnet === true || conn?.is_testnet === "1"
+      const conn = await (await import("@/lib/redis-db")).getConnection(this.connectionId)
+      const isTestOrDev = conn?.is_testnet === true || conn?.is_testnet === "1"
       if (qualifying.length === 0 && isTestOrDev) {
         if (realSets.length > 0) {
           qualifying = [realSets.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)[0]]
@@ -4332,21 +4271,14 @@ export class StrategyCoordinator {
 
 
 
-    // Persist LIVE sets — slim format (coord keys only). Skip in dev:
-    // setSettings writes to InlineLocalRedis (on-heap Map) on every cycle for
-    // every symbol; 20 symbols × every 0.3s = 67 writes/s with no reclaim.
-    // The coordIndex holds live state in dev; live:sets is only needed for the
-    // Phase 4 pipeline fallback (prod-only cross-cycle recovery path).
-    if (process.env.NODE_ENV !== "development") {
-      const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
-      await setSettings(liveKey, {
-        setKeys:    qualifying.map((s) => s.setKey),
-        count:      qualifying.length,
-        created:    new Date(),
-        executable: true,
-        _slim:      true,
-      })
-    }
+    const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
+    await setSettings(liveKey, {
+      setKeys:    qualifying.map((s) => s.setKey),
+      count:      qualifying.length,
+      created:    new Date(),
+      executable: true,
+      _slim:      true,
+    })
 
     // Create pseudo positions from the LIVE-qualifying subset only.
     // Previously received all `realSets` (up to 3000/symbol), causing N×3 Redis
@@ -4398,11 +4330,7 @@ export class StrategyCoordinator {
 
       // ── bumpValidPositions — Live-promoted Set counter ─────────────────
       // The `valid_positions:{conn}` hash tracks Sets reaching Live stage.
-      // Skip in dev: qualifying.length × multi() pipeline writes fire every 0.3s
-      // per symbol (up to 400 sets × 20 symbols = 8000 writes/cycle), driving
-      // heap pressure faster than GC can reclaim. The "Valid positions" dashboard
-      // tile is observability-only; the engine does not read from valid_positions.
-      if (process.env.NODE_ENV !== "development") {
+      {
         try {
           const { bumpValidPositions } = await import("@/lib/pos-history")
           const vpPipeline = getRedisClient().multi()

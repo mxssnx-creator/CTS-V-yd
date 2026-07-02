@@ -358,7 +358,7 @@ async function generateIndicationsForConnection(
     const realGenerated = Math.max(0, Math.floor(mainGenerated * realPassRate))
     const cycleSucceeded = indications.length > 0
 
-    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ───��────────
+    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ───���────────
     // market_data, all per-indication counters + latest hashes, progression
     // counters, cycle-completion accounting and final progression snapshot are
     // all queued into one multi()/exec() so N indication types + M counter
@@ -564,7 +564,6 @@ export async function GET() {
     let totalMain = 0
     let totalReal = 0
 
-    const isProd = process.env.NODE_ENV === "production"
     const cyclesPerCron = 1
 
     for (const connection of activeConnections) {
@@ -601,10 +600,7 @@ export async function GET() {
       let symbolsToProcess = symbolsRaw.length > 0
         ? symbolsRaw
         : Array.from(new Set([primarySymbol, "BTCUSDT"].filter(Boolean)))
-      // Production must process the operator-selected connection symbols, not a
-      // hard-coded market basket. Limit the per-tick batch to keep serverless
-      // invocations bounded; the next cron tick continues from fresh data.
-      if (isProd) symbolsToProcess = symbolsToProcess.slice(0, 20)
+      symbolsToProcess = symbolsToProcess.slice(0, 20)
 
       for (let c = 0; c < cyclesPerCron; c++) {
         // Process all symbols for this cycle concurrently.
@@ -624,23 +620,12 @@ export async function GET() {
           totalReal += r.real
         }
 
-        if (isProd && process.env.DISABLE_PROD_CRON_STRATEGIES !== "1") {
-          // Production deployments may not keep a long-lived engine loop hot,
-          // so cron must advance a bounded slice of the canonical strategy
-          // pipeline through Base/Main/Real too.
-          //
-          // CHANGED: previously this ran with isPrehistoric=true, which forced
-          // a NEUTRAL position context — meaning only the always-on `default`
-          // variant was ever produced, so trailing/block/dca stayed permanently
-          // dead on serverless-only deployments. We now run with REAL position
-          // context (isPrehistoric=false) so those gated variants fire, while
-          // passing skipLiveDispatch=true to keep the cron from placing real
-          // exchange orders. Live order placement remains SOLELY owned by the
-          // running engine/live-sync loop, so there is no double-dispatch even
-          // though the cron now produces the full variant set + pseudo-positions
-          // + stats. Keep it small (top two symbols per tick) to avoid blocking
-          // HTTP cron windows; set DISABLE_PROD_CRON_STRATEGIES=1 for
-          // dedicated-worker deployments where another process owns evaluation.
+        if (process.env.DISABLE_CRON_STRATEGIES !== "1") {
+          // Advance a bounded slice of the canonical strategy pipeline through
+          // Base/Main/Real on every cron tick. skipLiveDispatch=true keeps the
+          // cron from placing real exchange orders — live dispatch is owned by
+          // the running engine/live-sync loop. Keep it small (top two symbols
+          // per tick) to avoid blocking HTTP cron windows.
           const strategyItems = cycleResults
             .map((r, idx) => ({ symbol: symbolsToProcess[idx], indications: r.payload }))
             .filter((item) => item.indications.length > 0)
@@ -680,11 +665,9 @@ export async function GET() {
       }
     }
 
-    if (isProd) {
-      await client.hset("system:logistics", {
-        last_realtime_indication_cron: new Date().toISOString(),
-      }).catch(() => {})
-    }
+    await client.hset("system:logistics", {
+      last_realtime_indication_cron: new Date().toISOString(),
+    }).catch(() => {})
 
     return NextResponse.json({
       success: true,

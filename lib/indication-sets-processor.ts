@@ -133,19 +133,14 @@ export class IndicationSetsProcessor {
   //              × 5 types × 3 symbols = 7,830 keys/cycle → accumulates fast
   //   Dev  grid:  3 ranges × 2 dd × 1 lp × 2 fm = 12  keys/type/symbol
   //              × 5 types × 3 symbols = 180 keys/cycle — easily evictable
-  private readonly _isDev = process.env.NODE_ENV === "development"
-  private directionMoveRanges: number[] = this._isDev
-    ? [5, 15, 25]                                        // 3 representative dev ranges
-    : Array.from({ length: 29 }, (_, i) => i + 2)       // 2..30 prod
-  private optimalRanges: number[] = this._isDev
-    ? [5, 15, 25]
-    : Array.from({ length: 29 }, (_, i) => i + 2)
-  private drawdownRatios: number[] = this._isDev ? [0.5, 1.5]           : [0.5, 1.0, 1.5]
-  private lastPartRatios: number[] = this._isDev ? [0.5]                : [0.25, 0.5]
-  private factorMultipliers: number[] = this._isDev ? [0.9, 1.1]        : [0.9, 1.0, 1.1]
-  private activeThresholds: number[] = this._isDev ? [0.5, 2.5]         : [0.5, 1.0, 1.5, 2.0, 2.5]
-  private activeTimeRatios: number[] = this._isDev ? [1.0]              : [0.5, 1.0]
-  private activeAdvancedActivityRatios: number[] = this._isDev ? [1.0, 2.0] : [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  private directionMoveRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
+  private optimalRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2)
+  private drawdownRatios: number[] = [0.5, 1.0, 1.5]
+  private lastPartRatios: number[] = [0.25, 0.5]
+  private factorMultipliers: number[] = [0.9, 1.0, 1.1]
+  private activeThresholds: number[] = [0.5, 1.0, 1.5, 2.0, 2.5]
+  private activeTimeRatios: number[] = [0.5, 1.0]
+  private activeAdvancedActivityRatios: number[] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
   private activeAdvancedMinPositions = 3
   private activeAdvancedContinuationRatio = 0.6
   private shortPriceHistoryWarnings: Set<string> = new Set()
@@ -765,33 +760,6 @@ export class IndicationSetsProcessor {
       // The strategy-coordinator reads these keys to build Real-stage sets; it
       // only needs the most-recent entry (it re-evaluates from scratch each cycle)
       // so overwriting loses no functional data.
-      if (process.env.NODE_ENV === "development") {
-        const now = Date.now()
-        const timestamp = new Date().toISOString()
-        await Promise.all(
-          writes.map(async ({ setKey, indication, config }, idx) => {
-            const direction: "long" | "short" =
-              indication.direction === "short" ? "short"
-              : indication.direction === "long" ? "long"
-              : indication?.metadata?.firstDir < 0 ? "short"
-              : "long"
-            const entry = {
-              id: `${type}_${now}_${idx}`,
-              timestamp,
-              type,
-              direction,
-              profitFactor: indication.profitFactor,
-              signalScore: indication.signalScore,
-              rawSignalStrength: indication.rawSignalStrength,
-              confidence: indication.confidence,
-              config,
-              metadata: indication.metadata,
-            }
-            await client.set(setKey, JSON.stringify([entry]))
-          })
-        )
-        return
-      }
       const now = Date.now()
       const timestamp = new Date().toISOString()
 
@@ -1019,10 +987,7 @@ export class IndicationSetsProcessor {
       // far more than the low-RAM dev VM needs; 100 is plenty to evaluate forward
       // outcomes. Production keeps the full 1000-entry window.
       // Scale with symbol count: 30 per symbol in dev (e.g. 300 for 10 symbols).
-      const _nDevSyms = this._isDev
-        ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-        : 1
-      const pendingCap = this._isDev ? Math.max(100, _nDevSyms * 30) : 1000
+      const pendingCap = 1000
       await client.ltrim(key, -pendingCap, -1)
       await client.expire(key, 86400)
     } catch { /* non-critical */ }
