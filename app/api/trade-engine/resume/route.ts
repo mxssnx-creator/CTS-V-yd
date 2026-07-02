@@ -48,10 +48,16 @@ export async function POST() {
 
     try {
       await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")
+      console.log("[v0] Global running intent published for resume")
+    } catch (err) {
+      console.warn("[v0] Failed to publish running intent:", err instanceof Error ? err.message : String(err))
+      throw err
     } catch (err) {
       console.warn("[v0] Failed to clear global pause fields:", err instanceof Error ? err.message : String(err))
       // Non-fatal: status fields were already restored before resume.
     }
+
+    await coordinator.resume()
     
     // ── Clear "Paused" state on all Main Connections ───────────────────
     // When resuming the global coordinator, clear the pause marker and
