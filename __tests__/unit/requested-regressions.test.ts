@@ -860,6 +860,39 @@ describe("requested regression guardrails", () => {
     expect(route).not.toContain('memory: 0,')
 
     expect(helper).toContain('process.cpuUsage(previous.cpuUsage)')
+    expect(helper).toContain('/sys/fs/cgroup/memory.max')
+    expect(helper).toContain('/sys/fs/cgroup/cpu.max')
+    expect(helper).toContain('Math.max(0.1')
+    expect(helper).toContain('memory.rss')
+  })
+
+
+  test("progression stats endpoint is read-only for poll-derived real active averages", () => {
+    const route = read("app/api/connections/progression/[id]/stats/route.ts")
+    const snapshotBlock = route.slice(
+      route.indexOf("Active validated Real positions snapshot"),
+      route.indexOf("Live-stage OPEN positions", route.indexOf("Active validated Real positions snapshot")),
+    )
+
+    expect(snapshotBlock).toContain("/stats is a GET/read endpoint and must not mutate Redis")
+    expect(snapshotBlock).toContain("const existingRealActiveAvg = n(progHash.real_active_pos_avg)")
+    expect(snapshotBlock).not.toContain("hincrby")
+    expect(snapshotBlock).not.toContain("hset")
+  })
+
+  test("dashboard stats polling ignores stale overlapping responses", () => {
+    const quickstart = read("components/dashboard/quickstart-section.tsx")
+    const overview = read("components/dashboard/statistics-overview-v2.tsx")
+
+    expect(quickstart).toContain("const statsFetchSeqRef = useRef(0)")
+    expect(quickstart).toContain("const requestSeq = ++statsFetchSeqRef.current")
+    expect(quickstart).toContain("requestSeq !== statsFetchSeqRef.current")
+
+    expect(overview).toContain("const statsFetchSeqRef = useRef(0)")
+    expect(overview).toContain("const requestSeq = ++statsFetchSeqRef.current")
+    expect(overview).toContain("requestSeq !== statsFetchSeqRef.current")
+  })
+
     expect(helper).toContain('os.totalmem')
     expect(helper).toContain('memory.rss')
   })
