@@ -14,6 +14,10 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { canonicalTotalForSymbols, clampProcessedToTotal, getCanonicalSymbolSelection, ownsCanonicalSymbolSelectionEpoch } from "@/lib/trade-engine/symbol-selection-ownership"
 import { calculatePseudoClosePnl } from "@/lib/pseudo-position-costs"
 
+async function yieldToEventLoop(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve))
+}
+
 export interface ProcessingResult {
   indicationConfigs: number
   indicationResults: number
@@ -352,6 +356,9 @@ export class ConfigSetProcessor {
             }
           }
           currentTs += intervalMs
+          if (symbolIntervalCount % 1000 === 0) {
+            await yieldToEventLoop()
+          }
         }
 
         totalIntervalsProcessed += symbolIntervalCount
@@ -830,6 +837,7 @@ export class ConfigSetProcessor {
     const perConfigResults = await Promise.all(
       configs.map(async (config) => {
         try {
+          await yieldToEventLoop()
           const results = this.calculateIndicationResults(symbol, candles, config)
           if (results.length === 0) return 0
           if (typeof (this.indicationManager as any).addResults === "function") {
@@ -988,6 +996,7 @@ export class ConfigSetProcessor {
     const perConfigCounts = await Promise.all(
       configs.map(async (config) => {
         try {
+          await yieldToEventLoop()
           const positions = this.calculateStrategyPositions(symbol, candles, config)
           if (positions.length === 0) return 0
           if (typeof (this.strategyManager as any).addPositions === "function") {
@@ -1101,11 +1110,12 @@ export class ConfigSetProcessor {
     let entryTime = ""
     let positionSide: "long" | "short" = "long"
 
+    let rollingSum = prices.slice(0, position_cost_step).reduce((sum: number, p: any) => sum + p.price, 0)
+
     for (let i = position_cost_step; i < prices.length; i++) {
       const currentPrice = prices[i].price
       const currentTime = prices[i].time
-      const lookbackPrices = prices.slice(i - position_cost_step, i).map(p => p.price)
-      const avgPrice = lookbackPrices.reduce((a: number, b: number) => a + b, 0) / lookbackPrices.length
+      const avgPrice = rollingSum / position_cost_step
 
       if (!inPosition) {
         const priceDiff = (currentPrice - avgPrice) / avgPrice
@@ -1156,6 +1166,8 @@ export class ConfigSetProcessor {
           inPosition = false
         }
       }
+
+      rollingSum += currentPrice - prices[i - position_cost_step].price
     }
 
     if (inPosition && prices.length > 0) {

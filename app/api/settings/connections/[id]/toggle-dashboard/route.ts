@@ -221,6 +221,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         }
         
         // Update global engine intent first. A real explicit enable action
+        // clears any stale operator stop latch and starts/reconciles the
+        // process-level coordinator below.
         // clears any stale operator stop latch and then either queues the
         // dedicated coordinator worker or (only in dev/opt-in environments)
         // starts the local in-process runtime below.
@@ -245,14 +247,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           active_connections: String(activeDashboardCount),
         })
         
-        // Start in-process only when this worker is explicitly allowed to own
-        // engine loops or it already has a local coordinator running. In
-        // production/OpenNext the UI/API worker must stay responsive: enabling a
-        // connection should persist operator intent and request the dedicated
-        // coordinator to reconcile, not spin a heavy trade loop inside the
-        // request handler and starve subsequent status/UI requests.
+        // Start/reconcile in-process immediately. The coordinator owns the
+        // runtime locks and health timers; enable actions must not leave the
+        // global engine stuck in a queued-only state in production.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
+          const localStartAllowed = true
           const localStartAllowed =
             process.env.NODE_ENV !== "production" ||
             process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||

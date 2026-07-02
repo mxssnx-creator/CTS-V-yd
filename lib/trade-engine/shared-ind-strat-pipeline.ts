@@ -378,15 +378,18 @@ export async function runIndStratCycle(
       }
     }
 
-    // ── Phase 3: Strategy evaluation (UNIFIED, runs every cycle) ──────
-    // processStrategy self-fetches active indications from Redis when none
-    // are passed (line 136 of strategy-processor.ts), so it runs correctly
-    // on cycles where Phase 1 produced 0 new indications. The previous
-    // `if (result.indicationCount > 0)` gate caused `strategiesEvaluated`
-    // to return 0 on ~95% of cycles (most cycles have no new signals), which
-    // made `strategy_live_cycle_count` stay at 0 indefinitely.
-    // Always call — processStrategy returns early if no stored indications exist.
-    {
+    // ── Phase 3: Strategy evaluation (UNIFIED, indication-gated) ──────
+    // In production the API worker also owns the coordinator. Calling the
+    // full strategy evaluator on every empty warm-up tick can monopolize the
+    // Node event loop and make health/status routes look crashed. Run the
+    // evaluator when Phase 1 produced live indications (historical replay still
+    // passes its backdated indication array), and let the next productive tick
+    // advance the strategy/live stages.
+    const apiStrategyFlowEnabled =
+      process.env.NODE_ENV !== "production" ||
+      process.env.ENABLE_API_STRATEGY_FLOW === "1" ||
+      process.env.ENABLE_API_STRATEGY_FLOW === "true"
+    if (result.indicationCount > 0 && apiStrategyFlowEnabled) {
       const stratResult = await deps.strategy
         .processStrategy(symbol, indications)
         .catch((err) => {
@@ -398,12 +401,6 @@ export async function runIndStratCycle(
         })
       result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
       result.liveReady = stratResult.liveReady || 0
-
-      // ── Phase 4: REMOVED — live dispatch is handled exclusively by Phase 3 ──
-      // `processStrategy → StrategyCoordinator.createLiveSets` owns live selection
-      // and dispatch. Keeping a second shared-pipeline Phase 4 reader here would
-      // re-consume slim `real:sets` without the in-cycle coord/axis registry and
-      // could double-dispatch or conflict with the coordinator's selected buckets.
     }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err)

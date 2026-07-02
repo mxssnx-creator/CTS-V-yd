@@ -209,6 +209,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         engineStatus = "running"
         console.log(`[v0] [LiveTrade] Engine already running for ${connName} — flag updated, no restart`)
       } else {
+        // Engine is not running — start/reconcile it immediately so enabling
+        // Live Trade has an observable effect in production. The coordinator's
+        // startup and distributed ownership locks prevent duplicate runtimes.
+        try {
+          const localStartAllowed = true
         // Engine is not running. In production/OpenNext, the API worker must
         // not become the long-lived trade-loop owner after a settings click:
         // that starves health/status routes and looks like a coordinator crash.

@@ -141,6 +141,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             state_switch_version: stateSwitchVersion,
             reason: "connection_enable",
           })
+          const localStartAllowed = true
           const localStartAllowed =
             process.env.NODE_ENV !== "production" ||
             process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
