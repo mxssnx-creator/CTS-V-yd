@@ -1,3 +1,4 @@
+import { EventEmitter } from "events"
 import { initRedis, getSettings, setSettings, getConnection, getRedisClient } from "@/lib/redis-db"
 
 /**
@@ -7,7 +8,7 @@ import { initRedis, getSettings, setSettings, getConnection, getRedisClient } fr
  * When a connection's settings are updated, this module:
  * 1. Writes a change event to Redis so engines know to reload
  * 2. Determines if the change requires an engine restart vs hot reload
- * 3. Provides a polling mechanism for engines to detect changes
+ * 3. Emits an in-process event so local engines apply changes without timers
  */
 
 // Fields that require a full engine restart when changed
@@ -49,6 +50,34 @@ export interface SettingsChangeEvent {
   timestamp: string
   previousValues?: Record<string, unknown>
   newValues?: Record<string, unknown>
+}
+
+const SETTINGS_CHANGED_EVENT = "settings-changed"
+const settingsChangeBus = new EventEmitter()
+settingsChangeBus.setMaxListeners(500)
+
+export function onSettingsChanged(
+  connectionId: string,
+  handler: (event: SettingsChangeEvent) => void | Promise<void>,
+): () => void {
+  const listener = (event: SettingsChangeEvent) => {
+    if (event.connectionId !== connectionId) return
+    try {
+      void Promise.resolve(handler(event)).catch((error) => {
+        console.warn(
+          `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
+          error instanceof Error ? error.message : String(error),
+        )
+      })
+    } catch (error) {
+      console.warn(
+        `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
+  settingsChangeBus.on(SETTINGS_CHANGED_EVENT, listener)
+  return () => settingsChangeBus.off(SETTINGS_CHANGED_EVENT, listener)
 }
 
 async function clearEngineRestartFlags(connectionId: string): Promise<void> {
@@ -175,7 +204,7 @@ export async function notifySettingsChanged(
 
   // Event-state fast path: wake the owning in-process coordinator immediately
   // for reload/progression/coordination changes instead of waiting for the
-  // engine settings watcher timer. This only targets the affected connection;
+  // durable queue drain or a continuity sweep. This only targets the affected connection;
   // the durable settings_change envelope above remains the cross-worker source
   // of truth.
   try {
@@ -194,6 +223,12 @@ export async function notifySettingsChanged(
       eventErr instanceof Error ? eventErr.message : String(eventErr),
     )
   }
+
+  // Emit only after all durable state writes above have completed. The
+  // in-process engine subscriber may immediately consume and clear the pending
+  // settings_change envelope; emitting earlier can race with reload_required /
+  // restart_required state writes and leave stale flags behind.
+  settingsChangeBus.emit(SETTINGS_CHANGED_EVENT, event)
 
   return event
 }

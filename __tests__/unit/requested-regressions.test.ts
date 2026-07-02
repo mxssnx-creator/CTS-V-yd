@@ -897,6 +897,7 @@ describe("requested regression guardrails", () => {
   test("QuickStart live button uses effective live state and live-trade enable makes engine eligible", () => {
     const quickstart = read("components/dashboard/quickstart-section.tsx")
     const liveRoute = read("app/api/settings/connections/[id]/live-trade/route.ts")
+    const helper = read("lib/system-resource-metrics.ts")
 
     const quickstartHelper = quickstart.slice(
       quickstart.indexOf("QuickStart's Live button controls effective exchange order placement"),
@@ -915,6 +916,19 @@ describe("requested regression guardrails", () => {
     expect(liveEnableBlock).toContain('is_active: "1"')
     expect(helper).toContain('os.totalmem')
     expect(helper).toContain('memory.rss')
+  })
+
+  test("Redis migrations remain sequential for production schema upgrades", () => {
+    const source = read("lib/redis-migrations.ts")
+    const versions = Array.from(source.matchAll(/version:\s*(\d+)/g), (match) => Number(match[1]))
+    const gaps: Array<[number, number]> = []
+    for (let i = 1; i < versions.length; i++) {
+      if (versions[i] !== versions[i - 1] + 1) gaps.push([versions[i - 1], versions[i]])
+    }
+
+    expect(gaps).toEqual([])
+    expect(source).toContain('name: "043-reserved-schema-continuity"')
+    expect(source).toContain('name: "044-reserved-schema-continuity"')
   })
 
 })

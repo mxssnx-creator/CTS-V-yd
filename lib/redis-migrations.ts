@@ -2600,10 +2600,32 @@ const migrations: Migration[] = [
     },
   },
 
-  // ── Migration 042 ──────────────────────────────────────────────────────────
-  // Reconcile operator volume settings across raw + settings hashes without
-  // clobbering low-but-valid stress-test factors, and clear stale prehistoric
-  // gates once more for installations that already ran the old 041.
+  {
+    version: 43,
+    name: "043-reserved-schema-continuity",
+    description: "No-op continuity marker preserving sequential schema upgrades",
+    up: async (_client: any) => {
+      console.log("[v0] Migration 043: no-op schema continuity marker")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "42")
+    },
+  },
+  {
+    version: 44,
+    name: "044-reserved-schema-continuity",
+    description: "No-op continuity marker preserving sequential schema upgrades before connection cache rebuild",
+    up: async (_client: any) => {
+      console.log("[v0] Migration 044: no-op schema continuity marker")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "43")
+    },
+  },
+
+  // ── Migration 045 ──────────────────────────────────────────────────────────
+  // Rebuild the connection list cache from canonical connection hashes without
+  // clobbering live operator state or progressions.
   {
     version: 45,
     name: "045-rebuild-connection-list-cache",
