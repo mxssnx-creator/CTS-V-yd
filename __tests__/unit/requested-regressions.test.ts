@@ -913,6 +913,8 @@ describe("requested regression guardrails", () => {
     expect(liveEnableBlock).toContain('is_assigned: "1"')
     expect(liveEnableBlock).toContain('is_enabled_dashboard: "1"')
     expect(liveEnableBlock).toContain('is_active: "1"')
+    expect(helper).toContain('os.totalmem')
+    expect(helper).toContain('memory.rss')
   })
 
 })
