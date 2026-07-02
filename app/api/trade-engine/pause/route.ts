@@ -20,20 +20,27 @@ export async function POST() {
       return NextResponse.json({ success: false, error: "Trade engine coordinator not initialized" }, { status: 503 })
     }
 
-    await coordinator.pause()
-    
-    // ── Update Redis global state to "paused" ─────────────────────────
-    // Store the current status as previous_status so resume can restore
-    // the exact state (was it running, stopped, etc. before pause?)
+    // ── Update Redis global state to "paused" before stopping engines ──
+    // trade_engine:global is the authority checked by every worker. Publish
+    // paused intent first so remote owners stop doing work immediately and
+    // so no reconciliation/start path can race in as "running".
     const currentGlobalState = await client.hgetall("trade_engine:global").catch(() => ({}))
-    const previousStatus = (currentGlobalState as any).status || "stopped"
-    
+    const previousStatus = (currentGlobalState as any).status === "paused"
+      ? (currentGlobalState as any).previous_status || "running"
+      : (currentGlobalState as any).status || (currentGlobalState as any).operator_intent || "running"
+    const pausedAt = new Date().toISOString()
+
     await client.hset("trade_engine:global", { 
-      status: "paused", 
-      paused_at: new Date().toISOString(),
+      status: "paused",
+      operator_intent: "paused",
+      desired_status: "paused",
+      paused_at: pausedAt,
+      paused_by: "global_coordinator",
       previous_status: previousStatus,
     })
-    console.log(`[v0] Global status paused (was: ${previousStatus})`)
+    console.log(`[v0] Global pause intent published (was: ${previousStatus})`)
+
+    await coordinator.pause()
     
     // ── Set all Main Connections to "Paused" state ──────────────────
     // When the global coordinator is paused, all enabled Main Connections
@@ -45,7 +52,7 @@ export async function POST() {
       for (const connId of connections) {
         await client.hset(`trade_engine_state:${connId}`, {
           status: "paused",
-          paused_at: new Date().toISOString(),
+          paused_at: pausedAt,
           paused_by: "global_coordinator",
         })
       }
@@ -66,7 +73,7 @@ export async function POST() {
       for (const progId of progressionIds) {
         await client.hset(`progression:${progId}`, {
           status: "paused",
-          paused_at: new Date().toISOString(),
+          paused_at: pausedAt,
           paused_by: "global_coordinator",
         })
       }

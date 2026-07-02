@@ -1291,128 +1291,167 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Pause all engines
+   * Pause all engines. Redis `trade_engine:global` is the authority, so the
+   * paused intent is written before local teardown or reconciliation begins.
    */
   async pause(): Promise<void> {
-    console.log("[v0] [Coordinator] PAUSING global trade engine - stopping ALL engines...")
+    console.log("[v0] [Coordinator] PAUSING global trade engine - publishing paused intent...")
 
     this.isPaused = true
     this.isGloballyRunning = false
 
-    // Store which engines were running before pause (so resume can restore them)
     const stateSnapshot: Record<string, boolean> = {}
-    
-    // Stop ALL engine managers immediately
+    const nowIso = new Date().toISOString()
+
+    try {
+      const { initRedis, getRedisClient, getActiveConnectionsForEngine } = await import("@/lib/redis-db")
+      await initRedis()
+      const client = getRedisClient()
+      const currentGlobalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+      const previousStatus = currentGlobalState.status === "paused"
+        ? currentGlobalState.previous_status || "running"
+        : currentGlobalState.status || currentGlobalState.operator_intent || "running"
+
+      for (const [connectionId, manager] of this.engineManagers.entries()) {
+        stateSnapshot[connectionId] = manager.isEngineRunning
+      }
+
+      await client.hset("trade_engine:global", {
+        status: "paused",
+        operator_intent: "paused",
+        desired_status: "paused",
+        paused_at: nowIso,
+        paused_by: "global_coordinator",
+        previous_status: previousStatus,
+        engine_state_snapshot: JSON.stringify(stateSnapshot),
+        engine_state_paused_at: nowIso,
+      })
+
+      const remoteConnectionIds = new Set<string>(Array.from(this.engineManagers.keys()))
+      try {
+        const activeConnections = await getActiveConnectionsForEngine()
+        for (const connection of activeConnections) remoteConnectionIds.add(connection.id)
+      } catch { /* best-effort remote pause fanout */ }
+
+      await Promise.all(Array.from(remoteConnectionIds).map((connectionId) => Promise.all([
+        client.hset(`trade_engine_state:${connectionId}`, {
+          status: "paused",
+          pause_requested: "1",
+          pause_reason: "global_coordinator",
+          pause_requested_at: nowIso,
+          paused_at: nowIso,
+          paused_by: "global_coordinator",
+        }).catch(() => 0),
+        client.hset(`progression:${connectionId}`, {
+          status: "paused",
+          pause_requested: "1",
+          pause_reason: "global_coordinator",
+          pause_requested_at: nowIso,
+          paused_at: nowIso,
+          paused_by: "global_coordinator",
+        }).catch(() => 0),
+      ])))
+      console.log(`[v0] [Coordinator] Published paused intent for ${remoteConnectionIds.size} connection(s)`)
+    } catch (err) {
+      console.warn("[v0] [Coordinator] Failed to publish paused Redis intent before local stop:", err)
+      throw err
+    }
+
     const allConnectionIds = Array.from(this.engineManagers.keys())
-    console.log(`[v0] [Coordinator] Stopping ${allConnectionIds.length} trade engine(s)...`)
+    console.log(`[v0] [Coordinator] Stopping ${allConnectionIds.length} local trade engine(s)...`)
 
     for (const connectionId of allConnectionIds) {
       try {
         const manager = this.engineManagers.get(connectionId)
-        if (manager) {
-          const wasRunning = manager.isEngineRunning
-          stateSnapshot[connectionId] = wasRunning
-          if (wasRunning) {
-            await manager.stop()
-            console.log(`[v0] [Coordinator] ✓ Stopped engine for connection: ${connectionId}`)
-          }
+        if (manager?.isEngineRunning) {
+          await manager.stop()
+          console.log(`[v0] [Coordinator] ✓ Stopped local engine for connection: ${connectionId}`)
         }
       } catch (error) {
         console.error(`[v0] [Coordinator] Failed to stop engine for connection ${connectionId}:`, error)
       }
     }
 
-    // Store engine state snapshot in Redis for restore on resume
-    try {
-      const { getRedisClient } = await import("@/lib/redis-db")
-      const client = getRedisClient()
-      await client.hset("trade_engine:global", {
-        engine_state_snapshot: JSON.stringify(stateSnapshot),
-        engine_state_paused_at: new Date().toISOString(),
-      })
-      console.log("[v0] [Coordinator] Stored engine state snapshot for resume restoration")
-    } catch (err) {
-      console.warn("[v0] [Coordinator] Failed to store engine state snapshot:", err)
-      // Non-fatal - resume will just restart all enabled engines
-    }
-
-    console.log("[v0] [Coordinator] ✓ Global trade engine PAUSED - all engines stopped")
+    console.log("[v0] [Coordinator] ✓ Global trade engine PAUSED - intent is authoritative in Redis")
   }
 
   /**
-   * Resume all engines
+   * Resume all engines. Reads Redis intent instead of relying on local
+   * `isPaused`, then writes running intent before calling startEngine() so
+   * resume-triggered starts pass the global-intent guard.
    */
   async resume(): Promise<void> {
-    console.log("[v0] [Coordinator] RESUMING global trade engine - restarting all engines...")
-
-    if (!this.isPaused) {
-      console.log("[v0] [Coordinator] TradeEngines are not paused, nothing to resume")
-      return
-    }
-
-    this.isPaused = false
-    this.isGloballyRunning = true
+    console.log("[v0] [Coordinator] RESUMING global trade engine - publishing running intent...")
 
     try {
-      const { initRedis, getAllConnections, getRedisClient } = await import("@/lib/redis-db")
+      const { initRedis, getAssignedAndEnabledConnections, getRedisClient } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
 
       await initRedis()
-      const connections = await getAllConnections()
-      
+      const client = getRedisClient()
+      const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+      const currentIntent = globalState.operator_intent || globalState.desired_status || globalState.status || ""
+      if (currentIntent !== "paused" && currentIntent !== "running") {
+        console.log(`[v0] [Coordinator] Resume requested while global intent is "${currentIntent || "empty"}"; continuing as explicit operator resume`)
+      }
+
+      const nowIso = new Date().toISOString()
+      await client.hset("trade_engine:global", {
+        status: "running",
+        operator_intent: "running",
+        desired_status: "running",
+        resumed_at: nowIso,
+      })
+      await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")
+
+      this.isPaused = false
+      this.isGloballyRunning = true
+
+      const connections = await getAssignedAndEnabledConnections()
       if (!Array.isArray(connections)) {
         console.error("[v0] [Coordinator] ERROR: connections is not an array during resume")
         return
       }
 
-      // Get all connections with valid credentials
-      const validConnections = connections.filter((c) => {
-        const hasCredentials = (c.api_key || c.apiKey) && (c.api_secret || c.apiSecret)
-        return hasCredentials
-      })
-
-      console.log(`[v0] [Coordinator] Found ${validConnections.length} connections to resume`)
-
-      // Retrieve engine state snapshot from pause to respect individual states
       let stateSnapshot: Record<string, boolean> = {}
       try {
-        const client = getRedisClient()
-        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
-        if (globalState && globalState.engine_state_snapshot) {
+        if (globalState.engine_state_snapshot) {
           stateSnapshot = JSON.parse(globalState.engine_state_snapshot)
           console.log("[v0] [Coordinator] Restored engine state snapshot from pause")
         }
       } catch (err) {
         console.warn("[v0] [Coordinator] Failed to restore engine state snapshot:", err)
-        // Fall through - will restart all enabled engines (safe default)
       }
 
       const settings = await loadSettingsAsync()
       let resumedCount = 0
 
-      // Restart engines only if they were running before pause
-      for (const connection of validConnections) {
+      for (const connection of connections) {
         try {
           const connectionId = connection.id
           const wasRunningBeforePause = stateSnapshot[connectionId]
-          
-          // Only restart if it was running before pause, OR if we have no snapshot (first time)
-          if (wasRunningBeforePause !== false) {
-            const config: EngineConfig = {
-              connectionId,
-              allowInProcessStart: true,
-              indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
-              strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-            }
-
-            await this.startEngine(connectionId, config)
-            resumedCount++
-            const wasRunning = wasRunningBeforePause === true ? " (was running)" : " (no state record, defaulting to resume)"
-            console.log(`[v0] [Coordinator] ✓ Resumed: ${connection.name}${wasRunning}`)
-          } else {
+          if (wasRunningBeforePause === false) {
             console.log(`[v0] [Coordinator] ⊘ Skipped: ${connection.name} (was not running before pause)`)
+            continue
           }
+
+          await Promise.all([
+            client.hdel(`trade_engine_state:${connectionId}`, "pause_requested", "pause_reason", "pause_requested_at", "paused_at", "paused_by").catch(() => 0),
+            client.hdel(`progression:${connectionId}`, "pause_requested", "pause_reason", "pause_requested_at", "paused_at", "paused_by").catch(() => 0),
+          ])
+
+          const config: EngineConfig = {
+            connectionId,
+            allowInProcessStart: true,
+            indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
+            strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
+            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+          }
+
+          const didStart = await this.startEngine(connectionId, config)
+          if (didStart) resumedCount++
+          const wasRunning = wasRunningBeforePause === true ? " (was running)" : " (no state record, defaulting to resume)"
+          console.log(`[v0] [Coordinator] ${didStart ? "✓ Resumed" : "⊘ Resume start skipped"}: ${connection.name}${wasRunning}`)
         } catch (error) {
           console.error(`[v0] [Coordinator] Failed to resume engine for connection ${connection.id}:`, error)
         }

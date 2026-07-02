@@ -20,26 +20,24 @@ export async function POST() {
       return NextResponse.json({ success: false, error: "Trade engine coordinator not initialized" }, { status: 503 })
     }
 
-    await coordinator.resume()
-    
-    // ── Restore previous global status ──────────────────────────────────
-    // When resuming, restore the status to what it was before the pause
-    // (running, stopped, or whatever the previous_status field was set to).
-    // This ensures the coordinator's state is fully synchronized with Redis.
+    // ── Publish running intent before resume starts engines ─────────────
+    // startEngine() rejects starts unless trade_engine:global says running,
+    // so order this write before coordinator.resume().
     try {
-      const currentGlobalState = await client.hgetall("trade_engine:global").catch(() => ({}))
-      const previousStatus = (currentGlobalState as any).previous_status || "running"
-      
       await client.hset("trade_engine:global", {
-        status: previousStatus,
+        status: "running",
+        operator_intent: "running",
+        desired_status: "running",
         resumed_at: new Date().toISOString(),
       })
       await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")
-      console.log(`[v0] Global status restored to: ${previousStatus}`)
+      console.log("[v0] Global running intent published for resume")
     } catch (err) {
-      console.warn("[v0] Failed to restore global status:", err instanceof Error ? err.message : String(err))
-      // Non-fatal: continue even if status restore fails
+      console.warn("[v0] Failed to publish running intent:", err instanceof Error ? err.message : String(err))
+      throw err
     }
+
+    await coordinator.resume()
     
     // ── Clear "Paused" state on all Main Connections ───────────────────
     // When resuming the global coordinator, clear the pause marker and
