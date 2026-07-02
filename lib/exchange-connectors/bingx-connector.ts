@@ -765,9 +765,12 @@ export class BingXConnector extends BaseExchangeConnector {
     options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string; filledPrice?: number; avgPrice?: number; price?: number; filledQty?: number; executedQty?: number; status?: string }> {
     try {
-      // CRITICAL: Use official SDK for instant order placement
-      // SDK handles all signing, timestamp sync, and connection pooling
-      if (this.sdkClient) {
+      // Prefer the audited REST path for real order placement unless explicitly
+      // enabled. The SDK fast-path has different position-mode semantics across
+      // versions and was a prod/dev mismatch source for live orders; REST below
+      // carries our recvWindow, timestamp-resync, hedge/one-way fallback, and
+      // signed-query diagnostics.
+      if (process.env.ENABLE_BINGX_SDK_ORDERS === "1" && this.sdkClient) {
         try {
           const bingxSymbol = this.toBingXSymbol(symbol)
           const apiType = this.credentials.apiType || "perpetual_futures"
