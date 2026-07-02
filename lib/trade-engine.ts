@@ -1390,10 +1390,8 @@ export class GlobalTradeEngineCoordinator {
    * `isPaused`, then writes running intent before calling startEngine() so
    * resume-triggered starts pass the global-intent guard.
    */
-  async resume(): Promise<void> {
-    console.log("[v0] [Coordinator] RESUMING global trade engine - publishing running intent...")
   async resume(options: { force?: boolean } = {}): Promise<void> {
-    console.log("[v0] [Coordinator] RESUMING global trade engine - restarting all engines...")
+    console.log("[v0] [Coordinator] RESUMING global trade engine - publishing running intent...")
 
     try {
       const { initRedis, getAssignedAndEnabledConnections, getRedisClient } = await import("@/lib/redis-db")
@@ -1403,51 +1401,32 @@ export class GlobalTradeEngineCoordinator {
       const client = getRedisClient()
       const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
       const currentIntent = globalState.operator_intent || globalState.desired_status || globalState.status || ""
-      if (currentIntent !== "paused" && currentIntent !== "running") {
-        console.log(`[v0] [Coordinator] Resume requested while global intent is "${currentIntent || "empty"}"; continuing as explicit operator resume`)
       const redisPaused = globalState?.status === "paused" || globalState?.operator_intent === "paused"
 
       if (!options.force && !this.isPaused && !redisPaused) {
-        console.log("[v0] [Coordinator] TradeEngines are not paused, nothing to resume")
+        console.log(`[v0] [Coordinator] Resume requested while global intent is "${currentIntent || "empty"}" and coordinator is not paused; nothing to resume`)
         return
       }
 
-      const restoredStatus =
-        globalState.previous_status && globalState.previous_status !== "paused"
-          ? globalState.previous_status
-          : "running"
-
-      // Restore the complete operator-intent hash before any startEngine()
-      // calls. startEngine() intentionally refuses to start unless Redis says
-      // the global coordinator intent is running/enabled.
+      const restoredStatus = "running"
+      const nowIso = new Date().toISOString()
+      // Publish running intent before calling startEngine(); startEngine()
+      // intentionally refuses to start unless this hash says the coordinator
+      // is globally enabled. Clear operator_stopped so an explicit resume
+      // wins over an older stop marker.
       await client.hset("trade_engine:global", {
         status: restoredStatus,
-        desired_status: restoredStatus,
         operator_intent: restoredStatus,
-        resumed_at: new Date().toISOString(),
-      })
-
-      this.isPaused = false
-      this.isGloballyRunning = true
-
-      const connections = await getAllConnections()
-      
-      if (!Array.isArray(connections)) {
-        console.error("[v0] [Coordinator] ERROR: connections is not an array during resume")
-        return
-      }
-
-      const nowIso = new Date().toISOString()
-      await client.hset("trade_engine:global", {
-        status: "running",
-        operator_intent: "running",
-        desired_status: "running",
+        desired_status: restoredStatus,
+        operator_stopped: "0",
         resumed_at: nowIso,
+        updated_at: nowIso,
       })
       await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")
 
       this.isPaused = false
       this.isGloballyRunning = true
+      this.ensureBackgroundTimers()
 
       const connections = await getAssignedAndEnabledConnections()
       if (!Array.isArray(connections)) {
@@ -1458,7 +1437,6 @@ export class GlobalTradeEngineCoordinator {
       let stateSnapshot: Record<string, boolean> = {}
       try {
         if (globalState.engine_state_snapshot) {
-        if (globalState && globalState.engine_state_snapshot) {
           stateSnapshot = JSON.parse(globalState.engine_state_snapshot)
           console.log("[v0] [Coordinator] Restored engine state snapshot from pause")
         }
@@ -1486,9 +1464,9 @@ export class GlobalTradeEngineCoordinator {
           const config: EngineConfig = {
             connectionId,
             allowInProcessStart: true,
-            indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
-            strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+            indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
+            strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
+            realtimeInterval: settings.realtimeIntervalMs ? Math.max(0.1, settings.realtimeIntervalMs / 1000) : 0.3,
           }
 
           const didStart = await this.startEngine(connectionId, config)
@@ -1499,8 +1477,6 @@ export class GlobalTradeEngineCoordinator {
           console.error(`[v0] [Coordinator] Failed to resume engine for connection ${connection.id}:`, error)
         }
       }
-
-      await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")
 
       console.log(`[v0] [Coordinator] ✓ Global trade engine RESUMED: ${resumedCount} engines restarted`)
     } catch (error) {

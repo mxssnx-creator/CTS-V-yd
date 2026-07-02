@@ -846,4 +846,73 @@ describe("requested regression guardrails", () => {
     expect(source).not.toContain("top[minIdx] = indication")
   })
 
+
+  test("production system monitoring returns process resource metrics even when Redis is unavailable", () => {
+    const route = read("app/api/system/monitoring/route.ts")
+    const helper = read("lib/system-resource-metrics.ts")
+
+    expect(route).toContain('const resourceMetrics = getSystemResourceMetrics()')
+    expect(route.indexOf('const resourceMetrics = getSystemResourceMetrics()')).toBeLessThan(route.indexOf('await initRedis()'))
+    expect(route).toContain('Redis unavailable while collecting system metrics')
+    expect(route).toContain('cpu: resourceMetrics.cpuPercent')
+    expect(route).toContain('memory: resourceMetrics.memoryPercent')
+    expect(route).not.toContain('cpu: 0,')
+    expect(route).not.toContain('memory: 0,')
+
+    expect(helper).toContain('process.cpuUsage(previous.cpuUsage)')
+    expect(helper).toContain('/sys/fs/cgroup/memory.max')
+    expect(helper).toContain('/sys/fs/cgroup/cpu.max')
+    expect(helper).toContain('Math.max(0.1')
+    expect(helper).toContain('memory.rss')
+  })
+
+
+  test("progression stats endpoint is read-only for poll-derived real active averages", () => {
+    const route = read("app/api/connections/progression/[id]/stats/route.ts")
+    const snapshotBlock = route.slice(
+      route.indexOf("Active validated Real positions snapshot"),
+      route.indexOf("Live-stage OPEN positions", route.indexOf("Active validated Real positions snapshot")),
+    )
+
+    expect(snapshotBlock).toContain("/stats is a GET/read endpoint and must not mutate Redis")
+    expect(snapshotBlock).toContain("const existingRealActiveAvg = n(progHash.real_active_pos_avg)")
+    expect(snapshotBlock).not.toContain("hincrby")
+    expect(snapshotBlock).not.toContain("hset")
+  })
+
+  test("dashboard stats polling ignores stale overlapping responses", () => {
+    const quickstart = read("components/dashboard/quickstart-section.tsx")
+    const overview = read("components/dashboard/statistics-overview-v2.tsx")
+
+    expect(quickstart).toContain("const statsFetchSeqRef = useRef(0)")
+    expect(quickstart).toContain("const requestSeq = ++statsFetchSeqRef.current")
+    expect(quickstart).toContain("requestSeq !== statsFetchSeqRef.current")
+
+    expect(overview).toContain("const statsFetchSeqRef = useRef(0)")
+    expect(overview).toContain("const requestSeq = ++statsFetchSeqRef.current")
+    expect(overview).toContain("requestSeq !== statsFetchSeqRef.current")
+  })
+
+
+  test("QuickStart live button uses effective live state and live-trade enable makes engine eligible", () => {
+    const quickstart = read("components/dashboard/quickstart-section.tsx")
+    const liveRoute = read("app/api/settings/connections/[id]/live-trade/route.ts")
+
+    const quickstartHelper = quickstart.slice(
+      quickstart.indexOf("QuickStart's Live button controls effective exchange order placement"),
+      quickstart.indexOf("// ─── types", quickstart.indexOf("QuickStart's Live button controls effective exchange order placement")),
+    )
+    expect(quickstartHelper).toContain("toBooleanFlag(conn?.is_live_trade)")
+    expect(quickstartHelper).not.toContain("live_trade_requested) ||")
+    expect(quickstart).toContain("setLiveTradeActive(effectiveState)")
+
+    const liveEnableBlock = liveRoute.slice(
+      liveRoute.indexOf("If Live is turned on while the main engine is not already running"),
+      liveRoute.indexOf('live_trade_requested: "1"', liveRoute.indexOf("If Live is turned on while the main engine is not already running")) + 40,
+    )
+    expect(liveEnableBlock).toContain('is_assigned: "1"')
+    expect(liveEnableBlock).toContain('is_enabled_dashboard: "1"')
+    expect(liveEnableBlock).toContain('is_active: "1"')
+  })
+
 })
