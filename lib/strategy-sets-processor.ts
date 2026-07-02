@@ -138,6 +138,60 @@ export class StrategySetsProcessor {
     return this.limits[type] || DEFAULT_LIMITS[type] || 500
   }
 
+
+  private selectTopIndications(indications: any[], limit: number): any[] {
+    if (indications.length <= limit * 4) {
+      return [...indications]
+        .sort((a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
+        .slice(0, limit)
+    }
+
+    // Memory-safe top-K selection for full progression runs. Use a bounded
+    // min-heap so we keep only K references and avoid sorting/copying the full
+    // indication array. This is O(N log K) instead of the previous O(N*K)
+    // replacement scan and avoids large transient arrays during complete runs.
+    const heap: any[] = []
+    const pf = (item: any) => Number(item?.profitFactor ?? 0)
+    const swap = (i: number, j: number) => {
+      const tmp = heap[i]
+      heap[i] = heap[j]
+      heap[j] = tmp
+    }
+    const bubbleUp = (idx: number) => {
+      while (idx > 0) {
+        const parent = Math.floor((idx - 1) / 2)
+        if (pf(heap[parent]) <= pf(heap[idx])) break
+        swap(parent, idx)
+        idx = parent
+      }
+    }
+    const sinkDown = (idx: number) => {
+      while (true) {
+        const left = idx * 2 + 1
+        const right = left + 1
+        let smallest = idx
+        if (left < heap.length && pf(heap[left]) < pf(heap[smallest])) smallest = left
+        if (right < heap.length && pf(heap[right]) < pf(heap[smallest])) smallest = right
+        if (smallest === idx) break
+        swap(idx, smallest)
+        idx = smallest
+      }
+    }
+
+    for (const indication of indications) {
+      if (heap.length < limit) {
+        heap.push(indication)
+        bubbleUp(heap.length - 1)
+        continue
+      }
+      if (pf(indication) <= pf(heap[0])) continue
+      heap[0] = indication
+      sinkDown(0)
+    }
+
+    return heap.sort((a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
+  }
+
   /**
    * Process all strategy types independently for a symbol
    */
@@ -158,11 +212,8 @@ export class StrategySetsProcessor {
       // Sort indications by profitFactor descending so that the best-performing
       // signals are processed first across all strategy type pools.
       const rawTotal = indications.length
-      const sortedIndications = [...indications].sort(
-        (a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0)
-      )
-      const selectedTotal = sortedIndications.length
-      const selectedIndications = sortedIndications.slice(0, candidateLimit)
+      const selectedIndications = this.selectTopIndications(indications, candidateLimit)
+      const selectedTotal = selectedIndications.length
 
       // Process all 4 strategy types in parallel with independent logic
       const [baseResults, mainResults, realResults, liveResults] = await Promise.all([

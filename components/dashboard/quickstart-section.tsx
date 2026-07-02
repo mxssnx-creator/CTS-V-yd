@@ -959,7 +959,9 @@ export function QuickstartSection() {
       addLog("No connection selected — start the engine first", "warning")
       return
     }
-    const nextState = !liveTradeActive
+    const previousState = liveTradeActive
+    const nextState = !previousState
+    setLiveTradeActive(nextState)
     setLiveTradeLoading(true)
     addLog(`${nextState ? "Enabling" : "Disabling"} LIVE exchange trading...`, "info")
     try {
@@ -971,6 +973,7 @@ export function QuickstartSection() {
       const body = await res.json().catch(() => ({} as any))
       if (!res.ok || body?.success === false) {
         const hint = body?.hint ? ` — ${body.hint}` : ""
+        setLiveTradeActive(previousState)
         addLog(`Live toggle failed: ${body?.error || res.statusText}${hint}`, "error")
         return
       }
@@ -985,9 +988,15 @@ export function QuickstartSection() {
           : "LIVE exchange trading disabled",
         requestedState ? (effectiveState ? "success" : "warning") : "info",
       )
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("live-trade-toggled", {
+          detail: { connectionId: id, newState: requestedState, effectiveState },
+        }))
+      }
       // Refresh stats immediately so the Live counter reflects the new engine
       setTimeout(() => fetchStats(true), 1000)
     } catch (err) {
+      setLiveTradeActive(previousState)
       addLog(`Live toggle error: ${err instanceof Error ? err.message : String(err)}`, "error")
     } finally {
       setLiveTradeLoading(false)

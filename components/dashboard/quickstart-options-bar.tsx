@@ -395,7 +395,7 @@ export function QuickstartOptionsBar() {
   )
 
   const saveLiveTrade = useCallback(
-    async (next: boolean) => {
+    async (next: boolean, previous: boolean) => {
       if (!cid) return
       setSaveStatus("saving")
       try {
@@ -440,8 +440,10 @@ export function QuickstartOptionsBar() {
           )
         }
       } catch (err) {
-        // On network failure revert the optimistic toggle.
-        setControlOrders(!next)
+        // On network failure revert to the exact previous UI state. Using
+        // `!next` made stale/double events look inverted when the user was
+        // turning Control Orders off.
+        setControlOrders(previous)
         console.error("[v0] [QSOptions] POST live-trade failed:", err)
         showError()
       }
@@ -469,7 +471,10 @@ export function QuickstartOptionsBar() {
   const debouncedSavePf     = useDebouncedSaver(patchSettings, 350)
   const debouncedSaveVolume = useDebouncedSaver(saveVolume, 350)
   const debouncedSaveCoord  = useDebouncedSaver(patchSettings, 100)
-  const debouncedSaveLive   = useDebouncedSaver(saveLiveTrade, 100)
+  // Live switch is intentionally NOT debounced: it is a safety-critical
+  // operator intent bit, so send the exact checked value immediately and avoid
+  // stale queued saves inverting rapid on/off clicks.
+  const debouncedSaveLive   = saveLiveTrade
 
   // ── handlers ─────────────────────────────────────────────────────────
   const handlePfChange = useCallback(
@@ -521,8 +526,10 @@ export function QuickstartOptionsBar() {
 
   const handleControlOrdersChange = useCallback(
     (next: boolean) => {
-      setControlOrders(next)
-      debouncedSaveLive(next)
+      setControlOrders((previous) => {
+        void debouncedSaveLive(next, previous)
+        return next
+      })
     },
     [debouncedSaveLive],
   )
@@ -683,6 +690,7 @@ export function QuickstartOptionsBar() {
                     <Switch
                       checked={controlOrders}
                       disabled={disabled}
+                      onClick={(event) => event.stopPropagation()}
                       onCheckedChange={handleControlOrdersChange}
                       aria-label="Control orders"
                     />

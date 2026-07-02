@@ -108,7 +108,12 @@ export async function POST(req: NextRequest) {
 
     // Place market order with minimal volume
     console.log(`[PlaceOrder] Placing market order: ${exchangeSide} ${quantity} ${symbolKey} with leverage ${leverage}x`)
-    const result = await connector.placeOrder(symbolKey, exchangeSide, quantity, 0, "market")
+    const positionMode = String(connection.position_mode || "").toLowerCase()
+    const hedgeMode = positionMode.includes("hedge") || positionMode.includes("dual")
+    const orderOptions = hedgeMode
+      ? { hedgeMode: true, positionSide: (direction === "long" ? "LONG" : "SHORT") as "LONG" | "SHORT" }
+      : { hedgeMode: false }
+    const result = await connector.placeOrder(symbolKey, exchangeSide, quantity, 0, "market", orderOptions)
 
     console.log(`[PlaceOrder] Order result:`, result)
 

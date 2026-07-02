@@ -13,8 +13,8 @@ import { initRedis, getSettings, setSettings, getConnection, getRedisClient } fr
 // Fields that require a full engine restart when changed
 const RESTART_REQUIRED_FIELDS = [
   "api_key", "api_secret", "exchange", "is_testnet",
-  "api_type", "api_subtype", "is_enabled", "progression_epoch",
-  "api_type", "api_subtype", "is_enabled",
+  "api_type", "api_subtype", "progression_epoch",
+  "api_type", "api_subtype",
   // Browser/dialog saves must not stop or restart a live engine. Symbol and
   // mode changes are handled by the hot-reload path, which invalidates symbol
   // caches, refreshes per-cycle settings, and lets progression recoordination
@@ -27,7 +27,7 @@ const HOT_RELOAD_FIELDS = [
   "connection_settings", "strategies", "indications",
   "active_indications", "preset_type",
   "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
-  "is_live_trade", "is_preset_trade", "connection_method",
+  "is_enabled", "is_enabled_dashboard", "is_live_trade", "is_preset_trade", "connection_method",
   "live_volume_factor", "preset_volume_factor", "volume_factor_live",
   "volume_factor_preset", "volume_step_ratio",
   "profitFactorMin", "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
@@ -171,6 +171,28 @@ export async function notifySettingsChanged(
       } catch { /* non-critical */ }
       console.log(`[v0] [SettingsCoordinator] Engine hot-reload flagged for ${connectionId}`)
     }
+  }
+
+  // Event-state fast path: wake the owning in-process coordinator immediately
+  // for reload/progression/coordination changes instead of waiting for the
+  // engine settings watcher timer. This only targets the affected connection;
+  // the durable settings_change envelope above remains the cross-worker source
+  // of truth.
+  try {
+    const connection = await getConnection(connectionId).catch(() => null)
+    const { queueEngineRefreshRequest } = await import("@/lib/engine-refresh-queue")
+    await queueEngineRefreshRequest({
+      connectionId,
+      action: changeType === "restart" ? "refresh" : "refresh",
+      state_switch_version: String((connection as any)?.state_switch_version ?? 0),
+      reason: `settings_${changeType}:${changedFields.slice(0, 6).join(",")}`,
+      timestamp: new Date().toISOString(),
+    })
+  } catch (eventErr) {
+    console.warn(
+      `[v0] [SettingsCoordinator] Immediate event-state refresh failed for ${connectionId}:`,
+      eventErr instanceof Error ? eventErr.message : String(eventErr),
+    )
   }
 
   return event

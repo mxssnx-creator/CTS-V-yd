@@ -762,4 +762,62 @@ describe("requested regression guardrails", () => {
     )
   })
 
+  test("queued settings refreshes hot-apply one connection and do not reinitialize all engines", () => {
+    const coordinator = read("lib/trade-engine.ts")
+    const autoStart = read("lib/trade-engine-auto-start.ts")
+    const settingsCoordinator = read("lib/settings-coordinator.ts")
+
+    const healthBlock = coordinator.slice(
+      coordinator.indexOf('if (request.action === "stop")'),
+      coordinator.indexOf("// -- 2. Per-engine stall watchdog", coordinator.indexOf('if (request.action === "stop")')),
+    )
+    expect(healthBlock).toContain("await this.applyPendingChangesNow(request.connectionId)")
+    expect(healthBlock).not.toContain("await this.refreshEngines()")
+
+    const autoBlock = autoStart.slice(
+      autoStart.indexOf('if (request.action === "stop")'),
+      autoStart.indexOf("return processed", autoStart.indexOf('if (request.action === "stop")')),
+    )
+    expect(autoBlock).toContain("await coordinator.applyPendingChangesNow?.(request.connectionId)")
+    expect(autoBlock).not.toContain("await coordinator.refreshEngines()")
+
+    const restartFields = settingsCoordinator.slice(
+      settingsCoordinator.indexOf("const RESTART_REQUIRED_FIELDS"),
+      settingsCoordinator.indexOf("const HOT_RELOAD_FIELDS"),
+    )
+    expect(restartFields).not.toContain('"is_enabled"')
+    expect(settingsCoordinator).toContain('"is_enabled", "is_enabled_dashboard", "is_live_trade"')
+  })
+
+  test("QuickStart live controls send the checked state directly and revert to previous on failure", () => {
+    const optionsBar = read("components/dashboard/quickstart-options-bar.tsx")
+    const quickstartSection = read("components/dashboard/quickstart-section.tsx")
+    const activeCard = read("components/dashboard/active-connection-card.tsx")
+    const activeManager = read("components/dashboard/dashboard-active-connections-manager.tsx")
+
+    expect(optionsBar).toContain("void debouncedSaveLive(next, previous)")
+    expect(optionsBar).toContain("setControlOrders(previous)")
+    expect(optionsBar).toContain("onClick={(event) => event.stopPropagation()}")
+    expect(optionsBar).not.toContain("const debouncedSaveLive   = useDebouncedSaver(saveLiveTrade")
+
+    expect(quickstartSection).toContain("const previousState = liveTradeActive")
+    expect(quickstartSection).toContain("setLiveTradeActive(previousState)")
+    expect(quickstartSection).toContain("live-trade-toggled")
+
+    expect(activeCard).toContain("const previousState = liveTrade")
+    expect(activeCard).toContain("setLiveTrade(previousState)")
+    expect(activeCard).toContain("onCheckedChange={(checked) => {\n                    onToggle(connection.connectionId, checked)")
+    expect(activeManager).toContain("const newState = desiredState")
+    expect(activeManager).not.toContain("const newState = !currentState")
+  })
+
+  test("strategy set top-k selection uses a bounded heap for large progression inputs", () => {
+    const source = read("lib/strategy-sets-processor.ts")
+    expect(source).toContain("Memory-safe top-K selection")
+    expect(source).toContain("const heap: any[] = []")
+    expect(source).toContain("bubbleUp")
+    expect(source).toContain("sinkDown")
+    expect(source).not.toContain("top[minIdx] = indication")
+  })
+
 })
