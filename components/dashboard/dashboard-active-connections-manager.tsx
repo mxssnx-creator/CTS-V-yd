@@ -228,8 +228,10 @@ export function DashboardActiveConnectionsManager() {
     }
   }, [])
 
-  const handleToggle = async (connectionId: string, currentState: boolean) => {
-    const newState = !currentState
+  const handleToggle = async (connectionId: string, desiredState: boolean) => {
+    const currentState = activeConnectionsRef.current.find(ac => ac.connectionId === connectionId)?.isActive ?? false
+    const newState = desiredState
+    if (newState === currentState) return
 
     setTogglingIds(prev => new Set(prev).add(connectionId))
 

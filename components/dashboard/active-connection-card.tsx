@@ -103,7 +103,7 @@ interface ActiveConnectionCardProps {
   connection: ActiveConnection & { details?: Connection }
   expanded: boolean
   onExpand: (expanded: boolean) => void
-  onToggle: (connectionId: string, currentState: boolean) => Promise<void>
+  onToggle: (connectionId: string, desiredState: boolean) => Promise<void>
   onRemove: (connectionId: string, name: string) => Promise<void>
   isToggling: boolean
   isRemoving?: boolean
@@ -841,6 +841,8 @@ export function ActiveConnectionCard({
   // so the user can flip Live and the engine comes up with the flag set.
   const handleLiveTradeToggle = async (newState: boolean) => {
     const connName = connection.exchangeName
+    const previousState = liveTrade
+    setLiveTrade(newState)
     liveTradeLoadingRef.current = true
     setLiveTradeLoading(true)
     try {
@@ -868,9 +870,11 @@ export function ActiveConnectionCard({
           }))
         }
       } else {
+        setLiveTrade(previousState)
         toast.error(`Failed to toggle Live Trade: ${data.error || "Unknown error"}`)
       }
     } catch {
+      setLiveTrade(previousState)
       toast.error("Failed to toggle Live Trade")
     } finally {
       liveTradeLoadingRef.current = false
@@ -1071,8 +1075,9 @@ export function ActiveConnectionCard({
                 <Switch
                   id={`enable-${connection.connectionId}`}
                   checked={connection.isActive}
-                  onCheckedChange={() => {
-                    onToggle(connection.connectionId, connection.isActive)
+                  onClick={(event) => event.stopPropagation()}
+                  onCheckedChange={(checked) => {
+                    onToggle(connection.connectionId, checked)
                   }}
                   disabled={isToggling}
                   className="scale-[0.8]"
@@ -1111,6 +1116,7 @@ export function ActiveConnectionCard({
                 <Switch
                   id={`live-${connection.connectionId}`}
                   checked={liveTrade}
+                  onClick={(event) => event.stopPropagation()}
                   onCheckedChange={handleLiveTradeToggle}
                   disabled={liveTradeLoading}
                   className="scale-[0.8]"
@@ -1147,6 +1153,7 @@ export function ActiveConnectionCard({
                 <Switch
                   id={`preset-${connection.connectionId}`}
                   checked={presetMode}
+                  onClick={(event) => event.stopPropagation()}
                   onCheckedChange={handlePresetModeToggle}
                   disabled={presetModeLoading}
                   className="scale-[0.8]"

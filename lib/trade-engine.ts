@@ -669,10 +669,9 @@ export class GlobalTradeEngineCoordinator {
       if (!(await this.isGlobalCoordinatorEnabled(`startEngineFromConnectionConfig(${connectionId})`))) {
         return
       }
-      const { getAllConnections } = await import("@/lib/redis-db")
+      const { getConnection } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
-      const connections = await getAllConnections()
-      const connection = connections.find((c: any) => c.id === connectionId)
+      const connection = await getConnection(connectionId)
       if (!connection) {
         console.warn(
           `[v0] [Coordinator] restart skipped — connection ${connectionId} not found`,
@@ -943,13 +942,19 @@ export class GlobalTradeEngineCoordinator {
       this.pruneZombieManagers()
 
       const { getAssignedAndEnabledConnections } = await import("@/lib/redis-db")
+      const { isConnectionEligibleForEngine } = await import("@/lib/connection-state-utils")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
 
-      // Re-check against the canonical strict helper at the engine-start
-      // chokepoint so callers cannot accidentally use base `is_enabled` /
-      // legacy `enabled` as processing gates.
-      const strictlyEligibleIds = new Set((await getAssignedAndEnabledConnections()).map((c: any) => c.id))
-      connections = connections.filter((c: any) => strictlyEligibleIds.has(c.id))
+      // Re-check eligibility at the engine-start chokepoint. For targeted
+      // event-state starts (usually one connection), avoid loading every
+      // assigned connection from Redis; that all-connections read was a major
+      // production memory spike during progression/toggle bursts.
+      if (connections.length <= 2) {
+        connections = connections.filter((c: any) => isConnectionEligibleForEngine(c))
+      } else {
+        const strictlyEligibleIds = new Set((await getAssignedAndEnabledConnections()).map((c: any) => c.id))
+        connections = connections.filter((c: any) => strictlyEligibleIds.has(c.id))
+      }
 
       const enabledIds = new Set(connections.map(c => c.id))
       // Only count managers whose engine is actually running, not zombie Map entries from stale closures
@@ -960,10 +965,21 @@ export class GlobalTradeEngineCoordinator {
       )
       
       console.log(`[v0] [Coordinator] Missing engines check: shouldBeRunning=${enabledIds.size}, currentlyRunning=${runningIds.size}`)
+      const configuredMaxActive = Number(process.env.MAX_ACTIVE_TRADE_ENGINES || process.env.TRADE_ENGINE_MAX_ACTIVE || 0)
+      const maxActiveEngines = Number.isFinite(configuredMaxActive) && configuredMaxActive > 0
+        ? configuredMaxActive
+        : (process.env.NODE_ENV === "production" ? 2 : Number.POSITIVE_INFINITY)
       
       // Start engines for connections that should be running but aren't
       let started = 0
       for (const connection of connections) {
+        if (runningIds.size + started >= maxActiveEngines) {
+          console.warn(
+            `[v0] [Coordinator] Active engine cap reached (${runningIds.size + started}/${maxActiveEngines}); ` +
+              `leaving ${connection.id} queued for the next event/healing pass`,
+          )
+          continue
+        }
         if (!runningIds.has(connection.id)) {
           try {
             const hasCredentials = Boolean((connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret))
@@ -1543,9 +1559,15 @@ export class GlobalTradeEngineCoordinator {
             if (request.action === "stop") {
               await this.stopEngine(request.connectionId, { operatorRequested: true })
             } else if (request.action === "start") {
-              await this.startEngineFromConnectionConfig(request.connectionId)
+              if (!this.isEngineRunning(request.connectionId)) {
+                await this.startEngineFromConnectionConfig(request.connectionId)
+              }
             } else {
-              await this.refreshEngines()
+              // Settings/progression refresh requests must be hot-applied to the
+              // target connection only. Calling refreshEngines() here performed
+              // a full eligible-connection reconciliation every 10s and caused
+              // repeated reinitializations right after progress started.
+              await this.applyPendingChangesNow(request.connectionId)
             }
           }
         }

@@ -1,6 +1,7 @@
 import { getRedisClient, getSettings, setSettings } from "./redis-db"
 
 export const ENGINE_REFRESH_REQUEST_PREFIX = "engine_coordinator:refresh_requested:"
+const ENGINE_REFRESH_REQUEST_INDEX = "engine_coordinator:refresh_requested:index"
 
 export type EngineRefreshAction = "start" | "stop" | "refresh"
 
@@ -82,16 +83,30 @@ async function triggerImmediateEngineRefresh(reason: string): Promise<void> {
 
 export async function queueEngineRefreshRequest(request: EngineRefreshRequest): Promise<void> {
   await setSettings(`${ENGINE_REFRESH_REQUEST_PREFIX}${request.connectionId}`, request)
+  await (getRedisClient().sadd?.(`settings:${ENGINE_REFRESH_REQUEST_INDEX}`, request.connectionId) ?? Promise.resolve(0)).catch(() => 0)
+  // Do not block API/settings/progression writes on local coordinator work.
+  // In long-lived production workers this runs on the next turn; in serverless
+  // the durable queued request remains for the coordinator watchdog/cron.
+  void triggerImmediateEngineRefresh(request)
   await triggerImmediateEngineRefresh(request)
   await triggerImmediateEngineRefresh(request.reason || request.action || "queued_refresh")
 }
 
 export async function getQueuedEngineRefreshRequests(): Promise<Array<{ key: string; request: EngineRefreshRequest }>> {
   const client = getRedisClient()
-  const keys = await client.keys(`settings:${ENGINE_REFRESH_REQUEST_PREFIX}*`).catch(() => [] as string[])
+  let connectionIds = await (client.smembers?.(`settings:${ENGINE_REFRESH_REQUEST_INDEX}`) ?? Promise.resolve([] as string[])).catch(() => [] as string[])
+  if (!connectionIds || connectionIds.length === 0) {
+    // Backward-compatible fallback for queues written before the index existed.
+    const keys = await client.keys(`settings:${ENGINE_REFRESH_REQUEST_PREFIX}*`).catch(() => [] as string[])
+    connectionIds = keys
+      .filter((redisKey: string) => !redisKey.endsWith(ENGINE_REFRESH_REQUEST_INDEX))
+      .map((redisKey: string) => redisKey.replace(/^settings:/, "").slice(ENGINE_REFRESH_REQUEST_PREFIX.length))
+      .filter(Boolean)
+  }
+
   const requests = await Promise.all(
-    keys.map(async (redisKey) => {
-      const key = redisKey.replace(/^settings:/, "")
+    Array.from(new Set(connectionIds)).map(async (connectionId) => {
+      const key = `${ENGINE_REFRESH_REQUEST_PREFIX}${connectionId}`
       const request = await getSettings(key).catch(() => null)
       return request?.connectionId && request?.timestamp ? { key, request: request as EngineRefreshRequest } : null
     }),
@@ -100,5 +115,9 @@ export async function getQueuedEngineRefreshRequests(): Promise<Array<{ key: str
 }
 
 export async function clearEngineRefreshRequest(connectionId: string): Promise<void> {
-  await getRedisClient().del(`settings:${ENGINE_REFRESH_REQUEST_PREFIX}${connectionId}`).catch(() => 0)
+  const client = getRedisClient()
+  await Promise.all([
+    client.del(`settings:${ENGINE_REFRESH_REQUEST_PREFIX}${connectionId}`).catch(() => 0),
+    (client.srem?.(`settings:${ENGINE_REFRESH_REQUEST_INDEX}`, connectionId) ?? Promise.resolve(0)).catch(() => 0),
+  ])
 }

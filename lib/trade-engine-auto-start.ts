@@ -104,9 +104,11 @@ async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnTyp
     if (request.action === "stop") {
       await coordinator.stopEngine(request.connectionId, { operatorRequested: true })
     } else if (request.action === "start") {
-      await coordinator.startMissingEngines([connection])
+      if (!coordinator.isEngineRunning?.(request.connectionId)) {
+        await coordinator.startMissingEngines([connection])
+      }
     } else {
-      await coordinator.refreshEngines()
+      await coordinator.applyPendingChangesNow?.(request.connectionId)
     }
   }
 
