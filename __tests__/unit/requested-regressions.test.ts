@@ -668,6 +668,32 @@ describe("requested regression guardrails", () => {
     expect(dashboardRoute).toContain("Only /api/trade-engine/stop owns global shutdown")
   })
 
+
+  test("global resume restores Redis intent before startEngine and supports fresh-process paused state", () => {
+    const resumeRoute = read("app/api/trade-engine/resume/route.ts")
+    const coordinator = read("lib/trade-engine.ts")
+
+    const routeRestoreIndex = resumeRoute.indexOf('await client.hset("trade_engine:global", {')
+    const routeResumeIndex = resumeRoute.indexOf("await coordinator.resume({ force: true })")
+    expect(routeRestoreIndex).toBeGreaterThanOrEqual(0)
+    expect(routeRestoreIndex).toBeLessThan(routeResumeIndex)
+    expect(resumeRoute).toContain('status: previousStatus')
+    expect(resumeRoute).toContain('desired_status: previousStatus')
+    expect(resumeRoute).toContain('operator_intent: previousStatus')
+
+    const resumeBlock = coordinator.slice(
+      coordinator.indexOf("async resume(options: { force?: boolean } = {})"),
+      coordinator.indexOf("getEngineManager", coordinator.indexOf("async resume(options: { force?: boolean } = {})")),
+    )
+    expect(resumeBlock).toContain('const redisPaused = globalState?.status === "paused" || globalState?.operator_intent === "paused"')
+    expect(resumeBlock).toContain("if (!options.force && !this.isPaused && !redisPaused)")
+    expect(resumeBlock.indexOf('await client.hset("trade_engine:global", {')).toBeLessThan(resumeBlock.indexOf("await this.startEngine(connectionId, config)"))
+    expect(resumeBlock).toContain('status: restoredStatus')
+    expect(resumeBlock).toContain('desired_status: restoredStatus')
+    expect(resumeBlock).toContain('operator_intent: restoredStatus')
+    expect(resumeBlock.indexOf('await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")')).toBeGreaterThan(resumeBlock.indexOf('await client.hset("trade_engine:global", {'))
+  })
+
   test("dashboard detailed logs header action scrolls within the log dialog", () => {
     const button = read("components/dashboard/detailed-logs-button.tsx")
     const scrollArea = read("components/ui/scroll-area.tsx")
