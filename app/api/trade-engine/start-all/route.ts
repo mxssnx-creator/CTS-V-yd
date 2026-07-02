@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { initRedis, getAssignedAndEnabledConnections, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
-import { initRedis, getAllConnections, getSettings, getRedisClient, getAssignedAndEnabledConnections } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
 async function handleStartAll() {
