@@ -846,4 +846,22 @@ describe("requested regression guardrails", () => {
     expect(source).not.toContain("top[minIdx] = indication")
   })
 
+
+  test("production system monitoring returns process resource metrics even when Redis is unavailable", () => {
+    const route = read("app/api/system/monitoring/route.ts")
+    const helper = read("lib/system-resource-metrics.ts")
+
+    expect(route).toContain('const resourceMetrics = getSystemResourceMetrics()')
+    expect(route.indexOf('const resourceMetrics = getSystemResourceMetrics()')).toBeLessThan(route.indexOf('await initRedis()'))
+    expect(route).toContain('Redis unavailable while collecting system metrics')
+    expect(route).toContain('cpu: resourceMetrics.cpuPercent')
+    expect(route).toContain('memory: resourceMetrics.memoryPercent')
+    expect(route).not.toContain('cpu: 0,')
+    expect(route).not.toContain('memory: 0,')
+
+    expect(helper).toContain('process.cpuUsage(previous.cpuUsage)')
+    expect(helper).toContain('os.totalmem')
+    expect(helper).toContain('memory.rss')
+  })
+
 })
