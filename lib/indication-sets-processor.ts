@@ -366,6 +366,14 @@ export class IndicationSetsProcessor {
         return
       }
 
+      const apiSetFillEnabled =
+        process.env.NODE_ENV !== "production" ||
+        process.env.ENABLE_API_INDICATION_SET_FILL === "1" ||
+        process.env.ENABLE_API_INDICATION_SET_FILL === "true"
+      if (!apiSetFillEnabled) {
+        return
+      }
+
       // Process all 5 set-backed types in parallel with independent logic.
       // Use per-type isolation so an Optimal/Auto calculation failure never
       // aborts Direction/Move/Active for the same symbol and never crashes the

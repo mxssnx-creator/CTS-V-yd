@@ -72,6 +72,8 @@ export interface ConnectionStatus {
 
 export interface StartEngineOptions {
   markAssigned?: boolean
+  /** Force this process to own the runtime for explicit UI/API starts. */
+  forceLocalTakeover?: boolean
 }
 
 export interface StopEngineOptions {
@@ -216,6 +218,13 @@ export class GlobalTradeEngineCoordinator {
    * Start engine for a specific connection
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
+  async startEngine(connectionId: string, config: EngineConfig, options: StartEngineOptions = {}): Promise<boolean> {
+    const forceLocalTakeover = options.forceLocalTakeover === true || config.allowInProcessStart === true
+
+    // Production must allow in-process starts from the coordinator so explicit
+    // UI/API actions, auto-start healing sweeps, and continuity ticks all work
+    // without requiring a separate dedicated worker env flag. Duplicate starts
+    // are still guarded below by in-process and Redis startup locks.
   async startEngine(connectionId: string, config: EngineConfig, _options: StartEngineOptions = {}): Promise<boolean> {
     if (!this.canOwnEngineRuntime()) {
       console.warn(
@@ -279,11 +288,16 @@ export class GlobalTradeEngineCoordinator {
         const remoteHeartbeat = Number((remoteState as any)?.last_processor_heartbeat || 0)
         const remoteHeartbeatFresh =
           Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
-        if (remoteHeartbeatFresh) {
+        if (remoteHeartbeatFresh && !forceLocalTakeover) {
           console.warn(
             `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker with a fresh heartbeat; not clearing distributed running flag`,
           )
           return true
+        }
+        if (remoteHeartbeatFresh && forceLocalTakeover) {
+          console.warn(
+            `[v0] [STARTUP LOCK] Engine ${connectionId} has only a distributed heartbeat; explicit local start is taking ownership`,
+          )
         }
         // Redis flag can become stale across crashes/restarts; clear stale state
         // before continuing. Leaving it set made status endpoints report a
@@ -335,10 +349,15 @@ export class GlobalTradeEngineCoordinator {
         } catch { /* heartbeat read is best-effort */ }
 
         if (ownerHeartbeatFresh) {
+          if (!forceLocalTakeover) {
+            console.warn(
+              `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker (${acquired.existingOwner ?? "unknown"}) with a fresh heartbeat. Leaving existing owner untouched.`,
+            )
+            return true
+          }
           console.warn(
-            `[v0] [STARTUP LOCK] Engine ${connectionId} is owned by another worker (${acquired.existingOwner ?? "unknown"}) with a fresh heartbeat. Leaving existing owner untouched.`,
+            `[v0] [STARTUP LOCK] Engine ${connectionId} has a distributed owner (${acquired.existingOwner ?? "unknown"}); explicit local start is taking ownership.`,
           )
-          return true
         }
 
         console.warn(

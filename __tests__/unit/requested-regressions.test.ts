@@ -556,7 +556,7 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("workerAttached: hasLocalEngineRuntime")
     expect(source).toContain("distributedHeartbeatFresh: hasFreshDistributedHeartbeat")
     expect(source).toContain("distributedEngineCount")
-    expect(source).toContain("No local engine runtime is attached yet; explicit UI actions and continuity sweeps will reconcile queued engine work.")
+    expect(source).toContain("No local engine runtime is attached yet; explicit UI actions and continuity sweeps will attach engine work in this process.")
     expect(source).toContain("Optional for dedicated-worker deployments")
     expect(source).toContain("operatorStatus: operatorIntent")
     expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")

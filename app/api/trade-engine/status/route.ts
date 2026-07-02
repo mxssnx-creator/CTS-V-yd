@@ -132,7 +132,7 @@ export async function GET() {
         workerAttached: hasLocalEngineRuntime,
         globalHeartbeatFresh: hasFreshGlobalHeartbeat,
         connectionHeartbeatFresh: false,
-        actualRuntimeStatus: isGloballyPaused ? "paused" : (isGloballyRunning ? "queued" : "stopped"),
+        actualRuntimeStatus: isGloballyPaused ? "paused" : (isGloballyRunning ? "starting" : "stopped"),
         activeWorkerId: engineHash.active_worker_id || null,
         lastHeartbeatAt: globalHeartbeatAt || null,
         activeEngineCount: coordinator?.getActiveEngineCount() || 0,
@@ -189,7 +189,7 @@ export async function GET() {
             workerAttached: hasLocalEngineRuntime,
             distributedHeartbeatFresh: hasFreshDistributedHeartbeat,
             connectionHeartbeatFresh: hasFreshDistributedHeartbeat,
-            actualRuntimeStatus: connectionRunning ? "running" : (isGloballyPaused ? "paused" : (isGloballyRunning ? "queued" : "stopped")),
+            actualRuntimeStatus: connectionRunning ? "running" : (isGloballyPaused ? "paused" : (isGloballyRunning ? "starting" : "stopped")),
             lastProcessorHeartbeat: processorHeartbeat || null,
             assigned: conn.is_active_inserted === true || conn.is_active_inserted === "1" || conn.is_assigned === true || conn.is_assigned === "1" || conn.is_dashboard_inserted === true || conn.is_dashboard_inserted === "1",
             processingEnabled: conn.is_enabled_dashboard === true || conn.is_enabled_dashboard === "1",
@@ -250,7 +250,7 @@ export async function GET() {
       operatorIntent,
       globalCoordinatorIntent,
       operatorStatus: operatorIntent,
-      actualRuntimeStatus: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : (isGloballyRunning ? "queued" : "stopped")),
+      actualRuntimeStatus: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : (isGloballyRunning ? "starting" : "stopped")),
       actualStatus: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "degraded"),
       globalHeartbeatFresh: hasFreshGlobalHeartbeat,
       connectionHeartbeatFresh: distributedEngineCount > 0,
@@ -264,7 +264,7 @@ export async function GET() {
             : null),
         hint:
           activeEngineCount === 0
-            ? "No local engine runtime is attached yet; explicit UI actions and continuity sweeps will reconcile queued engine work."
+            ? "No local engine runtime is attached yet; explicit UI actions and continuity sweeps will attach engine work in this process."
             : null,
         requiredWorkerEnv: "Optional for dedicated-worker deployments: set ENABLE_TRADE_ENGINE_AUTOSTART=1 on exactly one long-lived worker/process; normal production Node processes auto-start foreground work from boot and continuity sweeps unless disabled.",
         worker: workerDiagnostic,
