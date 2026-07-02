@@ -897,6 +897,7 @@ describe("requested regression guardrails", () => {
   test("QuickStart live button uses effective live state and live-trade enable makes engine eligible", () => {
     const quickstart = read("components/dashboard/quickstart-section.tsx")
     const liveRoute = read("app/api/settings/connections/[id]/live-trade/route.ts")
+    const helper = read("lib/system-resource-metrics.ts")
 
     const quickstartHelper = quickstart.slice(
       quickstart.indexOf("QuickStart's Live button controls effective exchange order placement"),

@@ -606,9 +606,9 @@ export class TradeEngineManager {
    * When connection settings change (e.g. operator edits indication
    * thresholds, volume factor, presets, etc.) the API handler writes
    * a change event + bumps `settings_change_counter:{id}` in Redis.
-   * The `settingsWatcherTimer` below polls that counter every 3s and,
-   * on a bump, calls `applyPendingSettingsChange()` to dispatch the
-   * event:
+   * The settings watcher subscribes to the in-process settings event bus
+   * and calls `applyPendingSettingsChange()` as soon as the API emits the
+   * durable Redis event:
    *
    *   • `reload` → in-place: bump `settingsVersion`, re-read the
    *     connection snapshot, refresh config-set processor caches. No
@@ -620,7 +620,7 @@ export class TradeEngineManager {
    * a generational settings flip and bust any local memoization (e.g.
    * "did the indication thresholds change since I last computed?").
    */
-  private settingsWatcherTimer?: NodeJS.Timeout
+  private unsubscribeSettingsWatcher?: () => void
   private lastSettingsCounter = 0
   private settingsVersion = 0
   /** Set true while a settings apply is in flight to prevent overlap. */
@@ -1194,6 +1194,7 @@ export class TradeEngineManager {
       if (this.prehistoricTimer) { clearTimeout(this.prehistoricTimer); this.prehistoricTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
       if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
+      if (this.unsubscribeSettingsWatcher) { this.unsubscribeSettingsWatcher(); this.unsubscribeSettingsWatcher = undefined }
 
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
@@ -1386,11 +1387,11 @@ export class TradeEngineManager {
       this.lockExtendTimer = undefined
     }
     // Settings watcher must die alongside the engine — otherwise a
-    // stopped manager would keep polling and could re-apply a change
+    // stopped manager would keep an event subscription and could re-apply a change
     // it has no business touching.
-    if (this.settingsWatcherTimer) {
-      clearInterval(this.settingsWatcherTimer)
-      this.settingsWatcherTimer = undefined
+    if (this.unsubscribeSettingsWatcher) {
+      this.unsubscribeSettingsWatcher()
+      this.unsubscribeSettingsWatcher = undefined
     }
 
     this.isRunning = false
@@ -4277,42 +4278,49 @@ export class TradeEngineManager {
   // ────��───────────���───────────────────────────────────────────────────
 
   /**
-   * Starts the per-connection settings watcher (3s poll). Cheap: a
-   * single HGETALL on `settings:settings_change_counter:{id}` per
-   * tick, branchless when the counter hasn't moved.
+   * Starts the per-connection settings watcher. This is event-based:
+   * settings writes emit through settings-coordinator's in-process bus,
+   * so an owning manager applies the durable pending change immediately
+   * instead of waking on a timer. Cross-process/serverless durability is
+   * still provided by the Redis `settings_change:{id}` envelope and the
+   * engine refresh queue.
    */
   private startSettingsWatcher(): void {
-    if (this.settingsWatcherTimer) {
-      clearInterval(this.settingsWatcherTimer)
-      this.settingsWatcherTimer = undefined
+    if (this.unsubscribeSettingsWatcher) {
+      this.unsubscribeSettingsWatcher()
+      this.unsubscribeSettingsWatcher = undefined
     }
     // Seed the counter so we don't immediately re-apply a change that
     // happened BEFORE the engine started.
     void this.seedSettingsCounter()
-    this.settingsWatcherTimer = setInterval(async () => {
-      if (!this.isRunning) {
-        if (this.settingsWatcherTimer) {
-          clearInterval(this.settingsWatcherTimer)
-          this.settingsWatcherTimer = undefined
+    void import("@/lib/settings-coordinator").then(({ onSettingsChanged }) => {
+      if (!this.isRunning) return
+      this.unsubscribeSettingsWatcher = onSettingsChanged(this.connectionId, async (event) => {
+        if (!this.isRunning) {
+          if (this.unsubscribeSettingsWatcher) this.unsubscribeSettingsWatcher()
+          this.unsubscribeSettingsWatcher = undefined
+          return
         }
-        return
-      }
-      if (this.settingsApplying) return
-      try {
-        const { getChangeCounter } = await import("@/lib/settings-coordinator")
-        const counter = await getChangeCounter(this.connectionId)
-        if (counter > this.lastSettingsCounter) {
-          this.lastSettingsCounter = counter
-          await this.applyPendingSettingsChange()
+        if (this.settingsApplying) return
+        try {
+          const { getChangeCounter } = await import("@/lib/settings-coordinator")
+          const counter = await getChangeCounter(this.connectionId)
+          if (counter > this.lastSettingsCounter) this.lastSettingsCounter = counter
+          if (event.connectionId === this.connectionId) await this.applyPendingSettingsChange()
+        } catch (err) {
+          // Watcher failures must never kill the engine; just log once.
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] settings watcher event failed:`,
+            err instanceof Error ? err.message : String(err),
+          )
         }
-      } catch (err) {
-        // Watcher failures must never kill the engine; just log once.
-        console.warn(
-          `[v0] [Engine ${this.connectionId}] settings watcher poll failed:`,
-          err instanceof Error ? err.message : String(err),
-        )
-      }
-    }, 3000)
+      })
+    }).catch((err) => {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] settings watcher subscription failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    })
   }
 
   private async seedSettingsCounter(): Promise<void> {

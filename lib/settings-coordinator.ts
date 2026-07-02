@@ -1,3 +1,4 @@
+import { EventEmitter } from "events"
 import { initRedis, getSettings, setSettings, getConnection, getRedisClient } from "@/lib/redis-db"
 
 /**
@@ -7,7 +8,7 @@ import { initRedis, getSettings, setSettings, getConnection, getRedisClient } fr
  * When a connection's settings are updated, this module:
  * 1. Writes a change event to Redis so engines know to reload
  * 2. Determines if the change requires an engine restart vs hot reload
- * 3. Provides a polling mechanism for engines to detect changes
+ * 3. Emits an in-process event so local engines apply changes without timers
  */
 
 // Fields that require a full engine restart when changed
@@ -49,6 +50,27 @@ export interface SettingsChangeEvent {
   timestamp: string
   previousValues?: Record<string, unknown>
   newValues?: Record<string, unknown>
+}
+
+const SETTINGS_CHANGED_EVENT = "settings-changed"
+const settingsChangeBus = new EventEmitter()
+settingsChangeBus.setMaxListeners(500)
+
+export function onSettingsChanged(
+  connectionId: string,
+  handler: (event: SettingsChangeEvent) => void | Promise<void>,
+): () => void {
+  const listener = (event: SettingsChangeEvent) => {
+    if (event.connectionId !== connectionId) return
+    void Promise.resolve(handler(event)).catch((error) => {
+      console.warn(
+        `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    })
+  }
+  settingsChangeBus.on(SETTINGS_CHANGED_EVENT, listener)
+  return () => settingsChangeBus.off(SETTINGS_CHANGED_EVENT, listener)
 }
 
 async function clearEngineRestartFlags(connectionId: string): Promise<void> {
@@ -127,6 +149,8 @@ export async function notifySettingsChanged(
   await setSettings(`settings_change_counter:${connectionId}`, String(newCounter))
 
   console.log(`[v0] [SettingsCoordinator] Change event for ${connectionId}: type=${changeType}, fields=[${changedFields.join(",")}]`)
+
+  settingsChangeBus.emit(SETTINGS_CHANGED_EVENT, event)
 
   // If restart required, update engine state to signal restart needed
   if (changeType === "restart") {
