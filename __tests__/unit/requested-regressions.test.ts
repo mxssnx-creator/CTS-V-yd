@@ -893,4 +893,8 @@ describe("requested regression guardrails", () => {
     expect(overview).toContain("requestSeq !== statsFetchSeqRef.current")
   })
 
+    expect(helper).toContain('os.totalmem')
+    expect(helper).toContain('memory.rss')
+  })
+
 })
