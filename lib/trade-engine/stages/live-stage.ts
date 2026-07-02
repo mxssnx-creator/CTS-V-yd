@@ -1372,7 +1372,7 @@ async function placeProtectionOrder(
         const availableQty = extract110424Available(errMsg)
         if (availableQty !== null && availableQty < effectiveQty) {
           console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} — retrying with exact available qty`,
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ��� retrying with exact available qty`,
           )
           result = await placeStop(availableQty)
           if (result?.success) {
@@ -2116,7 +2116,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───�����────────────────────────────────────────────────────────
+// ── Main Pipeline ───�����──────────��─────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -2182,7 +2182,7 @@ export async function executeLivePosition(
     return cbSkipped
   }
 
-  // ── Non-recoverable-error cooldown gate ──
+  // ���─ Non-recoverable-error cooldown gate ──
   //
   // If we hit `code=101204` (Insufficient margin) within the exponential
   // backoff window (60s → 120s → 240s → 300s), skip this attempt and return
@@ -2908,10 +2908,12 @@ export async function executeLivePosition(
     // BingX's one-way-mode accounts auto-retry without positionSide if the
     // exchange rejects it (code 80014), so this is safe for both modes.
     //
-    // ── CRITICAL: Re-check is_live_trade gate RIGHT BEFORE order placement ──────
+    // ── CRITICAL: Re-check is_live_trade + is_testnet gate RIGHT BEFORE order placement ──────
     // The flag is checked once at entry (line 1959), but if the operator toggles
     // Control Orders off during preflight, we must catch it here before sending
     // the order to the exchange. This is a defensive second gate.
+    // ALSO check if the connection is pointing to a testnet exchange to prevent
+    // accidental real orders on testnet accounts (critical safety guard).
     const { getConnection: reCheckConn } = await import("@/lib/redis-db")
     const { isTruthyFlag: reCheckTruthy } = await import("@/lib/connection-state-utils")
     const freshSettings = (await reCheckConn(connectionId)) || {}
@@ -2919,6 +2921,25 @@ export async function executeLivePosition(
       !hasRealTradeBlock(freshSettings) &&
       (reCheckTruthy(freshSettings.is_live_trade) ||
         reCheckTruthy(freshSettings.live_trade_enabled))
+    
+    // CRITICAL: Prevent order placement on testnet connections
+    const isTestnetConnection = reCheckTruthy(freshSettings.is_testnet)
+    if (isTestnetConnection) {
+      livePosition.status = "rejected"
+      livePosition.statusReason =
+        `Testnet connection detected — live order placement blocked for safety. Use a production exchange connection for real trading.`
+      pushStep(livePosition, "entry", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        livePosition.statusReason,
+        { symbol: realPosition.symbol, direction: realPosition.direction, exchangeApi: freshSettings.exchange },
+      ).catch(() => {})
+      return livePosition
+    }
 
     if (!isStillLive) {
       livePosition.status = "rejected"
@@ -5032,7 +5053,7 @@ export async function reconcileLivePositions(
             return delta
           }
 
-          // ── Ownership guard ────────────────────���──────���──────────────
+          // ── Ownership guard ────────────────────�����─────���──────────────
           // Only arm SL/TP and issue force-closes on positions that carry
           // a system orderId — proof WE placed the entry order.
           // If orderId is absent, the exchange position at this

@@ -558,10 +558,10 @@ export class InlineLocalRedis implements RedisClientLike {
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
         // RSS trigger: in dev, Next.js + engine idle RSS is ~1.8–2.4 GB.
-        // Trigger at 2200 MB so eviction runs before the engine prehistoric burst
-        // (which adds 300-400 MB) pushes RSS past 2.5 GB and routes start timing out.
-        // Prod: 3000 MB (serverless containers rarely hit this; safety net only).
-        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 2_200 : 3_000
+        // CRITICAL: Market data accumulation causes OOM even with 4GB limit. Reduce trigger.
+        // Trigger at 1800 MB (200 MB lower) to catch burst EARLIER before RSS explodes 2.0→5.0GB.
+        // Prod: 2500 MB (more aggressive than before since market data kills dev fast).
+        const RSS_PRESSURE_MB = process.env.NODE_ENV === "development" ? 1_800 : 2_500
         const totalKeys = this.data.strings.size + this.data.hashes.size +
                           this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
         // Scale the key-count eviction trigger with symbol count so the threshold
@@ -2472,7 +2472,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
   return settings
 }
 
-// ───────────────────────────────────────��─────────────────────────────
+// ─────────────────────��─────────────────��─────────────────────────────
 // Canonical app-settings helpers
 //
 // The project historically drifted between two Redis hashes:
@@ -2730,10 +2730,13 @@ export async function getMarketData(symbol: string, interval: string): Promise<a
   }
 }
 
-export async function setMarketData(symbol: string, interval: string, data: any, ttlSeconds: number = 300): Promise<void> {
+export async function setMarketData(symbol: string, interval: string, data: any, ttlSeconds?: number): Promise<void> {
   await initRedis()
   const client = getClient()
-  await client.set(`market_data:${symbol}:${interval}`, JSON.stringify(data), { EX: ttlSeconds })
+  // Development mode: use aggressive 60s TTL to prevent market_data accumulation OOM
+  // Production mode: use longer 300s TTL for better backfill capability
+  const finalTtl = ttlSeconds ?? (process.env.NODE_ENV === "development" ? 60 : 300)
+  await client.set(`market_data:${symbol}:${interval}`, JSON.stringify(data), { EX: finalTtl })
 }
 
 // ========== Position Operations ==========

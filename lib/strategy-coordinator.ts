@@ -2247,7 +2247,7 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
-    // ── 2. Base/variant async processing ─��──────────────────────����───────────
+    // ── 2. Base/variant async processing ─��──────────────────────�����───────────
     // Process all baseSet × variant combinations in parallel for faster throughput.
     // Each combination calls the async buildVariantSet, which previously ran
     // sequentially. Now they all start together and resolve concurrently.
@@ -2535,7 +2535,7 @@ export class StrategyCoordinator {
           mainSets.push(axisSet)
           axisSetsAdded++
 
-          // ── Register axis SetCoordRecord ─────────────────────────────
+          // ── Register axis SetCoordRecord ───────────��─────────────────
           // Axis sets carry a synthetic entry but their quality data lives
           // on the parent Base Set. Recording the parentKey here enables
           // createLiveSets to do a O(1) base lookup instead of O(N) find().
@@ -4211,11 +4211,13 @@ export class StrategyCoordinator {
 
       // DEV/TEST fallback: when no Real sets yet but Main sets exist, allow
       // a temporary synthetic Real escalation so the live pipeline can be
-      // exercised in test environments. Guard by testnet flag or FORCE_LIVE env.
-      // In dev we short-circuit the getConnection() call (an async Redis read
-      // per cycle per symbol) since NODE_ENV==="development" already covers it.
+      // exercised in test environments. Guard by testnet flag ONLY.
+      // CRITICAL: FORCE_LIVE is NEVER a testnet override — it's a debug flag for dev.
+      // Always verify actual is_testnet on the connection record (async read required).
+      // In dev we short-circuit the getConnection() call since NODE_ENV==="development"
+      // already covers the dev-mode fallback below (line 4297).
       try {
-        const isDevEnv = process.env.NODE_ENV === "development" || process.env.FORCE_LIVE === "1"
+        const isDevEnv = process.env.NODE_ENV === "development"
         const conn = isDevEnv ? null : (await (await import("@/lib/redis-db")).getConnection(this.connectionId)) || {}
         const isTestConn = isDevEnv || conn?.is_testnet === true || conn?.is_testnet === "1"
         if (realSets.length === 0 && isTestConn) {
@@ -4290,8 +4292,9 @@ export class StrategyCoordinator {
 
     // DEV/TEST fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
     // Short-circuit getConnection() in dev — NODE_ENV check is free vs async Redis read per cycle.
+    // CRITICAL: FORCE_SIMULATED/FORCE_LIVE are debug flags; ALWAYS verify actual is_testnet on connection record.
     try {
-      const isDevMode = process.env.FORCE_SIMULATED === "1" || process.env.FORCE_LIVE === "1" || process.env.NODE_ENV === "development"
+      const isDevMode = process.env.NODE_ENV === "development"
       const conn = isDevMode ? null : await (await import("@/lib/redis-db")).getConnection(this.connectionId)
       const isTestOrDev = isDevMode || conn?.is_testnet === true || conn?.is_testnet === "1"
       if (qualifying.length === 0 && isTestOrDev) {
@@ -5603,7 +5606,7 @@ export class StrategyCoordinator {
    * Deterministic fingerprint of {base Set × variant × position context}.
    * Drives the "IF NOT ALREADY CREATED" dedup check.
    *
-   * ── Bucket ranges (P0-3, spec-aligned) ─��────────��───���───────��──────
+   * ── Bucket ranges (P0-3, spec-aligned) ─��────────��───����───────��──────
    * Spec ranges:
    *   - Prev Positions         1-12   (13 buckets 0-12)
    *   - Last Positions W/L     1-4    (5 buckets each 0-4)
