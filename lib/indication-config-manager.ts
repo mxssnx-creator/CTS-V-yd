@@ -76,17 +76,18 @@ export class IndicationConfigManager {
     const client = getRedisClient()
 
     const pattern = `indication:${this.connectionId}:config:*`
-    const keys = await client.keys(pattern)
+    const keys = (await client.keys(pattern)).filter((k: string) => !k.endsWith(":results"))
+    if (keys.length === 0) return []
 
+    // Fan out all GETs in parallel — was O(N) serial round-trips.
+    const values = await Promise.all(keys.map((k: string) => client.get(k).catch(() => null)))
     const configs: IndicationConfig[] = []
-    for (const key of keys) {
-      if (key.endsWith(":results")) continue
-      const data = await client.get(key)
-      if (data) {
+    for (const data of values) {
+      if (!data) continue
+      try {
         configs.push(JSON.parse(typeof data === "string" ? data : JSON.stringify(data)))
-      }
+      } catch { /* skip malformed */ }
     }
-
     return configs
   }
 
@@ -189,9 +190,6 @@ export class IndicationConfigManager {
   }
 
   async generateDefaultConfigs(): Promise<IndicationConfig[]> {
-    const configs: IndicationConfig[] = []
-    let idCounter = 1
-
     // Read per-connection minStep from Redis.
     // Only step-window sizes >= minStep are generated — raising the floor
     // eliminates fast short-window configs that tend to trigger on noise.
@@ -211,20 +209,21 @@ export class IndicationConfigManager {
     }
 
     const types = ["SMA", "EMA", "RSI", "MACD"]
-    // Full candidate pool 2–30 at practical intervals.
-    // Filter by operator-configured minStep floor.
     const ALL_STEPS = [2, 3, 5, 10, 15, 20, 25, 30]
-    const stepsOptions = ALL_STEPS.filter(s => s >= minStep)
+    const stepsOptions = ALL_STEPS.filter((s) => s >= minStep)
     const drawdownOptions = [0.05, 0.1, 0.15]
     const activeRatioOptions = [0.6, 0.7, 0.8]
     const lastPartRatioOptions = [0.2, 0.3, 0.4]
 
-    for (const type of types) {
+    // Build all config objects in memory first — no I/O yet.
+    const pending: Array<Omit<IndicationConfig, "connectionId" | "createdAt">> = []
+    let idCounter = 1
+    outer: for (const type of types) {
       for (const steps of stepsOptions) {
         for (const drawdown of drawdownOptions) {
           for (const activeRatio of activeRatioOptions) {
             for (const lastPartRatio of lastPartRatioOptions) {
-              const config = await this.createConfig({
+              pending.push({
                 id: `ind_${this.connectionId}_${idCounter++}`,
                 steps,
                 drawdown_ratio: drawdown,
@@ -233,16 +232,24 @@ export class IndicationConfigManager {
                 type,
                 enabled: true,
               })
-              configs.push(config)
-
-              if (configs.length >= 100) {
-                return configs
-              }
+              if (pending.length >= 100) break outer
             }
           }
         }
       }
     }
+
+    // Persist all configs in parallel — was sequential await per config.
+    const now = new Date().toISOString()
+    await initRedis()
+    const client = getRedisClient()
+    const pipe = client.multi()
+    const configs: IndicationConfig[] = pending.map((cfg) => {
+      const full: IndicationConfig = { ...cfg, connectionId: this.connectionId, createdAt: now }
+      pipe.set(this.getConfigKey(cfg.id), JSON.stringify(full))
+      return full
+    })
+    await pipe.exec()
 
     return configs
   }

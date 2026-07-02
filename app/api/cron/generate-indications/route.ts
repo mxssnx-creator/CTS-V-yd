@@ -358,7 +358,7 @@ async function generateIndicationsForConnection(
     const realGenerated = Math.max(0, Math.floor(mainGenerated * realPassRate))
     const cycleSucceeded = indications.length > 0
 
-    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ───���────────
+    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ───����────────
     // market_data, all per-indication counters + latest hashes, progression
     // counters, cycle-completion accounting and final progression snapshot are
     // all queued into one multi()/exec() so N indication types + M counter
@@ -597,9 +597,11 @@ export async function GET() {
         primarySymbol = await getMostVolatileSymbol(exchangeName)
       }
 
+      // Default 4 major symbols used when active_symbols is empty.
+      const DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
       let symbolsToProcess = symbolsRaw.length > 0
         ? symbolsRaw
-        : Array.from(new Set([primarySymbol, "BTCUSDT"].filter(Boolean)))
+        : Array.from(new Set([...DEFAULT_SYMBOLS, primarySymbol].filter(Boolean)))
       symbolsToProcess = symbolsToProcess.slice(0, 20)
 
       for (let c = 0; c < cyclesPerCron; c++) {

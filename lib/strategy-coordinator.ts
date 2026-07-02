@@ -749,6 +749,11 @@ export interface StrategyCoordinatorConfig {
   pruneStrategy?: "fifo" | "performance" | "hybrid"
 }
 
+// Module-level bootstrap log throttle — survives coordinator instance re-creation
+// because a new StrategyCoordinator is created each cron tick. Keyed by
+// "main:<connectionId>" and "real:<connectionId>". 60 s quiet period.
+const _bootstrapLoggedAt: Record<string, number> = {}
+
 export class StrategyCoordinator {
   static forceNextSettingsReload(_connectionId: string): number {
     return Date.now()
@@ -929,9 +934,6 @@ export class StrategyCoordinator {
    * fire once every 500 cycles instead of on every cycle.
    */
   private _stratCycleCount = 0
-  // Bootstrap log throttle — suppress repeated bootstrap relaxation logs after
-  // the first emission. Each key logs at most once per 60 s per coordinator instance.
-  private _bootstrapLoggedAt: Record<string, number> = {}
   // Dev-mode real:sets write throttle — only persists every 5th cycle to keep
   // the InlineLocalRedis heap bounded. Initialised lazily in createRealSets.
 
@@ -2195,10 +2197,10 @@ export class StrategyCoordinator {
       if (liveQuickstartOn) {
         const relaxed = Math.min(mainMinPF, 0.75)
         if (relaxed !== mainMinPF) {
-          const logKey = `main:${this.connectionId}`
-          const now = Date.now()
-          if (!this._bootstrapLoggedAt[logKey] || now - this._bootstrapLoggedAt[logKey] > 60_000) {
-            this._bootstrapLoggedAt[logKey] = now
+            const logKey = `main:${this.connectionId}`
+            const now = Date.now()
+            if (!_bootstrapLoggedAt[logKey] || now - _bootstrapLoggedAt[logKey] > 60_000) {
+              _bootstrapLoggedAt[logKey] = now
             console.log(
               `[v0] [StrategyCoordinator] ${this.connectionId} MAIN bootstrap (live quickstart): ` +
               `relaxed minProfitFactor ${mainMinPF} → ${relaxed} to allow first Base→Main→Real flow.`
@@ -3143,8 +3145,8 @@ export class StrategyCoordinator {
           if (relaxed !== realMinPF) {
             const logKey = `real:${this.connectionId}`
             const now = Date.now()
-            if (!this._bootstrapLoggedAt[logKey] || now - this._bootstrapLoggedAt[logKey] > 60_000) {
-              this._bootstrapLoggedAt[logKey] = now
+            if (!_bootstrapLoggedAt[logKey] || now - _bootstrapLoggedAt[logKey] > 60_000) {
+              _bootstrapLoggedAt[logKey] = now
               console.log(
                 `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
                 `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount=${realMinPos} ` +

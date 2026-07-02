@@ -838,8 +838,48 @@ export class InlineLocalRedis implements RedisClientLike {
       evicted += trimBucket(listKeys, listCap)
     }
 
+    // ── Terminal live:position purge ─────────────────────────────────────
+    // live:position:* hashes are globally protected (they must survive eviction
+    // so open positions are never accidentally dropped). But this means terminal
+    // (closed, rejected, cancelled) positions accumulate unboundedly. We trim
+    // them here: keep the most-recent MAX_TERMINAL_POSITIONS per connection by
+    // inspecting the "status" field of each hash. Open/placed positions are
+    // NEVER touched.
+    {
+      const MAX_TERMINAL_POSITIONS = 200
+      const TERMINAL_STATUSES = new Set(["closed","rejected","cancelled","expired","error"])
+      // Group terminal position keys by connection id (first segment of the id field
+      // or the key itself). Key format: live:position:<id> where id is like
+      // "live:bingx-x01:BTCUSDT:long:123456".
+      const terminalByConn = new Map<string, Array<[string, number]>>()
+      for (const [key, fields] of this.data.hashes.entries()) {
+        if (!key.startsWith("live:position:")) continue
+        if (key.startsWith("live:position:tracking:")) continue
+        const status = fields.get?.("status") ?? fields["status"] ?? ""
+        if (!TERMINAL_STATUSES.has(status)) continue
+        // Extract connection id from the position id embedded in the hash
+        const posId: string = fields.get?.("id") ?? fields["id"] ?? key
+        const connMatch = posId.match(/^live:([^:]+:[^:]+):/)
+        const connKey = connMatch ? connMatch[1] : "unknown"
+        const ts = Number(fields.get?.("closedAt") ?? fields["closedAt"] ?? fields.get?.("updatedAt") ?? fields["updatedAt"] ?? 0)
+        let arr = terminalByConn.get(connKey)
+        if (!arr) { arr = []; terminalByConn.set(connKey, arr) }
+        arr.push([key, ts])
+      }
+      for (const [, positions] of terminalByConn) {
+        if (positions.length <= MAX_TERMINAL_POSITIONS) continue
+        // Sort oldest-first, drop the excess old ones
+        positions.sort((a, b) => a[1] - b[1])
+        const drop = positions.length - MAX_TERMINAL_POSITIONS
+        for (let i = 0; i < drop; i++) {
+          this.data.hashes.delete(positions[i][0])
+          evicted++
+        }
+      }
+    }
+
     // ── Membership sets — prune oversized pseudo-position id sets ─────────
-    const SET_MEMBER_CAP = 4000
+    const SET_MEMBER_CAP = 800   // was 4000 — 800 is plenty for 4 symbols
     for (const [key, members] of this.data.sets.entries()) {
       if (
         (key.startsWith("pseudo_positions:") || key.startsWith("real_pseudo_positions:")) &&

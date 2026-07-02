@@ -3800,14 +3800,12 @@ export class TradeEngineManager {
         const _isLocalRun = process.env.NODE_ENV === "development" ||
           (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")
         if (_isLocalRun) {
-          const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "1"
-          const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 1)
-          // Fast path for the default single-symbol case — skip the Redis
-          // resolution chain entirely; BTCUSDT is the canonical dev fixture.
-          if (devCap === 1) return ["BTCUSDT"]
-          // For devCap > 1 fall through to the full resolution chain below
-          // (force_symbols → self-written symbols → volatility fetch).
-          // The resolved list is sliced to devCap at the end of this function.
+          // Default 4 symbols so BTCUSDT/ETHUSDT/SOLUSDT/XRPUSDT all trade.
+          // The old default of 1 bypassed force_symbols / active_symbols entirely.
+          const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "4"
+          const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 4)
+          // Fall through to the full resolution chain (force_symbols → active_symbols
+          // → volatility fetch). The resolved list is sliced to devCap at the end.
           ;(resolve as any)._devCap = devCap
         }
 
@@ -3900,20 +3898,22 @@ export class TradeEngineManager {
           }
         }
 
-        return ["DRIFTUSDT"]
+        // Fallback to the 4 standard majors so the engine always has something
+        // sensible to trade rather than an obscure / illiquid symbol.
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
       } catch (error) {
         console.error("[v0] Failed to get symbols, using fallback:", error instanceof Error ? error.message : String(error))
-        return ["DRIFTUSDT"]
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
       }
     }
 
     let resolved = await resolve()
-    // Apply dev symbol cap when V0_DEV_SYMBOL_COUNT > 1 (devCap was stashed
-    // on the resolve function to avoid a closure variable that could race
-    // with concurrent calls during hot-reload).
-    if (process.env.NODE_ENV === "development") {
+    // Apply dev symbol cap (devCap was stashed on the resolve function to
+    // avoid a closure variable that could race with concurrent calls).
+    if (process.env.NODE_ENV === "development" ||
+        (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")) {
       const devCap = (resolve as any)._devCap
-      if (typeof devCap === "number" && devCap > 1 && resolved.length > devCap) {
+      if (typeof devCap === "number" && resolved.length > devCap) {
         resolved = resolved.slice(0, devCap)
         console.log(`[v0] [getSymbols] Dev cap ${devCap}: using ${resolved.join(",")}`)
       }

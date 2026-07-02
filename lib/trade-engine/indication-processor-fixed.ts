@@ -351,10 +351,13 @@ export class IndicationProcessor {
         recordsProcessed++
       }
 
-      const directionStats = await setsProcessor.getSetStats(symbol, "direction")
-      const moveStats = await setsProcessor.getSetStats(symbol, "move")
-      const activeStats = await setsProcessor.getSetStats(symbol, "active")
-      const optimalStats = await setsProcessor.getSetStats(symbol, "optimal")
+      // Fan out all 4 stat reads in parallel — was 4 serial awaits.
+      const [directionStats, moveStats, activeStats, optimalStats] = await Promise.all([
+        setsProcessor.getSetStats(symbol, "direction"),
+        setsProcessor.getSetStats(symbol, "move"),
+        setsProcessor.getSetStats(symbol, "active"),
+        setsProcessor.getSetStats(symbol, "optimal"),
+      ])
 
       const ProgressionManager = await getProgressionManager()
       await ProgressionManager.incrementPrehistoricCycle(this.connectionId, symbol)

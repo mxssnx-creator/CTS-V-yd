@@ -137,10 +137,10 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // Each value is calibrated to a ~2×p99 RTT of a typical BingX API call
 // (BingX p99 ≈ 120–250 ms); the gap gives one retry margin without
 // stalling the full sync for multiple seconds on a flaky call.
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 15_000  // 15 seconds - cancel needs time
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 20_000  // 20 seconds - stop/TP placement on slow exchanges
-const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 seconds - position fetch with network latency
-const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 seconds - fill detection needs time on volatility
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 10_000  // 10 s — cancel; fail fast and retry next tick
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 10_000  // 10 s — SL/TP placement; BingX normally <3 s
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 10_000  // 10 s — position fetch
+const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  6_000  //  6 s — fill detection; retry via next sync tick on miss
 
 /**
  * Live position as it flows through the live-stage pipeline and is
@@ -1466,11 +1466,11 @@ async function placeProtectionOrder(
 async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
   if (!connector || typeof connector.getOpenOrders !== "function") return null
   try {
-    // 20 s upper bound — production timeout for real exchange network latency.
+    // 8 s upper bound — BingX normally responds in <3 s; 8 s is generous.
     // On timeout we degrade gracefully to drift-only reconciliation.
     const orders = (await withTimeout(
       connector.getOpenOrders() as Promise<any>,
-      20000,
+      8_000,
       "getOpenOrders(reconcile-tick)",
     )) as any[] | undefined
     if (!Array.isArray(orders)) return null
@@ -2116,7 +2116,7 @@ async function updateProtectionOrders(
   return result
 }
 
-// ── Main Pipeline ───�����──────────��─────────────────────────────────────────────
+// ── Main Pipeline ───�����──────���───��─────────────────────────────────────────────
 
 /**
  * Execute a real position on exchange as a live position with the full
@@ -5901,9 +5901,10 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const SYNC_CONCURRENCY = 12
     
     // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout for syncWithExchange.
-    // BingX can take 10-20 seconds on slow operations. Previously 6s but was
-    // causing timeouts and stalls. Increased to 20s to handle real exchange latency.
-    const SYNC_PER_POS_TIMEOUT_MS = 20_000
+    // Individual operation timeouts (getOrder=6s, placeStop=10s) mean the
+    // worst case per-position is ~16s; cap at 14s so one timed-out position
+    // can't stall the pool worker past one full tick period.
+    const SYNC_PER_POS_TIMEOUT_MS = 14_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
