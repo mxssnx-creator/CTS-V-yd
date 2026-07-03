@@ -140,7 +140,7 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // set conservatively to handle the worst case while still catching genuine
 // hangs.  SL/TP placement is the most critical path — a timeout here leaves
 // a position unprotected, so it gets more budget than cancel/fetch.
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 15_000  // 15 s — cancel; ok to be generous, retried next tick on failure
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 20_000  // 20 s — cancel; retried next tick on failure; raised from 15s as concurrent sweeps queue up
 const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 45_000  // 45 s — SL/TP placement; covers semaphore queue wait + BingX round-trip
 const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 s — position fetch for adoption + sync prefetch
 const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 s — fill detection; retry via next sync tick on miss
@@ -1190,15 +1190,25 @@ async function cancelProtectionOrder(
   if (!orderId) return false
   try {
     if (typeof connector?.cancelOrder !== "function") return false
-    // Bounded — a hanging cancelOrder must not block close/heal paths.
-    // On timeout we return false; the position close pipeline tolerates a
-    // failed cancel (the order will be reconciled on the next reconcile
-    // sweep, and the close itself proceeds regardless).
-    const res = await withTimeout(
-      connector.cancelOrder(symbol, orderId) as Promise<any>,
-      EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
-      `cancelOrder(${label} ${orderId})`,
-    )
+    // Use AbortController so the underlying HTTP connection is cancelled at
+    // the timeout boundary. Plain withTimeout leaves the fetch running after
+    // the Promise race resolves, producing zombie requests in the rate-limiter
+    // queue that block subsequent cancel/place calls.
+    const cancelAbort = new AbortController()
+    const cancelTimer = setTimeout(() => cancelAbort.abort(), EXCHANGE_TIMEOUT_CANCEL_ORDER_MS)
+    let res: any
+    try {
+      res = await (connector.cancelOrder(symbol, orderId, { signal: cancelAbort.signal } as any) as Promise<any>)
+    } catch (e: any) {
+      const msg = String(e?.message || e || "")
+      if (msg.includes("AbortError") || msg.includes("aborted") || msg.includes("abort")) {
+        console.warn(`${LOG_PREFIX} ${label} cancel timed out after ${EXCHANGE_TIMEOUT_CANCEL_ORDER_MS}ms — will retry on next sweep`)
+        return false
+      }
+      throw e
+    } finally {
+      clearTimeout(cancelTimer)
+    }
     if (res?.success) {
       console.log(`${LOG_PREFIX} ${label} cancelled: ${orderId}`)
       return true
@@ -2096,12 +2106,12 @@ async function updateProtectionOrders(
           pos.direction!,
         )
         // Only treat the leg as "armed at desiredSl" when we actually
-        // have a confirmed order id. Setting stopLossPrice = desiredSl
-        // on a failed placement would make the next pass think the
-        // level is live (priceDrifted compares < 0.25%) and skip
-        // retry — leaving the position permanently unprotected.
-        if (id) {
-          pos.stopLossOrderId = id
+        // have a confirmed numeric order id (not the "PRICE_CROSSED" sentinel
+        // which means market already blew past the SL and a force-close should
+        // happen on the next reconcile checkAndForceCloseOnSltpCross pass).
+        const slIdOk = id && id !== "PRICE_CROSSED" && id !== "position_exhausted"
+        if (slIdOk) {
+          pos.stopLossOrderId = id!
           pos.stopLossPrice = desiredSl
           pos.stopLossLastArmedAt = Date.now()
           result.changed = true
@@ -2158,8 +2168,9 @@ async function updateProtectionOrders(
           "TakeProfit",
           pos.direction!,
         )
-        if (id) {
-          pos.takeProfitOrderId = id
+        const tpIdOk = id && id !== "PRICE_CROSSED" && id !== "position_exhausted"
+        if (tpIdOk) {
+          pos.takeProfitOrderId = id!
           pos.takeProfitPrice = desiredTp
           pos.takeProfitLastArmedAt = Date.now()
           result.changed = true

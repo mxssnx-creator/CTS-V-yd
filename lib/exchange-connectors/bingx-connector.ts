@@ -1279,12 +1279,17 @@ export class BingXConnector extends BaseExchangeConnector {
     }
   }
 
-  async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
+  async cancelOrder(
+    symbol: string,
+    orderId: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<{ success: boolean; error?: string }> {
+    const callerSignal = opts?.signal
     try {
+      // Abort early if signal already fired (caller timed out while we were queued).
+      if (callerSignal?.aborted) return { success: false, error: "cancelOrder: aborted before start" }
+
       // Sync server time before any signed request.
-      // The throttle inside syncServerTime (60 s) means concurrent cancel
-      // calls don't pile up on re-sync — the first triggers a real HTTP
-      // call, subsequent ones within the window return immediately.
       await this.syncServerTime()
 
       this.log(`Cancelling order ${orderId} for ${symbol}`)
@@ -1303,13 +1308,13 @@ export class BingXConnector extends BaseExchangeConnector {
         return `${baseUrl}${endpoint}?${signedQs}&signature=${signature}`
       }
 
-      // LAZY URL BUILD: pass the builder itself so timestamp + signature are
-      // computed inside the rate-limit slot at send time, not at queue time.
-      const doRequest = () =>
+      // LAZY URL BUILD + callerSignal so the HTTP connection is physically
+      // cancelled when the caller's AbortController fires (20s cancel budget).
+      const doRequest = (sig?: AbortSignal) =>
         this.rateLimitedFetch(buildUrl, {
           method,
           headers: { "X-BX-APIKEY": this.credentials.apiKey },
-        })
+        }, sig ?? callerSignal)
 
       let response = await doRequest()
 
@@ -1333,7 +1338,7 @@ export class BingXConnector extends BaseExchangeConnector {
           this.lastTimeSync = 0
           this.syncPromise = null
           await this.syncServerTime()
-          const retryResponse = await doRequest()
+          const retryResponse = await doRequest(callerSignal)
           if (!retryResponse.ok) throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`)
           data = await this.safeJson(retryResponse)
 
