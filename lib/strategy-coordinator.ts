@@ -3916,13 +3916,6 @@ export class StrategyCoordinator {
         }
       } catch { /* fallback: 0 */ }
 
-      // Real input/fan-out accounting:
-      // - mainPFEligible is the upstream Main output eligible to enter Real PF.
-      // - realRelatedCreated is current-cycle Real fan-out beyond that input.
-      // - public real:evaluated counts every Real Set considered after fan-out.
-      const realRelatedCreated = realStageRelatedCreated
-      const realEvaluatedAfterFanOut = mainPFEligible + realRelatedCreated
-
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
         client.hset(realDetailKey, {
@@ -3933,6 +3926,8 @@ export class StrategyCoordinator {
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
           avg_pos_eval_real:  String(realAvgPosEval.toFixed(4)),
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
+          // evaluated = public Real denominator after fan-out; separate upstream
+          // input remains in strategies_active as {symbol}:real:input.
           // evaluated = PF-eligible Main inputs plus Real related/axis-created outputs;
           // separate upstream input remains in strategies_active as {symbol}:real:input.
           evaluated:          String(realTotalEvaluated),
