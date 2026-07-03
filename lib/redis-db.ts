@@ -966,12 +966,40 @@ export class InlineLocalRedis implements RedisClientLike {
   }
   
   private deleteKey(key: string): void {
+    this.cleanupSecondaryIndexesForDeletedKey(key)
     this.data.strings.delete(key)
     this.data.hashes.delete(key)
     this.data.sets.delete(key)
     this.data.lists.delete(key)
     this.data.sorted_sets.delete(key)
     this.data.ttl?.delete(key)
+  }
+
+  private cleanupSecondaryIndexesForDeletedKey(key: string): void {
+    const removeFromConnectionIndexes = (prefix: string, id: string) => {
+      for (const [setKey, members] of this.data.sets.entries()) {
+        if (setKey.startsWith(prefix)) {
+          members.delete(id)
+          if (members.size === 0) this.data.sets.delete(setKey)
+        }
+      }
+    }
+
+    if (key.startsWith("position:")) {
+      const id = key.slice("position:".length)
+      this.data.sets.get("idx:positions")?.delete(id)
+      removeFromConnectionIndexes("idx:positions:connection:", id)
+    } else if (key.startsWith("trade:")) {
+      const id = key.slice("trade:".length)
+      this.data.sets.get("idx:trades")?.delete(id)
+      removeFromConnectionIndexes("idx:trades:connection:", id)
+    } else if (key.startsWith("indication:")) {
+      const id = key.slice("indication:".length)
+      this.data.sets.get("idx:indications")?.delete(id)
+    } else if (key.startsWith("strategy:")) {
+      const id = key.slice("strategy:".length)
+      this.data.sets.get("idx:strategies")?.delete(id)
+    }
   }
   
   private setKeyTTL(key: string, seconds: number): void {
@@ -2304,6 +2332,95 @@ function parseHash(hash: Record<string, string> | null): Record<string, any> | n
   return result
 }
 
+
+const SECONDARY_INDEX_KEYS = {
+  positions: "idx:positions",
+  trades: "idx:trades",
+  indications: "idx:indications",
+  strategies: "idx:strategies",
+} as const
+
+function positionConnectionIndexKey(connectionId: string): string {
+  return `idx:positions:connection:${connectionId}`
+}
+
+function tradeConnectionIndexKey(connectionId: string): string {
+  return `idx:trades:connection:${connectionId}`
+}
+
+function getRecordConnectionId(record: Record<string, any> | null | undefined): string {
+  return String(record?.connectionId ?? record?.connection_id ?? "").trim()
+}
+
+async function readIndexedHashes(client: RedisClientLike, indexKey: string, keyPrefix: string): Promise<any[]> {
+  const ids = await client.smembers(indexKey).catch(() => [] as string[])
+  if (ids.length === 0) return []
+
+  const hashes = await Promise.all(
+    ids.map((id) => client.hgetall(`${keyPrefix}${id}`).catch(() => ({} as Record<string, string>))),
+  )
+
+  const records: any[] = []
+  const staleIds: string[] = []
+  for (let i = 0; i < ids.length; i++) {
+    const hash = hashes[i]
+    if (!hash || Object.keys(hash).length === 0) {
+      staleIds.push(ids[i])
+      continue
+    }
+    const parsed = parseHash(hash)
+    if (parsed) records.push(parsed)
+  }
+
+  if (staleIds.length > 0) {
+    await client.srem(indexKey, ...staleIds).catch(() => 0)
+  }
+
+  return records
+}
+
+async function updatePositionIndexes(client: RedisClientLike, id: string, position: Record<string, any>): Promise<void> {
+  const key = `position:${id}`
+  const previous = await client.hgetall(key).catch(() => ({} as Record<string, string>))
+  const previousConnectionId = getRecordConnectionId(previous)
+  const nextConnectionId = getRecordConnectionId(position)
+  await client.sadd(SECONDARY_INDEX_KEYS.positions, id)
+  if (previousConnectionId && previousConnectionId !== nextConnectionId) {
+    await client.srem(positionConnectionIndexKey(previousConnectionId), id).catch(() => 0)
+  }
+  if (nextConnectionId) {
+    await client.sadd(positionConnectionIndexKey(nextConnectionId), id)
+  }
+}
+
+async function removePositionIndexes(client: RedisClientLike, id: string): Promise<void> {
+  const existing = await client.hgetall(`position:${id}`).catch(() => ({} as Record<string, string>))
+  const connectionId = getRecordConnectionId(existing)
+  await client.srem(SECONDARY_INDEX_KEYS.positions, id).catch(() => 0)
+  if (connectionId) await client.srem(positionConnectionIndexKey(connectionId), id).catch(() => 0)
+}
+
+async function updateTradeIndexes(client: RedisClientLike, id: string, trade: Record<string, any>): Promise<void> {
+  const key = `trade:${id}`
+  const previous = await client.hgetall(key).catch(() => ({} as Record<string, string>))
+  const previousConnectionId = getRecordConnectionId(previous)
+  const nextConnectionId = getRecordConnectionId(trade)
+  await client.sadd(SECONDARY_INDEX_KEYS.trades, id)
+  if (previousConnectionId && previousConnectionId !== nextConnectionId) {
+    await client.srem(tradeConnectionIndexKey(previousConnectionId), id).catch(() => 0)
+  }
+  if (nextConnectionId) {
+    await client.sadd(tradeConnectionIndexKey(nextConnectionId), id)
+  }
+}
+
+async function removeTradeIndexes(client: RedisClientLike, id: string): Promise<void> {
+  const existing = await client.hgetall(`trade:${id}`).catch(() => ({} as Record<string, string>))
+  const connectionId = getRecordConnectionId(existing)
+  await client.srem(SECONDARY_INDEX_KEYS.trades, id).catch(() => 0)
+  if (connectionId) await client.srem(tradeConnectionIndexKey(connectionId), id).catch(() => 0)
+}
+
 // ========== Connection Operations ==========
 
 export async function getConnection(id: string): Promise<any | null> {
@@ -2818,18 +2935,7 @@ export async function getPosition(id: string): Promise<any | null> {
 export async function getAllPositions(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("position:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const positions: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    positions.push(parseHash(hash))
-  }
-  return positions
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.positions, "position:")
 }
 
 export async function savePosition(position: any): Promise<void> {
@@ -2968,12 +3074,14 @@ export async function savePosition(position: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
 
+  await updatePositionIndexes(client, id, data)
   await client.hset(`position:${id}`, data)
 }
 
 export async function deletePosition(id: string): Promise<void> {
   await initRedis()
   const client = getClient()
+  await removePositionIndexes(client, id)
   await client.del(`position:${id}`)
 }
 
@@ -2989,18 +3097,7 @@ export async function getTrade(id: string): Promise<any | null> {
 export async function getAllTrades(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("trade:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const trades: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    trades.push(parseHash(hash))
-  }
-  return trades
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.trades, "trade:")
 }
 
 export async function saveTrade(trade: any): Promise<void> {
@@ -3016,6 +3113,7 @@ export async function saveTrade(trade: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
   
+  await updateTradeIndexes(client, id, data)
   await client.hset(`trade:${id}`, data)
 }
 
@@ -3031,18 +3129,7 @@ export async function getIndication(id: string): Promise<any | null> {
 export async function getAllIndications(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("indication:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const indications: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    indications.push(parseHash(hash))
-  }
-  return indications
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.indications, "indication:")
 }
 
 export async function saveIndication(indication: any): Promise<void> {
@@ -3059,6 +3146,7 @@ export async function saveIndication(indication: any): Promise<void> {
   })
   
   const key = `indication:${id}`
+  await client.sadd(SECONDARY_INDEX_KEYS.indications, id)
   await client.hset(key, data)
   // Bound retention: prehistoric/realtime can mint hundreds of thousands
   // of these. Without a TTL the in-process Redis snapshot grows
@@ -3081,18 +3169,7 @@ export async function getStrategy(id: string): Promise<any | null> {
 export async function getAllStrategies(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("strategy:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const strategies: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    strategies.push(parseHash(hash))
-  }
-  return strategies
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.strategies, "strategy:")
 }
 
 export async function saveStrategy(strategy: any): Promise<void> {
@@ -3108,6 +3185,7 @@ export async function saveStrategy(strategy: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
   
+  await client.sadd(SECONDARY_INDEX_KEYS.strategies, id)
   await client.hset(`strategy:${id}`, data)
 }
 
@@ -3499,6 +3577,7 @@ export async function createPosition(data: any): Promise<any> {
   // 30 days is a reasonable retention window for trade history.
   const POSITION_TTL_SEC = 30 * 24 * 60 * 60
   await Promise.all([
+    updatePositionIndexes(client, id, positionData),
     client.hset(`position:${id}`, positionData),
     client.expire(`position:${id}`, POSITION_TTL_SEC),
     client.sadd("positions:all", id),
@@ -3677,66 +3756,12 @@ export async function verifyRedisHealth(): Promise<{ healthy: boolean; latency: 
 
 export async function getConnectionPositions(connectionId: string): Promise<any[]> {
   const client = getRedisClient()
-  const keys = await client.keys(`position:${connectionId}:*`)
-  const positions: any[] = []
-  
-  for (const key of keys) {
-    const data = await client.hgetall(key)
-    if (data && Object.keys(data).length > 0) {
-      positions.push({
-        id: key.replace(`position:${connectionId}:`, ""),
-        connection_id: connectionId,
-        ...data,
-      })
-    }
-  }
-  
-  // Also check global positions that reference this connection
-  const globalKeys = await client.keys("position:*")
-  for (const key of globalKeys) {
-    if (key.startsWith(`position:${connectionId}:`)) continue // Already processed
-    const data = await client.hgetall(key)
-    if (data && data.connection_id === connectionId) {
-      positions.push({
-        id: key.replace("position:", ""),
-        ...data,
-      })
-    }
-  }
-  
-  return positions
+  return readIndexedHashes(client, positionConnectionIndexKey(connectionId), "position:")
 }
 
 export async function getConnectionTrades(connectionId: string): Promise<any[]> {
   const client = getRedisClient()
-  const keys = await client.keys(`trade:${connectionId}:*`)
-  const trades: any[] = []
-  
-  for (const key of keys) {
-    const data = await client.hgetall(key)
-    if (data && Object.keys(data).length > 0) {
-      trades.push({
-        id: key.replace(`trade:${connectionId}:`, ""),
-        connection_id: connectionId,
-        ...data,
-      })
-    }
-  }
-  
-  // Also check global trades that reference this connection
-  const globalKeys = await client.keys("trade:*")
-  for (const key of globalKeys) {
-    if (key.startsWith(`trade:${connectionId}:`)) continue // Already processed
-    const data = await client.hgetall(key)
-    if (data && data.connection_id === connectionId) {
-      trades.push({
-        id: key.replace("trade:", ""),
-        ...data,
-      })
-    }
-  }
-  
-  return trades
+  return readIndexedHashes(client, tradeConnectionIndexKey(connectionId), "trade:")
 }
 
 export async function getProgressionLogs(connectionId: string, limit: number = 50): Promise<any[]> {
