@@ -137,7 +137,9 @@ export class BingXConnector extends BaseExchangeConnector {
       this.sdkClient = new BingXClient(requestExecutor)
       this.sdkAccount = new ApiAccount(credentials.apiKey, credentials.apiSecret)
       
-      console.log("[BingX] SDK client initialized (trade service + account enabled)")
+      // CRITICAL FIX: Removed log spam that appeared 50+ times per cycle
+      // SDK is initialized once per process, this log was noisy during development
+      // console.log("[BingX] SDK client initialized (trade service + account enabled)")
     } catch (err) {
       console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
       // Will fall back to manual REST
