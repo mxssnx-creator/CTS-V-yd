@@ -142,9 +142,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             reason: "connection_enable",
           })
           const localStartAllowed =
-            process.env.NODE_ENV !== "production" ||
-            process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
-            process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+            process.env.DISABLE_TRADE_ENGINE_IN_PROCESS !== "1" &&
+            process.env.NEXT_RUNTIME !== "edge"
           if (localStartAllowed && !coordinator.isEngineRunning(id)) {
             await coordinator.startMissingEngines([updatedConnection])
           }

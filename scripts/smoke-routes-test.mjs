@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
-import { rmSync, openSync, closeSync, existsSync } from 'node:fs'
+import { rmSync, openSync, closeSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 const port = 3002
@@ -45,19 +45,17 @@ let exitCode = 0
 try {
   let serverReady = false
   for (let i = 0; i < 90; i++) {
-    if (existsSync('.next/routes-manifest.json')) {
-      try {
-        const response = await fetch(base, {
-          cache: 'no-store',
-          signal: AbortSignal.timeout(5000),
-        })
-        if (response.ok || response.status === 307) {
-          serverReady = true
-          break
-        }
-      } catch {
-        // dev server not ready yet
+    try {
+      const response = await fetch(base, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(5000),
+      })
+      if (response.ok || response.status === 307) {
+        serverReady = true
+        break
       }
+    } catch {
+      // dev server not ready yet
     }
     await sleep(1000)
   }

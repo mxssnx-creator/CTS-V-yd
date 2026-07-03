@@ -247,14 +247,15 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           active_connections: String(activeDashboardCount),
         })
         
-        // Start/reconcile in-process only in dev or explicit diagnostics.
-        // Production API workers queue the durable start for the coordinator worker.
+        // Start/reconcile in-process for every Node runtime by default so
+        // production toggles do not wait forever for an optional external
+        // worker. Edge runtimes and explicitly disabled API workers still use
+        // the durable queue/continuity fallback.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           const localStartAllowed =
-            process.env.NODE_ENV !== "production" ||
-            process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
-            process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+            process.env.DISABLE_TRADE_ENGINE_IN_PROCESS !== "1" &&
+            process.env.NEXT_RUNTIME !== "edge"
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
