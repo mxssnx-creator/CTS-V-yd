@@ -4296,15 +4296,12 @@ export class StrategyCoordinator {
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
     // avgProfitFactor and take top N). Confidence is advisory metadata.
     //
-    // LIVE EXCHANGE DISPATCH CAP: exactly ONE set per direction per symbol.
+    // LIVE EXCHANGE DISPATCH CAP: Cap to top maxLive sets after PF/DDT filtering.
     // The Real stage evaluates hundreds of profile variants (default, blocks
-    // 1-8, dca, axis, trailing…) — that breadth is for STATISTICS, not for
-    // placing hundreds of live orders. Hedge netting already reduced the
-    // direction exposure; the live stage places at most 1 long + 1 short
-    // (the top-PF variant of each). Previously all qualifying variants (up
-    // to maxLive=90) were dispatched as real exchange orders every cycle,
-    // producing 90 order placements/rejections per tick and hundreds of
-    // stuck positions.
+    // 1-8, dca, axis, trailing…). The cap prevents 100+ simultaneous orders
+    // (which caused BingX 100421 backlog) but allows block + default variants
+    // to be tested together. The final dispatch loop (lines 4699-4715) enforces
+    // per-variant per-direction caps (1 default, 1 block, 1 dca per direction).
     const allQualifying = realSets
       .filter(
         (s) =>
@@ -4314,13 +4311,10 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    // Keep only the single best set per direction for actual dispatch.
-    const bestPerDirection = new Map<string, StrategySet>()
-    for (const s of allQualifying) {
-      const dir = s.direction === "short" ? "short" : "long"
-      if (!bestPerDirection.has(dir)) bestPerDirection.set(dir, s)
-    }
-    let qualifying = [...bestPerDirection.values()]
+    // Keep all qualifying sets (not filtered to 1 per direction).
+    // Block overlays will be added at line 4670, and the final dispatch loop
+    // at line 4699-4715 enforces per-variant caps (1 default + 1 block + 1 DCA).
+    let qualifying = allQualifying
 
     // Testnet fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
     // CRITICAL: Always verify actual is_testnet on connection record.
