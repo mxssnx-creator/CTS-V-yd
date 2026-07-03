@@ -1170,6 +1170,7 @@ export async function GET(
         `Clamping real to pipeline-aware ceiling (${realCeiling}).`,
       )
       stratCounts.real = realCeiling
+    }
     // Enforce cascade invariants for public progression counters. REAL may fan
     // out from upstream PF-eligible Main input, so real passed output can exceed
     // main as long as it does not exceed input + real:relatedCreated. During live
