@@ -618,7 +618,7 @@ export async function GET(
       ? Math.max(1, existingRealActiveSamples)
       : existingRealActiveSamples
 
-    // ── Live-stage OPEN positions + Set-relation join ─────�����───────────
+    // ── Live-stage OPEN positions + Set-relation join ─────�������───────────
     //
     // The operator asked for a coordination view that identifies which
     // Set each live exchange position came from. The live-stage
@@ -2207,7 +2207,7 @@ export async function GET(
       live: _liveBase > 0 ? Math.min(100, Math.round((_liveDispatched / _liveBase) * 1000) / 10) : 0,
     }
 
-    // ── REAL AVERAGES ────────────────────────────────────────────────────────
+    // ── REAL AVERAGES ────────────��───────────────────────────────────────────
     // Average real_samples:{id} ring buffer over 5-min window. Falls back to
     // live snapshot when no in-window samples exist (cold boot / fresh session).
     const _REAL_AVG_WINDOW_MS = 5 * 60 * 1000
