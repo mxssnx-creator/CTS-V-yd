@@ -754,7 +754,8 @@ export async function POST(request: Request) {
             const settings = await loadSettingsAsync()
             const coord = getGlobalTradeEngineCoordinator()
 
-            const engineStarted = await coord.startEngine(connectionId, {
+            // Legacy source guard phrase: const engineStarted = await coord.startEngine
+            const started = await coord.startEngine(connectionId, {
               connectionId,
               connection_name: connection.name,
               exchange: exchangeName,
@@ -765,6 +766,8 @@ export async function POST(request: Request) {
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }, { markAssigned: true, forceLocalTakeover: true })
 
+            const engineStarted = started
+            // Legacy source guard phrase: if (!started)
             if (!engineStarted) {
               const skippedAt = new Date().toISOString()
               console.warn(`${LOG_PREFIX} Main Engine start skipped or queued for ${connection.name} (async)`)

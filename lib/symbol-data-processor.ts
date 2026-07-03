@@ -209,6 +209,13 @@ export class SymbolDataProcessor {
       // Avoid unbounded realtime history growth; latest tick is sufficient here.
     } catch {
       // Best-effort realtime latest-tick persistence must never stall websocket processing.
+      
+    } catch (error) {
+      await this.progressManager.addError(
+        'market_data_store',
+        error instanceof Error ? error.message : 'Failed to store market data',
+        symbol
+      )
     }
   }
 
