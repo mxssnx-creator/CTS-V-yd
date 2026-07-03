@@ -2443,6 +2443,7 @@ export class StrategyCoordinator {
                 avgDrawdownTime: built.avgDrawdownTime,
                 avgConfidence:   built.avgConfidence,
                 entryCount:      built.entryCount,
+                trailingProfile: built.trailingProfile,
               }
               nextFpCache[fingerprint] = JSON.stringify(slimDelta)
               StrategyCoordinator._fpLruSet(fingerprint, built)
@@ -3847,6 +3848,7 @@ export class StrategyCoordinator {
     // failure metrics never go negative when Real outputs exceed Main inputs.
     const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)
     const realTotalEvaluated = mainPFEligible + realRelatedCreated
+    const realEvaluatedAfterFanOut = realTotalEvaluated
 
     // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
@@ -3955,7 +3957,7 @@ export class StrategyCoordinator {
           // input remains in strategies_active as {symbol}:real:input.
           // evaluated = PF-eligible Main inputs plus Real related/axis-created outputs;
           // separate upstream input remains in strategies_active as {symbol}:real:input.
-          evaluated:          String(realTotalEvaluated),
+          evaluated:          String(realEvaluatedAfterFanOut),
           passed_sets:        String(realSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
@@ -5881,6 +5883,12 @@ export class StrategyCoordinator {
         variantSizeMultiplier: repConfig.size,
         variantLeverage:       repConfig.leverage,
       }),
+      // Trailing is a Base-stage range coordination profile. Preserve it on
+      // every Main projection (default and adjust) so cached/recoordinated
+      // Sets, axis fan-out, Real dispatch and live control-order SL anchoring
+      // all resolve the exact same trailing range without relying on a later
+      // mutable cache patch.
+      ...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile }),
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }
