@@ -32,7 +32,6 @@ import { getRedisClient, initRedis, getSettings, getAppSettings, setSettings } f
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { emitIndicationUpdate } from "@/lib/broadcast-helpers"
 import {
-  compact,
   compactionCeiling,
   loadCompactionConfig,
   type CompactionConfig,
@@ -317,6 +316,65 @@ export class IndicationSetsProcessor {
         : cfg
     this.compactionCfgs[ckey] = finalCfg
     return finalCfg
+  }
+
+  /**
+   * Append one or more entries to an indication-set Redis LIST.
+   *
+   * The previous implementation performed GET → JSON.parse → push → SET for
+   * every write, so concurrent writers could overwrite each other. Lists let
+   * Redis perform the append server-side with RPUSH. We only LTRIM when the
+   * post-push length crosses the configured compaction ceiling, preserving the
+   * same "grow to floor + threshold%, then compact back to floor" policy and
+   * the newest-at-last ordering required by downstream readers.
+   */
+  private async appendIndicationEntries(
+    client: any,
+    setKey: string,
+    serializedEntries: string[],
+    cfg: CompactionConfig,
+  ): Promise<number> {
+    if (serializedEntries.length === 0) return 0
+    let length: number
+    try {
+      length = await client.rpush(setKey, ...serializedEntries)
+    } catch {
+      // Migration path for legacy JSON-array keys. Convert once by reading the
+      // string, deleting it, and recreating the same key as a Redis LIST.
+      const legacy = await this.readIndicationSetEntries(client, setKey)
+      await client.del(setKey)
+      const migrated = [...legacy.map((entry) => JSON.stringify(entry)), ...serializedEntries]
+      length = migrated.length > 0 ? await client.rpush(setKey, ...migrated) : 0
+    }
+    if (length >= compactionCeiling(cfg)) {
+      await client.ltrim(setKey, -cfg.floor, -1)
+      return Math.min(length, cfg.floor)
+    }
+    return length
+  }
+
+  private async readIndicationSetEntries(client: any, setKey: string): Promise<any[]> {
+    try {
+      const listValues: string[] = await client.lrange(setKey, 0, -1)
+      if (Array.isArray(listValues) && listValues.length > 0) {
+        return listValues
+          .map((raw) => {
+            try { return JSON.parse(raw) } catch { return null }
+          })
+          .filter(Boolean)
+      }
+    } catch {
+      // Legacy keys are JSON strings; real Redis raises WRONGTYPE for LRANGE.
+    }
+
+    try {
+      const raw = await client.get(setKey)
+      if (!raw) return []
+      const entries = JSON.parse(raw as string)
+      return Array.isArray(entries) ? entries : []
+    } catch {
+      return []
+    }
   }
 
   private parseRangeSettings(startRaw: any, endRaw: any, stepRaw: any, fallback: number[]): number[] {
@@ -821,53 +879,54 @@ export class IndicationSetsProcessor {
     try {
       const client = await getCachedClient()
 
-      // DEV MODE: overwrite each indication_set key with only the LATEST single
-      // entry instead of appending to a growing 250-item JSON array.
-      // Full grid:  250 entries × ~300 B/entry × 144 keys = ~11 MB per cycle.
-      // Dev  mode:  1 entry     × ~300 B/entry × 144 keys =  43 KB per cycle.
-      // The strategy-coordinator reads these keys to build Real-stage sets; it
-      // only needs the most-recent entry (it re-evaluates from scratch each cycle)
-      // so overwriting loses no functional data.
       const now = Date.now()
       const timestamp = new Date().toISOString()
 
-      // Process writes in bounded parallel chunks for high-frequency throughput.
-      const concurrency = 20
       // Resolve compaction config once for the whole batch — type is
       // fixed for all writes in this call (the public batchSave API
       // takes a single `type`), so a single async resolution covers
       // every chunk and keeps the inner loop synchronous w.r.t. config
       // lookup.
       const compactionCfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
-      for (let i = 0; i < writes.length; i += concurrency) {
-        const chunk = writes.slice(i, i + concurrency)
-        await Promise.all(
-          chunk.map(async ({ setKey, indication, config }, idx) => {
-            // Resolve direction with progressive fallbacks. The strategy
-            // coordinator + live-stage both use this field, so it MUST
-            // be on the persisted entry to avoid silent "long" fallback.
-            const direction: "long" | "short" =
-              indication.direction === "short"
-                ? "short"
-                : indication.direction === "long"
-                ? "long"
-                : indication?.metadata?.firstDir < 0
-                ? "short"
-                : "long"
+      const grouped = new Map<string, string[]>()
+      writes.forEach(({ setKey, indication, config }, idx) => {
+        // Resolve direction with progressive fallbacks. The strategy
+        // coordinator + live-stage both use this field, so it MUST
+        // be on the persisted entry to avoid silent "long" fallback.
+        const direction: "long" | "short" =
+          indication.direction === "short"
+            ? "short"
+            : indication.direction === "long"
+            ? "long"
+            : indication?.metadata?.firstDir < 0
+            ? "short"
+            : "long"
 
-            const entry = {
-              id: `${type}_${now}_${i + idx}_${Math.random().toString(36).slice(2, 6)}`,
-              timestamp,
-              type,
-              direction,
-              profitFactor: indication.profitFactor,
-              signalScore: indication.signalScore,
-              rawSignalStrength: indication.rawSignalStrength,
-              confidence: indication.confidence,
-              config,
-              metadata: indication.metadata,
-            }
+        const entry = {
+          id: `${type}_${now}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp,
+          type,
+          direction,
+          profitFactor: indication.profitFactor,
+          signalScore: indication.signalScore,
+          rawSignalStrength: indication.rawSignalStrength,
+          confidence: indication.confidence,
+          config,
+          metadata: indication.metadata,
+        }
 
+        const bucket = grouped.get(setKey)
+        if (bucket) bucket.push(JSON.stringify(entry))
+        else grouped.set(setKey, [JSON.stringify(entry)])
+      })
+
+      // Batch writes into a Redis pipeline: each set gets an RPUSH with all
+      // entries for that key. RPUSH appends server-side, avoiding the old
+      // GET/parse/append/SET lost-update race while preserving newest-at-last.
+      const pipe = client.pipeline ? client.pipeline() : client.multi()
+      const groupedEntries = Array.from(grouped.entries())
+      for (const [setKey, serializedEntries] of groupedEntries) {
+        pipe.rpush(setKey, ...serializedEntries)
             const existing = await client.get(setKey)
             let entries = existing ? JSON.parse(existing) : []
             // ── Newest-at-last (per spec) ──���─────────────────────────
@@ -894,6 +953,29 @@ export class IndicationSetsProcessor {
           }),
         )
       }
+      const lengths = await pipe.exec()
+
+      // Apply the same thresholded compaction policy, but with Redis-side
+      // LTRIM on the list rather than JSON array rewrites.
+      const trimPipe = client.pipeline ? client.pipeline() : client.multi()
+      let trimCount = 0
+      let idx = 0
+      for (const [setKey, serializedEntries] of groupedEntries) {
+        const slot = lengths?.[idx]
+        if (slot instanceof Error || (Array.isArray(slot) && slot[0] instanceof Error)) {
+          await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
+          idx++
+          continue
+        }
+        const rawLength = Array.isArray(slot) ? slot[1] : slot
+        const length = Number(rawLength) || 0
+        if (length >= compactionCeiling(compactionCfg)) {
+          trimPipe.ltrim(setKey, -compactionCfg.floor, -1)
+          trimCount++
+        }
+        idx++
+      }
+      if (trimCount > 0) await trimPipe.exec()
     } catch (error) {
       // Silent fail for non-critical batch operations
     }
@@ -920,9 +1002,6 @@ export class IndicationSetsProcessor {
   ): Promise<void> {
     try {
       const client = await getCachedClient()
-      
-      const existing = await client.get(setKey)
-      let entries = existing ? JSON.parse(existing) : []
 
       // Same direction-resolution logic as batchSaveIndications — see comment there.
       const direction: "long" | "short" =
@@ -935,10 +1014,10 @@ export class IndicationSetsProcessor {
           : "long"
 
       const id = `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-      // Newest-at-last per spec — see compaction module docs. The
-      // chronological invariant is required by the `mode: "recent"`
-      // compactor below (it does `slice(-floor)`).
-      entries.push({
+      // Newest-at-last per spec. Redis RPUSH appends at the tail, matching
+      // the previous chronological JSON-array invariant without a
+      // GET/parse/append/SET round-trip.
+      const entry = {
         id,
         timestamp: new Date().toISOString(),
         type,
@@ -949,13 +1028,15 @@ export class IndicationSetsProcessor {
         confidence: indication.confidence,
         config,
         metadata: indication.metadata,
-      })
+      }
 
       // Debounced threshold compaction. The cfg lookup is cached on
       // the processor instance with a 5s TTL so this single-save path
       // pays at most one Redis round-trip every 5s for config — every
       // subsequent call is a synchronous map lookup + a comparison.
       const cfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
+      await this.appendIndicationEntries(client, setKey, [JSON.stringify(entry)], cfg)
+      
       entries = compact(entries, cfg, "recent")
 
       // Broadcast indication update to connected clients. Direction is
@@ -1519,18 +1600,16 @@ export class IndicationSetsProcessor {
         }
       }
 
-      // Fan out all GETs in parallel — was N serial round-trips per stats call.
-      const rawValues = await Promise.all(keys.map((k: string) => client.get(k).catch(() => null)))
+      // Fan out all reads in parallel. New keys are Redis LISTs; legacy keys
+      // may still be JSON arrays, so the helper falls back to GET/JSON parse.
+      const values = await Promise.all(keys.map((k: string) => this.readIndicationSetEntries(client, k)))
 
       let totalEntries = 0
       let totalProfitFactor = 0
       let totalConfidence = 0
       let sampleCount = 0
 
-      for (const raw of rawValues) {
-        if (!raw) continue
-        let entries: any[]
-        try { entries = JSON.parse(raw as string) } catch { continue }
+      for (const entries of values) {
         if (!Array.isArray(entries)) continue
 
         totalEntries += entries.length
@@ -1563,20 +1642,14 @@ export class IndicationSetsProcessor {
       const keys = await this.getIndexedSetKeys(client, symbol, type)
       if (!keys || keys.length === 0) return []
 
-      // Fan out all GETs in parallel — same pattern as getCurrentIndications
-      // in indication-stage.ts to avoid sequential await latency.
-      const rawValues = await Promise.all(
-        keys.map((k: string) => client.get(k).catch(() => null)),
-      )
+      // Fan out all reads in parallel. New keys are Redis LISTs; legacy keys
+      // may still be JSON arrays, so the helper falls back to GET/JSON parse.
+      const values = await Promise.all(keys.map((k: string) => this.readIndicationSetEntries(client, k)))
       const allEntries: any[] = []
-      for (let i = 0; i < rawValues.length; i++) {
-        const raw = rawValues[i]
-        if (!raw) continue
-        try {
-          const entries = JSON.parse(raw as string)
-          if (!Array.isArray(entries)) continue
-          allEntries.push(...entries.map((entry) => ({ ...entry, setKey: keys[i] })))
-        } catch { /* skip malformed entries */ }
+      for (let i = 0; i < values.length; i++) {
+        const entries = values[i]
+        if (!Array.isArray(entries)) continue
+        allEntries.push(...entries.map((entry) => ({ ...entry, setKey: keys[i] })))
       }
 
       return allEntries

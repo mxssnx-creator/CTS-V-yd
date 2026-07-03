@@ -2060,21 +2060,27 @@ export async function ensureCoreRedis(): Promise<void> {
     }
 
     // Load the on-disk snapshot EXACTLY ONCE per process, gated on the global
-    // snapshot flag (not on data-map presence). This runs even when a sync
-    // getter built the empty instance first, and is skipped on hot-reload (the
-    // flag persists on globalThis), so we never overwrite live post-migration
-    // state. Concurrent callers across module scopes share one load promise.
+    // snapshot flag. If a sync getter built the instance and callers already
+    // wrote data before initRedis(), do not reload from disk over those live
+    // writes; mark the snapshot as handled instead. This keeps tests and
+    // pre-init bootstrap code from having settings overwritten by a stale
+    // dev snapshot while still loading snapshots for truly empty instances.
     if (!globalForRedis.__redis_snapshot_loaded) {
-      if (!globalForRedis.__redis_load_promise) {
-        globalForRedis.__redis_load_promise = redisInstance instanceof InlineLocalRedis ? redisInstance
-          .loadFromDisk()
-          .then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
-          .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false }) : Promise.resolve(false).then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
-        globalForRedis.__redis_load_promise.finally(() => {
-          globalForRedis.__redis_load_promise = undefined
-        })
+      const existingKeys = await redisInstance.dbSize().catch(() => 0)
+      if (existingKeys > 0) {
+        globalForRedis.__redis_snapshot_loaded = true
+      } else {
+        if (!globalForRedis.__redis_load_promise) {
+          globalForRedis.__redis_load_promise = redisInstance instanceof InlineLocalRedis ? redisInstance
+            .loadFromDisk()
+            .then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
+            .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false }) : Promise.resolve(false).then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
+          globalForRedis.__redis_load_promise.finally(() => {
+            globalForRedis.__redis_load_promise = undefined
+          })
+        }
+        await globalForRedis.__redis_load_promise
       }
-      await globalForRedis.__redis_load_promise
     }
 
     const pong = await redisInstance.ping()
