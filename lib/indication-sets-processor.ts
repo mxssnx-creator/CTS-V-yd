@@ -144,8 +144,8 @@ export class IndicationSetsProcessor {
   /**
    * Per-type compaction config, resolved once per ~5s via the cached
    * `loadCompactionConfig` helper. Keeping a per-processor copy lets the
-   * hot-path `saveIndicationToSet` call `compact()` without touching the
-   * settings hash on every fill.
+   * hot-path append helper enforce compaction without touching the settings
+   * hash on every fill.
    */
   private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
   // Dev mode uses a minimal range grid so the 4-GB v0 sandbox VM can run the
@@ -962,12 +962,13 @@ export class IndicationSetsProcessor {
         else grouped.set(setKey, [JSON.stringify(entry)])
       })
 
-      // Batch writes into a Redis pipeline: each set gets an RPUSH with all
-      // entries for that key. RPUSH appends server-side, avoiding the old
-      // GET/parse/append/SET lost-update race while preserving newest-at-last.
-      const pipe = client.pipeline ? client.pipeline() : client.multi()
+      // Append each grouped set through the shared helper so legacy JSON-array
+      // keys are migrated to Redis LISTs consistently with the single-save path.
       const groupedEntries = Array.from(grouped.entries())
       for (const [setKey, serializedEntries] of groupedEntries) {
+        await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
+        await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
+      }
         pipe.rpush(setKey, ...serializedEntries)
       for (const [_setKey, serializedEntries] of groupedEntries) {
         pipe.rpush(_setKey, ...serializedEntries)
