@@ -135,12 +135,41 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // Target: syncWithExchange completes in <1 s on the hot path.
 // These timeouts bound per-call worst case so the pool never hangs.
 // Each value is calibrated to a ~2×p99 RTT of a typical BingX API call
-// (BingX p99 ≈ 120–250 ms); the gap gives one retry margin without
-// stalling the full sync for multiple seconds on a flaky call.
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 10_000  // 10 s — cancel; fail fast and retry next tick
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 10_000  // 10 s — SL/TP placement; BingX normally <3 s
-const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 10_000  // 10 s — position fetch
-const EXCHANGE_TIMEOUT_GET_ORDER_MS     =  6_000  //  6 s — fill detection; retry via next sync tick on miss
+// Observed BingX p99 in production is 2–4 s per call; under load with 8
+// symbols placing simultaneous orders it can reach 6–8 s.  Timeouts are
+// set conservatively to handle the worst case while still catching genuine
+// hangs.  SL/TP placement is the most critical path — a timeout here leaves
+// a position unprotected, so it gets more budget than cancel/fetch.
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 15_000  // 15 s — cancel; ok to be generous, retried next tick on failure
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 25_000  // 25 s — SL/TP placement; must not leave positions unprotected
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 s — position fetch for adoption + sync prefetch
+const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 s — fill detection; retry via next sync tick on miss
+
+// ── Global SL/TP placement semaphore ─────────────────────────────────────
+// With 8 symbols each opening positions in the same cycle, all fire their
+// SL/TP calls simultaneously.  8 concurrent stop-order requests saturate
+// BingX's per-IP bucket (~5 req/s for order writes) and produce cascading
+// timeouts.  This semaphore limits concurrent PLACE_STOP calls across ALL
+// positions to 3 at a time — enough for throughput without hitting the limit.
+// Queued callers wait their turn; the 25 s outer timeout includes wait time.
+let __stopSemCount = 0
+const __STOP_SEM_LIMIT = 3
+const __stopSemQueue: Array<() => void> = []
+function acquireStopSem(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (__stopSemCount < __STOP_SEM_LIMIT) {
+      __stopSemCount++
+      resolve()
+    } else {
+      __stopSemQueue.push(() => { __stopSemCount++; resolve() })
+    }
+  })
+}
+function releaseStopSem(): void {
+  __stopSemCount = Math.max(0, __stopSemCount - 1)
+  const next = __stopSemQueue.shift()
+  if (next) next()
+}
 
 /**
  * Live position as it flows through the live-stage pipeline and is
@@ -1067,7 +1096,7 @@ async function sweepOrphanProtectionOrders(
   try {
     const raw = (await withTimeout(
       connector.getOpenOrders(symbol) as Promise<any>,
-      10000,
+      15_000,
       `sweepOrphan.getOpenOrders(${symbol})`,
     )) as any[] | undefined
     orders = Array.isArray(raw) ? raw : []
@@ -1338,6 +1367,11 @@ async function placeProtectionOrder(
     // try-catch we guarantee all code paths reach the retry checks with a
     // well-shaped result object.
     const placeStop = async (qty: number): Promise<any> => {
+      // Acquire the global semaphore before calling the exchange.
+      // This serialises concurrent SL/TP calls across all symbols to at most
+      // __STOP_SEM_LIMIT=3 in-flight at once, preventing BingX rate-limit
+      // saturation when 8 symbols place protection orders in the same cycle.
+      await acquireStopSem()
       try {
         return await withTimeout(
           connector.placeStopOrder(
@@ -1356,6 +1390,8 @@ async function placeProtectionOrder(
         )
       } catch (e: any) {
         return { success: false, error: String(e?.message || e) }
+      } finally {
+        releaseStopSem()
       }
     }
 
@@ -1466,11 +1502,11 @@ async function placeProtectionOrder(
 async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
   if (!connector || typeof connector.getOpenOrders !== "function") return null
   try {
-    // 8 s upper bound — BingX normally responds in <3 s; 8 s is generous.
+    // 15 s upper bound — BingX can take 6–8 s under load with many symbols.
     // On timeout we degrade gracefully to drift-only reconciliation.
     const orders = (await withTimeout(
       connector.getOpenOrders() as Promise<any>,
-      8_000,
+      15_000,
       "getOpenOrders(reconcile-tick)",
     )) as any[] | undefined
     if (!Array.isArray(orders)) return null
@@ -4524,7 +4560,7 @@ async function checkAndForceCloseOnSltpCross(
   }
 
   const fillPrice = pos.averageExecutionPrice
-  // Require a confirmed fill price — entryPrice is an estimate and can be
+  // Require a confirmed fill price �� entryPrice is an estimate and can be
   // stale. If averageExecutionPrice is missing the position has not been
   // confirmed filled yet; skip until it is.
   if (!fillPrice || fillPrice <= 0) return null
@@ -5962,16 +5998,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // Target: all positions complete in <1 s total.
     //
     // SYNC_CONCURRENCY: Max concurrent positions to sync in parallel.
-    // Bounds total fanout to prevent rate-limit spikes on venue buckets.
-    // BingX: 100 req/s sustained, 200 burst. With ≤10 open positions,
-    // all positions start concurrently (ceil(10/12)=1 pass).
-    const SYNC_CONCURRENCY = 12
+    // Reduced from 12 to 5: with 13 positions each making 1–3 API calls
+    // (getOrder, placeStop, getPositions), 12-wide concurrency fires 30+
+    // simultaneous requests which saturates BingX's per-IP bucket and causes
+    // cascading timeouts.  5 concurrent × ~3 s/pos = ~8 s total for 13 pos.
+    const SYNC_CONCURRENCY = 5
     
-    // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout for syncWithExchange.
-    // Individual operation timeouts (getOrder=6s, placeStop=10s) mean the
-    // worst case per-position is ~16s; cap at 14s so one timed-out position
-    // can't stall the pool worker past one full tick period.
-    const SYNC_PER_POS_TIMEOUT_MS = 14_000
+    // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout.
+    // Individual operation timeouts are now getOrder=12s, placeStop=20s.
+    // Per-position cap at 30s — enough for the worst case (fill-detect +
+    // SL/TP placement) without letting one hung call stall the pool indefinitely.
+    const SYNC_PER_POS_TIMEOUT_MS = 30_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {

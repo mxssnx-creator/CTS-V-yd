@@ -413,7 +413,9 @@ export async function runIndStratCycle(
     // evaluator when Phase 1 produced live indications (historical replay still
     // passes its backdated indication array), and let the next productive tick
     // advance the strategy/live stages.
-    // Timeout: 25s — strategy coordinator fan-out across all sets for one symbol.
+    // Timeout: 40s — strategy coordinator fan-out across all sets for one symbol.
+    // TRBUSDT and similar high-set-count symbols regularly reach 25-35 s;
+    // raised to avoid spurious phase-timeout errors that discard valid work.
     const apiStrategyFlowEnabled =
       process.env.NODE_ENV !== "production" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "1" ||
@@ -422,7 +424,7 @@ export async function runIndStratCycle(
       const stratResult = await withPhaseTimeout(
         deps.strategy.processStrategy(symbol, indications),
         `Phase3/processStrategy/${symbol}`,
-        25_000,
+        40_000,
       ).catch((err) => {
           console.error(
             `[v0] [SharedPipeline] processStrategy failed for ${symbol} (mode=${mode}):`,

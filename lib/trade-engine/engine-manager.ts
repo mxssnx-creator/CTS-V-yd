@@ -288,12 +288,15 @@ import { fetchTopSymbols } from "@/lib/top-symbols"
 const _devSymCount = process.env.NODE_ENV === "development"
   ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
   : 0
-// For 8 symbols: ceil(8/2)=4 — 2 batches instead of 4 batches.
-// Per-phase timeouts in shared-ind-strat-pipeline.ts (Phase1=20s, Phase2=8s, Phase3=25s)
-// prevent any single stuck symbol from blocking the batch indefinitely.
+// For 8 symbols with concurrency=2: 4 sequential batches of 2.
+// Each batch runs Phase1+Phase2+Phase3 for 2 symbols in parallel.
+// Phase3 (strategy evaluation) is CPU-heavy — 3800+ sets per symbol.
+// Running 4 symbols simultaneously saturated single-threaded Node and
+// caused Phase3 to regularly exceed 40s. With concurrency=2, each batch
+// completes in ~30s, well within the 120s outer cycle deadline.
 const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development"
-  ? Math.min(4, Math.max(1, Math.ceil(_devSymCount / 2)))
-  : 4
+  ? Math.min(2, Math.max(1, Math.ceil(_devSymCount / 4)))
+  : 2
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
