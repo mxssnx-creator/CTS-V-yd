@@ -109,3 +109,52 @@ describe("settings propagation", () => {
     expect(writes.some((w) => w.key === "trade_engine_state:conn-main")).toBe(true)
   })
 })
+
+describe("System tab capacity controls", () => {
+  test("exposes capacity and stage controls using canonical settings keys", () => {
+    const fs = require("fs")
+    const path = require("path")
+    const source = fs.readFileSync(
+      path.join(process.cwd(), "components/settings/tabs/system-tab.tsx"),
+      "utf8",
+    )
+
+    expect(source).toContain("Capacity & Stage Limits")
+    for (const key of [
+      "symbolOrderType",
+      "numberOfSymbolsToSelect",
+      "mainSymbols",
+      "forcedSymbols",
+      "setCompactionFloor",
+      "setCompactionThresholdPct",
+      "setCompactionByType",
+      "indication.direction",
+      "indication.move",
+      "indication.active",
+      "indication.optimal",
+      "indication.active_advanced",
+      "strategy.base",
+      "strategy.main",
+      "strategy.real",
+      "strategy.live",
+      "indicationTimeoutMs",
+      "indication_state_retention_hours",
+      "maxRealSets",
+      "stageMinPosCountBase",
+      "stageMinPosCountMain",
+      "stageMinPosCountReal",
+      "baseProfitFactor",
+      "mainProfitFactor",
+      "realProfitFactor",
+      "liveProfitFactor",
+      "maxDrawdownTimeMainHours",
+      "maxDrawdownTimeRealHours",
+      "maxDrawdownTimeLiveHours",
+    ]) {
+      expect(source).toContain(key)
+    }
+
+    expect(source).not.toContain('handleSettingChange("symbolCount"')
+    expect(source).not.toContain('handleSettingChange("capacity')
+  })
+})

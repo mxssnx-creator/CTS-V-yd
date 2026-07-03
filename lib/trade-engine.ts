@@ -122,16 +122,16 @@ export class GlobalTradeEngineCoordinator {
   /**
    * Whether this Node process is allowed to own long-running trade loops.
    *
-   * Default to self-contained runtime ownership. Production previously needed a
-   * separate worker opt-in, so valid dashboard/quickstart actions could persist
-   * operator intent but never make progress and the UI stayed at
-   * "Queued / waiting for worker". Operators who intentionally run a dedicated
-   * external worker can still opt this process out explicitly.
+   * Production API workers are queued-only unless explicitly opted in; this
+   * keeps request/response workers responsive and leaves long-running loops to
+   * the coordinator worker. Development keeps foreground ownership for local UX.
    */
   private canOwnEngineRuntime(): boolean {
     if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1") return false
     if (process.env.NEXT_RUNTIME === "edge") return false
-    return true
+    return process.env.NODE_ENV !== "production" ||
+      (process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
+        process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1")
   }
 
   constructor() {
@@ -223,7 +223,7 @@ export class GlobalTradeEngineCoordinator {
 
     if (!this.canOwnEngineRuntime()) {
       console.warn(
-        `[v0] [Coordinator] startEngine(${connectionId}) skipped because in-process runtime ownership is disabled for this worker.`,
+        `[v0] [Coordinator] startEngine(${connectionId}) skipped — queued-only in this production API worker. Leaving start request queued.`,
       )
       return false
     }

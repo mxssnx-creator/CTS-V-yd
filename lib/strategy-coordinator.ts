@@ -992,7 +992,10 @@ export class StrategyCoordinator {
   // warmup cycles caused OOM kills before health probes could complete.
   // Scale with symbol count: 1 symbol → 600 slots; 10 symbols → 2000 slots.
   // Each slot ~2-5 KB → 600 slots ≈ 1.2-3 MB (was 16-40 MB at 8000).
-  private static readonly _AXIS_LRU_MAX = 2_000
+  private static readonly _AXIS_LRU_MAX = (() => {
+    const raw = Number(process.env.STRATEGY_AXIS_LRU_MAX ?? "")
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2_000
+  })()
   private static readonly _axisLruMap: Map<string, StrategySet> = new Map()
   private static _axisLruGet(key: string): StrategySet | undefined {
     const hit = StrategyCoordinator._axisLruMap.get(key)
@@ -2532,7 +2535,7 @@ export class StrategyCoordinator {
       // full Cartesian materialization.
       // Scale with symbol count so multi-symbol dev runs don't OOM.
       // Base: 300 sets per symbol in dev, 50 in prod by default.
-      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING for controlled load tests.
+      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING for controlled load tests (production default: 50).
       // V0_DEV_SYMBOL_COUNT controls the dev symbol count (default 1).
       // At 10 symbols: 10 × 300 = 3000 ceiling (well within 4GB heap with
       // the new per-symbol eviction caps in redis-db).
@@ -2546,7 +2549,7 @@ export class StrategyCoordinator {
       // ≈ 2 on 8 GB. 5000 × 2 = 10000 on the actual 8.6 GB VM.
       const _axGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
-      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? Math.round(5_000 * _axMemScale)
+      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (process.env.NODE_ENV === "production" ? 50 : Math.round(5_000 * _axMemScale))
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3513,7 +3516,7 @@ export class StrategyCoordinator {
     // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
     // candidates for the live dispatch to find qualifying PF-positive sets.
-    // Scale with dev symbol count: 60 real sets per symbol in dev, 100 in prod.
+    // Scale with dev symbol count: 60 real sets per symbol in dev, production default: 100.
     const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_SAFETY_CEILING ?? "")
     const configuredRealCeiling =
       Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
@@ -3522,7 +3525,7 @@ export class StrategyCoordinator {
     // Default scales with VM RAM just like the axis ceiling.
     const _rsGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
     const _rsMemScale = _rsGl ? Math.max(1, _rsGl.heapMB / 2_048) : 1
-    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? Math.round(5_000 * _rsMemScale)
+    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale))
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at

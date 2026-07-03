@@ -12,12 +12,22 @@
 const REDIS_DB_VERSION = "3.0.0"
 void REDIS_DB_VERSION
 
+interface SortedSetEntry {
+  score: number
+  member: string
+}
+
+interface SortedSetData {
+  entries: SortedSetEntry[]
+  memberIndex: Map<string, SortedSetEntry>
+}
+
 interface RedisData {
   strings: Map<string, string>
   hashes: Map<string, Record<string, string>>
   sets: Map<string, Set<string>>
   lists: Map<string, string[]>
-  sorted_sets: Map<string, Array<{ score: number; member: string }>>
+  sorted_sets: Map<string, SortedSetData>
   ttl: Map<string, number> // key -> expiration timestamp in ms
   requestStats: {
     lastSecond: number
@@ -245,7 +255,7 @@ export class InlineLocalRedis implements RedisClientLike {
       hashes: Array.from(d.hashes.entries()),
       sets: Array.from(d.sets.entries()).map(([k, s]) => [k, Array.from(s)]),
       lists: Array.from(d.lists.entries()),
-      sorted_sets: Array.from(d.sorted_sets.entries()),
+      sorted_sets: Array.from(d.sorted_sets.entries()).map(([k, z]) => [k, z.entries]),
       ttl: Array.from(d.ttl.entries()),
     })
   }
@@ -264,7 +274,12 @@ export class InlineLocalRedis implements RedisClientLike {
       if (Array.isArray(parsed.lists))
         d.lists = new Map(parsed.lists)
       if (Array.isArray(parsed.sorted_sets))
-        d.sorted_sets = new Map(parsed.sorted_sets)
+        d.sorted_sets = new Map(
+          parsed.sorted_sets.map(([k, z]: [string, SortedSetEntry[] | { entries?: SortedSetEntry[] }]) => [
+            k,
+            this.createSortedSet(Array.isArray(z) ? z : z?.entries || []),
+          ]),
+        )
       if (Array.isArray(parsed.ttl))
         d.ttl = new Map(parsed.ttl)
       return true
@@ -659,7 +674,7 @@ export class InlineLocalRedis implements RedisClientLike {
         for (const item of l) bytes += (item?.length ?? 0) + 16
         bump(k, bytes)
       }
-      for (const [k, z] of this.data.sorted_sets.entries()) bump(k, z.length * 64)
+      for (const [k, z] of this.data.sorted_sets.entries()) bump(k, z.entries.length * 64)
       const top = [...counts.entries()]
         .sort((a, b) => b[1].approxBytes - a[1].approxBytes)
         .slice(0, 8)
@@ -1000,6 +1015,84 @@ export class InlineLocalRedis implements RedisClientLike {
       const id = key.slice("strategy:".length)
       this.data.sets.get("idx:strategies")?.delete(id)
     }
+  private compareSortedSetEntries(a: SortedSetEntry, b: SortedSetEntry): number {
+    return a.score - b.score || a.member.localeCompare(b.member)
+  }
+
+  private createSortedSet(entries: SortedSetEntry[] = []): SortedSetData {
+    const memberIndex = new Map<string, SortedSetEntry>()
+    const sortedEntries: SortedSetEntry[] = []
+
+    for (const entry of entries) {
+      if (!entry || typeof entry.member !== "string") continue
+      const normalized = { score: Number(entry.score), member: entry.member }
+      if (!Number.isFinite(normalized.score)) continue
+      memberIndex.set(normalized.member, normalized)
+    }
+
+    sortedEntries.push(...memberIndex.values())
+    sortedEntries.sort((a, b) => this.compareSortedSetEntries(a, b))
+    return { entries: sortedEntries, memberIndex }
+  }
+
+  private getSortedSet(key: string): SortedSetData | undefined {
+    const zset = this.data.sorted_sets.get(key)
+    if (!zset) return undefined
+
+    // Tolerate in-memory data created by older module versions during hot reload.
+    if (Array.isArray(zset)) {
+      const migrated = this.createSortedSet(zset)
+      this.data.sorted_sets.set(key, migrated)
+      return migrated
+    }
+
+    if (!zset.memberIndex) {
+      const rebuilt = this.createSortedSet(zset.entries || [])
+      this.data.sorted_sets.set(key, rebuilt)
+      return rebuilt
+    }
+
+    return zset
+  }
+
+  private lowerBoundByScore(entries: SortedSetEntry[], score: number): number {
+    let low = 0
+    let high = entries.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (entries[mid].score < score) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+
+  private upperBoundByScore(entries: SortedSetEntry[], score: number): number {
+    let low = 0
+    let high = entries.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (entries[mid].score <= score) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+
+  private insertionIndex(entries: SortedSetEntry[], entry: SortedSetEntry): number {
+    let low = 0
+    let high = entries.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (this.compareSortedSetEntries(entries[mid], entry) < 0) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+
+  private parseSortedSetScore(value: number | string, fallbackInfinity: number): number {
+    if (value === "-inf") return Number.NEGATIVE_INFINITY
+    if (value === "+inf") return Number.POSITIVE_INFINITY
+    const parsed = Number(value)
+    return Number.isNaN(parsed) ? fallbackInfinity : parsed
   }
   
   private setKeyTTL(key: string, seconds: number): void {
@@ -1492,68 +1585,81 @@ export class InlineLocalRedis implements RedisClientLike {
   }
 
   async zadd(key: string, score: number, member: string): Promise<number> {
-    const set = this.data.sorted_sets.get(key) || []
-    const existingIndex = set.findIndex((entry) => entry.member === member)
-    if (existingIndex >= 0) {
-      set[existingIndex] = { score, member }
-      this.data.sorted_sets.set(key, set.sort((a, b) => a.score - b.score))
+    const zset = this.getSortedSet(key) || this.createSortedSet()
+    const existing = zset.memberIndex.get(member)
+    const entry = { score, member }
+
+    if (existing) {
+      const existingIndex = this.insertionIndex(zset.entries, existing)
+      if (zset.entries[existingIndex]?.member === member) {
+        zset.entries.splice(existingIndex, 1)
+      }
+      zset.memberIndex.set(member, entry)
+      zset.entries.splice(this.insertionIndex(zset.entries, entry), 0, entry)
+      this.data.sorted_sets.set(key, zset)
       return 0
     }
-    set.push({ score, member })
-    this.data.sorted_sets.set(key, set.sort((a, b) => a.score - b.score))
+
+    zset.memberIndex.set(member, entry)
+    zset.entries.splice(this.insertionIndex(zset.entries, entry), 0, entry)
+    this.data.sorted_sets.set(key, zset)
     return 1
   }
 
   async zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]> {
     if (this.isExpired(key)) return []
-    const set = this.data.sorted_sets.get(key) || []
-    const minValue = min === "-inf" ? Number.NEGATIVE_INFINITY : Number(min)
-    const maxValue = max === "+inf" ? Number.POSITIVE_INFINITY : Number(max)
-    return set.filter((entry) => entry.score >= minValue && entry.score <= maxValue).map((entry) => entry.member)
+    const entries = this.getSortedSet(key)?.entries || []
+    const minValue = this.parseSortedSetScore(min, Number.NEGATIVE_INFINITY)
+    const maxValue = this.parseSortedSetScore(max, Number.POSITIVE_INFINITY)
+    const start = this.lowerBoundByScore(entries, minValue)
+    const end = this.upperBoundByScore(entries, maxValue)
+    return entries.slice(start, end).map((entry) => entry.member)
   }
 
   async zremrangebyscore(key: string, min: number | string, max: number | string): Promise<number> {
-    const set = this.data.sorted_sets.get(key) || []
-    const minValue = min === "-inf" ? Number.NEGATIVE_INFINITY : Number(min)
-    const maxValue = max === "+inf" ? Number.POSITIVE_INFINITY : Number(max)
-    const before = set.length
-    const remaining = set.filter((entry) => entry.score < minValue || entry.score > maxValue)
-    if (remaining.length === 0) this.data.sorted_sets.delete(key)
-    else this.data.sorted_sets.set(key, remaining)
-    return before - remaining.length
+    const zset = this.getSortedSet(key)
+    if (!zset) return 0
+    const minValue = this.parseSortedSetScore(min, Number.NEGATIVE_INFINITY)
+    const maxValue = this.parseSortedSetScore(max, Number.POSITIVE_INFINITY)
+    const start = this.lowerBoundByScore(zset.entries, minValue)
+    const end = this.upperBoundByScore(zset.entries, maxValue)
+    const removed = zset.entries.slice(start, end)
+    if (removed.length === 0) return 0
+    for (const entry of removed) zset.memberIndex.delete(entry.member)
+    zset.entries.splice(start, removed.length)
+    if (zset.entries.length === 0) this.data.sorted_sets.delete(key)
+    else this.data.sorted_sets.set(key, zset)
+    return removed.length
   }
 
   /** Return members in ascending score order between indices start and stop (inclusive). */
   async zrange(key: string, start: number, stop: number): Promise<string[]> {
     if (this.isExpired(key)) return []
-    const set = this.data.sorted_sets.get(key) || []
-    const sorted = [...set].sort((a, b) => a.score - b.score)
-    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
-    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+    const entries = this.getSortedSet(key)?.entries || []
+    const end = stop < 0 ? entries.length + stop + 1 : stop + 1
+    return entries.slice(start < 0 ? Math.max(0, entries.length + start) : start, end).map(e => e.member)
   }
 
   /** Return members in descending score order between indices start and stop (inclusive). */
   async zrevrange(key: string, start: number, stop: number): Promise<string[]> {
     if (this.isExpired(key)) return []
-    const set = this.data.sorted_sets.get(key) || []
-    const sorted = [...set].sort((a, b) => b.score - a.score)
-    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
-    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+    const entries = this.getSortedSet(key)?.entries || []
+    const reversed = [...entries].reverse()
+    const end = stop < 0 ? reversed.length + stop + 1 : stop + 1
+    return reversed.slice(start < 0 ? Math.max(0, reversed.length + start) : start, end).map(e => e.member)
   }
 
   /** Return the score of a member in a sorted set. */
   async zscore(key: string, member: string): Promise<string | null> {
     if (this.isExpired(key)) return null
-    const set = this.data.sorted_sets.get(key)
-    if (!set) return null
-    const entry = set.find(e => e.member === member)
+    const entry = this.getSortedSet(key)?.memberIndex.get(member)
     return entry !== undefined ? String(entry.score) : null
   }
 
   /** Return the cardinality (number of members) of a sorted set. */
   async zcard(key: string): Promise<number> {
     if (this.isExpired(key)) return 0
-    return (this.data.sorted_sets.get(key) || []).length
+    return (this.getSortedSet(key)?.entries || []).length
   }
 
   async trackDatabaseOperation(limit: number): Promise<{ current: number; limit: number; exceeded: boolean }> {
@@ -2419,6 +2525,87 @@ async function removeTradeIndexes(client: RedisClientLike, id: string): Promise<
   const connectionId = getRecordConnectionId(existing)
   await client.srem(SECONDARY_INDEX_KEYS.trades, id).catch(() => 0)
   if (connectionId) await client.srem(tradeConnectionIndexKey(connectionId), id).catch(() => 0)
+export class DatabaseWriteRateLimitError extends Error {
+  readonly code = "DATABASE_WRITE_RATE_LIMIT_EXCEEDED"
+  readonly operationName: string
+  readonly scope: "second" | "minute"
+  readonly current: number
+  readonly limit: number
+
+  constructor(operationName: string, scope: "second" | "minute", current: number, limit: number) {
+    super(`Database write budget exceeded for ${operationName}: ${current}/${limit} per ${scope}`)
+    this.name = "DatabaseWriteRateLimitError"
+    this.operationName = operationName
+    this.scope = scope
+    this.current = current
+    this.limit = limit
+  }
+}
+
+type DatabaseWriteBudgetOptions = { optional?: boolean }
+type DatabaseWriteBudgetResult = { allowed: boolean; reason?: DatabaseWriteRateLimitError }
+
+const DATABASE_WRITE_LIMIT_LOG_INTERVAL_MS = 60_000
+
+function parseDatabaseLimit(value: unknown): number {
+  const parsed = Number(value ?? 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0
+}
+
+function warnDatabaseWriteBudgetExceeded(error: DatabaseWriteRateLimitError, optional: boolean): void {
+  const globalBudget = globalThis as unknown as { __db_write_budget_last_warn?: Record<string, number> }
+  if (!globalBudget.__db_write_budget_last_warn) globalBudget.__db_write_budget_last_warn = {}
+  const logKey = `${error.operationName}:${error.scope}:${optional ? "optional" : "required"}`
+  const now = Date.now()
+  if (now - (globalBudget.__db_write_budget_last_warn[logKey] || 0) < DATABASE_WRITE_LIMIT_LOG_INTERVAL_MS) return
+  globalBudget.__db_write_budget_last_warn[logKey] = now
+  console.warn(
+    `[v0] [Redis Write Budget] ${optional ? "Skipping optional" : "Blocking required"} write ${error.operationName}: ${error.current}/${error.limit} per ${error.scope}`,
+  )
+}
+
+async function readDatabaseWriteLimits(client: RedisClientLike): Promise<{ perSecond: number; perMinute: number }> {
+  try {
+    const systemSettings = parseHash(await client.hgetall("settings:system")) || {}
+    return {
+      perSecond: parseDatabaseLimit((systemSettings as any).databaseLimitPerSecond),
+      perMinute: parseDatabaseLimit((systemSettings as any).databaseLimitPerMinute),
+    }
+  } catch {
+    return { perSecond: 0, perMinute: 0 }
+  }
+}
+
+function trackDatabaseSecondOperation(limit: number): { current: number; limit: number; exceeded: boolean } {
+  const globalTracker = globalThis as unknown as { __db_ops_second_tracker?: { second: number; count: number } }
+  const currentSecond = Math.floor(Date.now() / 1000)
+  if (!globalTracker.__db_ops_second_tracker || globalTracker.__db_ops_second_tracker.second !== currentSecond) {
+    globalTracker.__db_ops_second_tracker = { second: currentSecond, count: 0 }
+  }
+  globalTracker.__db_ops_second_tracker.count++
+  const current = globalTracker.__db_ops_second_tracker.count
+  return { current, limit, exceeded: limit > 0 && current > limit }
+}
+
+export async function assertDatabaseWriteBudget(
+  operationName: string,
+  options: DatabaseWriteBudgetOptions = {},
+): Promise<DatabaseWriteBudgetResult> {
+  const client = getClient()
+  const { perSecond, perMinute } = await readDatabaseWriteLimits(client)
+
+  const secondResult = trackDatabaseSecondOperation(perSecond)
+  const minuteResult = await client.trackDatabaseOperation(perMinute)
+  const exceeded = secondResult.exceeded
+    ? new DatabaseWriteRateLimitError(operationName, "second", secondResult.current, secondResult.limit)
+    : minuteResult.exceeded
+      ? new DatabaseWriteRateLimitError(operationName, "minute", minuteResult.current, minuteResult.limit)
+      : null
+
+  if (!exceeded) return { allowed: true }
+  warnDatabaseWriteBudgetExceeded(exceeded, !!options.optional)
+  if (options.optional) return { allowed: false, reason: exceeded }
+  throw exceeded
 }
 
 // ========== Connection Operations ==========
@@ -2945,6 +3132,7 @@ export async function savePosition(position: any): Promise<void> {
   if (!id) {
     throw new Error("Position must have an id")
   }
+  await assertDatabaseWriteBudget("savePosition")
 
   // Special-case live positions (keys prefixed with "live:") — the live
   // pipeline uses JSON-string keys and open/closed indices under
@@ -3107,6 +3295,7 @@ export async function saveTrade(trade: any): Promise<void> {
   if (!id) {
     throw new Error("Trade must have an id")
   }
+  await assertDatabaseWriteBudget("saveTrade")
   
   const data = flattenForHmset({
     ...trade,
@@ -3139,6 +3328,8 @@ export async function saveIndication(indication: any): Promise<void> {
   if (!id) {
     throw new Error("Indication must have an id")
   }
+  const budget = await assertDatabaseWriteBudget("saveIndication", { optional: true })
+  if (!budget.allowed) return
   
   const data = flattenForHmset({
     ...indication,
@@ -3179,6 +3370,7 @@ export async function saveStrategy(strategy: any): Promise<void> {
   if (!id) {
     throw new Error("Strategy must have an id")
   }
+  await assertDatabaseWriteBudget("saveStrategy")
   
   const data = flattenForHmset({
     ...strategy,
@@ -3791,6 +3983,8 @@ export async function logProgressionEvent(
   metadata?: Record<string, any>
 ): Promise<void> {
   const client = getRedisClient()
+  const budget = await assertDatabaseWriteBudget("logProgressionEvent", { optional: true })
+  if (!budget.allowed) return
   const logsKey = `progression:${connectionId}:logs`
   
   const logEntry = JSON.stringify({
@@ -3840,10 +4034,10 @@ export async function flushAll(): Promise<void> {
   await client.flushDb()
 }
 
-// Cache getRedisStats for 5 s. The underlying `client.keys("*")` is an
-// O(N) scan over the entire keyspace, so hammering it from a polling
-// monitoring dashboard would be a foot-gun. The cached value is plenty
-// fresh for a "connected + key count" display.
+// Cache getRedisStats for 5 s. The key count comes from `client.dbSize()`
+// rather than `client.keys("*")`, so this health/stat path avoids
+// materializing the full key list while still protecting polling dashboards
+// from repeatedly hitting Redis.
 let _redisStatsCache: {
   value: { connected: boolean; memoryUsage: number; keyCount: number; uptime: number }
   ts: number
@@ -3862,11 +4056,11 @@ export async function getRedisStats(): Promise<{
   }
   try {
     const client = getRedisClient()
-    const keys = await client.keys("*")
+    const keyCount = await client.dbSize()
     const value = {
       connected: true,
       memoryUsage: 0, // In-memory implementation doesn't track this
-      keyCount: keys.length,
+      keyCount,
       uptime: Date.now() - (globalThis as any).__redis_start_time || 0,
     }
     _redisStatsCache = { value, ts: now }
