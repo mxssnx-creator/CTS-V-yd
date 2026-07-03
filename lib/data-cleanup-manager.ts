@@ -94,6 +94,81 @@ export class DataCleanupManager {
     }
   }
 
+  private async syncLivePositionsToDatabase(): Promise<void> {
+    try {
+      const { query } = await import("@/lib/db")
+      await initRedis()
+      const client = getRedisClient()
+
+      // Find all closed live positions that haven't been synced to the database yet
+      const allConnectionIds: string[] = []
+      const keys = await client.keys("live:positions:*:closed")
+      for (const key of keys) {
+        const match = key.match(/live:positions:(.+?):closed/)
+        if (match && match[1]) {
+          allConnectionIds.push(match[1])
+        }
+      }
+
+      for (const connId of allConnectionIds) {
+        const closedListKey = `live:positions:${connId}:closed`
+        const closedPositionIds = await client.lrange(closedListKey, 0, -1)
+
+        for (const posId of closedPositionIds) {
+          const liveKey = `live:position:${posId}`
+          const posData = await client.get(liveKey)
+          if (!posData) continue
+
+          try {
+            const position = JSON.parse(posData)
+            // Check if already synced to database
+            const existing = await query(
+              `SELECT id FROM positions WHERE id = $1 AND connection_id = $2`,
+              [position.id, connId]
+            )
+
+            if (existing && existing.length > 0) continue // Already synced
+
+            // CRITICAL: Persist live position with actual realized_pnl from Redis to database
+            // This ensures PnL stats queries can find closed positions
+            await query(
+              `INSERT INTO positions (
+                id, connection_id, symbol, direction, 
+                entry_price, exit_price, quantity,
+                opened_at, closed_at, status,
+                realized_pnl, realized_pnl_percent
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+              ON CONFLICT (id) DO UPDATE SET
+                exit_price = $6,
+                closed_at = $9,
+                status = $10,
+                realized_pnl = $11,
+                realized_pnl_percent = $12`,
+              [
+                position.id,
+                connId,
+                position.symbol,
+                position.direction,
+                parseFloat(position.entryPrice || position.entry_price || "0"),
+                parseFloat(position.closePrice || position.exit_price || "0"),
+                parseFloat(position.quantity || "0"),
+                new Date(position.openedAt || position.opened_at || Date.now()),
+                position.closedAt ? new Date(position.closedAt) : new Date(),
+                position.status || "closed",
+                parseFloat(position.realizedPnL || position.realized_pnl || "0"),
+                parseFloat(position.realizedPnL_Percent || position.realized_pnl_percent || "0"),
+              ]
+            )
+          } catch (err) {
+            console.warn(`[v0] Failed to sync position ${posId} to database:`, err)
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[v0] Error syncing live positions to database:", err)
+    }
+  }
+
   private async runCleanup(): Promise<void> {
     console.log("[v0] Running data cleanup...")
 
@@ -110,6 +185,11 @@ export class DataCleanupManager {
 
       let archivedPositions = 0
       let cleanedMarketData = 0
+
+      // CRITICAL FIX: Sync closed live positions from Redis to database so stats queries can find them
+      // Previously, positions were only archived to Redis summaries, never making it to PostgreSQL.
+      // This caused negative PnL to never be reported in stats because the PnL stats endpoint queries the database.
+      await this.syncLivePositionsToDatabase()
 
       // Clean old closed exchange positions
       const connectionKeys = await client.keys("exchange_positions:*:closed")
