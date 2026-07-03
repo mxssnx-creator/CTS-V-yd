@@ -3968,7 +3968,7 @@ export class StrategyCoordinator {
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
       // aggregates to a "Strategies (Real, alive now)" tile. Note this
       // is the COUNT-AFTER-SORT-AND-CAP, i.e. exactly what propagates
-      // forward to Live evaluation — not the raw post-filter count.
+      // forward to Live evaluation �� not the raw post-filter count.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
           [`${symbol}:real`]:           String(realSets.length),
@@ -4785,6 +4785,14 @@ export class StrategyCoordinator {
                   (coordIndex ? coordIndex.base.byKey.get(parentKey)?.trailingProfile : undefined)
 
                 let sl = protection.stopLossPct
+                // CRITICAL FIX: Add slippage buffer to block variant SL prices
+                // Larger positions experience worse fills due to order book depth.
+                // Block positions (1.15-1.25x) need ~0.5-1.0% wider SL bands to account
+                // for fill slippage so SL doesn't immediately cross on entry.
+                if (set.variant === "block" && effectiveSizeMult > 1.0) {
+                  const slippageBuffer = Math.min(0.5, (effectiveSizeMult - 1.0) * 2.0)  // 0.2-0.5% buffer for 1.1-1.25x sizes
+                  sl = Math.max(0.5, sl + slippageBuffer)  // Add buffer, but keep minimum 0.5%
+                }
                 if (set.variant === "trailing" && resolvedTrailingProfile && resolvedTrailingProfile.stopRatio > 0) {
                   // Trailing-variant: initial SL = trailing stop distance.
                   // The live-stage `computeSetAwareSL` applies the same logic
@@ -5607,9 +5615,14 @@ export class StrategyCoordinator {
         // ── Block sub-configs ─ size is the *base* multiplier that the
         // block overlay then scales by `(1 + (blockCount−1)×ratio)` so the
         // block count and operator vol-ratio knob both flow into live notional.
+        // CRITICAL FIX: Reduced from 1.5/2.0 to 1.15/1.25 to prevent slippage
+        // beyond SL triggers. Larger positions were getting filled at prices
+        // that immediately crossed their own SL triggers on the same tick,
+        // causing immediate losses. Smaller multipliers allow fills to stay
+        // within the expected SL/TP band without forced closure.
         configs: [
-          { size: 1.5, leverage: 2, state: "add", pfBias: 1.08, ddtBias: 45 },
-          { size: 2.0, leverage: 2, state: "add", pfBias: 1.12, ddtBias: 75 },
+          { size: 1.15, leverage: 2, state: "add", pfBias: 1.08, ddtBias: 45 },
+          { size: 1.25, leverage: 2, state: "add", pfBias: 1.12, ddtBias: 75 },
         ],
       },
       {
