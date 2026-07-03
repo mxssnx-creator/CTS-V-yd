@@ -3865,8 +3865,26 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       indexPurged++
     }
 
+    // CRITICAL: Purge live:lock:* dedup keys from the previous run.
+    // These locks have a 5-minute TTL. If the server restarts before TTL
+    // expires, the position hashes are deleted (above) but the lock keys
+    // survive. The next dispatch for that symbol+direction tries to acquire,
+    // gets null (lock held), looks for an existing open position (finds none —
+    // it was deleted), and returns "rejected". Every subsequent signal defers
+    // for 5 minutes until the TTL expires. Purging at boot ensures a clean
+    // slate so the first cycle can place real orders immediately.
+    const lockKeys: string[] = await client.keys("live:lock:*").catch(() => [])
+    for (const k of lockKeys) {
+      await client.del(k).catch(() => 0)
+    }
+
     const symDesc = devSymCount === 1 ? "force_symbols=BTCUSDT" : `symbol_count=${devSymCount} (volatility_1h)`
-    console.log(`[v0] [Boot] Pinned ${symDesc} across all key namespaces${purged > 0 ? `, purged ${purged} stale live:position keys` : ""}${indexPurged > 0 ? `, cleared ${indexPurged} stale position index lists` : ""}`)
+    console.log(
+      `[v0] [Boot] Pinned ${symDesc} across all key namespaces` +
+      (purged > 0 ? `, purged ${purged} stale live:position keys` : "") +
+      (indexPurged > 0 ? `, cleared ${indexPurged} stale position index lists` : "") +
+      (lockKeys.length > 0 ? `, released ${lockKeys.length} stale dedup locks` : ""),
+    )
   }
 
   return { createdOrUpdated, credentialsInjected }

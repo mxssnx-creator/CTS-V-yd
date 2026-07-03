@@ -1341,10 +1341,20 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       if (!this.isBingXSuccess(data.code)) {
-        // "Order does not exist" codes — order was already filled/cancelled.
+        // "Order does not exist" / "order not exist" — already filled or cancelled.
+        // BingX uses different msg strings across API versions:
+        //   "order does not exist" (swap v2)
+        //   "order not exist"      (swap v2 alternate / some regions)
+        // Also catch code=109400 when msg contains "not exist" (distinct from the
+        // timestamp variant handled above which contains "timestamp").
         const code = String(data.code)
-        if (code === "100410" || code === "101400" || code === "80012" ||
-            (data.msg && String(data.msg).toLowerCase().includes("order does not exist"))) {
+        const msgLower = String(data.msg ?? "").toLowerCase()
+        const isOrderGone =
+          code === "100410" || code === "101400" || code === "80012" ||
+          msgLower.includes("order does not exist") ||
+          msgLower.includes("order not exist") ||
+          (code === "109400" && msgLower.includes("not exist"))
+        if (isOrderGone) {
           this.log(`Order ${orderId} already gone (code=${code}) — treating as cancelled`)
           return { success: true }
         }

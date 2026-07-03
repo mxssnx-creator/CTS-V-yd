@@ -495,18 +495,32 @@ export class IndicationSetsProcessor {
       } catch { /* non-critical: dashboard falls back to cumulative */ }
 
       if (totalQualified > 0) {
-        console.log(
-          `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} ActiveAdvanced=${activeAdvancedResults?.qualified}/${activeAdvancedResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
-        )
+        // Throttle console log to once per 60 s per symbol.
+        // During historical replay a single cycle runs up to 30 steps; each
+        // step calls processAllIndicationSets and would emit this line, producing
+        // 30+ identical lines per symbol per cycle. One line per minute is enough.
+        const throttleKey = `${symbol}:${this.connectionId}`
+        const lastLogBucket = (this as any)._setsLogBucket
+        const nowBucket = Math.floor(Date.now() / 60_000)
+        if (!lastLogBucket || lastLogBucket[throttleKey] !== nowBucket) {
+          if (!(this as any)._setsLogBucket) (this as any)._setsLogBucket = {}
+          ;(this as any)._setsLogBucket[throttleKey] = nowBucket
+          console.log(
+            `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} ActiveAdvanced=${activeAdvancedResults?.qualified}/${activeAdvancedResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
+          )
+        }
 
-        await logProgressionEvent(this.connectionId, "indications_sets", "info", `All indication types processed for ${symbol}`, {
-          direction: directionResults,
-          move: moveResults,
-          active: activeResults,
-          active_advanced: activeAdvancedResults,
-          optimal: optimalResults,
-          duration,
-        })
+        // Also throttle the Redis progression event — same 60s bucket.
+        if ((this as any)._setsLogBucket?.[throttleKey] === nowBucket) {
+          await logProgressionEvent(this.connectionId, "indications_sets", "info", `All indication types processed for ${symbol}`, {
+            direction: directionResults,
+            move: moveResults,
+            active: activeResults,
+            active_advanced: activeAdvancedResults,
+            optimal: optimalResults,
+            duration,
+          })
+        }
       }
     } catch (error) {
       console.error(`[v0] [IndicationSets] Failed to process sets for ${symbol}:`, error)
