@@ -1,4 +1,35 @@
 // Migration 025 deadlock fix applied — forces full server restart
+
+const localServerActionAllowedOrigins = ["localhost:3002", "127.0.0.1:3002"]
+
+function normalizeAllowedOrigin(value) {
+  const trimmed = value?.trim()
+  if (!trimmed) return []
+
+  try {
+    return [new URL(trimmed).host]
+  } catch {
+    return [trimmed.replace(/^https?:\/\//, "").replace(/\/.*$/, "")]
+  }
+}
+
+function getServerActionAllowedOrigins() {
+  const configuredOrigins = [
+    process.env.NEXT_PUBLIC_APP_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    process.env.SERVER_ACTION_ALLOWED_ORIGINS,
+  ]
+    .flatMap((value) => value?.split(",") ?? [])
+    .flatMap(normalizeAllowedOrigin)
+    .filter(Boolean)
+
+  const origins =
+    process.env.NODE_ENV === "production"
+      ? configuredOrigins
+      : [...configuredOrigins, ...localServerActionAllowedOrigins]
+
+  return [...new Set(origins)]
+}
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
@@ -42,7 +73,7 @@ const nextConfig = {
   },
   experimental: {
     serverActions: {
-      allowedOrigins: ["*"],
+      allowedOrigins: getServerActionAllowedOrigins(),
     },
     // instrumentation.ts is auto-discovered by Next.js and remains the
     // deterministic server-side boot sequence entry point.
