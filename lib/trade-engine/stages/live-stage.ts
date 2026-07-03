@@ -1368,13 +1368,18 @@ async function placeProtectionOrder(
     // well-shaped result object.
     const placeStop = async (qty: number): Promise<any> => {
       // Acquire the global semaphore before calling the exchange.
-      // This serialises concurrent SL/TP calls across all symbols to at most
-      // __STOP_SEM_LIMIT=3 in-flight at once, preventing BingX rate-limit
-      // saturation when 8 symbols place protection orders in the same cycle.
       await acquireStopSem()
       try {
-        return await withTimeout(
-          connector.placeStopOrder(
+        // Create an AbortController that fires at EXCHANGE_TIMEOUT_PLACE_STOP_MS.
+        // This signal is threaded all the way into the underlying fetch call via
+        // PlaceOrderOptions.signal → rateLimitedFetch, so the HTTP connection is
+        // actually cancelled on timeout rather than just the Promise being raced.
+        // Without this the fetch continues running long after withTimeout fires,
+        // producing latency=71-118s in logs even though the caller gave up at 45s.
+        const abortCtrl = new AbortController()
+        const abortTimer = setTimeout(() => abortCtrl.abort(), EXCHANGE_TIMEOUT_PLACE_STOP_MS)
+        try {
+          const result = await connector.placeStopOrder(
             symbol,
             closeSide,
             qty,
@@ -1383,13 +1388,19 @@ async function placeProtectionOrder(
             {
               reduceOnly: true,
               positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+              signal: abortCtrl.signal,
             },
-          ) as Promise<any>,
-          EXCHANGE_TIMEOUT_PLACE_STOP_MS,
-          `placeStopOrder(${orderLabel} ${symbol})`,
-        )
-      } catch (e: any) {
-        return { success: false, error: String(e?.message || e) }
+          )
+          clearTimeout(abortTimer)
+          return result
+        } catch (e: any) {
+          clearTimeout(abortTimer)
+          const msg = String(e?.message || e)
+          if (msg.includes("AbortError") || msg.includes("aborted") || msg.includes("abort")) {
+            return { success: false, error: `[placeStopOrder(${orderLabel} ${symbol})] Timeout after ${EXCHANGE_TIMEOUT_PLACE_STOP_MS}ms` }
+          }
+          return { success: false, error: msg }
+        }
       } finally {
         releaseStopSem()
       }

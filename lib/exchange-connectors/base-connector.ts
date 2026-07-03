@@ -108,6 +108,11 @@ export interface PlaceOrderOptions {
   positionSide?: "LONG" | "SHORT"
   hedgeMode?: boolean
   clientOrderId?: string
+  /** AbortSignal from the caller's timeout controller. Threaded into the
+   *  underlying fetch so the HTTP connection is physically cancelled when
+   *  the timeout fires, preventing zombie requests from completing 60-90s
+   *  after the caller has already given up. */
+  signal?: AbortSignal
 }
 
 export abstract class BaseExchangeConnector {
@@ -244,13 +249,33 @@ export abstract class BaseExchangeConnector {
    * defers timestamp + signature computation to the moment the rate-limit
    * slot is actually acquired, so the timestamp is always fresh.
    */
-  protected async rateLimitedFetch(url: string | (() => string), options?: RequestInit): Promise<Response> {
+  protected async rateLimitedFetch(
+    url: string | (() => string),
+    options?: RequestInit,
+    outerSignal?: AbortSignal,
+  ): Promise<Response> {
+    // outerSignal — provided by the caller's withTimeout wrapper.  Passed to
+    // the rate-limiter so that if withTimeout fires while the request is still
+    // in the queue (can happen when 16 SL/TP calls queue simultaneously), the
+    // queued slot is dropped immediately rather than running stale work after
+    // the timeout has already fired.
     return this.rateLimiter.execute(async () => {
       // Resolve the URL INSIDE the rate-limit slot so lazily-built signed
       // URLs carry a timestamp from send time, not queue-entry time.
       const resolvedUrl = typeof url === "function" ? url() : url
+
+      // Combine the outer abort signal with an internal per-fetch timeout so
+      // either side can cancel the HTTP connection.
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+      if (outerSignal) {
+        if (outerSignal.aborted) {
+          clearTimeout(timeoutId)
+          controller.abort()
+        } else {
+          outerSignal.addEventListener("abort", () => controller.abort(), { once: true })
+        }
+      }
 
       try {
         const response = await fetch(resolvedUrl, {
@@ -263,7 +288,7 @@ export abstract class BaseExchangeConnector {
         clearTimeout(timeoutId)
         throw error
       }
-    })
+    }, outerSignal)
   }
 
   abstract testConnection(): Promise<ExchangeConnectorResult>
