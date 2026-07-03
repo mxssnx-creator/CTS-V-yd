@@ -285,17 +285,21 @@ export async function completeStartup() {
       console.warn(`[v0] [Startup] ⚠ Failed to initialize global trade engine boot metadata (non-fatal):`, err)
     }
 
-    // Step 7: Clean up orphaned progress flags from incomplete shutdowns
-    console.log(`[v0] [Startup] Step 7/8: Cleaning up orphaned engine state...`)
-    await cleanupOrphanedProgress()
-    console.log(`[v0] [Startup] ✓ Cleanup complete\n`)
+    // Step 7: Clean up orphaned progress flags from incomplete shutdowns (non-blocking)
+    // Run in background to prevent blocking server startup
+    console.log(`[v0] [Startup] Step 7/8: Scheduling orphaned engine state cleanup...`)
+    cleanupOrphanedProgress().catch(err => 
+      console.warn(`[v0] [Startup] Background cleanup error:`, err)
+    )
+    console.log(`[v0] [Startup] ✓ Cleanup scheduled\n`)
 
-    // Step 8: Reconcile stranded live positions left open by a prior unclean shutdown.
-    // This runs after the coordinator is initialized so the engine can be queried.
-    // Errors are non-fatal — logged and swallowed so startup always completes.
-    console.log(`[v0] [Startup] Step 8/8: Reconciling stranded open positions...`)
-    await reconcileStrandedPositions()
-    console.log(`[v0] [Startup] ✓ Stranded position reconciliation complete\n`)
+    // Step 8: Reconcile stranded live positions (non-blocking)
+    // Run in background to prevent blocking server startup
+    console.log(`[v0] [Startup] Step 8/8: Scheduling stranded position reconciliation...`)
+    reconcileStrandedPositions().catch(err =>
+      console.warn(`[v0] [Startup] Background reconciliation error:`, err)
+    )
+    console.log(`[v0] [Startup] ✓ Reconciliation scheduled\n`)
 
     console.log(`[v0] [Startup] ========================================`)
     console.log(`[v0] [Startup] ✓ Pre-startup sequence complete`)
