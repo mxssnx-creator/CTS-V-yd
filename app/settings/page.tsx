@@ -781,7 +781,7 @@ export default function SettingsPage() {
     tradeMode: initialSettings.tradeMode ?? "both",
     strategyTrailingEnabled: initialSettings.strategyTrailingEnabled ?? true,
     strategyBlockEnabled: initialSettings.strategyBlockEnabled ?? true,
-    strategyDcaEnabled: initialSettings.strategyDcaEnabled ?? true,
+    strategyDcaEnabled: initialSettings.strategyDcaEnabled ?? false,
     // FIX: Ensure useMainSymbols default is applied
     useMainSymbols: initialSettings.useMainSymbols ?? false,
     // FIX: Ensure numberOfSymbolsToSelect default is applied

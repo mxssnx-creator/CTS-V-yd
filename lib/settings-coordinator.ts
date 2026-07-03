@@ -22,6 +22,29 @@ const RESTART_REQUIRED_FIELDS = [
   // update Redis state without tearing down live trade.
 ]
 
+// Settings that alter the actual strategy/progression graph must start a
+// fresh generation. A hot reload can update scalar caches, but it cannot
+// safely cancel in-flight prehistoric/strategy/realtime work that was born
+// for the old axes, symbols, variants, thresholds, DCA/block state, or
+// sizing. Restarting preserves live exchange position/order records while
+// giving the computational progression a new epoch.
+const PROGRESSION_RESTART_FIELDS = [
+  "connection_settings", "strategies", "indications", "active_indications",
+  "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
+  "is_live_trade", "is_preset_trade", "connection_method",
+  "live_volume_factor", "preset_volume_factor", "volume_factor_live",
+  "volume_factor_preset", "volume_step_ratio", "volume_factor",
+  "profitFactorMin", "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+  "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+  "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
+  "coordination_settings", "variantTrailingEnabled", "variantBlockEnabled", "variantDcaEnabled",
+  "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+  "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+  "blockVolumeRatio", "blockMaxStack", "blockPauseCountRatio",
+  "minimal_step_count", "minimalStepCount", "minStep",
+  "prevPosWindow", "prevPosMinCount", "mainEvalPosCount", "realEvalPosCount",
+]
+
 // Fields that can be hot-reloaded without restart
 const HOT_RELOAD_FIELDS = [
   "name", "volume_factor", "margin_type", "position_mode",
@@ -107,10 +130,14 @@ async function clearEngineRestartFlags(connectionId: string): Promise<void> {
  * Determine the type of change based on which fields were modified
  */
 export function classifyChange(changedFields: string[]): ChangeType {
-  if (changedFields.some(f => RESTART_REQUIRED_FIELDS.includes(f))) {
+  const normalized = changedFields.flatMap((field) => {
+    const f = String(field || "")
+    return f.startsWith("connection_settings.") ? [f, f.slice("connection_settings.".length)] : [f]
+  })
+  if (normalized.some(f => RESTART_REQUIRED_FIELDS.includes(f) || PROGRESSION_RESTART_FIELDS.includes(f))) {
     return "restart"
   }
-  if (changedFields.some(f => HOT_RELOAD_FIELDS.includes(f))) {
+  if (normalized.some(f => HOT_RELOAD_FIELDS.includes(f))) {
     return "reload"
   }
   return "cosmetic"
@@ -212,7 +239,7 @@ export async function notifySettingsChanged(
     const { queueEngineRefreshRequest } = await import("@/lib/engine-refresh-queue")
     await queueEngineRefreshRequest({
       connectionId,
-      action: changeType === "restart" ? "refresh" : "refresh",
+      action: changeType === "restart" ? "restart" : "refresh",
       state_switch_version: String((connection as any)?.state_switch_version ?? 0),
       reason: `settings_${changeType}:${changedFields.slice(0, 6).join(",")}`,
       timestamp: new Date().toISOString(),

@@ -3,7 +3,7 @@ import { getRedisClient, getSettings, setSettings } from "./redis-db"
 export const ENGINE_REFRESH_REQUEST_PREFIX = "engine_coordinator:refresh_requested:"
 const ENGINE_REFRESH_REQUEST_INDEX = "engine_coordinator:refresh_requested:index"
 
-export type EngineRefreshAction = "start" | "stop" | "refresh"
+export type EngineRefreshAction = "start" | "stop" | "refresh" | "restart"
 
 export interface EngineRefreshRequest {
   connectionId: string

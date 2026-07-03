@@ -59,7 +59,7 @@ export function PresetTypeDialog({ open, onOpenChange, presetType, onSave }: Pre
   const [baseSettings, setBaseSettings] = useState<BaseSettings>({
     trailingEnabled: true,
     blockEnabled: true,
-    dcaEnabled: true,
+    dcaEnabled: false,
   })
   const [loadingBaseSettings, setLoadingBaseSettings] = useState(true)
 
@@ -78,7 +78,7 @@ export function PresetTypeDialog({ open, onOpenChange, presetType, onSave }: Pre
         setBaseSettings({
           trailingEnabled: settings.trailingEnabled !== false, // Default true
           blockEnabled: settings.blockEnabled !== false, // Default true
-          dcaEnabled: settings.dcaEnabled !== false, // Default true
+          dcaEnabled: settings.dcaEnabled === true, // Default false
         })
       }
     } catch (error) {

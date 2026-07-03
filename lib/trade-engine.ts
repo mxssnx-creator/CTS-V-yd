@@ -532,6 +532,9 @@ export class GlobalTradeEngineCoordinator {
         "stop_requested",
         "stop_reason",
         "stop_requested_at",
+        "restart_request",
+        "settings_change_marker",
+        "restart_requested_at",
         "running",
         "is_running",
         "engine_started",
@@ -542,6 +545,9 @@ export class GlobalTradeEngineCoordinator {
         "stop_requested",
         "stop_reason",
         "stop_requested_at",
+        "restart_request",
+        "settings_change_marker",
+        "restart_requested_at",
         "is_running",
         "running",
         "engine_started",
@@ -741,6 +747,18 @@ export class GlobalTradeEngineCoordinator {
           if (!this.isEngineRunning(request.connectionId)) {
             await this.startEngineFromConnectionConfig(request.connectionId)
           }
+        } else if (request.action === "restart") {
+          if (!this.isEngineRunning(request.connectionId)) {
+            // A different production worker may own this engine. Leave the
+            // durable restart request queued so the owning coordinator's
+            // health-monitor drain can consume it instead of letting an API
+            // worker clear the request without restarting anything.
+            console.log(
+              `[v0] [Coordinator] Restart request for ${request.connectionId} is not local; leaving queued for owner`,
+            )
+            continue
+          }
+          await this.restartEngine(request.connectionId)
         } else {
           // Settings/progression refresh requests must be hot-applied to the
           // target connection only. Calling refreshEngines() here performed
