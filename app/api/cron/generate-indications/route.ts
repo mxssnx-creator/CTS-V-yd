@@ -516,6 +516,34 @@ async function generateIndicationsForConnection(
   return result
 }
 
+
+function parsePositiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value || "", 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+async function runBounded<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return []
+
+  const concurrency = Math.max(1, Math.min(Math.floor(limit), items.length))
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex++
+      results[index] = await fn(items[index], index)
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  return results
+}
+
 // ── Per-process in-flight guard ──────────────────────────────────────────────
 // Prevents concurrent executions within the SAME Node process (e.g. two tabs
 // call the cron at the same millisecond and both enter before either finishes).
@@ -636,15 +664,18 @@ export async function GET() {
       symbolsToProcess = symbolsToProcess.slice(0, 20)
 
       for (let c = 0; c < cyclesPerCron; c++) {
-        // Process all symbols for this cycle concurrently.
+        // Process symbols for this cycle with bounded concurrency.
         // Each call touches distinct market_data:{symbol} and
         // indications:{conn}:{type}:latest keys so there is no key collision.
         // The progression:{conn} hincrby writes are atomic per-key operations so
         // concurrent increments are safe (the Redis emulator serialises them).
-        const cycleResults = await Promise.all(
-          symbolsToProcess.map(symbol =>
-            generateIndicationsForConnection(connection.id, symbol, client, exchangeName)
-          )
+        // Keep the default intentionally small to avoid CPU/network spikes when
+        // many symbols or connections are active, while preserving result order.
+        const symbolConcurrency = parsePositiveInteger(process.env.CRON_SYMBOL_CONCURRENCY, 4)
+        const cycleResults = await runBounded(
+          symbolsToProcess,
+          symbolConcurrency,
+          (symbol) => generateIndicationsForConnection(connection.id, symbol, client, exchangeName),
         )
         for (const r of cycleResults) {
           totalIndications += r.indications
