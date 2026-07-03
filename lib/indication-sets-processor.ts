@@ -982,35 +982,120 @@ export class IndicationSetsProcessor {
   /**
    * Record a realized outcome sample and return the current profit factor.
    *
-   * Previous impl: read entire JSON blob (up to ~300 KB for 1000 samples),
-   * push, trim, write back — O(N) parse+stringify on every indication hit.
-   *
-   * New impl: store samples as a Redis LIST (rpush + ltrim = 2 O(1) ops).
-   * Profit factor is recomputed from the list, which costs one LRANGE but
-   * avoids the full JSON round-trip on every write.  The list cap (1000)
-   * matches the previous blob cap so downstream PF values are identical.
+   * Outcome samples stay in the capped Redis LIST for audit/debug consumers,
+   * while `${setKey}:outcome_stats` maintains the rolling aggregate used for
+   * profit-factor reads. This avoids an LRANGE + full-window recomputation on
+   * every sample. If the aggregate hash is missing or malformed, rebuild it
+   * once from the capped list and continue from the repaired values.
    */
   private async recordOutcomeSample(setKey: string, sample: any): Promise<number> {
     const client = await getCachedClient()
     const key = `${setKey}:outcomes`
+    const statsKey = `${setKey}:outcome_stats`
+    const cap = 1000
 
-    // Append new sample and cap to 1000 entries atomically.
-    const pipe = client.multi()
-    pipe.rpush(key, JSON.stringify(sample))
-    pipe.ltrim(key, -1000, -1)
-    await pipe.exec()
+    const sampleProfit = this.toOutcomeAmount(sample?.profit)
+    const sampleLoss = this.toOutcomeAmount(sample?.loss)
+    const newLength = await client.rpush(key, JSON.stringify(sample))
 
-    // Compute PF from the full window (one LRANGE).
+    let evictedProfit = 0
+    let evictedLoss = 0
+    let evictedCount = 0
+    if (newLength > cap) {
+      const evictedRaw: string[] = await client.lrange(key, 0, newLength - cap - 1)
+      for (const item of evictedRaw) {
+        const parsed = this.parseOutcomeSample(item)
+        if (!parsed) continue
+        evictedProfit += parsed.profit
+        evictedLoss += parsed.loss
+        evictedCount++
+      }
+      await client.ltrim(key, -cap, -1)
+    }
+
+    const existingStats = this.parseOutcomeStats(await client.hgetall(statsKey))
+    if (!existingStats) {
+      return this.repairOutcomeStatsFromSamples(client, key, statsKey)
+    }
+
+    const grossProfit = Math.max(0, existingStats.grossProfit + sampleProfit - evictedProfit)
+    const grossLoss = Math.max(0, existingStats.grossLoss + sampleLoss - evictedLoss)
+    const count = Math.max(0, existingStats.count + 1 - evictedCount)
+
+    await client.hset(statsKey, {
+      grossProfit: String(grossProfit),
+      grossLoss: String(grossLoss),
+      count: String(count),
+    })
+
+    return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+  }
+
+  private toOutcomeAmount(value: any): number {
+    const amount = Number(value || 0)
+    return Number.isFinite(amount) && amount > 0 ? amount : 0
+  }
+
+  private parseOutcomeSample(raw: string): { profit: number; loss: number } | null {
+    try {
+      const sample = JSON.parse(raw)
+      return {
+        profit: this.toOutcomeAmount(sample?.profit),
+        loss: this.toOutcomeAmount(sample?.loss),
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private parseOutcomeStats(
+    stats: Record<string, string> | null | undefined,
+  ): { grossProfit: number; grossLoss: number; count: number } | null {
+    if (
+      !stats ||
+      !Object.prototype.hasOwnProperty.call(stats, "grossProfit") ||
+      !Object.prototype.hasOwnProperty.call(stats, "grossLoss") ||
+      !Object.prototype.hasOwnProperty.call(stats, "count")
+    ) {
+      return null
+    }
+    const grossProfit = Number(stats.grossProfit)
+    const grossLoss = Number(stats.grossLoss)
+    const count = Number(stats.count)
+    if (
+      !Number.isFinite(grossProfit) ||
+      !Number.isFinite(grossLoss) ||
+      !Number.isFinite(count) ||
+      grossProfit < 0 ||
+      grossLoss < 0 ||
+      count < 0
+    ) {
+      return null
+    }
+    return { grossProfit, grossLoss, count }
+  }
+
+  private async repairOutcomeStatsFromSamples(client: any, key: string, statsKey: string): Promise<number> {
     const raw: string[] = await client.lrange(key, 0, -1)
     let grossProfit = 0
-    let grossLoss   = 0
+    let grossLoss = 0
+    let count = 0
     for (const item of raw) {
-      try {
-        const s = JSON.parse(item)
-        grossProfit += Number(s.profit || 0)
-        grossLoss   += Number(s.loss   || 0)
-      } catch { /* skip malformed */ }
+      const parsed = this.parseOutcomeSample(item)
+      if (!parsed) continue
+      grossProfit += parsed.profit
+      grossLoss += parsed.loss
+      count++
     }
+    await client.hset(statsKey, {
+      grossProfit: String(grossProfit),
+      grossLoss: String(grossLoss),
+      count: String(count),
+    })
+    return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+  }
+
+  private profitFactorFromOutcomeStats(grossProfit: number, grossLoss: number): number {
     if (grossLoss <= 0) return grossProfit > 0 ? grossProfit / 0.000001 : 0
     return grossProfit / grossLoss
   }
