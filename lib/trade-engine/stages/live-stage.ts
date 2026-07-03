@@ -4090,12 +4090,18 @@ export async function closeLivePosition(
     }
 
     if (hasSystemOrderId && exchangeConnector && typeof exchangeConnector.closePosition === "function") {
+      // maxRetries=2, per-attempt timeout=25s, backoff=500ms/1s.
+      // Total worst-case: 25s + 0.5s + 25s + 1s + 25s ≈ 76s.
+      // SYNC_PER_POS_TIMEOUT_MS=55s fires before a third attempt can land,
+      // so in practice the loop runs at most 2 attempts (50s) before the
+      // outer sync timeout triggers the DB-close fallback.
+      // AbortController is used so the HTTP connection is physically
+      // cancelled when the 25s timer fires — preventing zombie requests
+      // that kept running for 60-90s in logs after the timeout had already
+      // fired.
       const maxRetries = 2
-      // Tighter backoff: 200 → 400 ms. Transient API blips (rate-limit
-      // bump, brief network reload) clear in well under 500 ms; the old
-      // 500/1000 ms schedule wasted ~1.5 s per failing close without
-      // improving success rates.
-      const backoffMs = [200, 400]
+      const backoffMs = [500, 1000]
+      const CLOSE_ATTEMPT_TIMEOUT_MS = 25_000
 
       const isAlreadyClosedError = (msg: string): boolean => {
         const m = String(msg || "").toLowerCase()
@@ -4147,19 +4153,27 @@ export async function closeLivePosition(
             `${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`,
           )
 
-          // Per-attempt hard timeout.  BingX swap close = getPositions (~800ms)
-          // + market-close order (~800ms) ≈ 1.6s on the Vercel→BingX link.
-          // The previous 2s left almost no margin and caused consistent
-          // timeouts under any load.  8s is still a firm bound that keeps the
-          // loop moving while tolerating one round of network jitter or a
-          // single timestamp-retry re-sync inside cancelOrder.
-          const closePromise = exchangeConnector.closePosition(position.symbol, position.direction)
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Exchange close timeout after 20s")), 20_000),
-          )
-          const r = (await Promise.race([closePromise, timeoutPromise])) as
-            | { success?: boolean; error?: string }
-            | undefined
+          // Use AbortController so the underlying HTTP connection is physically
+          // cancelled when the timeout fires. Plain Promise.race leaves the
+          // fetch running in the background producing latency=60-90s in logs.
+          const closeAbort = new AbortController()
+          const closeTimer = setTimeout(() => closeAbort.abort(), CLOSE_ATTEMPT_TIMEOUT_MS)
+          let r: { success?: boolean; error?: string } | undefined
+          try {
+            r = (await exchangeConnector.closePosition(
+              position.symbol,
+              position.direction,
+              { signal: closeAbort.signal } as any,
+            )) as any
+          } catch (innerErr: any) {
+            const msg = String(innerErr?.message || innerErr || "")
+            if (msg.includes("AbortError") || msg.includes("aborted") || msg.includes("abort")) {
+              throw new Error(`Exchange close timeout after ${CLOSE_ATTEMPT_TIMEOUT_MS / 1000}s`)
+            }
+            throw innerErr
+          } finally {
+            clearTimeout(closeTimer)
+          }
 
           if (r && typeof r === "object" && r.success === true) {
             exchangeCloseSuccess = true
