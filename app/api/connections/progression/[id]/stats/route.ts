@@ -2139,10 +2139,11 @@ export async function GET(
       den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
     // CUMULATIVE FUNNEL (operator spec): each stage's Eval% = sets that
     // survived/evaluated at the stage ÷ the full candidate pool considered at
-    // the stage, where the pool = (sets PASSED FORWARD from the previous stage)
-    // + (sets ADDITIONALLY CREATED via variant/axis fan-out at this stage).
+    // the stage. Main computes that pool as input + related fan-out. Real stores
+    // the unified pool directly in `strategies_real_evaluated`, matching
+    // `strategy_detail:*:real.evaluated`.
     //   strategies_{stage}_total           = stage OUTPUT (promoted / passed)
-    //   strategies_{stage}_evaluated        = stage INPUT  (passed forward in)
+    //   strategies_{stage}_evaluated        = stage evaluated pool
     //   strategies_{stage}_related_created  = additionally created at the stage
     const _baseOutput      = Number(progHash.strategies_base_total            || "0")
     const _baseEvaluated   = Number(progHash.strategies_base_evaluated        || "0")
@@ -2151,18 +2152,17 @@ export async function GET(
     const _mainCreated     = Number(progHash.strategies_main_related_created  || "0")
     const _realOutput      = Number(progHash.strategies_real_total            || "0")
     const _realInput       = Number(progHash.strategies_real_evaluated        || "0")
-    const _realCreated     = Number(progHash.strategies_real_related_created  || "0")
     // base = evaluated ÷ overall generated (pipeline entry — every Base Set is
     //        evaluated, so ~100% when any exist, expressed as the true ratio).
     // main = main output ÷ (passed-forward-from-base + additionally-created-at-main)
-    // real = real output ÷ (passed-forward-from-main + additionally-created-at-real)
+    // real = real output ÷ Real evaluated pool (already includes Real fan-out)
     // live evalPct = sets dispatched this cycle / real sets available for dispatch
     const _liveDispatched = stratCounts.live || 0
     const _liveBase       = stratCounts.real  || 0
     const stageEvalPercent = {
       base: _pct(_baseEvaluated, _baseOutput),
       main: _pct(_mainOutput, _mainInput + _mainCreated),
-      real: _pct(_realOutput, _realInput + _realCreated),
+      real: _pct(_realOutput, _realInput),
       // Live: what fraction of Real-stage survivors were dispatched to exchange
       live: _liveBase > 0 ? Math.min(100, Math.round((_liveDispatched / _liveBase) * 1000) / 10) : 0,
     }

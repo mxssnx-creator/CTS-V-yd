@@ -144,8 +144,8 @@ export class IndicationSetsProcessor {
   /**
    * Per-type compaction config, resolved once per ~5s via the cached
    * `loadCompactionConfig` helper. Keeping a per-processor copy lets the
-   * hot-path `saveIndicationToSet` call `compact()` without touching the
-   * settings hash on every fill.
+   * hot-path append helper enforce compaction without touching the settings
+   * hash on every fill.
    */
   private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
   // Dev mode uses a minimal range grid so the 4-GB v0 sandbox VM can run the
@@ -962,62 +962,13 @@ export class IndicationSetsProcessor {
         else grouped.set(setKey, [JSON.stringify(entry)])
       })
 
-      // Batch writes into a Redis pipeline: each set gets an RPUSH with all
-      // entries for that key. RPUSH appends server-side, avoiding the old
-      // GET/parse/append/SET lost-update race while preserving newest-at-last.
-      const pipe = client.pipeline ? client.pipeline() : client.multi()
+      // Append each grouped set through the shared helper so legacy JSON-array
+      // keys are migrated to Redis LISTs consistently with the single-save path.
       const groupedEntries = Array.from(grouped.entries())
       for (const [setKey, serializedEntries] of groupedEntries) {
-        pipe.rpush(setKey, ...serializedEntries)
-            const existing = await client.get(setKey)
-            let entries = existing ? JSON.parse(existing) : []
-            // ── Newest-at-last (per spec) ──���─────────────────────────
-            // The compaction policy drops oldest by `slice(-floor)`,
-            // which requires chronological order. Use `push`, never
-            // `unshift`. Switching from the prior unshift+slice(0, n)
-            // pattern keeps reads in the same order downstream
-            // consumers expected, just from the *other end* of the
-            // array — and the dashboard's "newest first" surfaces all
-            // already reverse the array on read, so no UI change is
-            // needed.
-            entries.push(entry)
-            // ── Debounced threshold compaction ───────────────────────
-            // `compact` returns the original array if length < ceiling
-            // (cheap O(1) check). When it does fire, it returns a
-            // fresh `slice(-floor)` — same big-O as the old
-            // `slice(0, limit)` path but only every (ceiling-floor)
-            // cycles instead of every cycle. We use the per-batch
-            // resolved config (compactionCfg) so the inner loop avoids
-            // any async hop.
-            entries = compact(entries, compactionCfg, "recent")
-            await client.set(setKey, JSON.stringify(entries))
-            await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
-          }),
-        )
+        await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
+        await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
       }
-      const lengths = await pipe.exec()
-
-      // Apply the same thresholded compaction policy, but with Redis-side
-      // LTRIM on the list rather than JSON array rewrites.
-      const trimPipe = client.pipeline ? client.pipeline() : client.multi()
-      let trimCount = 0
-      let idx = 0
-      for (const [setKey, serializedEntries] of groupedEntries) {
-        const slot = lengths?.[idx]
-        if (slot instanceof Error || (Array.isArray(slot) && slot[0] instanceof Error)) {
-          await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
-          idx++
-          continue
-        }
-        const rawLength = Array.isArray(slot) ? slot[1] : slot
-        const length = Number(rawLength) || 0
-        if (length >= compactionCeiling(compactionCfg)) {
-          trimPipe.ltrim(setKey, -compactionCfg.floor, -1)
-          trimCount++
-        }
-        idx++
-      }
-      if (trimCount > 0) await trimPipe.exec()
     } catch (error) {
       // Silent fail for non-critical batch operations
     }
@@ -1078,15 +1029,12 @@ export class IndicationSetsProcessor {
       // subsequent call is a synchronous map lookup + a comparison.
       const cfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
       await this.appendIndicationEntries(client, setKey, [JSON.stringify(entry)], cfg)
-      
-      entries = compact(entries, cfg, "recent")
 
       // Broadcast indication update to connected clients. Direction is
       // derived from the actual indication signal — directional types
       // (direction/move) report UP/DOWN, all other types (active /
       // optimal / active_advanced) report NEUTRAL.
       const symbol = setKey.split(':')[2]
-      await client.set(setKey, JSON.stringify(entries))
       await this.indexSetKey(client, setKey, symbol, type)
 
       const broadcastDirection: "UP" | "DOWN" | "NEUTRAL" =

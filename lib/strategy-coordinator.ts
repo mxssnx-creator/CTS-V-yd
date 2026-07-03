@@ -3805,10 +3805,16 @@ export class StrategyCoordinator {
     })
 
     // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
-    // pre-gated sets). Used for correct passRatioReal and evaluated counters.
-    // After the merged pos-gate + PF/DDT pass, `realQualifying` is the survivor list;
-    // `skippedRealLowPos` is the count of pos-gated rejects. PF-eligible = total - pos-gated.
+    // pre-gated sets). After the merged pos-gate + PF/DDT pass, `realQualifying`
+    // is the survivor list; `skippedRealLowPos` is the count of pos-gated rejects.
+    // PF-eligible = total - pos-gated.
     const mainPFEligible = mainSets.length - skippedRealLowPos
+
+    // Real can fan out additional related/axis-created outputs beyond the PF-eligible
+    // Main inputs. Use a denominator that includes both terms so pass-rate and
+    // failure metrics never go negative when Real outputs exceed Main inputs.
+    const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)
+    const realTotalEvaluated = mainPFEligible + realRelatedCreated
 
     // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
@@ -3832,8 +3838,11 @@ export class StrategyCoordinator {
       const realAvgConf      = n > 0 ? _sumConf / n : 0
       const realEntriesTotal = _sumEC
       const realAvgPosPerSet = n > 0 ? _sumEC   / n : 0
-      // passRatioReal = fraction of ELIGIBLE Main Sets that passed into Real.
-      const passRatioReal = mainPFEligible > 0 ? n / mainPFEligible : 0
+      // passRatioReal = fraction of Real evaluated work that passed into Real.
+      // Denominator includes both PF-eligible Main inputs and Real related/axis
+      // fan-out outputs, keeping the ratio bounded when fan-out creates more
+      // Real Sets than the original Main input count.
+      const passRatioReal = realTotalEvaluated > 0 ? n / realTotalEvaluated : 0
       // Average entryCount per Real Set ��� identical to realAvgPosPerSet.
       // The previous formula used Math.max(1, entryCount||1) which biased
       // Sets with entryCount=0 upward. Reuse the already-correct value.
@@ -3910,9 +3919,8 @@ export class StrategyCoordinator {
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
           avg_pos_eval_real:  String(realAvgPosEval.toFixed(4)),
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
-          // evaluated = Sets that entered the PF/DDT gate (not pre-gated by pos-count).
-          // Using mainSets.length inflates this by the full axis fan-out.
-          evaluated:          String(mainPFEligible),
+          // evaluated = PF-eligible Main inputs + Real related/axis-created outputs.
+          evaluated:          String(realTotalEvaluated),
           passed_sets:        String(realSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
@@ -3944,7 +3952,7 @@ export class StrategyCoordinator {
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
           [`s:${symbol}:passed`]:     String(realSets.length),
-          [`s:${symbol}:evaluated`]:  String(mainPFEligible),
+          [`s:${symbol}:evaluated`]:  String(realTotalEvaluated),
           [`s:${symbol}:apf`]:        String(realAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(realAvgDDT)),
           [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
@@ -3958,7 +3966,7 @@ export class StrategyCoordinator {
         // Overwriting them with Real's realSets.length would corrupt MAIN's
         // pass statistics and make passed_sets > evaluated impossible to read.
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
-        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
+        client.set(`strategies:${this.connectionId}:real:evaluated`, String(realTotalEvaluated)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
         client.expire(`strategies:${this.connectionId}:real:count`, 86400),
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
@@ -3974,18 +3982,17 @@ export class StrategyCoordinator {
       // which resolves the settings:-prefixed path correctly.
 
       // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
-      // strategies_real_evaluated = Main Sets that entered REAL (input count).
+      // strategies_real_evaluated = PF-eligible Main inputs plus Real related/axis-created outputs.
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
-      if (mainPFEligible > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainPFEligible))
+      if (realTotalEvaluated > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realTotalEvaluated))
 
       // strategies_real_related_created = Real Sets created via axis/variant
       // fan-out BEYOND the Main Sets that entered (mirrors the Main stage's
       // `strategies_main_related_created = mainSets.length - reused`). This is
-      // the "additionally created" term the dashboard's Real Eval% funnel needs
-      // for its denominator: Real% = real_total / (real_evaluated + real_related_created).
-      // Without it the Real funnel had no fan-out term and read inconsistently
-      // vs. Main. max(0, …) because Real can also net-filter below the input.
-      const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)
+      // the "additionally created" term the dashboard can display alongside the
+      // Real evaluated pool. `strategies_real_evaluated` already includes this
+      // fan-out term so Real pass denominators stay consistent across Redis/detail
+      // fields. max(0, …) because Real can also net-filter below the input.
       if (realRelatedCreated > 0) {
         writes.push(client.hincrby(redisKey, "strategies_real_related_created", realRelatedCreated))
       }
@@ -3999,10 +4006,9 @@ export class StrategyCoordinator {
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
           [`${symbol}:real`]:           String(realSets.length),
-          // real:evaluated = Main Sets that entered PF evaluation (excludes
-          // pos-count pre-gated Sets). Cross-symbol sum in stats route will
-          // match stratCounts.real denominator exactly.
-          [`${symbol}:real:evaluated`]: String(mainPFEligible),
+          // real:evaluated = PF-eligible Main inputs plus Real related/axis-created
+          // outputs. Cross-symbol sum in stats route matches the Real pass denominator.
+          [`${symbol}:real:evaluated`]: String(realTotalEvaluated),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
@@ -4202,10 +4208,10 @@ export class StrategyCoordinator {
         type: "real",
         symbol,
         timestamp: new Date(),
-        // totalCreated = Sets that entered PF evaluation (axis fan-out excluded from denominator).
-        totalCreated: mainPFEligible,
+        // totalCreated = PF-eligible Main inputs plus Real related/axis-created outputs.
+        totalCreated: realTotalEvaluated,
         passedEvaluation: realSets.length,
-        failedEvaluation: mainPFEligible - realSets.length,
+        failedEvaluation: Math.max(0, realTotalEvaluated - realSets.length),
         avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgProfitFactor, 0) / realSets.length : 0,
         avgDrawdownTime: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / realSets.length : 0,
       },

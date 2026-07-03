@@ -992,4 +992,26 @@ describe("requested regression guardrails", () => {
     expect(coordinator).toContain("restart escalation disabled")
   })
 
+  test("Real-stage evaluation denominator includes related outputs and never reports negative failures", () => {
+    const source = read("lib/strategy-coordinator.ts")
+
+    expect(source).toContain("const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)")
+    expect(source).toContain("const realTotalEvaluated = mainPFEligible + realRelatedCreated")
+    expect(source).toContain("const passRatioReal = realTotalEvaluated > 0 ? n / realTotalEvaluated : 0")
+    expect(source).toContain("evaluated:          String(realTotalEvaluated)")
+    expect(source).toContain("[`s:${symbol}:evaluated`]:  String(realTotalEvaluated)")
+    expect(source).toContain('client.set(`strategies:${this.connectionId}:real:evaluated`, String(realTotalEvaluated))')
+    expect(source).toContain("totalCreated: realTotalEvaluated")
+    expect(source).toContain("failedEvaluation: Math.max(0, realTotalEvaluated - realSets.length)")
+    expect(source).not.toContain("failedEvaluation: mainPFEligible - realSets.length")
+
+    const mainPFEligible = 3
+    const realSetsLength = 5
+    const realRelatedCreated = Math.max(0, realSetsLength - mainPFEligible)
+    const realTotalEvaluated = mainPFEligible + realRelatedCreated
+
+    expect(Math.max(0, realTotalEvaluated - realSetsLength)).toBe(0)
+    expect(realTotalEvaluated).toBe(5)
+  })
+
 })
