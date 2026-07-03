@@ -29,6 +29,7 @@ import { BackupManager } from "@/components/monitoring/backup-manager"
 import { EmergencyStopButton } from "@/components/emergency-stop-button"
 import { SystemVerificationPanel } from "@/components/system/system-verification-panel"
 import { PageHeader } from "@/components/page-header"
+import { PnLDashboard } from "@/components/pnl-dashboard"
 
 type LogLevel = "info" | "warning" | "error" | "debug"
 type SystemState = "active" | "inactive" | "error" | "warning"
@@ -387,8 +388,9 @@ export default function MonitoringPage() {
         </div>
       </div>
 
-      <Tabs defaultValue="verification" className="space-y-4">
-        <TabsList className="grid w-full grid-cols-8">
+      <Tabs defaultValue="pnl" className="space-y-4">
+        <TabsList className="grid w-full grid-cols-9">
+          <TabsTrigger value="pnl">PnL & Performance</TabsTrigger>
           <TabsTrigger value="verification">System Verification</TabsTrigger>
           <TabsTrigger value="states">System States</TabsTrigger>
           <TabsTrigger value="alerts">Alerts</TabsTrigger>
@@ -398,6 +400,18 @@ export default function MonitoringPage() {
           <TabsTrigger value="toasts">Toast Messages</TabsTrigger>
           <TabsTrigger value="export">Export</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="pnl" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Real-Time PnL & Performance Tracking</CardTitle>
+              <CardDescription>Live profit/loss metrics, win rates, and last 25 executed positions</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <PnLDashboard connectionId={selectedConnectionId || "bingx-x01"} />
+            </CardContent>
+          </Card>
+        </TabsContent>
 
         <TabsContent value="verification" className="space-y-4">
           <Card>

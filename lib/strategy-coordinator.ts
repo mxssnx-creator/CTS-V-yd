@@ -3968,7 +3968,7 @@ export class StrategyCoordinator {
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
       // aggregates to a "Strategies (Real, alive now)" tile. Note this
       // is the COUNT-AFTER-SORT-AND-CAP, i.e. exactly what propagates
-      // forward to Live evaluation — not the raw post-filter count.
+      // forward to Live evaluation �� not the raw post-filter count.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
           [`${symbol}:real`]:           String(realSets.length),
@@ -4296,15 +4296,12 @@ export class StrategyCoordinator {
     // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
     // avgProfitFactor and take top N). Confidence is advisory metadata.
     //
-    // LIVE EXCHANGE DISPATCH CAP: exactly ONE set per direction per symbol.
+    // LIVE EXCHANGE DISPATCH CAP: Cap to top maxLive sets after PF/DDT filtering.
     // The Real stage evaluates hundreds of profile variants (default, blocks
-    // 1-8, dca, axis, trailing…) — that breadth is for STATISTICS, not for
-    // placing hundreds of live orders. Hedge netting already reduced the
-    // direction exposure; the live stage places at most 1 long + 1 short
-    // (the top-PF variant of each). Previously all qualifying variants (up
-    // to maxLive=90) were dispatched as real exchange orders every cycle,
-    // producing 90 order placements/rejections per tick and hundreds of
-    // stuck positions.
+    // 1-8, dca, axis, trailing…). The cap prevents 100+ simultaneous orders
+    // (which caused BingX 100421 backlog) but allows block + default variants
+    // to be tested together. The final dispatch loop (lines 4699-4715) enforces
+    // per-variant per-direction caps (1 default, 1 block, 1 dca per direction).
     const allQualifying = realSets
       .filter(
         (s) =>
@@ -4314,13 +4311,10 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    // Keep only the single best set per direction for actual dispatch.
-    const bestPerDirection = new Map<string, StrategySet>()
-    for (const s of allQualifying) {
-      const dir = s.direction === "short" ? "short" : "long"
-      if (!bestPerDirection.has(dir)) bestPerDirection.set(dir, s)
-    }
-    let qualifying = [...bestPerDirection.values()]
+    // Keep all qualifying sets (not filtered to 1 per direction).
+    // Block overlays will be added at line 4670, and the final dispatch loop
+    // at line 4699-4715 enforces per-variant caps (1 default + 1 block + 1 DCA).
+    let qualifying = allQualifying
 
     // Testnet fallback: if no qualifying Real sets, promote the top Real or top Main set so live dispatch can run.
     // CRITICAL: Always verify actual is_testnet on connection record.
@@ -4791,6 +4785,14 @@ export class StrategyCoordinator {
                   (coordIndex ? coordIndex.base.byKey.get(parentKey)?.trailingProfile : undefined)
 
                 let sl = protection.stopLossPct
+                // CRITICAL FIX: Add slippage buffer to block variant SL prices
+                // Larger positions experience worse fills due to order book depth.
+                // Block positions (1.15-1.25x) need ~0.5-1.0% wider SL bands to account
+                // for fill slippage so SL doesn't immediately cross on entry.
+                if (set.variant === "block" && effectiveSizeMult > 1.0) {
+                  const slippageBuffer = Math.min(0.5, (effectiveSizeMult - 1.0) * 2.0)  // 0.2-0.5% buffer for 1.1-1.25x sizes
+                  sl = Math.max(0.5, sl + slippageBuffer)  // Add buffer, but keep minimum 0.5%
+                }
                 if (set.variant === "trailing" && resolvedTrailingProfile && resolvedTrailingProfile.stopRatio > 0) {
                   // Trailing-variant: initial SL = trailing stop distance.
                   // The live-stage `computeSetAwareSL` applies the same logic
@@ -5613,9 +5615,14 @@ export class StrategyCoordinator {
         // ── Block sub-configs ─ size is the *base* multiplier that the
         // block overlay then scales by `(1 + (blockCount−1)×ratio)` so the
         // block count and operator vol-ratio knob both flow into live notional.
+        // CRITICAL FIX: Reduced from 1.5/2.0 to 1.15/1.25 to prevent slippage
+        // beyond SL triggers. Larger positions were getting filled at prices
+        // that immediately crossed their own SL triggers on the same tick,
+        // causing immediate losses. Smaller multipliers allow fills to stay
+        // within the expected SL/TP band without forced closure.
         configs: [
-          { size: 1.5, leverage: 2, state: "add", pfBias: 1.08, ddtBias: 45 },
-          { size: 2.0, leverage: 2, state: "add", pfBias: 1.12, ddtBias: 75 },
+          { size: 1.15, leverage: 2, state: "add", pfBias: 1.08, ddtBias: 45 },
+          { size: 1.25, leverage: 2, state: "add", pfBias: 1.12, ddtBias: 75 },
         ],
       },
       {

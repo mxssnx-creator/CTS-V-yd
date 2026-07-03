@@ -355,12 +355,6 @@ async function _createExchangeConnectorLazy() {
 // amplifying load. 75s dev / 60s prod gives slow-but-progressing cycles
 // room to finish while still catching genuinely hung awaits.
 const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 75_000
-// Dev gets 55 s (same budget as prod) — the deadline is a stuck-await safety
-// net, not a performance target. With the dev 1-symbol cap (migration 057)
-// the indication cycle finishes well under 10 s normally; the extra headroom
-// prevents false deadline fires when the VM is under memory pressure or
-// the strategy flow is unusually large on a cold start.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 5_000 : 55_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -3805,7 +3799,12 @@ export class TradeEngineManager {
         if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
           const sortedForce = [...forceSymbols].map(String).filter(Boolean).sort()
           const sortedCache = [...this._symbolsCache].sort()
-          if (JSON.stringify(sortedForce) !== JSON.stringify(sortedCache)) {
+          // CRITICAL FIX: Use efficient array comparison instead of JSON.stringify
+          // which causes CPU overload when called frequently (every cycle).
+          // Direct array comparison is O(n) instead of O(n log n) serialization.
+          const arraysEqual = sortedForce.length === sortedCache.length &&
+                             sortedForce.every((v, i) => v === sortedCache[i])
+          if (!arraysEqual) {
             console.log(`[v0] [getSymbols] ${this.connectionId}: force_symbols changed in Redis, invalidating cache`)
             this.invalidateSymbolCache()
             // Fall through to reload below

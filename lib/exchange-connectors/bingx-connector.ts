@@ -839,10 +839,14 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       // FALLBACK: Manual REST implementation
-      // Sync server time before any signed request to prevent timestamp errors
-      await this.syncServerTime()
+      // NO pre-sync here — the lazy URL builder (below) computes timestamp at
+      // send time inside the rate-limit slot. If it fails with 100421, the
+      // retry-after-resync logic will handle it. A pre-sync here would only
+      // help if there are NO other requests between now and the fetch, which
+      // is false under load (parallel getPositions etc. run concurrently and
+      // stale the offset).
 
-      // ���─ Quantity sanity & formatting ─────────────────────────────────────
+      // ──── Quantity sanity & formatting ─────────────────────────────────────
       // BingX rejects quantities that fall below the symbol step size, and in
       // many cases responds with its generic "this api is not exist" error
       // instead of a precise reason. Normalise the quantity to a reasonable
@@ -1814,8 +1818,11 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setLeverage(symbol: string, leverage: number): Promise<{ success: boolean; error?: string }> {
     try {
-      // Sync server time before any signed request
-      await this.syncServerTime()
+      // NO pre-sync — lazy URL builder computes timestamp at send time.
+      // The comment at line 1857 is now outdated: "the first sync we do at
+      // the top of setLeverage is fine" — that was true when there were no
+      // other concurrent requests, but under load it only helps the first call
+      // until other requests stale the offset before the fetch happens.
 
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting leverage to ${leverage}x for ${bingxSymbol} on both sides`)
@@ -1889,8 +1896,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setMarginType(symbol: string, marginType: "cross" | "isolated"): Promise<{ success: boolean; error?: string }> {
     try {
-      // Sync server time before any signed request
-      await this.syncServerTime()
+      // NO pre-sync — lazy URL builder computes timestamp at send time, same as setLeverage.
 
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting margin type to ${marginType} for ${bingxSymbol}`)

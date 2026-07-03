@@ -49,12 +49,18 @@ export async function GET() {
             [conn.id]
           )
 
+          // Determine if engine is running based on health status:
+          // Health components report "healthy" when their cycles are progressing.
+          const isRunning = engineStatus?.health?.components?.realtime?.status === "healthy"
+            || engineStatus?.health?.components?.indications?.status === "healthy"
+            || engineStatus?.health?.components?.strategies?.status === "healthy"
+
           return {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
-            status: engineStatus?.status || state[0]?.state || "idle",
-            isRunning: engineStatus?.status === "running",
+            status: isRunning ? "running" : "idle",
+            isRunning,
             lastUpdate: state[0]?.updated_at || null,
             errorMessage: engineStatus?.errorMessage || null,
           }
