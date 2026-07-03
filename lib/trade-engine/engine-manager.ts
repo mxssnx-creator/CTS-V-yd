@@ -4124,7 +4124,18 @@ export class TradeEngineManager {
     try {
       const flagKey = `engine_is_running:${this.connectionId}`
       const client = getRedisClient()
-      await client.set(flagKey, isRunning ? "1" : "0")
+      const now = Date.now()
+      const writes: Promise<unknown>[] = [client.set(flagKey, isRunning ? "1" : "0")]
+      if (isRunning) {
+        writes.push(client.hset("trade_engine:global", {
+          actual_status: "running",
+          active_worker_id: `engine-manager:${process.pid}`,
+          last_heartbeat_at: String(now),
+          last_heartbeat_iso: new Date(now).toISOString(),
+          updated_at: new Date(now).toISOString(),
+        }).catch(() => undefined))
+      }
+      await Promise.all(writes)
       console.log(`[v0] [Engine Flag] ${flagKey}=${isRunning ? "1" : "0"}`)
     } catch (error) {
       console.error("[v0] Failed to set running flag:", error)
@@ -4152,17 +4163,27 @@ export class TradeEngineManager {
         checkMemoryAndTriggerGC()
         
         const stateKey = `trade_engine_state:${this.connectionId}`
-        await setSettings(stateKey, {
-          status: "running",
-          last_indication_run: new Date().toISOString(),
-          // STABILITY: dedicated millis-epoch heartbeat read by the
-          // coordinator's stall watchdog. Numeric form is much cheaper
-          // for the watchdog to compare than re-parsing an ISO string,
-          // and it isolates "engine alive" from "indication ran" — the
-          // two used to be conflated which made stall detection unreliable.
-          last_processor_heartbeat: Date.now(),
-          connection_id: this.connectionId,
-        })
+        const now = Date.now()
+        await Promise.all([
+          setSettings(stateKey, {
+            status: "running",
+            last_indication_run: new Date().toISOString(),
+            // STABILITY: dedicated millis-epoch heartbeat read by the
+            // coordinator's stall watchdog. Numeric form is much cheaper
+            // for the watchdog to compare than re-parsing an ISO string,
+            // and it isolates "engine alive" from "indication ran" — the
+            // two used to be conflated which made stall detection unreliable.
+            last_processor_heartbeat: now,
+            connection_id: this.connectionId,
+          }),
+          getRedisClient().hset("trade_engine:global", {
+            actual_status: "running",
+            active_worker_id: `engine-manager:${process.pid}`,
+            last_heartbeat_at: String(now),
+            last_heartbeat_iso: new Date(now).toISOString(),
+            updated_at: new Date(now).toISOString(),
+          }).catch(() => undefined),
+        ])
       } catch {
         // Silent fail - heartbeat is non-critical
       }

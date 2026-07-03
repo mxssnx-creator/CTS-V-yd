@@ -2462,6 +2462,7 @@ export async function saveConnection(connection: any): Promise<void> {
   await Promise.all([
     client.hset(`connection:${id}`, data),
     client.sadd("connections", id),
+    syncMainEnabledConnectionIndex(client, { ...data, id }),
   ])
   invalidateConnectionsCache()
 }
@@ -2472,6 +2473,7 @@ export async function deleteConnection(id: string): Promise<void> {
   await Promise.all([
     client.del(`connection:${id}`),
     client.srem("connections", id),
+    client.srem("connections:main:enabled", id),
   ])
   invalidateConnectionsCache()
 }
@@ -3146,6 +3148,16 @@ export function isConnectionMainEnabled(connection: any): boolean {
   return isConnectionAssignedToMain(connection) && isEnabledFlag(connection.is_enabled_dashboard)
 }
 
+async function syncMainEnabledConnectionIndex(client: RedisClientLike, connection: any): Promise<void> {
+  const id = String(connection?.id || "").trim()
+  if (!id) return
+  if (isConnectionMainEnabled(connection)) {
+    await client.sadd("connections:main:enabled", id)
+  } else {
+    await client.srem("connections:main:enabled", id)
+  }
+}
+
 export function isConnectionProcessingEnabled(connection: any): boolean {
   return isEnabledFlag(connection.is_enabled_dashboard)
 }
@@ -3356,19 +3368,33 @@ export async function getCurrentSiteInstanceId(): Promise<string | null> {
 
 export async function getActiveConnectionsForEngine(): Promise<any[]> {
   const client = getRedisClient()
-  const keys = await client.keys("connection:*")
+  const indexedIds = await client.smembers("connections:main:enabled").catch(() => [] as string[])
   const connections: any[] = []
 
-  for (const key of keys) {
-    if (key.includes(":settings") || key.includes(":state")) continue
-    const data = await client.hgetall(key)
+  if (indexedIds.length > 0) {
+    await Promise.all(indexedIds.map(async (id) => {
+      const data = await client.hgetall(`connection:${id}`).catch(() => ({}))
+      const connection = { id, ...data }
+      if (data && Object.keys(data).length > 0 && isConnectionMainEnabled(connection)) {
+        connections.push(connection)
+      } else {
+        await client.srem("connections:main:enabled", id).catch(() => 0)
+      }
+    }))
+    return connections
+  }
+
+  const ids = await client.smembers("connections").catch(() => [] as string[])
+  for (const id of ids) {
+    const data = await client.hgetall(`connection:${id}`)
     if (data && Object.keys(data).length > 0) {
       const connection = {
-        id: key.replace("connection:", ""),
+        id,
         ...data,
       }
       if (isConnectionMainEnabled(connection)) {
         connections.push(connection)
+        await client.sadd("connections:main:enabled", id).catch(() => 0)
       }
     }
   }
@@ -3416,7 +3442,11 @@ export async function createConnection(data: any): Promise<any> {
       id,
       updated_at: new Date().toISOString(),
     }
-    await client.hset(`connection:${id}`, merged)
+    await Promise.all([
+      client.hset(`connection:${id}`, merged),
+      client.sadd("connections", id),
+      syncMainEnabledConnectionIndex(client, merged),
+    ])
     invalidateConnectionsCache()
     return merged
   }
@@ -3427,7 +3457,11 @@ export async function createConnection(data: any): Promise<any> {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
-  await client.hset(`connection:${id}`, connectionData)
+  await Promise.all([
+    client.hset(`connection:${id}`, connectionData),
+    client.sadd("connections", id),
+    syncMainEnabledConnectionIndex(client, connectionData),
+  ])
   invalidateConnectionsCache()
   return connectionData
 }
@@ -3443,7 +3477,10 @@ export async function updateConnection(id: string, updates: any): Promise<any> {
     ...updates,
     updated_at: new Date().toISOString(),
   }
-  await client.hset(`connection:${id}`, updated)
+  await Promise.all([
+    client.hset(`connection:${id}`, updated),
+    syncMainEnabledConnectionIndex(client, updated),
+  ])
   invalidateConnectionsCache()
   return updated
 }
@@ -3755,17 +3792,7 @@ export async function getEnabledConnections(): Promise<any[]> {
 }
 
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
-  const allConnections = await getAllConnections()
-  return allConnections.filter(conn => {
-    // Canonical engine eligibility: assigned to Main Connections and
-    // enabled via is_enabled_dashboard.
-    return isConnectionMainEnabled(conn)
-    // Keep this eligibility in sync with isConnectionReadyForEngine(), which
-    // startEngine() re-checks immediately before acquiring startup locks.
-    // Live-trade intent is deliberately not part of engine-processing
-    // eligibility; it only controls whether live orders may be placed.
-    return isConnectionMainEnabled(conn) && !!conn?.exchange && !!conn?.api_type
-  })
+  return getActiveConnectionsForEngine()
 }
 
 export async function getConnectionsByExchange(exchange: string): Promise<any[]> {

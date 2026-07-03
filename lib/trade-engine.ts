@@ -121,17 +121,17 @@ export class GlobalTradeEngineCoordinator {
 
   /**
    * Whether this Node process is allowed to own long-running trade loops.
-   * Production UI/API workers must default to "queue only": starting the
-   * realtime coordinator in the request worker can starve health/settings
-   * routes after enable/disable or settings saves. Dedicated workers (or
-   * explicit diagnostics) opt in with one of these env flags.
+   *
+   * Default to self-contained runtime ownership. Production previously needed a
+   * separate worker opt-in, so valid dashboard/quickstart actions could persist
+   * operator intent but never make progress and the UI stayed at
+   * "Queued / waiting for worker". Operators who intentionally run a dedicated
+   * external worker can still opt this process out explicitly.
    */
   private canOwnEngineRuntime(): boolean {
-    return (
-      process.env.NODE_ENV !== "production" ||
-      process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
-      process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
-    )
+    if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1") return false
+    if (process.env.NEXT_RUNTIME === "edge") return false
+    return true
   }
 
   constructor() {
@@ -223,8 +223,7 @@ export class GlobalTradeEngineCoordinator {
 
     if (!this.canOwnEngineRuntime()) {
       console.warn(
-        `[v0] [Coordinator] startEngine(${connectionId}) queued-only in this production API worker; ` +
-          "set ENABLE_TRADE_ENGINE_IN_PROCESS=1 on the coordinator worker to own runtime loops.",
+        `[v0] [Coordinator] startEngine(${connectionId}) skipped because in-process runtime ownership is disabled for this worker.`,
       )
       return false
     }
@@ -722,13 +721,6 @@ export class GlobalTradeEngineCoordinator {
         if (request.action === "stop") {
           await this.stopEngine(request.connectionId, { operatorRequested: true })
         } else if (request.action === "start") {
-          if (!this.canOwnEngineRuntime()) {
-            console.log(
-              `[v0] [Coordinator] Leaving start request queued for ${request.connectionId}; ` +
-                "this production API worker is not allowed to own engine loops.",
-            )
-            continue
-          }
           if (!this.isEngineRunning(request.connectionId)) {
             await this.startEngineFromConnectionConfig(request.connectionId)
           }
@@ -1080,7 +1072,7 @@ export class GlobalTradeEngineCoordinator {
       const configuredMaxActive = Number(process.env.MAX_ACTIVE_TRADE_ENGINES || process.env.TRADE_ENGINE_MAX_ACTIVE || 0)
       const maxActiveEngines = Number.isFinite(configuredMaxActive) && configuredMaxActive > 0
         ? configuredMaxActive
-        : (process.env.NODE_ENV === "production" ? 2 : Number.POSITIVE_INFINITY)
+        : Number.POSITIVE_INFINITY
       
       // Start engines for connections that should be running but aren't
       let started = 0
