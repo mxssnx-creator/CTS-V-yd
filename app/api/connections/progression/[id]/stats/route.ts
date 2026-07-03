@@ -1140,18 +1140,24 @@ export async function GET(
       })
     )
     // Enforce cascade invariants for all public progression counters:
-    // BASE expands into MAIN variants, REAL is a filtered subset of MAIN, and
-    // LIVE is a dispatch subset of REAL. During live runs, per-stage writers can
-    // briefly update different fields in separate Redis calls, so a stats read
-    // may observe `real > main` (or `live > real`) for one request. Normalize the
-    // snapshot here instead of exposing an impossible state to the dashboard,
-    // validation scripts, and operators watching long-running progressions.
-    if (stratCounts.main > 0 && stratCounts.real > stratCounts.main) {
+    // BASE expands into MAIN variants, REAL filters MAIN inputs and may also
+    // create additional Real Sets through related/axis fan-out, and LIVE is a
+    // dispatch subset of REAL. During live runs, per-stage writers can briefly
+    // update different fields in separate Redis calls, so a stats read may
+    // observe impossible overages. Normalize only when REAL exceeds the
+    // pipeline-aware ceiling: main inputs + Real Sets created at the Real stage.
+    // `strategies_real_related_created` is cumulative, so do not use it as
+    // the per-snapshot allowance; `strategies_real_last_created` is the
+    // coordinator's current-cycle related/axis-created Real fan-out.
+    const realRelatedCreatedForCurrentSnapshot = n(progHash.strategies_real_last_created)
+    const realCeiling = stratCounts.main + realRelatedCreatedForCurrentSnapshot
+    if (stratCounts.main > 0 && stratCounts.real > realCeiling) {
       console.warn(
-        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > main (${stratCounts.main}). ` +
-        `Clamping real to main for cascade consistency.`,
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > ` +
+        `main (${stratCounts.main}) + realRelatedCreated (${realRelatedCreatedForCurrentSnapshot}). ` +
+        `Clamping real to pipeline-aware ceiling (${realCeiling}).`,
       )
-      stratCounts.real = stratCounts.main
+      stratCounts.real = realCeiling
       activeStratByStage.real = Math.min(activeStratByStage.real || 0, stratCounts.real)
       activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
     }
@@ -2508,8 +2514,10 @@ export async function GET(
             // NOTE: realEvaluated = Main sets that ENTERED Real-stage PF evaluation
             // (the INPUT count, written as mainPFEligible by the coordinator).
             // stratCounts.real = Real sets that PASSED and survived to dispatch
-            // (the OUTPUT count). Input is always >= output after filtering, so
-            // realEvaluated > real is CORRECT and expected — do NOT clamp here.
+            // (the OUTPUT count), plus any related/axis-created fan-out that
+            // the Real stage materialized for this snapshot. With fan-out
+            // enabled, output can legitimately exceed the upstream input by
+            // that related-created amount, so do NOT clamp realEvaluated here.
             return stratEvaluated.real || 0
           })(),
         },
