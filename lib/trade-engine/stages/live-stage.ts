@@ -149,11 +149,11 @@ const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 s — fill detection; re
 // With 8 symbols each opening long+short positions, up to 16 SL+TP calls
 // can be queued simultaneously.  BingX allows ~5 order-write req/s per IP.
 // Limit=6 lets 6 calls run in parallel; with p99 latency of ~5s each,
-// 16 calls flush in ~14s (ceil(16/6) = 3 passes × ~5s).
-// The EXCHANGE_TIMEOUT_PLACE_STOP_MS (45s) covers the worst-case queue wait
-// (2 passes waiting × 5s) + one actual BingX round-trip (~5s) with margin.
+// 16 calls flush in ~27s (ceil(16/3) = 6 passes × ~4.5s).
+// Lower concurrency means each BingX request gets more bandwidth.
+// EXCHANGE_TIMEOUT_PLACE_STOP_MS (60s) covers worst-case queue wait.
 let __stopSemCount = 0
-const __STOP_SEM_LIMIT = 6
+const __STOP_SEM_LIMIT = 3
 const __stopSemQueue: Array<() => void> = []
 function acquireStopSem(): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -4086,7 +4086,7 @@ export async function closeLivePosition(
       // outer sync timeout triggers the DB-close fallback.
       const maxRetries = 2
       const backoffMs = [500, 1000]
-      const CLOSE_ATTEMPT_TIMEOUT_MS = 25_000
+      const CLOSE_ATTEMPT_TIMEOUT_MS = 35_000
 
       const isAlreadyClosedError = (msg: string): boolean => {
         const m = String(msg || "").toLowerCase()
@@ -5550,7 +5550,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
   const client = getRedisClient()
   const syncStartMs = Date.now()
 
-  // ── Cross-caller single-flight gate ─────────────────────────────────
+  // ── Cross-caller single-flight gate ��────────────────────────────────
   // `syncWithExchange` has three independent callers in production:
   //   1. RealtimeProcessor.maybeRunLiveSync() — every 200 ms (in-process
   //      gate `liveSyncInFlight` covers same-process collisions only)
@@ -6054,9 +6054,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const SYNC_CONCURRENCY = 5
     
     // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout.
-    // Individual operation timeouts: getOrder=12s, placeStop=60s.
-    // Per-position cap at 70s.
-    const SYNC_PER_POS_TIMEOUT_MS = 70_000
+    // Individual operation timeouts: getOrder=12s, placeStop=60s, close=35s×2.
+    // Per-position cap at 80s gives close 2 full attempts plus a getOrder check.
+    const SYNC_PER_POS_TIMEOUT_MS = 80_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
