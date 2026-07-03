@@ -71,12 +71,18 @@ class PerformanceProfiler {
     cycle.endTime = endTime
     cycle.duration = endTime - cycle.startTime
 
-    // Track operation timings
+    // Track operation timings with bounded history per operation
+    const MAX_TIMINGS_PER_OP = 1000
     for (const op of cycle.operations) {
       if (!this.operationTimings.has(op.name)) {
         this.operationTimings.set(op.name, [])
       }
-      this.operationTimings.get(op.name)!.push(op.duration)
+      const timings = this.operationTimings.get(op.name)!
+      timings.push(op.duration)
+      // Keep only last 1000 entries per operation to prevent memory explosion
+      if (timings.length > MAX_TIMINGS_PER_OP) {
+        timings.shift()
+      }
     }
 
     // Cleanup old cycles to prevent memory bloat

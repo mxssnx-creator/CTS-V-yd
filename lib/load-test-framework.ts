@@ -39,12 +39,16 @@ class LoadTestFramework {
     let failureCount = 0
     const issues: string[] = []
 
-    // Simulate high-frequency operations
-    const tasks = []
+    // CRITICAL FIX: Properly throttle concurrent operations to prevent memory explosion
+    // Previous code accumulated unbounded task array, causing malloc crash with 10K+ tasks.
+    // Now we properly await batches of concurrent operations.
+    const batchSize = Math.min(config.concurrencyFactor, 100) // Cap at 100 concurrent
+    let taskBatch: Promise<any>[] = []
+
     for (let connIdx = 0; connIdx < config.connections; connIdx++) {
       for (let symIdx = 0; symIdx < config.symbolsPerConnection; symIdx++) {
         for (let cycleIdx = 0; cycleIdx < config.cyclesPerSymbol; cycleIdx++) {
-          tasks.push(
+          taskBatch.push(
             this.simulateTradeOperation()
               .then((duration) => {
                 responseTimes.push(duration)
@@ -56,16 +60,19 @@ class LoadTestFramework {
               })
           )
 
-          // Throttle concurrency
-          if (tasks.length >= config.concurrencyFactor) {
-            await Promise.race(tasks.slice(-config.concurrencyFactor))
+          // Execute batch when it reaches size, then clear and start new batch
+          if (taskBatch.length >= batchSize) {
+            await Promise.allSettled(taskBatch)
+            taskBatch = []
           }
         }
       }
     }
 
-    // Wait for all operations to complete
-    await Promise.allSettled(tasks)
+    // Wait for any remaining operations in final batch
+    if (taskBatch.length > 0) {
+      await Promise.allSettled(taskBatch)
+    }
 
     const endTime = performance.now()
     const endMem = process.memoryUsage().heapUsed / 1024 / 1024
