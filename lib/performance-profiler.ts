@@ -29,10 +29,17 @@ interface PerformanceStats {
   slowCycles: CycleMetrics[]
 }
 
+interface OperationTimingRing {
+  values: number[]
+  nextIndex: number
+  count: number
+}
+
 class PerformanceProfiler {
   private cycles: Map<string, CycleMetrics> = new Map()
-  private operationTimings: Map<string, number[]> = new Map()
+  private operationTimings: Map<string, OperationTimingRing> = new Map()
   private readonly MAX_HISTORY = 1000
+  private readonly MAX_TIMINGS_PER_OP = 1000
   private readonly SLOW_CYCLE_THRESHOLD_MS = 250 // 300ms default - 250ms = 50ms buffer
 
   startCycle(connectionId: string, phase: string, symbol?: string): string {
@@ -72,17 +79,20 @@ class PerformanceProfiler {
     cycle.duration = endTime - cycle.startTime
 
     // Track operation timings with bounded history per operation
-    const MAX_TIMINGS_PER_OP = 1000
     for (const op of cycle.operations) {
-      if (!this.operationTimings.has(op.name)) {
-        this.operationTimings.set(op.name, [])
+      let timings = this.operationTimings.get(op.name)
+      if (!timings) {
+        timings = {
+          values: new Array(this.MAX_TIMINGS_PER_OP),
+          nextIndex: 0,
+          count: 0,
+        }
+        this.operationTimings.set(op.name, timings)
       }
-      const timings = this.operationTimings.get(op.name)!
-      timings.push(op.duration)
-      // Keep only last 1000 entries per operation to prevent memory explosion
-      if (timings.length > MAX_TIMINGS_PER_OP) {
-        timings.shift()
-      }
+
+      timings.values[timings.nextIndex] = op.duration
+      timings.nextIndex = (timings.nextIndex + 1) % this.MAX_TIMINGS_PER_OP
+      timings.count = Math.min(timings.count + 1, this.MAX_TIMINGS_PER_OP)
     }
 
     // Cleanup old cycles to prevent memory bloat
@@ -105,9 +115,14 @@ class PerformanceProfiler {
 
     const operationBreakdown: Record<string, { count: number; avgDuration: number }> = {}
     for (const [name, timings] of this.operationTimings.entries()) {
-      const avg = timings.reduce((a, b) => a + b, 0) / timings.length
+      let totalDuration = 0
+      for (let i = 0; i < timings.count; i++) {
+        totalDuration += timings.values[i]
+      }
+
+      const avg = timings.count > 0 ? totalDuration / timings.count : 0
       operationBreakdown[name] = {
-        count: timings.length,
+        count: timings.count,
         avgDuration: Math.round(avg * 100) / 100,
       }
     }
