@@ -523,11 +523,48 @@ async function generateIndicationsForConnection(
 // process without a Redis round-trip.
 let _cronInFlight = false
 
+const CRON_LOCK_KEY = "cron_lock:generate-indications"
+// Keep the lock comfortably above this route's worst-case duration: one cron can
+// process up to 20 symbols per active connection, then run strategy flow batches
+// and realtime SL/TP sweeps before returning.
+const CRON_LOCK_TTL = 120 // seconds
+const CRON_LOCK_RELEASE_SCRIPT = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`
+
+function createCronLockToken(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+async function releaseCronLock(client: any, token: string): Promise<void> {
+  if (typeof client?.eval === "function") {
+    await client.eval(CRON_LOCK_RELEASE_SCRIPT, {
+      keys: [CRON_LOCK_KEY],
+      arguments: [token],
+    })
+    return
+  }
+
+  // Inline/local Redis emulator does not expose Lua/eval. This compare-then-del
+  // fallback is best-effort only because the GET and DEL are separate operations;
+  // production Redis clients should use the atomic Lua path above when available.
+  const currentToken = await client.get(CRON_LOCK_KEY)
+  if (currentToken === token) {
+    await client.del(CRON_LOCK_KEY)
+  }
+}
+
 export async function GET() {
   // ── Same-process guard ──────────────────────────────────────────────────────
   if (_cronInFlight) {
     return NextResponse.json({ success: true, skipped: true, reason: "in-flight" }, { status: 200 })
   }
+
+  const cronLockToken = createCronLockToken()
+  let acquiredCronLock = false
 
   try {
     const { initRedis, getRedisClient, getAllConnections } = await import("@/lib/redis-db")
@@ -535,18 +572,13 @@ export async function GET() {
     const client = getRedisClient()
 
     // ── Redis in-flight dedup lock (cross-process / cross-tab) ─────────────
-    // Key TTL = 5s. If any caller (another tab, another serverless invocation)
-    // already acquired the lock, skip this tick and return 200 immediately
-    // instead of racing on the progression:{conn} hincrby counters.
-    // We use the plain Redis `SET NX EX` primitive — no owner-token needed
-    // because we only need mutual exclusion within the TTL window, not
-    // ownership revocation. The lock auto-expires so a crashed caller never
-    // blocks future ticks.
-    const CRON_LOCK_KEY  = "cron_lock:generate-indications"
-    const CRON_LOCK_TTL  = 5     // seconds — one full cron window
-    let acquiredCronLock = false
+    // If any caller (another tab, another serverless invocation) already
+    // acquired the lock, skip this tick and return 200 immediately instead of
+    // racing on the progression:{conn} hincrby counters. Each invocation stores
+    // a unique owner token so the finally block only releases the lock it owns;
+    // the TTL still guarantees a crashed caller never blocks future ticks.
     try {
-      const setResult = await client.set(CRON_LOCK_KEY, "1", { NX: true, EX: CRON_LOCK_TTL })
+      const setResult = await client.set(CRON_LOCK_KEY, cronLockToken, { NX: true, EX: CRON_LOCK_TTL })
       acquiredCronLock = setResult === "OK"
     } catch {
       // If the lock store is unreachable treat as acquired so processing continues.
@@ -718,13 +750,18 @@ export async function GET() {
   } finally {
     // Always release both guards so the next tick can run.
     _cronInFlight = false
-    // Release the Redis lock early (before TTL) so subsequent ticks don't
-    // wait the full 5s when the handler finishes quickly.
-    try {
-      const { getRedisClient } = await import("@/lib/redis-db")
-      const c = getRedisClient()
-      if (c) await c.del("cron_lock:generate-indications").catch(() => {})
-    } catch { /* non-critical */ }
+    // Release the Redis lock early (before TTL) so subsequent ticks don't wait
+    // when this handler finishes quickly, but only if this invocation still owns
+    // the token. Atomic Lua compare-and-delete is used when exposed by the Redis
+    // client; the inline/local emulator falls back to a documented best-effort
+    // GET/DEL equality guard.
+    if (acquiredCronLock) {
+      try {
+        const { getRedisClient } = await import("@/lib/redis-db")
+        const c = getRedisClient()
+        if (c) await releaseCronLock(c, cronLockToken).catch(() => {})
+      } catch { /* non-critical */ }
+    }
   }
 }
 
