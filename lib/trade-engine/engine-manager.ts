@@ -3847,10 +3847,9 @@ export class TradeEngineManager {
         const _isLocalRun = process.env.NODE_ENV === "development" ||
           (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")
         if (_isLocalRun) {
-          // Default 4 symbols so BTCUSDT/ETHUSDT/SOLUSDT/XRPUSDT all trade.
-          // The old default of 1 bypassed force_symbols / active_symbols entirely.
-          const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "4"
-          const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 4)
+          const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "1"
+          const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 1)
+          if (devCap === 1) return ["BTCUSDT"]
           // Fall through to the full resolution chain (force_symbols → active_symbols
           // → volatility fetch). The resolved list is sliced to devCap at the end.
           ;(resolve as any)._devCap = devCap

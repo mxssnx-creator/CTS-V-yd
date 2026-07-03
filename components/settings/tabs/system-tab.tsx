@@ -367,11 +367,87 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                 whose entry shape costs more or less to recompute. */}
             <div className="space-y-4 border-t pt-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold">Set Compaction</h3>
+                <h3 className="text-lg font-semibold">Capacity & Stage Limits</h3>
                 <span className="text-xs text-muted-foreground">
-                  Rearrange policy for every Set pool
+                  Symbol fan-out, Set compaction, and stage promotion gates
                 </span>
               </div>
+              <div className="space-y-4 rounded-lg border p-3 bg-muted/20">
+                <div>
+                  <h4 className="text-sm font-semibold">Symbol Fan-Out</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Mirrors Exchange → Symbol Configuration and writes the same canonical settings keys.
+                  </p>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>Symbol Order Type</Label>
+                    <Select
+                      value={settings.symbolOrderType || "volume24h"}
+                      onValueChange={(value) => handleSettingChange("symbolOrderType", value)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="volume24h">24h Volume (Highest First)</SelectItem>
+                        <SelectItem value="marketCap">Market Cap (Largest First)</SelectItem>
+                        <SelectItem value="priceChange24h">24h Price Change</SelectItem>
+                        <SelectItem value="volatility">Volatility (Most Volatile)</SelectItem>
+                        <SelectItem value="trades24h">24h Trades (Most Active)</SelectItem>
+                        <SelectItem value="alphabetical">Alphabetical (A-Z)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Canonical key: <code>symbolOrderType</code>.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Symbol Count</Label>
+                      <span className="text-sm font-semibold tabular-nums">{settings.numberOfSymbolsToSelect || 8}</span>
+                    </div>
+                    <Slider
+                      min={2}
+                      max={30}
+                      step={1}
+                      value={[settings.numberOfSymbolsToSelect || 8]}
+                      onValueChange={([value]) => handleSettingChange("numberOfSymbolsToSelect", value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Canonical key: <code>numberOfSymbolsToSelect</code> (the exchange fan-out symbol count).
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-4 text-xs">
+                  <div className="space-y-2">
+                    <Label>Main Symbols</Label>
+                    <div className="flex flex-wrap gap-2 rounded border p-2 min-h-10 bg-background">
+                      {(settings.mainSymbols || ["BTC", "ETH", "BNB", "XRP", "ADA", "SOL"]).map((symbol: string) => (
+                        <span key={symbol} className="px-2 py-1 rounded-full bg-primary/10 text-primary">{symbol}</span>
+                      ))}
+                    </div>
+                    <p className="text-muted-foreground">
+                      Edit membership on Exchange; System displays the canonical <code>mainSymbols</code> list.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Forced Symbols</Label>
+                    <div className="flex flex-wrap gap-2 rounded border p-2 min-h-10 bg-background">
+                      {(settings.forcedSymbols || ["XRP", "BCH"]).map((symbol: string) => (
+                        <span key={symbol} className="px-2 py-1 rounded-full bg-accent text-accent-foreground">{symbol}</span>
+                      ))}
+                    </div>
+                    <p className="text-muted-foreground">
+                      Always included via canonical <code>forcedSymbols</code>; edit the list on Exchange.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
               <p className="text-xs text-muted-foreground">
                 Buffers grow to <strong>floor × (1 + threshold%)</strong> entries
                 before being compacted back to <strong>floor</strong> — newest
@@ -499,6 +575,88 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                   </div>
                 </div>
               </details>
+
+              <div className="space-y-4 rounded-lg border p-3 bg-muted/20">
+                <div>
+                  <h4 className="text-sm font-semibold">Strategy Stage Thresholds</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Mirrors Strategy → Base stage promotion gates and writes the same PF, DDT, and min-position keys.
+                  </p>
+                </div>
+
+                <div className="grid md:grid-cols-4 gap-4">
+                  {([
+                    { key: "baseProfitFactor", label: "Base PF", value: settings.baseProfitFactor ?? 0.9 },
+                    { key: "mainProfitFactor", label: "Main PF", value: settings.mainProfitFactor ?? 1.0 },
+                    { key: "realProfitFactor", label: "Real PF", value: settings.realProfitFactor ?? 1.0 },
+                    { key: "liveProfitFactor", label: "Live PF", value: settings.liveProfitFactor ?? 1.0 },
+                  ] as const).map((row) => (
+                    <div key={row.key} className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <Label>{row.label}</Label>
+                        <span className="text-sm font-semibold tabular-nums">{Number(row.value).toFixed(1)}</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={2}
+                        step={0.1}
+                        value={[row.value]}
+                        onValueChange={([value]) => handleSettingChange(row.key, value)}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid md:grid-cols-3 gap-4">
+                  {([
+                    { key: "maxDrawdownTimeMainHours", label: "Main DDT Ceiling", value: settings.maxDrawdownTimeMainHours ?? 4 },
+                    { key: "maxDrawdownTimeRealHours", label: "Real DDT Ceiling", value: settings.maxDrawdownTimeRealHours ?? 4 },
+                    { key: "maxDrawdownTimeLiveHours", label: "Live DDT Ceiling", value: settings.maxDrawdownTimeLiveHours ?? 4 },
+                  ] as const).map((row) => (
+                    <div key={row.key} className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <Label>{row.label}</Label>
+                        <span className="text-sm font-semibold tabular-nums">{row.value}h</span>
+                      </div>
+                      <Slider
+                        min={1}
+                        max={72}
+                        step={1}
+                        value={[row.value]}
+                        onValueChange={([value]) => handleSettingChange(row.key, value)}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid md:grid-cols-3 gap-4">
+                  {([
+                    { key: "stageMinPosCountBase", label: "Base → Main Min Positions", value: settings.stageMinPosCountBase ?? 0, defaultText: "Default 15" },
+                    { key: "stageMinPosCountMain", label: "Main → Real Min Positions", value: settings.stageMinPosCountMain ?? 0, defaultText: "Default 15" },
+                    { key: "stageMinPosCountReal", label: "Real → Live Min Positions", value: settings.stageMinPosCountReal ?? 0, defaultText: "Default 10" },
+                  ] as const).map((row) => (
+                    <div key={row.key} className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <Label>{row.label}</Label>
+                        <span className="text-sm font-semibold tabular-nums">{row.value === 0 ? row.defaultText : row.value}</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={50}
+                        step={5}
+                        value={[row.value]}
+                        onValueChange={([value]) => handleSettingChange(row.key, value)}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  Also surfaced in this System tab: <code>maxRealSets</code>, <code>indicationTimeoutMs</code>,
+                  indication retention, global <code>setCompactionFloor</code>/<code>setCompactionThresholdPct</code>,
+                  indication compaction overrides, and strategy compaction overrides above.
+                </p>
+              </div>
             </div>
 
             <div className="space-y-4 border-t pt-4">
