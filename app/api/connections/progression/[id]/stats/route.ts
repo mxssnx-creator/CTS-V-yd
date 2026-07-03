@@ -618,7 +618,7 @@ export async function GET(
       ? Math.max(1, existingRealActiveSamples)
       : existingRealActiveSamples
 
-    // ── Live-stage OPEN positions + Set-relation join ─────�������───────────
+    // ── Live-stage OPEN positions + Set-relation join ─────���������───────────
     //
     // The operator asked for a coordination view that identifies which
     // Set each live exchange position came from. The live-stage
@@ -1158,11 +1158,6 @@ export async function GET(
     // may observe `real > main` (or `live > real`) for one request. Normalize the
     // snapshot here instead of exposing an impossible state to the dashboard,
     // validation scripts, and operators watching long-running progressions.
-    if (stratCounts.main > 0 && stratCounts.real > stratCounts.main) {
-      // Cascade-invariant normalization: real and main are written in separate Redis
-      // calls; a stats read can land between them producing a transient real > main.
-      // This is an expected read-time race, not a data corruption — use debug level.
-      stratCounts.real = stratCounts.main
     // BASE expands into MAIN variants, REAL filters MAIN inputs and may also
     // create additional Real Sets through related/axis fan-out, and LIVE is a
     // dispatch subset of REAL. During live runs, per-stage writers can briefly
