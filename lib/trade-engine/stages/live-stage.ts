@@ -140,8 +140,8 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // set conservatively to handle the worst case while still catching genuine
 // hangs.  SL/TP placement is the most critical path — a timeout here leaves
 // a position unprotected, so it gets more budget than cancel/fetch.
-const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 20_000  // 20 s — cancel; retried next tick on failure; raised from 15s as concurrent sweeps queue up
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 45_000  // 45 s — SL/TP placement; covers semaphore queue wait + BingX round-trip
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 30_000  // 30 s — cancel; retried next tick on failure; covers queue wait + BingX round-trip
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 60_000  // 60 s — SL/TP placement; covers semaphore queue wait + BingX round-trip
 const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 s — position fetch for adoption + sync prefetch
 const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 s — fill detection; retry via next sync tick on miss
 
@@ -6054,9 +6054,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const SYNC_CONCURRENCY = 5
     
     // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout.
-    // Individual operation timeouts: getOrder=12s, placeStop=45s (includes
-    // semaphore queue wait).  Per-position cap at 55s.
-    const SYNC_PER_POS_TIMEOUT_MS = 55_000
+    // Individual operation timeouts: getOrder=12s, placeStop=60s.
+    // Per-position cap at 70s.
+    const SYNC_PER_POS_TIMEOUT_MS = 70_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {

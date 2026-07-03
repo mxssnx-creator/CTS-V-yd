@@ -302,6 +302,10 @@ async function executeReadyStrategiesAsLiveOrders(
 // slow Redis call in Phase 1 never wedges all 8 symbols for 120s.
 // Phase budgets: Phase1=20s, Phase2=8s, Phase3=25s (well under the 120s outer deadline).
 function withPhaseTimeout<T>(work: Promise<T>, label: string, ms: number): Promise<T> {
+  // When ms=Infinity, skip the timeout entirely — the outer cycle deadline
+  // (engine-manager) is the correct bound. setTimeout(fn, Infinity) would fire
+  // at 1ms in Node.js (V8 clamps Infinity to MAX_TIMEOUT), so we guard here.
+  if (!isFinite(ms) || ms <= 0) return work
   return new Promise<T>((resolve, reject) => {
     let done = false
     const t = setTimeout(() => {
@@ -413,19 +417,14 @@ export async function runIndStratCycle(
     // evaluator when Phase 1 produced live indications (historical replay still
     // passes its backdated indication array), and let the next productive tick
     // advance the strategy/live stages.
-    // Phase3 timeout is mode-aware:
-    //   historical — 90s. During startup backfill, processStrategy evaluates
-    //     all 3800+ sets against backdated candle data sequentially. With 8
-    //     symbols, even at concurrency=2 the first cycle can approach 60-80s
-    //     per symbol. A premature timeout discards all the indication work
-    //     from Phase1, stalls set-count growth, and prevents live dispatch.
-    //   realtime — 90s. In steady state the coordinator reuses cached data,
-    //     but high-set-count symbols (BEATUSDT, BOMEUSDT, TRBUSDT) with 3800+
-    //     sets on single-threaded Node regularly hit 60-85s under concurrent
-    //     load from other symbols processing in the same cycle. 90s matches
-    //     the historical budget and sits safely within the 120s outer cycle
-    //     deadline (leaving 30s for Phases 1/2 and live dispatch).
-    const PHASE3_TIMEOUT_MS = 90_000
+    // Phase3 has no inner timeout. processStrategy is CPU-bound and with 3800+
+    // sets takes 50-110s per symbol on single-threaded Node. A fixed inner
+    // timeout was too conservative and discarded valid indication work from
+    // Phase1/Phase2. The outer cycle deadline (120s dev / 75s prod) enforced
+    // by the engine is the correct bound: if the cycle runs long, the engine
+    // skips it and tries again next tick. Setting PHASE3_TIMEOUT_MS=Infinity
+    // disables the Promise.race in the caller.
+    const PHASE3_TIMEOUT_MS = Infinity
     const apiStrategyFlowEnabled =
       process.env.NODE_ENV !== "production" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "1" ||
