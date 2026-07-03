@@ -1372,7 +1372,7 @@ async function placeProtectionOrder(
         const availableQty = extract110424Available(errMsg)
         if (availableQty !== null && availableQty < effectiveQty) {
           console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ��������� retrying with exact available qty`,
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ���������� retrying with exact available qty`,
           )
           result = await placeStop(availableQty)
           if (result?.success) {
@@ -6034,7 +6034,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           console.log(
             `${LOG_PREFIX} EXTERNALLY-CLOSED detected for ${position.symbol} ${position.direction} (id=${position.id}) — finalising in Redis`,
           )
-          // Fire-and-forget — don't block the close path on a log write.
+          // Fire-and-forget ��� don't block the close path on a log write.
           logProgressionEvent(
             connectionId,
             "live_trading",

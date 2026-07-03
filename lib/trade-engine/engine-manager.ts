@@ -3799,7 +3799,12 @@ export class TradeEngineManager {
         if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
           const sortedForce = [...forceSymbols].map(String).filter(Boolean).sort()
           const sortedCache = [...this._symbolsCache].sort()
-          if (JSON.stringify(sortedForce) !== JSON.stringify(sortedCache)) {
+          // CRITICAL FIX: Use efficient array comparison instead of JSON.stringify
+          // which causes CPU overload when called frequently (every cycle).
+          // Direct array comparison is O(n) instead of O(n log n) serialization.
+          const arraysEqual = sortedForce.length === sortedCache.length &&
+                             sortedForce.every((v, i) => v === sortedCache[i])
+          if (!arraysEqual) {
             console.log(`[v0] [getSymbols] ${this.connectionId}: force_symbols changed in Redis, invalidating cache`)
             this.invalidateSymbolCache()
             // Fall through to reload below
