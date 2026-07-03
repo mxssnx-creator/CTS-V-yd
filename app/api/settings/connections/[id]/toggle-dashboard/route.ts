@@ -272,12 +272,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
-            if (!started && !coordinator.isEngineRunning(resolvedId)) {
+            const engineStarted = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
+            if (!engineStarted && !coordinator.isEngineRunning(resolvedId)) {
               throw new Error("Coordinator did not start the engine after enable; startup lock may be held by another worker")
             }
             
-            console.log(`[v0] [Toggle] ✓ Engine ${started ? "started" : "already running"} directly for ${connection.name}`)
+            console.log(`[v0] [Toggle] ✓ Engine ${engineStarted ? "started" : "already running"} directly for ${connection.name}`)
             await logProgressionEvent(resolvedId, "engine_started_direct", "info", "Main Trade Engine started directly from enable", {
               connectionId: resolvedId,
               connectionName: connection.name,

@@ -73,15 +73,15 @@ describe("GlobalTradeEngineCoordinator.startEngine lock contention", () => {
     const quickStart = read("app/api/trade-engine/quick-start/route.ts")
     const startAll = read("app/api/trade-engine/start-all/route.ts")
 
-    expect(quickStart).toContain("const started = await coord.startEngine")
-    expect(quickStart).toContain("if (!started)")
+    expect(quickStart).toContain("const engineStarted = await coord.startEngine")
+    expect(quickStart).toContain("if (!engineStarted)")
     expect(quickStart).toContain("engine_start_skipped")
-    expect(quickStart.indexOf("if (!started)")).toBeLessThan(quickStart.indexOf("Main Engine started for"))
+    expect(quickStart.indexOf("if (!engineStarted)")).toBeLessThan(quickStart.indexOf("Main Engine started for"))
 
-    expect(startAll).toContain("const started = await coordinator.startEngine")
-    expect(startAll).toContain("success: started")
-    expect(startAll).toContain('message: started ? "Engine started" : "Engine start skipped by coordinator"')
-    expect(startAll).toContain("if (started)")
+    expect(startAll).toContain("const engineStarted = await coordinator.startEngine")
+    expect(startAll).toContain("success: engineStarted")
+    expect(startAll).toContain('message: engineStarted ? "Engine started" : "Engine start skipped by coordinator"')
+    expect(startAll).toContain("if (engineStarted)")
   })
 
 })

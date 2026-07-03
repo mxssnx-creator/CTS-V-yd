@@ -264,13 +264,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
               realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(connectionId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
-            if (!started && !coordinator.isEngineRunning(connectionId)) {
+            const engineStarted = await coordinator.startEngine(connectionId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
+            if (!engineStarted && !coordinator.isEngineRunning(connectionId)) {
               throw new Error("Coordinator did not start the engine; startup lock may still be owned by another worker")
             }
             engineStatus = "running"
-            engineStartedNow = started
-            console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
+            engineStartedNow = engineStarted
+            console.log(`[v0] [LiveTrade] Engine ${engineStarted ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
           } else {
             await queueEngineRefreshRequest({
               timestamp: new Date().toISOString(),

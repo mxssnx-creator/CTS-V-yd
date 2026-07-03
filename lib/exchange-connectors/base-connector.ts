@@ -137,7 +137,9 @@ export abstract class BaseExchangeConnector {
     const timestamp = new Date().toISOString()
     const logMessage = `[${timestamp}] ${message}`
     this.logs.push(logMessage)
-    console.log(`[v0] ${logMessage}`)
+    if (process.env.NODE_ENV !== "test" && !process.env.JEST_WORKER_ID) {
+      console.log(`[v0] ${logMessage}`)
+    }
   }
 
   /**

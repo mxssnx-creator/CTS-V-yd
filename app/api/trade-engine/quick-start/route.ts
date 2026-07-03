@@ -749,7 +749,7 @@ export async function POST(request: Request) {
         // several seconds while it syncs exchange time and spins up workers.
         // Awaiting it inside the HTTP handler causes the request to hang.
         // We log the result via a detached promise so diagnostics are preserved.
-        ;(async () => {
+        const engineBoot = (async () => {
           try {
             const settings = await loadSettingsAsync()
             const coord = getGlobalTradeEngineCoordinator()
@@ -823,6 +823,9 @@ export async function POST(request: Request) {
             }).catch(() => {})
           }
         })()
+        if (process.env.NODE_ENV === "test") {
+          await engineBoot
+        }
       }
     
     // Store in global quickstart state
