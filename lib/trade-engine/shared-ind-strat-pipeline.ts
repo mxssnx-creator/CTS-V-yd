@@ -413,9 +413,15 @@ export async function runIndStratCycle(
     // evaluator when Phase 1 produced live indications (historical replay still
     // passes its backdated indication array), and let the next productive tick
     // advance the strategy/live stages.
-    // Timeout: 40s — strategy coordinator fan-out across all sets for one symbol.
-    // TRBUSDT and similar high-set-count symbols regularly reach 25-35 s;
-    // raised to avoid spurious phase-timeout errors that discard valid work.
+    // Phase3 timeout is mode-aware:
+    //   historical — 90s. During startup backfill, processStrategy evaluates
+    //     all 3800+ sets against backdated candle data sequentially. With 8
+    //     symbols, even at concurrency=2 the first cycle can approach 60-80s
+    //     per symbol. A premature timeout discards all the indication work
+    //     from Phase1, stalls set-count growth, and prevents live dispatch.
+    //   realtime — 40s. In steady state the coordinator reuses cached data;
+    //     only the delta from new indications is re-evaluated. 40s is generous.
+    const PHASE3_TIMEOUT_MS = mode === "historical" ? 90_000 : 40_000
     const apiStrategyFlowEnabled =
       process.env.NODE_ENV !== "production" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "1" ||
@@ -424,7 +430,7 @@ export async function runIndStratCycle(
       const stratResult = await withPhaseTimeout(
         deps.strategy.processStrategy(symbol, indications),
         `Phase3/processStrategy/${symbol}`,
-        40_000,
+        PHASE3_TIMEOUT_MS,
       ).catch((err) => {
           console.error(
             `[v0] [SharedPipeline] processStrategy failed for ${symbol} (mode=${mode}):`,

@@ -1428,9 +1428,12 @@ async function placeProtectionOrder(
     if (!result?.success) {
       const errMsg109 = String(result?.error || "")
       if (errMsg109.includes("109420") || /position not exist/i.test(errMsg109)) {
-        // OPTIMIZATION: Use exponential backoff (500ms, 1s, 2s) instead of fixed 6s
-        // Positions typically visible within 500ms-1s on BingX
-        const BACKOFF_DELAYS_MS = [500, 1000, 2000]
+        // Exponential backoff: 1s, 2s, 4s.
+        // BingX hedge-mode positions can take 2–4 s to become visible
+        // under load. The old 500ms/1s/2s budget was exhausted too quickly,
+        // causing the protection order to be deferred to the next reconcile
+        // tick — leaving the position unprotected for up to 60 s.
+        const BACKOFF_DELAYS_MS = [1000, 2000, 4000]
         let retryAttempt = 0
         while (retryAttempt < BACKOFF_DELAYS_MS.length && !result?.success) {
           const delay = BACKOFF_DELAYS_MS[retryAttempt]
@@ -1444,7 +1447,7 @@ async function placeProtectionOrder(
           retryAttempt++
         }
         if (!result?.success) {
-          console.warn(`${tag} 109420 retries exhausted (tried 500ms, 1s, 2s) — reconcile will retry on next tick`)
+          console.warn(`${tag} 109420 retries exhausted (tried 1s, 2s, 4s) — reconcile will retry on next tick`)
         }
       }
     }
@@ -1463,11 +1466,22 @@ async function placeProtectionOrder(
       )
       return orderId
     }
-    // result.error is the connector's normalized venue-side message
-    // (e.g. "BingX stop order error (code=110413): Take Profit price
-    // should be greater than the current price"). We log it verbatim so
-    // operators see the EXACT venue rejection without having to jump
-    // log layers.
+    // code=110412 / 110413: "SL price must be > current price" (for long SL placed above mark)
+    // or "TP price must be < current price" (for short TP placed above mark after a spike).
+    // The protection price was valid at calculation time but the market moved past it between
+    // calculation and placement. Return the sentinel "PRICE_CROSSED" so the caller can
+    // force-close the position immediately instead of waiting for the next reconcile tick.
+    const errMsg = String(result?.error || "")
+    const is110412 = errMsg.includes("110412") || /SL price should (be|not be)|Stop Loss price should/i.test(errMsg)
+    const is110413 = errMsg.includes("110413") || /TP price should (be|not be)|Take Profit price should/i.test(errMsg)
+    if (is110412 || is110413) {
+      console.warn(
+        `${tag} PRICE_CROSSED (code=${is110412 ? "110412" : "110413"}): market moved past ${kind} trigger — position will be force-closed`,
+      )
+      return "PRICE_CROSSED"
+    }
+    // result.error is the connector's normalized venue-side message.
+    // Log verbatim so operators see the EXACT venue rejection.
     console.warn(
       `${tag} VENUE REJECTED: error="${result?.error || "unknown"}" code=${result?.code ?? "n/a"} latency=${latencyMs}ms`,
     )
@@ -1724,7 +1738,7 @@ function priceDrifted(current: number | undefined, desired: number): boolean {
 // MIN_REARM_MS (30 s) — for static SL/TP price drift: long enough to absorb
 //   a normal oscillation window (BTC 0.5% range typically resolves in ~5-15 s).
 //
-// TRAILING_REARM_MS (5 s) — for trailing ratchet advances: the trailing stop
+// TRAILING_REARM_MS (5 s) �� for trailing ratchet advances: the trailing stop
 //   machine ratchets approximately every strategy cycle (~5 s). A 30 s cooldown
 //   here means the exchange order would lag the ratchet by up to 5 cycles, leaving
 //   the position underprotected while the trailing level was moving in our favour.
@@ -3669,6 +3683,19 @@ export async function executeLivePosition(
             realPosition.direction,
           )
         : (livePosition.takeProfitOrderId || null)
+
+      // "PRICE_CROSSED" sentinel: market moved past the protection price between
+      // calculation and placement (BingX 110412/110413). Force-close immediately
+      // rather than waiting up to one full reconcile tick with no protection.
+      if (slOrderId === "PRICE_CROSSED" || tpOrderId === "PRICE_CROSSED") {
+        const crossedLeg = slOrderId === "PRICE_CROSSED" ? "StopLoss" : "TakeProfit"
+        console.warn(
+          `${LOG_PREFIX} ${crossedLeg} PRICE_CROSSED for ${realPosition.symbol} — triggering immediate force-close`,
+        )
+        livePosition.closeReason = "protection_price_crossed_at_placement"
+        await closeLivePosition(livePosition, connectionId, exchangeConnector, `${crossedLeg} price crossed market at initial placement`)
+        return livePosition
+      }
 
       if (slOrderId) {
         livePosition.stopLossOrderId = slOrderId
