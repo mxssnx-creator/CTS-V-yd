@@ -4502,13 +4502,13 @@ async function checkAndForceCloseOnSltpCross(
 ): Promise<"sl_hit" | "tp_hit" | null> {
   if (!Number.isFinite(markPrice) || markPrice <= 0) return null
   if (pos.executedQuantity <= 0) return null
-  // Skip positions whose entry order has not confirmed yet — using entryPrice
-  // as a proxy for the fill price would produce incorrect SL/TP cross signals.
-  // The `placed` skip is the most operationally significant — a position
-  // stuck in `placed` is never evaluated for close. The stuck-placed
-  // detector in syncWithExchange handles the safety net; this is
-  // intentionally silent for terminal statuses to avoid log spam.
+  
+  // CRITICAL GUARD: Skip positions that are already closed or have a close reason set.
+  // Without this guard, multiple concurrent reconciliation paths call this function
+  // on the same position, all detecting the SL/TP cross and all calling closeLivePosition(),
+  // resulting in duplicate close attempts and memory overload from redundant API calls.
   if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
+  if (pos.closeReason || pos.closedAt) return null  // Already being closed elsewhere
   if (!isSystemTrackedLivePosition(pos, connectionId)) return null
   if (pos.status === "placed") {
     // Rate-limit to once-per-minute per position by using updatedAt as
