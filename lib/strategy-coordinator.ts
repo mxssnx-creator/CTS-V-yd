@@ -776,6 +776,10 @@ export class StrategyCoordinator {
     pruneStrategy: "hybrid",
   }
 
+  private strategyMainAxisSetsCeiling = 50
+  private strategyRealSetsSafetyCeiling = 100
+  private strategyLiveSetsCeiling = 90
+
   /**
    * Per-cycle cached coordination settings (axes + variants toggles).
    * The coordinator loads this from connection settings on each flow and
@@ -1269,6 +1273,24 @@ export class StrategyCoordinator {
       }
       this._coordinationSettings.mainEvalPosCount = evalCount((s as any).mainEvalPosCount) ?? 15
       this._coordinationSettings.realEvalPosCount = evalCount((s as any).realEvalPosCount) ?? 10
+
+      // ── Strategy pipeline ceilings (Settings → System) ────────────────
+      // These used to be production-only env constants, so the UI could show
+      // `maxRealSets=12000` while the runtime hard-clamped to 100. Load all
+      // strategy ceilings from app/connection settings in the same 5s refresh
+      // path as the PF/DDT gates so production tuning does not require a
+      // redeploy and the System tab reflects the actual enforced limits.
+      const intSetting = (raw: unknown, fallback: number, min: number, max: number): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n <= 0) return fallback
+        return Math.max(min, Math.min(max, Math.floor(n)))
+      }
+      this.config.maxEntriesPerSet = intSetting((s as any).strategyMaxEntriesPerSet, 250, 50, 750)
+      this.strategyMainAxisSetsCeiling = intSetting((s as any).strategyMainAxisSetsCeiling, 50, 10, 50_000)
+      this.strategyRealSetsSafetyCeiling = intSetting((s as any).strategyRealSetsSafetyCeiling, 100, 25, 50_000)
+      this.config.maxRealSets = intSetting((s as any).maxRealSets, this.strategyRealSetsSafetyCeiling, 1, this.strategyRealSetsSafetyCeiling)
+      this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 90, 1, 1_000)
+      this.config.maxLiveSets = this.strategyLiveSetsCeiling
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -2546,7 +2568,10 @@ export class StrategyCoordinator {
       // ≈ 2 on 8 GB. 5000 × 2 = 10000 on the actual 8.6 GB VM.
       const _axGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
-      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? (process.env.NODE_ENV === "production" ? 50 : Math.round(5_000 * _axMemScale))
+      const MAIN_AXIS_SETS_CEILING =
+        configuredAxisCeiling ??
+        this.strategyMainAxisSetsCeiling ??
+        (process.env.NODE_ENV === "production" ? 50 : Math.round(5_000 * _axMemScale))
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3553,7 +3578,10 @@ export class StrategyCoordinator {
     // Default scales with VM RAM just like the axis ceiling.
     const _rsGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
     const _rsMemScale = _rsGl ? Math.max(1, _rsGl.heapMB / 2_048) : 1
-    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? (process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale))
+    const REAL_SETS_SAFETY_CEILING =
+      configuredRealCeiling ??
+      this.strategyRealSetsSafetyCeiling ??
+      (process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale))
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
@@ -4323,7 +4351,10 @@ export class StrategyCoordinator {
         // can carry two reduce-only control orders (SL + TP), so cap dispatch to
         // 90 positions per cycle (≤180 controls) and leave room for manual orders,
         // in-flight cancels, and venue-side lag.
-        this._cachedExchangeMaxLive = exchange === "bingx" ? 90 : (this.config.maxLiveSets || 500)
+        const configuredLiveCap = this.config.maxLiveSets || this.strategyLiveSetsCeiling || 90
+        this._cachedExchangeMaxLive = exchange === "bingx"
+          ? Math.min(configuredLiveCap, 90)
+          : configuredLiveCap
         this._cachedExchangeMaxLiveAt = now
       }
       maxLive = this._cachedExchangeMaxLive || 500
