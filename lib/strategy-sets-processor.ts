@@ -232,10 +232,11 @@ export class StrategySetsProcessor {
 
       if (totalQualified > 0) {
         console.log(
-          `[v0] [StrategySets] ${symbol}: All types evaluated in ${duration}ms | Raw=${rawTotal} Selected=${selectedTotal} | Base qualified=${baseResults?.qualified} Main qualified=${mainResults?.qualified} Real qualified=${realResults?.qualified} Live qualified=${liveResults?.qualified}`
+          `[v0] [StrategySets] ${symbol}: All types evaluated in ${duration}ms | Raw=${rawTotal} Selected=${selectedTotal} | Total qualified=${totalQualified} | Base qualified=${baseResults?.qualified} Main qualified=${mainResults?.qualified} Real qualified=${realResults?.qualified} Live qualified=${liveResults?.qualified}`
         )
 
         await logProgressionEvent(this.connectionId, "strategies_sets", "info", `All strategy types evaluated for ${symbol}`, {
+          totalQualified,
           base: baseResults,
           main: mainResults,
           real: realResults,
