@@ -155,6 +155,49 @@ export class IndicationSetsProcessor {
     this.loadSettings()
   }
 
+  private getSetIndexKeys(symbol: string, type: string): string[] {
+    return [
+      `indication_sets:index:${this.connectionId}`,
+      `indication_sets:index:${this.connectionId}:${symbol}`,
+      `indication_sets:index:${this.connectionId}:${symbol}:${type}`,
+    ]
+  }
+
+  private async indexSetKey(client: any, setKey: string, symbol: string, type: string): Promise<void> {
+    const indexes = this.getSetIndexKeys(symbol, type)
+    const pipeline = client.multi()
+    for (const indexKey of indexes) pipeline.sadd(indexKey, setKey)
+    await pipeline.exec().catch(() => {})
+  }
+
+  private async getIndexedSetKeys(client: any, symbol: string, type: string): Promise<string[]> {
+    const typeIndexKey = `indication_sets:index:${this.connectionId}:${symbol}:${type}`
+    let keys = ((await client.smembers(typeIndexKey).catch(() => [])) || []) as string[]
+    if (keys.length > 0) return keys
+
+    // Startup/repair fallback only: bounded SCAN is used to backfill the
+    // maintained per-connection/per-symbol/per-type indexes for legacy keys.
+    // Dashboard polling paths normally read only the index set above.
+    const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
+    if (typeof client.scan !== "function") return keys
+    let cursor = "0"
+    do {
+      const result = await client.scan(cursor, "MATCH", `${prefix}*`, "COUNT", 100).catch(() => null)
+      if (!result) break
+      cursor = String(result[0] ?? "0")
+      keys.push(...((result[1] || []) as string[]))
+    } while (cursor !== "0")
+
+    if (keys.length > 0) {
+      const pipeline = client.multi()
+      for (const setKey of keys) {
+        for (const indexKey of this.getSetIndexKeys(symbol, type)) pipeline.sadd(indexKey, setKey)
+      }
+      await pipeline.exec().catch(() => {})
+    }
+    return keys
+  }
+
   private async loadSettings(): Promise<void> {
     try {
       // Mirror-aware read so operator values saved via the UI
@@ -847,6 +890,7 @@ export class IndicationSetsProcessor {
             // any async hop.
             entries = compact(entries, compactionCfg, "recent")
             await client.set(setKey, JSON.stringify(entries))
+            await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
           }),
         )
       }
@@ -914,13 +958,14 @@ export class IndicationSetsProcessor {
       const cfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
       entries = compact(entries, cfg, "recent")
 
-      await client.set(setKey, JSON.stringify(entries))
-      
       // Broadcast indication update to connected clients. Direction is
       // derived from the actual indication signal — directional types
       // (direction/move) report UP/DOWN, all other types (active /
       // optimal / active_advanced) report NEUTRAL.
       const symbol = setKey.split(':')[2]
+      await client.set(setKey, JSON.stringify(entries))
+      await this.indexSetKey(client, setKey, symbol, type)
+
       const broadcastDirection: "UP" | "DOWN" | "NEUTRAL" =
         type === "direction" || type === "move"
           ? direction === "long"
@@ -1463,8 +1508,7 @@ export class IndicationSetsProcessor {
           error: "Redis client not available",
         }
       }
-      const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
-      const keys = await client.keys(`${prefix}*`)
+      const keys = await this.getIndexedSetKeys(client, symbol, type)
       if (!keys || keys.length === 0) {
         return {
           type,
@@ -1516,15 +1560,7 @@ export class IndicationSetsProcessor {
   async getSetEntries(symbol: string, type: string, limit = 50): Promise<any[]> {
     try {
       const client = await getCachedClient()
-      const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
-      // NOTE: client.keys() is a full-keyspace scan. Acceptable here because
-      // this method is called only for the dashboard "Indications" detail
-      // panel (low frequency) and because the InlineLocalRedis Map scan is
-      // O(N) in the number of stored keys but bounded by per-symbol type
-      // ceiling (at most ~144 keys in dev / ~522 in prod per type×symbol).
-      // A SCAN-based alternative would be equivalent — InlineLocalRedis has
-      // no SCAN, so keys() is the only option for the in-process client.
-      const keys = await client.keys(`${prefix}*`)
+      const keys = await this.getIndexedSetKeys(client, symbol, type)
       if (!keys || keys.length === 0) return []
 
       // Fan out all GETs in parallel — same pattern as getCurrentIndications
