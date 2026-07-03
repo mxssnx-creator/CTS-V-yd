@@ -1294,20 +1294,36 @@ export class IndicationSetsProcessor {
             })
           }
           // Single read-modify-write per setKey regardless of how many
-          // pending items referenced it.
-          const existing = await client.get(setKey)
-          let entries: any[] = []
-          try { entries = existing ? JSON.parse(existing as string) : [] } catch { /* keep [] */ }
+          // pending items referenced it. Read through the shared helper so
+          // LIST-backed sets stay in the modern representation and legacy
+          // JSON-array strings are still readable during migration.
+          const entries = await this.readIndicationSetEntries(client, setKey)
           let patchCount = items.length
+          let patched = false
           for (let i = entries.length - 1; i >= 0 && patchCount > 0; i--) {
             if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
               const closed = items[items.length - patchCount].closed
               entries[i].profitFactor = pf
               entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
               patchCount--
+              patched = true
             }
           }
-          await client.set(setKey, JSON.stringify(entries))
+          if (!patched) return
+
+          // Preserve LIST-backed indication_set:* keys when closing pending
+          // realtime outcomes. DEL + RPUSH recreates the key as a Redis LIST
+          // instead of SET-ing a legacy JSON string, then applies the same
+          // compaction and index policy used by appendIndicationEntries().
+          const type = (setKey.split(":")[3] || "direction") as keyof IndicationSetLimits
+          const cfg = await this.resolveCompaction(type)
+          const serializedEntries = entries.map((entry) => JSON.stringify(entry))
+          await client.del(setKey)
+          const length = serializedEntries.length > 0 ? await client.rpush(setKey, ...serializedEntries) : 0
+          if (length >= compactionCeiling(cfg)) {
+            await client.ltrim(setKey, -cfg.floor, -1)
+          }
+          await this.indexSetKey(client, setKey, setKey.split(":")[2], type)
         }),
       )
 
