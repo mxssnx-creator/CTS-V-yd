@@ -59,6 +59,7 @@ class ProcessingMetricsTracker {
   private connectionId: string
   private metrics: ProcessingMetrics
   private updateInterval: NodeJS.Timeout | null = null
+  private lastAccessedAt: number = Date.now()
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -97,6 +98,14 @@ class ProcessingMetricsTracker {
     }
   }
 
+  private touch(): void {
+    this.lastAccessedAt = Date.now()
+  }
+
+  getLastAccessedAt(): number {
+    return this.lastAccessedAt
+  }
+
   private createPhaseMetrics(): PhaseMetrics {
     return {
       status: 'idle',
@@ -119,6 +128,7 @@ class ProcessingMetricsTracker {
     itemsTotal: number,
     timeframe: string = '1m'
   ): void {
+    this.touch()
     const phaseMetrics = this.metrics.phases[phase]
     phaseMetrics.status = 'running'
     phaseMetrics.itemsProcessed = 0
@@ -137,6 +147,7 @@ class ProcessingMetricsTracker {
     itemsProcessed: number,
     totalDuration: number = 0
   ): void {
+    this.touch()
     const phaseMetrics = this.metrics.phases[phase]
     phaseMetrics.itemsProcessed = itemsProcessed
     phaseMetrics.progress = phaseMetrics.itemsTotal > 0 ? (itemsProcessed / phaseMetrics.itemsTotal) * 100 : 0
@@ -149,6 +160,7 @@ class ProcessingMetricsTracker {
    * Record phase completion
    */
   recordPhaseCompletion(phase: 'prehistoric' | 'realtime' | 'indication' | 'strategy', duration: number): void {
+    this.touch()
     const phaseMetrics = this.metrics.phases[phase]
     phaseMetrics.status = 'completed'
     phaseMetrics.cycleCount += 1
@@ -162,6 +174,7 @@ class ProcessingMetricsTracker {
    * Record phase error
    */
   recordPhaseError(phase: 'prehistoric' | 'realtime' | 'indication' | 'strategy', error: string): void {
+    this.touch()
     const phaseMetrics = this.metrics.phases[phase]
     phaseMetrics.status = 'error'
     phaseMetrics.errors += 1
@@ -174,6 +187,7 @@ class ProcessingMetricsTracker {
    * Record data size for symbol and timeframe
    */
   recordDataSize(symbol: string, timeframe: string, count: number): void {
+    this.touch()
     if (!this.metrics.dataSizes[symbol]) {
       this.metrics.dataSizes[symbol] = {}
     }
@@ -184,6 +198,7 @@ class ProcessingMetricsTracker {
    * Increment evaluation count
    */
   incrementEvaluationCount(type: keyof ProcessingMetrics['evaluationCounts']): void {
+    this.touch()
     this.metrics.evaluationCounts[type] += 1
   }
 
@@ -191,6 +206,7 @@ class ProcessingMetricsTracker {
    * Update pseudo position metrics
    */
   updatePseudoPositionMetrics(created: number, evaluated: number, active: number): void {
+    this.touch()
     this.metrics.pseudoPositions.totalCreated += created
     this.metrics.pseudoPositions.totalEvaluated += evaluated
     this.metrics.pseudoPositions.currentActive = active
@@ -200,7 +216,7 @@ class ProcessingMetricsTracker {
    * Update performance metrics
    */
   updatePerformanceMetrics(cycleDuration: number): void {
-    const prev = this.metrics.performanceMetrics.avgCycleDuration || 0
+    this.touch()
     const totalTime = this.metrics.performanceMetrics.totalProcessingTime || 0
     const cycleCount = Object.values(this.metrics.phases).reduce((sum, p) => sum + p.cycleCount, 0)
 
@@ -219,6 +235,7 @@ class ProcessingMetricsTracker {
    * Get current metrics
    */
   getMetrics(): ProcessingMetrics {
+    this.touch()
     return {
       ...this.metrics,
       timestamp: new Date().toISOString(),
@@ -229,6 +246,7 @@ class ProcessingMetricsTracker {
    * Get metrics summary for logging
    */
   getMetricsSummary(): string {
+    this.touch()
     const m = this.metrics
     const phases = Object.entries(m.phases)
       .map(([name, phase]) => `${name}: ${phase.cycleCount} cycles, ${phase.itemsProcessed}/${phase.itemsTotal} items`)
@@ -316,6 +334,7 @@ class ProcessingMetricsTracker {
    * Reset metrics
    */
   reset(): void {
+    this.touch()
     this.metrics = this.initializeMetrics()
   }
 }
@@ -323,8 +342,48 @@ class ProcessingMetricsTracker {
 // Global trackers per connection
 const trackers = new Map<string, ProcessingMetricsTracker>()
 
+const DEFAULT_TRACKER_IDLE_TTL_MS = 60 * 60 * 1000
+const DEFAULT_TRACKER_CLEANUP_LIMIT = 100
+const TRACKER_CLEANUP_INTERVAL_MS = 60 * 1000
+let lastTrackerCleanupAt = 0
+
+function getConfiguredTrackerIdleTtlMs(): number {
+  const ttlMs = Number(process.env.PROCESSING_METRICS_TRACKER_IDLE_TTL_MS)
+  return Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_TRACKER_IDLE_TTL_MS
+}
+
+export function cleanupIdleMetricsTrackers(
+  ttlMs: number = getConfiguredTrackerIdleTtlMs(),
+  maxToCleanup: number = DEFAULT_TRACKER_CLEANUP_LIMIT
+): number {
+  if (ttlMs <= 0 || maxToCleanup <= 0) return 0
+
+  const cutoff = Date.now() - ttlMs
+  let cleaned = 0
+
+  for (const [connectionId, tracker] of trackers) {
+    if (cleaned >= maxToCleanup) break
+    if (tracker.getLastAccessedAt() > cutoff) continue
+
+    tracker.stopMetricsPersistence()
+    trackers.delete(connectionId)
+    cleaned += 1
+  }
+
+  return cleaned
+}
+
+function cleanupIdleMetricsTrackersIfDue(): void {
+  const now = Date.now()
+  if (now - lastTrackerCleanupAt < TRACKER_CLEANUP_INTERVAL_MS) return
+
+  lastTrackerCleanupAt = now
+  cleanupIdleMetricsTrackers()
+}
+
 export function getMetricsTracker(connectionId: string): ProcessingMetricsTracker {
   if (!trackers.has(connectionId)) {
+    cleanupIdleMetricsTrackersIfDue()
     const tracker = new ProcessingMetricsTracker(connectionId)
     tracker.startMetricsPersistence()
     trackers.set(connectionId, tracker)
