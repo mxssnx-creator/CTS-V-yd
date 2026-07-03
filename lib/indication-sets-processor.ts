@@ -967,6 +967,8 @@ export class IndicationSetsProcessor {
       // GET/parse/append/SET lost-update race while preserving newest-at-last.
       const pipe = client.pipeline ? client.pipeline() : client.multi()
       const groupedEntries = Array.from(grouped.entries())
+      for (const [setKey, serializedEntries] of groupedEntries) {
+        pipe.rpush(setKey, ...serializedEntries)
       for (const [_setKey, serializedEntries] of groupedEntries) {
         pipe.rpush(_setKey, ...serializedEntries)
       }
@@ -985,6 +987,7 @@ export class IndicationSetsProcessor {
         const slot = lengths?.[idx]
         if (slot instanceof Error || (Array.isArray(slot) && slot[0] instanceof Error)) {
           await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
+          await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
           idx++
           continue
         }
@@ -994,6 +997,7 @@ export class IndicationSetsProcessor {
           trimPipe.ltrim(setKey, -compactionCfg.floor, -1)
           trimCount++
         }
+        await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
         idx++
       }
       if (trimCount > 0) await trimPipe.exec()

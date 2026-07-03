@@ -1151,6 +1151,25 @@ export async function GET(
         stratEvaluated[type] = fromActiveEval > 0 ? fromActiveEval : 0
       })
     )
+    // Enforce cascade invariants for all public progression counters:
+    // BASE expands into MAIN variants, REAL filters MAIN inputs and may also
+    // create additional Real Sets through related/axis fan-out, and LIVE is a
+    // dispatch subset of REAL. During live runs, per-stage writers can briefly
+    // update different fields in separate Redis calls, so a stats read may
+    // observe impossible overages. Normalize only when REAL exceeds the
+    // pipeline-aware ceiling: main inputs + Real Sets created at the Real stage.
+    // `strategies_real_related_created` is cumulative, so do not use it as
+    // the per-snapshot allowance; `strategies_real_last_created` is the
+    // coordinator's current-cycle related/axis-created Real fan-out.
+    const realRelatedCreatedForCurrentSnapshot = n(progHash.strategies_real_last_created)
+    const realCeiling = stratCounts.main + realRelatedCreatedForCurrentSnapshot
+    if (stratCounts.main > 0 && stratCounts.real > realCeiling) {
+      console.warn(
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > ` +
+        `main (${stratCounts.main}) + realRelatedCreated (${realRelatedCreatedForCurrentSnapshot}). ` +
+        `Clamping real to pipeline-aware ceiling (${realCeiling}).`,
+      )
+      stratCounts.real = realCeiling
     // Enforce cascade invariants for public progression counters. REAL may fan
     // out from upstream PF-eligible Main input, so real passed output can exceed
     // main as long as it does not exceed input + real:relatedCreated. During live
@@ -2518,6 +2537,14 @@ export async function GET(
             return eval_val || main
           })(),
           realEvaluated: (() => {
+            // NOTE: realEvaluated = Main sets that ENTERED Real-stage PF evaluation
+            // (the INPUT count, written as mainPFEligible by the coordinator).
+            // stratCounts.real = Real sets that PASSED and survived to dispatch
+            // (the OUTPUT count), plus any related/axis-created fan-out that
+            // the Real stage materialized for this snapshot. With fan-out
+            // enabled, output can legitimately exceed the upstream input by
+            // that related-created amount, so do NOT clamp realEvaluated here.
+            return stratEvaluated.real || 0
             // NOTE: Real accounting has three meanings:
             // - real:input = upstream Main PF-eligible input before Real fan-out.
             // - real:relatedCreated = current-cycle Real fan-out added to input.
