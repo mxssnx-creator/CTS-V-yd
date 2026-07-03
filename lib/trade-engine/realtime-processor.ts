@@ -35,6 +35,7 @@ import { getMarketDataCached, prefetchMarketDataBatch } from "./market-data-cach
 // constants below are kept as fallback defaults when the cache is empty on
 // cold start.
 import { getEngineTimings } from "@/lib/engine-timings"
+import { performanceProfiler } from "@/lib/performance-profiler"
 
 // ── Module-level import memoization for live-sync hot paths ──────────
 // `fireSyncLiveFromPseudo` and `maybeRunLiveSync` were previously doing
@@ -351,7 +352,12 @@ export class RealtimeProcessor {
    * gate follow-up work (telemetry, backoff) without re-querying Redis.
    */
   async processRealtimeUpdates(): Promise<{ updates: number }> {
+    // PERFORMANCE: Start cycle profiling
+    const cycleId = performanceProfiler.startCycle(this.connectionId, "realtime")
+    
     try {
+      performanceProfiler.recordOperation(cycleId, "init")
+      
       // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
       // When user updates connection settings via UI, a dirty flag is set.
       // On the next realtime tick, we detect it and clear the flag so
@@ -476,6 +482,7 @@ export class RealtimeProcessor {
       // progression contract.
 
       if (count === 0) {
+        performanceProfiler.endCycle(cycleId)
         return { updates: 0 }
       }
 
@@ -543,12 +550,14 @@ export class RealtimeProcessor {
         // Non-critical visibility metric — never break the realtime loop.
       }
 
+      performanceProfiler.endCycle(cycleId)
       return { updates: count }
     } catch (error) {
       console.error("[v0] Failed to process realtime updates:", error)
       await logProgressionEvent(this.connectionId, "realtime_error", "error", "Realtime processor failed", {
         error: error instanceof Error ? error.message : String(error),
       })
+      performanceProfiler.endCycle(cycleId)
       return { updates: 0 }
     }
   }
