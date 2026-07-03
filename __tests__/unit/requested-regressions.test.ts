@@ -1118,4 +1118,15 @@ describe("requested regression guardrails", () => {
     expect(liveStage).toContain("liveKeys.has(pseudoSetKey)")
   })
 
+
+  test("dashboard footer shows session instance and running time", () => {
+    const source = read("components/dashboard/dashboard.tsx")
+
+    expect(source).toContain("function DashboardRuntimeFooter()")
+    expect(source).toContain("Unique Session / Instance ID")
+    expect(source).toContain("createSessionInstanceId")
+    expect(source).toContain("Running: {formatDuration")
+    expect(source).toContain("<DashboardRuntimeFooter />")
+  })
+
 })
