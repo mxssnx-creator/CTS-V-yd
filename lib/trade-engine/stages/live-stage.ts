@@ -1527,8 +1527,9 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   // directly avoids the percentage-anchored re-derivation below which would
   // always revert to the static origin level, fighting the ratchet every tick.
   let desiredSl: number
-  if (pos.trailingActive && Number.isFinite(pos.trailingStopPrice) && pos.trailingStopPrice > 0) {
-    desiredSl = pos.trailingStopPrice
+  const trailingPrice = typeof pos.trailingStopPrice === "number" ? pos.trailingStopPrice : 0
+  if (pos.trailingActive && Number.isFinite(trailingPrice) && trailingPrice > 0) {
+    desiredSl = trailingPrice
   } else {
     // Do not apply the hard live-entry minimum here. This helper is shared by
     // exchange control-order reconciliation, system-close checks, and operator
@@ -1560,17 +1561,6 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
       : 0
   // Final NaN guard: ensure result is safe before returning
   if (!Number.isFinite(desiredTp)) desiredTp = 0
-
-  return { desiredSl, desiredTp }
-}
-
-  const tpPct = Math.max(0, pos.takeProfit || 0) / 100
-  const desiredTp =
-    tpPct > 0
-      ? pos.direction === "long"
-        ? fillPrice * (1 + tpPct)
-        : fillPrice * (1 - tpPct)
-      : 0
 
   return { desiredSl, desiredTp }
 }

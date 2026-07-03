@@ -378,10 +378,26 @@ Example with ratio 1.5:
   validateMarketChangeSync(priceChanges: number[], ratioFactor: number): boolean {
     if (priceChanges.length < 3) return false
     const total = priceChanges.length
-    const overallAvg = priceChanges.reduce((s, c) => s + c, 0) / total
+    if (total <= 0) return false // Guard against empty array (already checked above, but belt-and-suspenders)
+    
+    const sum = priceChanges.reduce((s, c) => s + c, 0)
+    // Guard against NaN from summing invalid prices
+    if (!Number.isFinite(sum)) return false
+    
+    const overallAvg = sum / total
+    if (!Number.isFinite(overallAvg)) return false // Handle NaN/Infinity
+    
     const last20Count = Math.max(1, Math.floor(total * 0.2))
-    const last20Avg = priceChanges.slice(-last20Count).reduce((s, c) => s + c, 0) / last20Count
-    return last20Avg >= overallAvg * ratioFactor
+    const last20Sum = priceChanges.slice(-last20Count).reduce((s, c) => s + c, 0)
+    if (!Number.isFinite(last20Sum)) return false
+    
+    // Guard against division: last20Count is always >= 1 from Math.max, but be explicit
+    const last20Avg = last20Count > 0 ? last20Sum / last20Count : 0
+    if (!Number.isFinite(last20Avg)) return false
+    
+    // Guard ratioFactor and final comparison against NaN
+    const expectedThreshold = Number.isFinite(ratioFactor) && ratioFactor > 0 ? overallAvg * ratioFactor : 0
+    return Number.isFinite(expectedThreshold) && Number.isFinite(last20Avg) && last20Avg >= expectedThreshold
   }
 
   async validateMarketChange(priceChanges: number[], ratioFactor: number): Promise<boolean> {
