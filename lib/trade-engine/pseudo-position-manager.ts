@@ -386,8 +386,18 @@ export class PseudoPositionManager {
         trailing_stop_ratio: hasTrailingProfile
           ? String(params.trailingStopRatio)
           : "0",
+        // CRITICAL: Validate stepRatio is positive and finite before storing.
+        // If stepRatio is 0, NaN, or negative, re-anchoring breaks (infinite loops
+        // or immediate re-triggers). Default to stopRatio/2 if invalid.
         trailing_step_ratio: hasTrailingProfile
-          ? String(params.trailingStepRatio)
+          ? (() => {
+              const stepRatio = params.trailingStepRatio || 0
+              if (!Number.isFinite(stepRatio) || stepRatio <= 0) {
+                const fallback = (params.trailingStopRatio || 0) / 2
+                return String(Number.isFinite(fallback) && fallback > 0 ? fallback : 0.01)
+              }
+              return String(stepRatio)
+            })()
           : "0",
         // Activation state — flipped to "1" the first cycle in which
         // `gain_ratio >= trailing_start_ratio`. Until then trailing is

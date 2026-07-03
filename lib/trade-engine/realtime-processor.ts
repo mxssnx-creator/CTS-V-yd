@@ -815,7 +815,16 @@ export class RealtimeProcessor {
 
       const startRatio = parseFloat(position.trailing_start_ratio || "0")
       const stopRatio = parseFloat(position.trailing_stop_ratio || "0")
-      const stepRatio = parseFloat(position.trailing_step_ratio || "0")
+      let stepRatio = parseFloat(position.trailing_step_ratio || "0")
+      
+      // CRITICAL: Validate stepRatio is not zero or too small. If stepRatio is
+      // 0 or NaN, re-anchoring would happen on every price change, breaking the
+      // entire trailing mechanism. Default to stopRatio/2 if invalid.
+      if (!Number.isFinite(stepRatio) || stepRatio <= 0) {
+        stepRatio = stopRatio > 0 ? stopRatio / 2 : 0
+        if (!Number.isFinite(stepRatio)) stepRatio = 0
+      }
+      
       const useMultiStep = startRatio > 0 && stopRatio > 0
 
       const client = getRedisClient()
@@ -888,7 +897,11 @@ export class RealtimeProcessor {
         // in the favourable direction. Step is computed against the
         // STORED anchor (not currentPrice) so a single big tick doesn't
         // skip over and immediately re-anchor on the next.
-        const stepDistance = anchorStored * stepRatio
+        // CRITICAL: Enforce minimum stepRatio to prevent ratcheting too frequently.
+        // If stepRatio is too small, every small price tick would trigger re-anchoring.
+        const minStepRatio = 0.001  // 0.1% minimum step size (can be overridden via settings)
+        const safeStepRatio = Math.max(stepRatio, minStepRatio)
+        const stepDistance = anchorStored * safeStepRatio
         if (side === "long") {
           if (currentPrice <= anchorStored + stepDistance) return
           const newAnchor = currentPrice
