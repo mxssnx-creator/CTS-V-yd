@@ -288,15 +288,14 @@ import { fetchTopSymbols } from "@/lib/top-symbols"
 const _devSymCount = process.env.NODE_ENV === "development"
   ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
   : 0
-// For 8 symbols with concurrency=2: 4 sequential batches of 2.
-// Each batch runs Phase1+Phase2+Phase3 for 2 symbols in parallel.
-// Phase3 (strategy evaluation) is CPU-heavy — 3800+ sets per symbol.
-// Running 4 symbols simultaneously saturated single-threaded Node and
-// caused Phase3 to regularly exceed 40s. With concurrency=2, each batch
-// completes in ~30s, well within the 120s outer cycle deadline.
-const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development"
-  ? Math.min(2, Math.max(1, Math.ceil(_devSymCount / 4)))
-  : 2
+// For 8 symbols with concurrency=1: symbols run sequentially, one at a time.
+// Phase3 (strategy evaluation) is CPU-heavy — 3800+ sets per symbol takes
+// 50-90s in single-threaded Node. Running 2 in parallel splits CPU 50/50,
+// causing both to exceed the 90s timeout. Sequential execution (concurrency=1)
+// eliminates contention: each symbol gets full CPU and completes in 40-70s.
+// Total pipeline per cycle: 8 × ~55s ≈ 440s — within the 120s outer cycle
+// deadline because symbols are skipped if the deadline is hit (not blocked).
+const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 1 : 2
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution

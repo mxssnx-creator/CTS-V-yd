@@ -4084,10 +4084,6 @@ export async function closeLivePosition(
       // SYNC_PER_POS_TIMEOUT_MS=55s fires before a third attempt can land,
       // so in practice the loop runs at most 2 attempts (50s) before the
       // outer sync timeout triggers the DB-close fallback.
-      // AbortController is used so the HTTP connection is physically
-      // cancelled when the 25s timer fires — preventing zombie requests
-      // that kept running for 60-90s in logs after the timeout had already
-      // fired.
       const maxRetries = 2
       const backoffMs = [500, 1000]
       const CLOSE_ATTEMPT_TIMEOUT_MS = 25_000
@@ -4142,27 +4138,14 @@ export async function closeLivePosition(
             `${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`,
           )
 
-          // Use AbortController so the underlying HTTP connection is physically
-          // cancelled when the timeout fires. Plain Promise.race leaves the
-          // fetch running in the background producing latency=60-90s in logs.
-          const closeAbort = new AbortController()
-          const closeTimer = setTimeout(() => closeAbort.abort(), CLOSE_ATTEMPT_TIMEOUT_MS)
-          let r: { success?: boolean; error?: string } | undefined
-          try {
-            r = (await exchangeConnector.closePosition(
-              position.symbol,
-              position.direction,
-              { signal: closeAbort.signal } as any,
-            )) as any
-          } catch (innerErr: any) {
-            const msg = String(innerErr?.message || innerErr || "")
-            if (msg.includes("AbortError") || msg.includes("aborted") || msg.includes("abort")) {
-              throw new Error(`Exchange close timeout after ${CLOSE_ATTEMPT_TIMEOUT_MS / 1000}s`)
-            }
-            throw innerErr
-          } finally {
-            clearTimeout(closeTimer)
-          }
+          // withTimeout wraps closePosition. The rate-limiter enforces the
+          // HTTP timeout from dispatch time (not enqueue time) via executeTimeoutMs,
+          // so this covers only actual BingX round-trip time.
+          const r = (await withTimeout(
+            exchangeConnector.closePosition(position.symbol, position.direction),
+            CLOSE_ATTEMPT_TIMEOUT_MS,
+            `closePosition(${position.symbol} ${position.direction})`,
+          )) as { success?: boolean; error?: string } | undefined
 
           if (r && typeof r === "object" && r.success === true) {
             exchangeCloseSuccess = true
@@ -5750,7 +5733,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       })(),
     ])
 
-    // ── Observability heartbeat ───────────────────────────────────────
+    // ── Observability heartbeat ────────────────────────────────���──────
     // Previously this function ran silently when there were zero
     // tracked positions OR when every position was in a "do nothing"
     // state — producing the operator's "orders not closing, no logs"
