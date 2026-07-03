@@ -419,9 +419,12 @@ export async function runIndStratCycle(
     //     symbols, even at concurrency=2 the first cycle can approach 60-80s
     //     per symbol. A premature timeout discards all the indication work
     //     from Phase1, stalls set-count growth, and prevents live dispatch.
-    //   realtime — 40s. In steady state the coordinator reuses cached data;
-    //     only the delta from new indications is re-evaluated. 40s is generous.
-    const PHASE3_TIMEOUT_MS = mode === "historical" ? 90_000 : 40_000
+    //   realtime — 60s. In steady state the coordinator reuses cached data,
+    //     but high-set-count symbols (BEATUSDT, BOMEUSDT, TRBUSDT) with 3800+
+    //     sets still regularly hit 40-55s on single-threaded Node under load.
+    //     60s eliminates spurious phase-timeout errors while still sitting
+    //     well within the 120s outer cycle deadline.
+    const PHASE3_TIMEOUT_MS = mode === "historical" ? 90_000 : 60_000
     const apiStrategyFlowEnabled =
       process.env.NODE_ENV !== "production" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "1" ||

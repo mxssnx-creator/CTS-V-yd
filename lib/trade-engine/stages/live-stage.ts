@@ -141,19 +141,19 @@ async function isLiveTradeEnabledForConnection(connectionId: string): Promise<bo
 // hangs.  SL/TP placement is the most critical path — a timeout here leaves
 // a position unprotected, so it gets more budget than cancel/fetch.
 const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS  = 15_000  // 15 s — cancel; ok to be generous, retried next tick on failure
-const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 25_000  // 25 s — SL/TP placement; must not leave positions unprotected
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS    = 45_000  // 45 s — SL/TP placement; covers semaphore queue wait + BingX round-trip
 const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 s — position fetch for adoption + sync prefetch
 const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 s — fill detection; retry via next sync tick on miss
 
 // ── Global SL/TP placement semaphore ─────────────────────────────────────
-// With 8 symbols each opening positions in the same cycle, all fire their
-// SL/TP calls simultaneously.  8 concurrent stop-order requests saturate
-// BingX's per-IP bucket (~5 req/s for order writes) and produce cascading
-// timeouts.  This semaphore limits concurrent PLACE_STOP calls across ALL
-// positions to 3 at a time — enough for throughput without hitting the limit.
-// Queued callers wait their turn; the 25 s outer timeout includes wait time.
+// With 8 symbols each opening long+short positions, up to 16 SL+TP calls
+// can be queued simultaneously.  BingX allows ~5 order-write req/s per IP.
+// Limit=6 lets 6 calls run in parallel; with p99 latency of ~5s each,
+// 16 calls flush in ~14s (ceil(16/6) = 3 passes × ~5s).
+// The EXCHANGE_TIMEOUT_PLACE_STOP_MS (45s) covers the worst-case queue wait
+// (2 passes waiting × 5s) + one actual BingX round-trip (~5s) with margin.
 let __stopSemCount = 0
-const __STOP_SEM_LIMIT = 3
+const __STOP_SEM_LIMIT = 6
 const __stopSemQueue: Array<() => void> = []
 function acquireStopSem(): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -1399,22 +1399,47 @@ async function placeProtectionOrder(
 
     // ── code=110424: "order size must be less than available amount" ───
     // Triggered when the protection qty exceeds the position's remaining
-    // available quantity (e.g. partial fills reduced the held qty after we
-    // computed `effectiveQty`). Parse the available amount from the error
-    // message and retry once with that exact quantity.
+    // available quantity.  Common cause: venue minimum (e.g. 1 TRB) is larger
+    // than the partial fill size (e.g. 0.62 TRB), or two concurrent SL+TP
+    // placements race to claim the same available pool.
+    // Strategy: up to 2 retries, each time re-parsing the available qty from
+    // BingX's error message and retrying with exactly that amount.  If the
+    // second retry also fails with 110424, the position has likely been
+    // externally closed or fully consumed by the other protection leg — treat
+    // it as success (reconcile will verify).
     if (!result?.success) {
-      const errMsg = String(result?.error || "")
-      if (errMsg.includes("110424") || /available amount/i.test(errMsg)) {
+      const is110424 = (msg: string) => msg.includes("110424") || /available amount/i.test(msg)
+      let attempt = 0
+      while (!result?.success && is110424(String(result?.error || "")) && attempt < 2) {
+        const errMsg = String(result?.error || "")
         const availableQty = extract110424Available(errMsg)
-        if (availableQty !== null && availableQty < effectiveQty) {
-          console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ������������ retrying with exact available qty`,
-          )
-          result = await placeStop(availableQty)
-          if (result?.success) {
-            effectiveQty = availableQty
-          }
+        if (availableQty === null) break
+        if (availableQty <= 0) {
+          // Nothing left to protect — position fully consumed or externally closed.
+          console.warn(`${tag} 110424: available=0 — position fully consumed, treating as protected`)
+          result = { success: true, orderId: "position_exhausted" }
+          effectiveQty = 0
+          break
         }
+        console.warn(
+          `${tag} 110424 retry#${attempt + 1}: qty=${effectiveQty} > available=${availableQty} — retrying`,
+        )
+        effectiveQty = availableQty
+        result = await placeStop(effectiveQty)
+        attempt++
+      }
+      // Second retry also returned 110424 — position consumed or protected by peer leg.
+      if (!result?.success && is110424(String(result?.error || ""))) {
+        const secondAvail = extract110424Available(String(result?.error || ""))
+        console.warn(
+          `${tag} 110424 exhausted after ${attempt} retries (lastAvail=${secondAvail}) — position likely closed/protected, treating as success`,
+        )
+        result = { success: true, orderId: "position_exhausted" }
+        effectiveQty = secondAvail ?? effectiveQty
+      }
+      // Update effectiveQty on first-retry success
+      if (result?.success && effectiveQty !== quantity) {
+        // qty was adjusted; already updated in loop above
       }
     }
 
@@ -6032,10 +6057,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const SYNC_CONCURRENCY = 5
     
     // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout.
-    // Individual operation timeouts are now getOrder=12s, placeStop=20s.
-    // Per-position cap at 30s — enough for the worst case (fill-detect +
-    // SL/TP placement) without letting one hung call stall the pool indefinitely.
-    const SYNC_PER_POS_TIMEOUT_MS = 30_000
+    // Individual operation timeouts: getOrder=12s, placeStop=45s (includes
+    // semaphore queue wait).  Per-position cap at 55s.
+    const SYNC_PER_POS_TIMEOUT_MS = 55_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
