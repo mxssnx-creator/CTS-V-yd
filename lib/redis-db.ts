@@ -560,15 +560,20 @@ export class InlineLocalRedis implements RedisClientLike {
     // that accumulate across hot-reload cycles.
     void this.cleanupVolatileRuntimeState({ reason: "inline-startup" })
 
+    // Keep the once-per-second timer cheap: memoryUsage() and Map.size reads are
+    // O(1), while TTL expiry and eviction each scan key maps. Run those full
+    // scans at a slower cadence during normal operation, but bypass the cadence
+    // immediately when memory crosses the configured heap/RSS thresholds.
+    const FULL_CLEANUP_INTERVAL_MS = 15_000
+    let _lastFullCleanupMs = 0
+
     // Throttle eviction log output: only print once per 60 s when stuck above
     // the threshold so the server log stays readable.
     let _lastEvictionLogMs = 0
 
     const ttlCleanupTimer = setInterval(() => {
       try {
-        // First, clean up expired keys
-        this.cleanupExpiredKeys()
-
+        const now        = Date.now()
         const mem        = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
@@ -576,15 +581,22 @@ export class InlineLocalRedis implements RedisClientLike {
                            this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
 
         // Three-tier pressure response:
-        //   NORMAL  → no action
-        //   WARM    → evict + GC
-        //   CRITICAL → volatile cleanup + 3× evict passes + GC + throttle sleep
+        //   NORMAL  → TTL cleanup only on the slower full-scan cadence
+        //   WARM    → immediately evict + GC when heap/RSS/key pressure is high
+        //   CRITICAL → immediately volatile cleanup + 3× evict passes + GC
         const isCritical = rssMB > MEM.rssHardMB
         const isWarm     = isCritical || heapUsedMB > MEM.heapMB || rssMB > MEM.rssSoftMB || totalKeys > MEM.maxKeys
+        const shouldRunFullCleanup = isWarm || now - _lastFullCleanupMs >= FULL_CLEANUP_INTERVAL_MS
+
+        if (!shouldRunFullCleanup) return
+        _lastFullCleanupMs = now
+
+        // Expired-key cleanup scans the TTL map, so avoid doing it every second
+        // unless pressure requires immediate cleanup.
+        this.cleanupExpiredKeys()
 
         if (!isWarm) return
 
-        const now = Date.now()
         if (now - _lastEvictionLogMs > 60_000) {
           _lastEvictionLogMs = now
           const reason = isCritical
@@ -594,7 +606,10 @@ export class InlineLocalRedis implements RedisClientLike {
               : heapUsedMB > MEM.heapMB
                 ? `Heap=${heapUsedMB.toFixed(0)}MB >${MEM.heapMB}MB`
                 : `Keys=${totalKeys} >${MEM.maxKeys}`
-          console.log(`[v0] [Redis Memory] ${reason} — evicting. Families: ${this.describeKeyFamilies()}`)
+          // describeKeyFamilies() performs full key-family scans; only pay that
+          // cost when a log line will actually be emitted.
+          const families = this.describeKeyFamilies()
+          console.log(`[v0] [Redis Memory] ${reason} — evicting. Families: ${families}`)
         }
 
         if (isCritical) {
