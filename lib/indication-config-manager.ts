@@ -43,6 +43,28 @@ export class IndicationConfigManager {
     return `indication:${this.connectionId}:config:${configId}:results`
   }
 
+  private getConfigIndexKey(): string {
+    return `indication:${this.connectionId}:configs:index`
+  }
+
+  private async scanConfigKeys(client: any): Promise<string[]> {
+    // Startup/repair fallback only: this bounded SCAN backfills the maintained
+    // config index for legacy data created before the index existed. Normal
+    // dashboard/hot-path reads use SMEMBERS on getConfigIndexKey().
+    const pattern = `indication:${this.connectionId}:config:*`
+    const keys: string[] = []
+    if (typeof client.scan !== "function") return keys
+    let cursor = "0"
+    do {
+      const result = await client.scan(cursor, "MATCH", pattern, "COUNT", 100).catch(() => null)
+      if (!result) break
+      cursor = String(result[0] ?? "0")
+      const batch = (result[1] || []).filter((k: string) => !k.endsWith(":results"))
+      keys.push(...batch)
+    } while (cursor !== "0")
+    return keys
+  }
+
   async createConfig(config: Omit<IndicationConfig, "connectionId" | "createdAt">): Promise<IndicationConfig> {
     await initRedis()
     const client = getRedisClient()
@@ -54,7 +76,10 @@ export class IndicationConfigManager {
     }
 
     const key = this.getConfigKey(config.id)
-    await client.set(key, JSON.stringify(fullConfig))
+    const pipeline = client.multi()
+    pipeline.set(key, JSON.stringify(fullConfig))
+    pipeline.sadd(this.getConfigIndexKey(), key)
+    await pipeline.exec()
 
     console.log(`[v0] [IndicationConfigManager] Created config ${config.id} for ${this.connectionId}`)
     return fullConfig
@@ -75,8 +100,11 @@ export class IndicationConfigManager {
     await initRedis()
     const client = getRedisClient()
 
-    const pattern = `indication:${this.connectionId}:config:*`
-    const keys = (await client.keys(pattern)).filter((k: string) => !k.endsWith(":results"))
+    let keys = ((await client.smembers(this.getConfigIndexKey()).catch(() => [])) || []) as string[]
+    if (keys.length === 0) {
+      keys = await this.scanConfigKeys(client)
+      if (keys.length > 0) await client.sadd(this.getConfigIndexKey(), ...keys).catch(() => 0)
+    }
     if (keys.length === 0) return []
 
     // Fan out all GETs in parallel — was O(N) serial round-trips.
@@ -102,7 +130,10 @@ export class IndicationConfigManager {
 
     const updated = { ...config, ...updates }
     const key = this.getConfigKey(configId)
-    await client.set(key, JSON.stringify(updated))
+    const pipeline = client.multi()
+    pipeline.set(key, JSON.stringify(updated))
+    pipeline.sadd(this.getConfigIndexKey(), key)
+    await pipeline.exec()
 
     console.log(`[v0] [IndicationConfigManager] Updated config ${configId}`)
   }
@@ -114,8 +145,11 @@ export class IndicationConfigManager {
     const configKey = this.getConfigKey(configId)
     const resultsKey = this.getResultsKey(configId)
 
-    await client.del(configKey)
-    await client.del(resultsKey)
+    const pipeline = client.multi()
+    pipeline.del(configKey)
+    pipeline.del(resultsKey)
+    pipeline.srem(this.getConfigIndexKey(), configKey)
+    await pipeline.exec()
 
     console.log(`[v0] [IndicationConfigManager] Deleted config ${configId}`)
   }
