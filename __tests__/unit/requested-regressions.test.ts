@@ -233,8 +233,8 @@ describe("requested regression guardrails", () => {
 
     expect(processor).toContain("[`${symbol}:move`]: String(moveQ)")
     expect(processor).not.toContain('pipe.hincrby(w5Key,  "move"')
-    expect(cron).toContain("pipeline.hset(w5Key,  `${symbol}:${type}`, String(count))")
-    expect(cron).toContain("Zeroes are written too")
+    expect(cron).toContain("runIndStratCycle(connectionId, symbol, \"realtime\"")
+    expect(cron).toContain("ensureCurrentMarketDataCandle(symbol, client)")
     expect(tracking).toContain("aggregateWindowByType")
     expect(tracking).toContain("prefer the per-symbol snapshot")
     expect(tracking).toContain("if (idx <= 0 && hasSymbolField[type]) continue")
@@ -1020,13 +1020,42 @@ describe("requested regression guardrails", () => {
     expect(coordinator).toContain("restart escalation disabled")
   })
 
+  test("QuickStart commits running Redis intent before dispatching engine starts", () => {
+    const quickStart = read("app/api/trade-engine/quick-start/route.ts")
+    const step4 = quickStart.slice(
+      quickStart.indexOf("// Step 4: Start engine"),
+      quickStart.indexOf("// Store in global quickstart state"),
+    )
+    const intentWriteIndex = step4.indexOf('await client.hset("trade_engine:global", {')
+    const startAllIndex = step4.indexOf("coordinator.startAll()")
+    const targetedStartIndex = step4.indexOf("const engineStarted = await coord.startEngine")
+
+    expect(intentWriteIndex).toBeGreaterThanOrEqual(0)
+    expect(intentWriteIndex).toBeLessThan(startAllIndex)
+    expect(intentWriteIndex).toBeLessThan(targetedStartIndex)
+    expect(step4).toContain('operator_stopped: "0"')
+    expect(step4).toContain("updated_at: quickstartGlobalStartedAt")
+    expect(step4).toContain("const quickstartGlobalStartedAt = new Date().toISOString()")
+
+    const intentBlock = step4.slice(intentWriteIndex, step4.indexOf("})", intentWriteIndex))
+    expect(intentBlock).toContain('status: "running"')
+    expect(intentBlock).toContain('desired_status: "running"')
+    expect(intentBlock).toContain('operator_intent: "running"')
+
+    const targetedStartBlock = step4.slice(targetedStartIndex)
+    expect(targetedStartBlock).toContain("if (!engineStarted)")
+    expect(targetedStartBlock).toContain('"engine_start_skipped"')
+    expect(targetedStartBlock).toContain('phase: "queued"')
+    expect(targetedStartBlock).toContain('status: "skipped_queued"')
+  })
+
   test("Real-stage evaluation denominator includes related outputs and never reports negative failures", () => {
     const source = read("lib/strategy-coordinator.ts")
 
     expect(source).toContain("const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)")
     expect(source).toContain("const realTotalEvaluated = mainPFEligible + realRelatedCreated")
     expect(source).toContain("const passRatioReal = realTotalEvaluated > 0 ? n / realTotalEvaluated : 0")
-    expect(source).toContain("evaluated:          String(realTotalEvaluated)")
+    expect(source).toContain("evaluated:          String(realEvaluatedAfterFanOut)")
     expect(source).toContain("[`s:${symbol}:evaluated`]:  String(realTotalEvaluated)")
     expect(source).toContain('client.set(`strategies:${this.connectionId}:real:evaluated`, String(realTotalEvaluated))')
     expect(source).toContain("totalCreated: realTotalEvaluated")
@@ -1040,6 +1069,34 @@ describe("requested regression guardrails", () => {
 
     expect(Math.max(0, realTotalEvaluated - realSetsLength)).toBe(0)
     expect(realTotalEvaluated).toBe(5)
+  })
+
+  test("production cron route uses canonical ind-strat pipeline for all configured symbols", () => {
+    const cron = read("app/api/cron/generate-indications/route.ts")
+    const pipeline = read("lib/trade-engine/shared-ind-strat-pipeline.ts")
+    const strategy = read("lib/trade-engine/strategy-processor.ts")
+
+    expect(cron).toContain('runIndStratCycle(connectionId, symbol, "realtime"')
+    expect(cron).toContain("new IndicationProcessor(connection.id)")
+    expect(cron).toContain("new RealtimeProcessor(connection.id)")
+    expect(cron).toContain("new StrategyProcessor(connection.id)")
+    expect(cron).toContain("new IndicationSetsProcessor(connection.id)")
+    expect(cron).toContain("ensureCurrentMarketDataCandle(symbol, client)")
+    expect(cron).toContain("const symbolConcurrency = parsePositiveInteger(process.env.CRON_SYMBOL_CONCURRENCY, 4)")
+    expect(cron).toContain("const symbolLimit = parsePositiveInteger(process.env.CRON_SYMBOL_LIMIT, 20)")
+    expect(cron).toContain("symbolsToProcess,")
+    expect(cron).not.toContain("executeStrategyFlowBatch(strategyItems.slice(0, 2)")
+    expect(cron).not.toContain("strategyItems.slice(0, 2)")
+    expect(cron).toContain("skipLiveDispatch: process.env.CRON_LIVE_DISPATCH")
+    expect(cron).toContain("enableStrategyFlow: process.env.DISABLE_CRON_STRATEGIES !== \"1\"")
+
+    const pseudoIdx = pipeline.indexOf("updateOpenPseudoPositionsForSymbol(symbol)")
+    const strategyIdx = pipeline.lastIndexOf("processStrategy(symbol, indications")
+    expect(pseudoIdx).toBeGreaterThan(0)
+    expect(strategyIdx).toBeGreaterThan(pseudoIdx)
+    expect(pipeline).toContain("deps.enableStrategyFlow === true")
+    expect(strategy).toContain("skipLiveDispatch: boolean = false")
+    expect(strategy).toContain("executeStrategyFlow(symbol, validIndications, false, undefined, skipLiveDispatch)")
   })
 
 })

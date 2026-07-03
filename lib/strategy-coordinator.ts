@@ -3928,6 +3928,8 @@ export class StrategyCoordinator {
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
           // evaluated = public Real denominator after fan-out; separate upstream
           // input remains in strategies_active as {symbol}:real:input.
+          // evaluated = PF-eligible Main inputs plus Real related/axis-created outputs;
+          // separate upstream input remains in strategies_active as {symbol}:real:input.
           evaluated:          String(realTotalEvaluated),
           passed_sets:        String(realSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
@@ -3989,6 +3991,13 @@ export class StrategyCoordinator {
       // real:sets persistence path and the reader at createLiveSets uses getSettings()
       // which resolves the settings:-prefixed path correctly.
 
+      // strategies_real_related_created = Real Sets created via axis/variant
+      // fan-out BEYOND the Main Sets that entered (mirrors the Main stage's
+      // `strategies_main_related_created = mainSets.length - reused`). This is
+      // the "additionally created" term the dashboard can display alongside the
+      // Real evaluated pool. `strategies_real_evaluated` already includes this
+      // fan-out term so Real pass denominators stay consistent across Redis/detail
+      // fields. max(0, …) because Real can also net-filter below the input.
       // strategies_real_total = cumulative Sets PROMOTED by REAL (passed output count).
       // strategies_real_evaluated = every Real Set considered after current-cycle
       // fan-out (upstream PF-eligible Main input + Real related-created fan-out).
@@ -4013,7 +4022,7 @@ export class StrategyCoordinator {
           [`${symbol}:real`]:           String(realSets.length),
           // real:evaluated = PF-eligible Main inputs plus Real related/axis-created
           // outputs. Cross-symbol sum in stats route matches the Real pass denominator.
-          [`${symbol}:real:evaluated`]: String(realTotalEvaluated),
+          [`${symbol}:real:evaluated`]: String(realEvaluatedAfterFanOut),
           // real:input = upstream Main Sets that entered Real PF eligibility
           // before Real's current-cycle related-created fan-out.
           [`${symbol}:real:input`]: String(mainPFEligible),

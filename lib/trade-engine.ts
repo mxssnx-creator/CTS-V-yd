@@ -916,6 +916,7 @@ export class GlobalTradeEngineCoordinator {
       }
       
       const settings = await loadSettingsAsync()
+      const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
       let successCount = 0
       
       for (const connection of validConnections) {
@@ -928,16 +929,29 @@ export class GlobalTradeEngineCoordinator {
             realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
           }
           
-          await this.startEngine(connection.id, config)
-          successCount++
-          console.log(`[v0] [Coordinator] ✓ Started: ${connection.name}`)
+          const didStart = await this.startEngine(connection.id, config)
+          if (didStart === true) {
+            successCount++
+            console.log(`[v0] [Coordinator] ✓ Started: ${connection.name}`)
+          } else {
+            const reason = "queued-only or already owned"
+            console.warn(`[v0] [Coordinator] ⚠ Skipped start for ${connection.name}: ${reason}`)
+            await logProgressionEvent(
+              connection.id,
+              "engine_start_skipped",
+              "warning",
+              "Coordinator start skipped",
+              { connectionId: connection.id, reason },
+            )
+          }
         } catch (error) {
           console.error(`[v0] [Coordinator] ✗ Failed to start ${connection.name}:`, error)
         }
       }
       
-      this.isGloballyRunning = true
-      console.log(`[v0] [Coordinator] ✓ Global engine started: ${successCount}/${validConnections.length} connections active`)
+      this.isGloballyRunning = successCount > 0
+      const globalStartSymbol = successCount > 0 ? "✓" : "⚠"
+      console.log(`[v0] [Coordinator] ${globalStartSymbol} Global engine started: ${successCount}/${validConnections.length} connections active`)
     } catch (error) {
       console.error("[v0] [Coordinator] Failed to start global engine:", error)
     }

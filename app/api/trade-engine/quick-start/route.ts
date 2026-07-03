@@ -624,9 +624,22 @@ export async function POST(request: Request) {
           : "Starting Global Trade Engine Coordinator...",
         updated_at: new Date().toISOString(),
       })
+
+      // ALWAYS start global coordinator - ensures all workers and progression systems are active.
+      // Publish and await the Redis operator intent before any start dispatch so
+      // startEngine()/isGlobalCoordinatorEnabled() cannot observe stale stopped intent.
+      const quickstartGlobalStartedAt = new Date().toISOString()
+      await client.hset("trade_engine:global", {
+        status: "running",
+        desired_status: "running",
+        operator_intent: "running",
+        operator_stopped: "0",
+        started_at: quickstartGlobalStartedAt,
+        updated_at: quickstartGlobalStartedAt,
+        coordinator_ready: "true",
+      })
       
       try {
-        // ALWAYS start global coordinator - ensures all workers and progression systems are active
         // ── Stable QuickStart re-entry for THIS connection ─────────────
         // If the engine is already running, do NOT stop/restart it and do
         // NOT wipe progression/prehistory counters. Repeated QuickStart
@@ -709,16 +722,7 @@ export async function POST(request: Request) {
         // Non-blocking — just patches in-process objects, no I/O.
         setImmediate(() => patchIndicationProcessorCaches(coordinator))
 
-        // Persist coordinator-ready marker. Cheap hset — does not await engine boot.
-        client.hset("trade_engine:global", {
-          status: "running",
-          desired_status: "running",
-          operator_intent: "running",
-          started_at: new Date().toISOString(),
-          coordinator_ready: "true",
-        }).catch(() => {})
-
-        console.log(`${LOG_PREFIX} ✓ Global Coordinator boot dispatched (fire-and-forget)`)
+        console.log(`${LOG_PREFIX} ✓ Global Coordinator intent committed and boot dispatched (fire-and-forget)`)
         await logProgressionEvent("global", "global_coordinator_started", "info", "Global Trade Engine Coordinator started via QuickStart")
         
       } catch (globalStartError) {
@@ -751,6 +755,7 @@ export async function POST(request: Request) {
             const coord = getGlobalTradeEngineCoordinator()
 
             const started = await coord.startEngine(connectionId, {
+            const engineStarted = await coord.startEngine(connectionId, {
               connectionId,
               connection_name: connection.name,
               exchange: exchangeName,
@@ -768,6 +773,25 @@ export async function POST(request: Request) {
                 connectionName: connection.name,
                 exchange: exchangeName,
                 testPassed,
+            if (!engineStarted) {
+              const skippedAt = new Date().toISOString()
+              await logProgressionEvent(connectionId, "engine_start_skipped", "warning", "Main Trade Engine start skipped or queued via QuickStart", {
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                reason: "Coordinator returned false; start request was skipped or left queued",
+              })
+              await setSettings(`engine_progression:${connectionId}`, {
+                phase: "queued",
+                status: "skipped_queued",
+                progress: 15,
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                symbols,
+                testPassed,
+                detail: "Engine start was skipped by the coordinator and remains queued for a worker to process.",
+                updated_at: skippedAt,
               })
               return
             }
