@@ -112,15 +112,27 @@ export async function GET(request: NextRequest) {
     
     for (let i = 0; i < positions.length; i++) {
       const pos = positions[i]
-      const pnl = parseFloat(pos.realized_pnl || "0")
-      const pnlPercent = parseFloat(pos.realized_pnl_percent || "0")
+      if (!pos) continue // Skip null positions
+      
+      const pnl = parseFloat(String(pos.realized_pnl ?? 0))
+      const pnlPercent = parseFloat(String(pos.realized_pnl_percent ?? 0))
+      
+      // Validate parsed values
+      if (!isFinite(pnl) || !isFinite(pnlPercent)) continue
       
       totalPnL += pnl
       
-      // Calculate holding time
-      const openedAt = new Date(pos.opened_at).getTime()
-      const closedAt = new Date(pos.closed_at).getTime()
-      const holdingTimeMin = Math.round((closedAt - openedAt) / 60000)
+      // Calculate holding time with error handling
+      let holdingTimeMin = 0
+      try {
+        const openedAt = new Date(pos.opened_at).getTime()
+        const closedAt = new Date(pos.closed_at).getTime()
+        if (isFinite(openedAt) && isFinite(closedAt)) {
+          holdingTimeMin = Math.round((closedAt - openedAt) / 60000)
+        }
+      } catch {
+        holdingTimeMin = 0
+      }
       totalHoldingTime += holdingTimeMin
       
       // Track wins/losses
@@ -138,21 +150,27 @@ export async function GET(request: NextRequest) {
       
       // Last 25 positions tracking
       if (i < 25) {
-        last25Positions.push({
-          id: pos.id,
-          symbol: pos.symbol,
-          direction: pos.direction,
-          entry_price: parseFloat(pos.entry_price),
-          exit_price: parseFloat(pos.exit_price),
-          quantity: parseFloat(pos.quantity),
-          opened_at: pos.opened_at,
-          closed_at: pos.closed_at,
-          pnl,
-          pnl_percent: pnlPercent,
-          holding_time_min: holdingTimeMin,
-        })
-        last25PnL += pnl
-        if (pnl > 0) last25Wins++
+        const entryPrice = parseFloat(String(pos.entry_price ?? 0)) || 0
+        const exitPrice = parseFloat(String(pos.exit_price ?? 0)) || 0
+        const quantity = parseFloat(String(pos.quantity ?? 0)) || 0
+        
+        if (isFinite(entryPrice) && isFinite(exitPrice) && isFinite(quantity)) {
+          last25Positions.push({
+            id: pos.id || `unknown-${i}`,
+            symbol: pos.symbol || "UNKNOWN",
+            direction: pos.direction || "unknown",
+            entry_price: entryPrice,
+            exit_price: exitPrice,
+            quantity,
+            opened_at: pos.opened_at || new Date().toISOString(),
+            closed_at: pos.closed_at || new Date().toISOString(),
+            pnl,
+            pnl_percent: pnlPercent,
+            holding_time_min: holdingTimeMin,
+          })
+          last25PnL += pnl
+          if (pnl > 0) last25Wins++
+        }
       }
     }
     
@@ -178,7 +196,7 @@ export async function GET(request: NextRequest) {
       closed_positions: wins + losses + breakEven,
       open_positions: openPositionsCount,
       total_pnl: parseFloat(totalPnL.toFixed(8)),
-      total_pnl_percent: totalTrades > 0 ? parseFloat(((totalPnL / (totalWinPnL + totalLossPnL)) * 100).toFixed(2)) : 0,
+      total_pnl_percent: totalTrades > 0 && (totalWinPnL + totalLossPnL) > 0 ? parseFloat(((totalPnL / (totalWinPnL + totalLossPnL)) * 100).toFixed(2)) : 0,
       wins,
       losses,
       break_even: breakEven,

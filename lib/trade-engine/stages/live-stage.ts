@@ -1372,7 +1372,7 @@ async function placeProtectionOrder(
         const availableQty = extract110424Available(errMsg)
         if (availableQty !== null && availableQty < effectiveQty) {
           console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ������� retrying with exact available qty`,
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ��������� retrying with exact available qty`,
           )
           result = await placeStop(availableQty)
           if (result?.success) {
@@ -1517,15 +1517,17 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
   desiredTp: number
 } {
   const fillPrice = pos.averageExecutionPrice || pos.entryPrice
-  if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
+  // CRITICAL: Guard against undefined, NaN, negative, or zero fill prices
+  // that would cause NaN or Infinity propagation in SL/TP calculations.
+  if (!Number.isFinite(fillPrice) || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
 
-  // ── Trailing stop: use the ratcheted absolute price directly ─�����─────────�������
+  // ── Trailing stop: use the ratcheted absolute price directly ────────────────
   // When trailing is active syncLiveFromPseudo stamps pos.trailingStopPrice
   // with the latest ratcheted absolute stop level. Using that absolute price
   // directly avoids the percentage-anchored re-derivation below which would
   // always revert to the static origin level, fighting the ratchet every tick.
   let desiredSl: number
-  if (pos.trailingActive && pos.trailingStopPrice && pos.trailingStopPrice > 0) {
+  if (pos.trailingActive && Number.isFinite(pos.trailingStopPrice) && pos.trailingStopPrice > 0) {
     desiredSl = pos.trailingStopPrice
   } else {
     // Do not apply the hard live-entry minimum here. This helper is shared by
@@ -1534,14 +1536,33 @@ function computeDesiredProtectionPrices(pos: LivePosition): {
     // SL policy, so reconciliation must honor the position's already-stored SL
     // value. New live positions and operator overrides normalize that stored
     // value at their boundaries instead.
-    const slPct = Math.max(0, pos.stopLoss || 0) / 100
+    const rawSlPct = pos.stopLoss || 0
+    // Guard: ensure stopLoss is numeric and non-negative before percentage calc
+    const slPct = Number.isFinite(rawSlPct) && rawSlPct > 0 ? (rawSlPct / 100) : 0
     desiredSl =
       slPct > 0
         ? pos.direction === "long"
           ? fillPrice * (1 - slPct)
           : fillPrice * (1 + slPct)
         : 0
+    // Final NaN guard: ensure result is safe before returning
+    if (!Number.isFinite(desiredSl)) desiredSl = 0
   }
+
+  const rawTpPct = pos.takeProfit || 0
+  // Guard: ensure takeProfit is numeric and non-negative before percentage calc
+  const tpPct = Number.isFinite(rawTpPct) && rawTpPct > 0 ? (rawTpPct / 100) : 0
+  let desiredTp =
+    tpPct > 0
+      ? pos.direction === "long"
+        ? fillPrice * (1 + tpPct)
+        : fillPrice * (1 - tpPct)
+      : 0
+  // Final NaN guard: ensure result is safe before returning
+  if (!Number.isFinite(desiredTp)) desiredTp = 0
+
+  return { desiredSl, desiredTp }
+}
 
   const tpPct = Math.max(0, pos.takeProfit || 0) / 100
   const desiredTp =
@@ -6689,21 +6710,32 @@ export async function syncLiveFromPseudo(
         const livePos = matches[i]
         try {
           let effectiveSlPct = slPct
-          if (trailingActive && trailingStopPrice > 0) {
+          // CRITICAL: Guard trailing stop calculation against NaN and division errors
+          if (trailingActive && Number.isFinite(trailingStopPrice) && trailingStopPrice > 0) {
             const fill = Number(livePos.averageExecutionPrice || livePos.entryPrice || 0)
-            if (fill > 0) {
+            // Ensure fill price is valid and positive before using in division
+            if (Number.isFinite(fill) && fill > 0) {
               const liveSide: "long" | "short" =
                 livePos.direction === "short" ? "short" : "long"
               // Distance from fill to the trailing stop expressed as a
               // percentage of the fill price (always positive regardless of
               // direction — the trailing machine ensures trailingStopPrice
               // is below fill for longs and above fill for shorts).
-              const distPct =
-                liveSide === "long"
-                  ? ((fill - trailingStopPrice) / fill) * 100
-                  : ((trailingStopPrice - fill) / fill) * 100
+              let distPct: number
+              if (liveSide === "long") {
+                distPct = ((fill - trailingStopPrice) / fill) * 100
+              } else {
+                distPct = ((trailingStopPrice - fill) / fill) * 100
+              }
+              // Guard against NaN from division or calculation errors, and
+              // ensure distPct is positive (should always be for valid trailing levels)
               if (Number.isFinite(distPct) && distPct > 0) {
                 effectiveSlPct = distPct
+              } else if (!Number.isFinite(distPct)) {
+                // If distPct is NaN or Infinity, log it but keep current SL percentage
+                console.warn(
+                  `${LOG_PREFIX} distPct is ${distPct} for ${livePos.symbol} (fill=${fill}, trailing=${trailingStopPrice}, side=${liveSide})`
+                )
               }
             }
           }
@@ -6750,12 +6782,25 @@ export async function syncLiveFromPseudo(
           const currentSlPct = typeof livePos.stopLoss === "number" ? livePos.stopLoss : undefined
           const currentTpPct = typeof livePos.takeProfit === "number" ? livePos.takeProfit : undefined
           const ordersMissing = !livePos.stopLossOrderId || !livePos.takeProfitOrderId
-          const slDeltaPct = currentSlPct !== undefined && effectiveSlPct !== undefined
-            ? Math.abs(effectiveSlPct - currentSlPct) / Math.max(currentSlPct, 0.001)
-            : 1  // undefined → treat as changed
-          const tpDeltaPct = currentTpPct !== undefined && tpPct !== undefined
-            ? Math.abs(tpPct - currentTpPct) / Math.max(currentTpPct, 0.001)
-            : (tpPct !== undefined ? 1 : 0)  // tpPct newly defined → changed; both undefined → no change
+          // CRITICAL: Guard against division by zero and NaN propagation.
+          // currentSlPct/tpPct could be 0, negative, or NaN. Use safe division with
+          // explicit isFinite checks to prevent crashes on trailing stop updates.
+          const slDeltaPct = (() => {
+            if (currentSlPct === undefined || effectiveSlPct === undefined) return 1 // treat as changed
+            if (!Number.isFinite(currentSlPct) || !Number.isFinite(effectiveSlPct)) return 1
+            if (currentSlPct <= 0) return 1 // undefined SL → treat as changed
+            const delta = Math.abs(effectiveSlPct - currentSlPct) / Math.abs(currentSlPct)
+            return Number.isFinite(delta) ? delta : 1
+          })()
+          
+          const tpDeltaPct = (() => {
+            if (currentTpPct === undefined && tpPct === undefined) return 0 // both undefined → no change
+            if (currentTpPct === undefined || tpPct === undefined) return 1 // one newly defined → changed
+            if (!Number.isFinite(currentTpPct) || !Number.isFinite(tpPct)) return 1
+            if (currentTpPct <= 0) return 1 // undefined TP → treat as changed
+            const delta = Math.abs(tpPct - currentTpPct) / Math.abs(currentTpPct)
+            return Number.isFinite(delta) ? delta : 1
+          })()
           // When trailing is active the ratchet can advance even when the
           // derived slPct (from distPct calculation above) looks stable within
           // 0.25%.  The absolute stop price advancing is always significant —

@@ -145,7 +145,7 @@ export function PnLDashboard({ connectionId = "bingx-x01" }: { connectionId?: st
             <p className="text-lg font-semibold text-green-600">{formatCurrency(stats.largest_win)}</p>
             <p className="text-lg font-semibold text-red-600">{formatCurrency(stats.largest_loss)}</p>
           </div>
-          <p className="text-xs text-muted-foreground">Range: {Math.abs(stats.largest_win - stats.largest_loss).toFixed(8)}</p>
+          <p className="text-xs text-muted-foreground">Range: {isFinite(stats.largest_win) && isFinite(stats.largest_loss) ? Math.abs(stats.largest_win - stats.largest_loss).toFixed(8) : "N/A"}</p>
         </div>
 
         <div className="rounded-lg border border-border bg-card p-4">
