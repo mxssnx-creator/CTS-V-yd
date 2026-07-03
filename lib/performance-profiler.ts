@@ -29,14 +29,15 @@ interface PerformanceStats {
   slowCycles: CycleMetrics[]
 }
 
-class PerformanceProfiler {
+export class PerformanceProfiler {
   private cycles: Map<string, CycleMetrics> = new Map()
   private operationTimings: Map<string, number[]> = new Map()
+  private cycleSeq = 0
   private readonly MAX_HISTORY = 1000
   private readonly SLOW_CYCLE_THRESHOLD_MS = 250 // 300ms default - 250ms = 50ms buffer
 
   startCycle(connectionId: string, phase: string, symbol?: string): string {
-    const cycleId = `${phase}-${connectionId}-${symbol || "all"}-${Date.now()}`
+    const cycleId = `${phase}-${connectionId}-${symbol || "all"}-${Date.now()}-${this.cycleSeq++}`
     const metrics: CycleMetrics = {
       startTime: performance.now(),
       phase,
