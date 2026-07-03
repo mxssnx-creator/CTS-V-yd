@@ -3815,10 +3815,10 @@ export async function flushAll(): Promise<void> {
   await client.flushDb()
 }
 
-// Cache getRedisStats for 5 s. The underlying `client.keys("*")` is an
-// O(N) scan over the entire keyspace, so hammering it from a polling
-// monitoring dashboard would be a foot-gun. The cached value is plenty
-// fresh for a "connected + key count" display.
+// Cache getRedisStats for 5 s. The key count comes from `client.dbSize()`
+// rather than `client.keys("*")`, so this health/stat path avoids
+// materializing the full key list while still protecting polling dashboards
+// from repeatedly hitting Redis.
 let _redisStatsCache: {
   value: { connected: boolean; memoryUsage: number; keyCount: number; uptime: number }
   ts: number
@@ -3837,11 +3837,11 @@ export async function getRedisStats(): Promise<{
   }
   try {
     const client = getRedisClient()
-    const keys = await client.keys("*")
+    const keyCount = await client.dbSize()
     const value = {
       connected: true,
       memoryUsage: 0, // In-memory implementation doesn't track this
-      keyCount: keys.length,
+      keyCount,
       uptime: Date.now() - (globalThis as any).__redis_start_time || 0,
     }
     _redisStatsCache = { value, ts: now }
