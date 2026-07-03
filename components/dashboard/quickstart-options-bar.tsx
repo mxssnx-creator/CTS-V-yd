@@ -315,7 +315,7 @@ export function QuickstartOptionsBar() {
         // coordination — the previous run was already trailing).
         setTrailingEnabled(variants.trailing !== false)
         setBlockEnabled(variants.block !== false)
-        setDcaEnabled(variants.dca !== false)
+        setDcaEnabled(variants.dca === true)
       }
 
       if (volumeRes.ok) {

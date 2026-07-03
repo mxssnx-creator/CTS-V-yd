@@ -136,37 +136,128 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                 </p>
               </div>
 
-              {/* ── REAL-stage propagation cap ──────────────────────────
-                  This is the hard ceiling consumed by
-                  `StrategyCoordinator.evaluateRealSets`: after PF/DDT
-                  filtering and PF-descending sort, only the top N Sets
-                  propagate to Live evaluation. 12000 is the operational
-                  default — high enough that it rarely binds, yet bounds
-                  unbounded growth when the funnel widens. Range is
-                  1k–25k; step 500 keeps the slider usable while letting
-                  the operator dial in mid-range values. */}
-              <div className="space-y-2 pt-2 border-t border-dashed border-border/40">
-                <div className="flex items-center justify-between">
-                  <Label>Max Real Sets per Cycle</Label>
-                  <span className="text-sm font-semibold tabular-nums">
-                    {(settings.maxRealSets ?? 12000).toLocaleString()}
-                  </span>
+              {/* ── Strategy pipeline ceilings ──────────────────────────
+                  These are the same safety rails consumed by
+                  `StrategyCoordinator`: per-Set entry count, Main axis
+                  fan-out, Real-stage safety ceiling, operator Real pass-
+                  through cap, and Live dispatch cap. Keep them together so
+                  an operator can tune the whole Strategies pipeline from
+                  Settings → System instead of editing env vars. */}
+              <div className="space-y-4 pt-2 border-t border-dashed border-border/40">
+                <div className="space-y-1">
+                  <h4 className="text-sm font-semibold">Strategies Pipeline Ceilings</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Resource ceilings for Strategy Set creation and live dispatch.
+                    Lower values improve production liveness; higher values widen
+                    the strategy funnel on larger workers.
+                  </p>
                 </div>
-                <Slider
-                  value={[settings.maxRealSets ?? 12000]}
-                  onValueChange={(v) => handleSettingChange("maxRealSets", v[0])}
-                  min={1000}
-                  max={25000}
-                  step={500}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Hard ceiling on REAL-stage Sets that propagate to Live
-                  each cycle. After PF / DDT filtering and PF-descending
-                  priority sort, only the top N Sets survive. Default
-                  <strong> 12,000</strong>; raise if the funnel is wide and
-                  you observe the cap binding in logs, lower to keep
-                  evaluation tight on resource-constrained runs.
-                </p>
+
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Entries per Strategy Set</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyMaxEntriesPerSet ?? 250).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyMaxEntriesPerSet ?? 250]}
+                      onValueChange={(v) => handleSettingChange("strategyMaxEntriesPerSet", v[0])}
+                      min={50}
+                      max={750}
+                      step={50}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Maximum config entries packed into each Strategy Set.
+                      Default <strong>250</strong>.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Main Axis Sets per Symbol</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyMainAxisSetsCeiling ?? 50).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyMainAxisSetsCeiling ?? 50]}
+                      onValueChange={(v) => handleSettingChange("strategyMainAxisSetsCeiling", v[0])}
+                      min={10}
+                      max={5000}
+                      step={10}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Per-symbol ceiling for Main-stage position-count axis fan-out.
+                      Default <strong>50</strong> in production.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Real Sets Safety Ceiling</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyRealSetsSafetyCeiling ?? 100).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyRealSetsSafetyCeiling ?? 100]}
+                      onValueChange={(v) => {
+                        handleSettingChange("strategyRealSetsSafetyCeiling", v[0])
+                        if ((settings.maxRealSets ?? 100) > v[0]) handleSettingChange("maxRealSets", v[0])
+                      }}
+                      min={25}
+                      max={25000}
+                      step={25}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Hard memory-safety ceiling for Real-stage Sets.
+                      <code>maxRealSets</code> cannot exceed this value.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Max Real Sets per Cycle</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.maxRealSets ?? 100).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[Math.min(settings.maxRealSets ?? 100, settings.strategyRealSetsSafetyCeiling ?? 100)]}
+                      onValueChange={(v) => handleSettingChange("maxRealSets", v[0])}
+                      min={25}
+                      max={settings.strategyRealSetsSafetyCeiling ?? 100}
+                      step={25}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Operator cap on Real Sets that propagate toward Live after
+                      PF/DDT filtering and variant-fair ranking.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2 md:col-span-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Live Exchange Dispatch Sets</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyLiveSetsCeiling ?? 90).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyLiveSetsCeiling ?? 90]}
+                      onValueChange={(v) => handleSettingChange("strategyLiveSetsCeiling", v[0])}
+                      min={1}
+                      max={500}
+                      step={1}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Maximum qualifying Sets considered for live exchange order
+                      dispatch per symbol. BingX default <strong>90</strong> leaves
+                      room under its open-order limits for SL/TP control orders.
+                    </p>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -367,11 +458,87 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                 whose entry shape costs more or less to recompute. */}
             <div className="space-y-4 border-t pt-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold">Set Compaction</h3>
+                <h3 className="text-lg font-semibold">Capacity & Stage Limits</h3>
                 <span className="text-xs text-muted-foreground">
-                  Rearrange policy for every Set pool
+                  Symbol fan-out, Set compaction, and stage promotion gates
                 </span>
               </div>
+              <div className="space-y-4 rounded-lg border p-3 bg-muted/20">
+                <div>
+                  <h4 className="text-sm font-semibold">Symbol Fan-Out</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Mirrors Exchange → Symbol Configuration and writes the same canonical settings keys.
+                  </p>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>Symbol Order Type</Label>
+                    <Select
+                      value={settings.symbolOrderType || "volume24h"}
+                      onValueChange={(value) => handleSettingChange("symbolOrderType", value)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="volume24h">24h Volume (Highest First)</SelectItem>
+                        <SelectItem value="marketCap">Market Cap (Largest First)</SelectItem>
+                        <SelectItem value="priceChange24h">24h Price Change</SelectItem>
+                        <SelectItem value="volatility">Volatility (Most Volatile)</SelectItem>
+                        <SelectItem value="trades24h">24h Trades (Most Active)</SelectItem>
+                        <SelectItem value="alphabetical">Alphabetical (A-Z)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Canonical key: <code>symbolOrderType</code>.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Symbol Count</Label>
+                      <span className="text-sm font-semibold tabular-nums">{settings.numberOfSymbolsToSelect || 8}</span>
+                    </div>
+                    <Slider
+                      min={2}
+                      max={30}
+                      step={1}
+                      value={[settings.numberOfSymbolsToSelect || 8]}
+                      onValueChange={([value]) => handleSettingChange("numberOfSymbolsToSelect", value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Canonical key: <code>numberOfSymbolsToSelect</code> (the exchange fan-out symbol count).
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-4 text-xs">
+                  <div className="space-y-2">
+                    <Label>Main Symbols</Label>
+                    <div className="flex flex-wrap gap-2 rounded border p-2 min-h-10 bg-background">
+                      {(settings.mainSymbols || ["BTC", "ETH", "BNB", "XRP", "ADA", "SOL"]).map((symbol: string) => (
+                        <span key={symbol} className="px-2 py-1 rounded-full bg-primary/10 text-primary">{symbol}</span>
+                      ))}
+                    </div>
+                    <p className="text-muted-foreground">
+                      Edit membership on Exchange; System displays the canonical <code>mainSymbols</code> list.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Forced Symbols</Label>
+                    <div className="flex flex-wrap gap-2 rounded border p-2 min-h-10 bg-background">
+                      {(settings.forcedSymbols || ["XRP", "BCH"]).map((symbol: string) => (
+                        <span key={symbol} className="px-2 py-1 rounded-full bg-accent text-accent-foreground">{symbol}</span>
+                      ))}
+                    </div>
+                    <p className="text-muted-foreground">
+                      Always included via canonical <code>forcedSymbols</code>; edit the list on Exchange.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
               <p className="text-xs text-muted-foreground">
                 Buffers grow to <strong>floor × (1 + threshold%)</strong> entries
                 before being compacted back to <strong>floor</strong> — newest
@@ -499,6 +666,88 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                   </div>
                 </div>
               </details>
+
+              <div className="space-y-4 rounded-lg border p-3 bg-muted/20">
+                <div>
+                  <h4 className="text-sm font-semibold">Strategy Stage Thresholds</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Mirrors Strategy → Base stage promotion gates and writes the same PF, DDT, and min-position keys.
+                  </p>
+                </div>
+
+                <div className="grid md:grid-cols-4 gap-4">
+                  {([
+                    { key: "baseProfitFactor", label: "Base PF", value: settings.baseProfitFactor ?? 0.9 },
+                    { key: "mainProfitFactor", label: "Main PF", value: settings.mainProfitFactor ?? 1.0 },
+                    { key: "realProfitFactor", label: "Real PF", value: settings.realProfitFactor ?? 1.0 },
+                    { key: "liveProfitFactor", label: "Live PF", value: settings.liveProfitFactor ?? 1.0 },
+                  ] as const).map((row) => (
+                    <div key={row.key} className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <Label>{row.label}</Label>
+                        <span className="text-sm font-semibold tabular-nums">{Number(row.value).toFixed(1)}</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={2}
+                        step={0.1}
+                        value={[row.value]}
+                        onValueChange={([value]) => handleSettingChange(row.key, value)}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid md:grid-cols-3 gap-4">
+                  {([
+                    { key: "maxDrawdownTimeMainHours", label: "Main DDT Ceiling", value: settings.maxDrawdownTimeMainHours ?? 4 },
+                    { key: "maxDrawdownTimeRealHours", label: "Real DDT Ceiling", value: settings.maxDrawdownTimeRealHours ?? 4 },
+                    { key: "maxDrawdownTimeLiveHours", label: "Live DDT Ceiling", value: settings.maxDrawdownTimeLiveHours ?? 4 },
+                  ] as const).map((row) => (
+                    <div key={row.key} className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <Label>{row.label}</Label>
+                        <span className="text-sm font-semibold tabular-nums">{row.value}h</span>
+                      </div>
+                      <Slider
+                        min={1}
+                        max={72}
+                        step={1}
+                        value={[row.value]}
+                        onValueChange={([value]) => handleSettingChange(row.key, value)}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid md:grid-cols-3 gap-4">
+                  {([
+                    { key: "stageMinPosCountBase", label: "Base → Main Min Positions", value: settings.stageMinPosCountBase ?? 0, defaultText: "Default 15" },
+                    { key: "stageMinPosCountMain", label: "Main → Real Min Positions", value: settings.stageMinPosCountMain ?? 0, defaultText: "Default 15" },
+                    { key: "stageMinPosCountReal", label: "Real → Live Min Positions", value: settings.stageMinPosCountReal ?? 0, defaultText: "Default 10" },
+                  ] as const).map((row) => (
+                    <div key={row.key} className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <Label>{row.label}</Label>
+                        <span className="text-sm font-semibold tabular-nums">{row.value === 0 ? row.defaultText : row.value}</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={50}
+                        step={5}
+                        value={[row.value]}
+                        onValueChange={([value]) => handleSettingChange(row.key, value)}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  Also surfaced in this System tab: <code>maxRealSets</code>, <code>indicationTimeoutMs</code>,
+                  indication retention, global <code>setCompactionFloor</code>/<code>setCompactionThresholdPct</code>,
+                  indication compaction overrides, and strategy compaction overrides above.
+                </p>
+              </div>
             </div>
 
             <div className="space-y-4 border-t pt-4">

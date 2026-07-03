@@ -604,7 +604,7 @@ function getDefaultSettings(): Settings {
     strategy_time_interval: 1,
     strategy_min_profit_factor: 0.5,
     trailing_enabled: true,
-    dca_enabled: true,
+    dca_enabled: false,
 
     // Notification
     enable_notifications: true,

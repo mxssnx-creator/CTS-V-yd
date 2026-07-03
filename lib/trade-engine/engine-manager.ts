@@ -661,6 +661,47 @@ export class TradeEngineManager {
     console.log("[v0] TradeEngineManager initialized")
   }
 
+
+  /**
+   * Cross-process cancellation point for superseded progressions. Settings
+   * saves/new starts write stop_requested or restart_request into Redis so an
+   * old production/dev owner stops its timers before it can keep processing
+   * stale settings. Live exchange position/order records are not deleted; the
+   * replacement generation adopts and manages them until normal close.
+   */
+  private async stopIfSupersededByNewGeneration(context: string): Promise<boolean> {
+    if (!this.isRunning) return true
+    try {
+      const client = getRedisClient()
+      const state = await client.hgetall(`trade_engine_state:${this.connectionId}`).catch(() => ({} as Record<string, string>))
+      const settingsState = await client.hgetall(`settings:trade_engine_state:${this.connectionId}`).catch(() => ({} as Record<string, string>))
+      const stopRequested =
+        state.stop_requested === "1" || state.stop_requested === "true" ||
+        settingsState.stop_requested === "1" || settingsState.stop_requested === "true" ||
+        state.restart_request === "1" || state.restart_request === "true" ||
+        settingsState.restart_request === "1" || settingsState.restart_request === "true"
+      if (!stopRequested) return false
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] ${context}: superseded generation requested; stopping stale timers before next cycle`,
+      )
+      await logProgressionEvent(
+        this.connectionId,
+        "superseded_generation_stop",
+        "warning",
+        "Stopping stale engine generation after settings/progression restart request",
+        { context, epoch: this.epoch, connectionId: this.connectionId },
+      ).catch(() => {})
+      await this.stop()
+      return true
+    } catch (err) {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] ${context}: superseded-generation check failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return false
+    }
+  }
+
   /**
    * Public getter to check if engine is running
    */
@@ -792,14 +833,57 @@ export class TradeEngineManager {
         const symbolsHash = symbols.slice().sort().join("|") // simple deterministic hash; do not reorder runtime processing
         // Snapshot a minimal but useful slice of current connection settings
         const connData = (await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
+        const state = (await redisClient.hgetall(`settings:trade_engine_state:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
+        const connectionSettings = {
+          ...((await redisClient.hgetall(`settings:connection_settings:${this.connectionId}`).catch(() => ({}))) as Record<string, string>),
+          ...((await redisClient.hgetall(`connection_settings:${this.connectionId}`).catch(() => ({}))) as Record<string, string>),
+        }
+        const fpValue = (key: string, fallback = ""): string => {
+          const v = (connectionSettings as any)[key] ?? (state as any)[key] ?? (connData as any)[key] ?? fallback
+          if (v === undefined || v === null) return fallback
+          if (typeof v === "object") {
+            try { return JSON.stringify(v) } catch { return fallback }
+          }
+          return String(v)
+        }
+        const progressionFingerprintFields = [
+          "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+          "profitFactorMin",
+          "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+          "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
+          "variantTrailingEnabled", "variantBlockEnabled", "variantDcaEnabled",
+          "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+          "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+          "blockVolumeRatio", "blockMaxStack", "blockPauseCountRatio",
+          "minimal_step_count", "minimalStepCount", "minStep",
+          "prevPosWindow", "prevPosMinCount", "mainEvalPosCount", "realEvalPosCount",
+          "live_volume_factor", "preset_volume_factor", "volume_factor_live", "volume_factor_preset",
+          "volume_step_ratio", "volume_factor",
+          "coordination_settings", "strategies", "indications", "active_indications",
+        ]
+        const settingsFingerprint = JSON.stringify({
+          engineType: config.engine_type || "main",
+          is_live_trade: connData.is_live_trade || "0",
+          is_testnet: connData.is_testnet || "0",
+          is_preset_trade: connData.is_preset_trade || "0",
+          connection_method: connData.connection_method || "library",
+          margin_type: connData.margin_type || "cross",
+          position_mode: connData.position_mode || "hedge",
+          settings: Object.fromEntries(progressionFingerprintFields.map((field) => [field, fpValue(field)])),
+        })
         const settingsSnapshot = {
           symbol_count: symbolCount,
           symbols_hash: symbolsHash,
           engine_type: config.engine_type || "main",
           is_live_trade: connData.is_live_trade || "0",
+          is_testnet: connData.is_testnet || "0",
           is_preset_trade: connData.is_preset_trade || "0",
           live_volume_factor: connData.live_volume_factor ?? String(MIN_VOLUME_FACTOR),
           connection_method: connData.connection_method || "library",
+          margin_type: connData.margin_type || "cross",
+          position_mode: connData.position_mode || "hedge",
+          progression_fingerprint: settingsFingerprint,
+          settings: Object.fromEntries(progressionFingerprintFields.map((field) => [field, fpValue(field)])),
           updated_at: new Date().toISOString(),
         }
 
@@ -1946,6 +2030,8 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("indication-tick")) return
+
 
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
@@ -2552,6 +2638,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("strategy-tick")) return
 
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
@@ -2870,6 +2957,7 @@ export class TradeEngineManager {
 
     const tickLivePositions = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("live-positions-tick")) return
       const cycleStart = Date.now()
 
       // ── Single-flight guard ───────��─────────────────────────────────
@@ -3334,6 +3422,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("prehistoric-tick")) return
       const cycleStart = Date.now()
 
       try {
@@ -3853,10 +3942,9 @@ export class TradeEngineManager {
         const _isLocalRun = process.env.NODE_ENV === "development" ||
           (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")
         if (_isLocalRun) {
-          // Default 4 symbols so BTCUSDT/ETHUSDT/SOLUSDT/XRPUSDT all trade.
-          // The old default of 1 bypassed force_symbols / active_symbols entirely.
-          const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "4"
-          const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 4)
+          const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "1"
+          const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 1)
+          if (devCap === 1) return ["BTCUSDT"]
           // Fall through to the full resolution chain (force_symbols → active_symbols
           // → volatility fetch). The resolved list is sliced to devCap at the end.
           ;(resolve as any)._devCap = devCap
@@ -4130,7 +4218,18 @@ export class TradeEngineManager {
     try {
       const flagKey = `engine_is_running:${this.connectionId}`
       const client = getRedisClient()
-      await client.set(flagKey, isRunning ? "1" : "0")
+      const now = Date.now()
+      const writes: Promise<unknown>[] = [client.set(flagKey, isRunning ? "1" : "0")]
+      if (isRunning) {
+        writes.push(client.hset("trade_engine:global", {
+          actual_status: "running",
+          active_worker_id: `engine-manager:${process.pid}`,
+          last_heartbeat_at: String(now),
+          last_heartbeat_iso: new Date(now).toISOString(),
+          updated_at: new Date(now).toISOString(),
+        }).catch(() => undefined))
+      }
+      await Promise.all(writes)
       console.log(`[v0] [Engine Flag] ${flagKey}=${isRunning ? "1" : "0"}`)
     } catch (error) {
       console.error("[v0] Failed to set running flag:", error)
@@ -4158,17 +4257,27 @@ export class TradeEngineManager {
         checkMemoryAndTriggerGC()
         
         const stateKey = `trade_engine_state:${this.connectionId}`
-        await setSettings(stateKey, {
-          status: "running",
-          last_indication_run: new Date().toISOString(),
-          // STABILITY: dedicated millis-epoch heartbeat read by the
-          // coordinator's stall watchdog. Numeric form is much cheaper
-          // for the watchdog to compare than re-parsing an ISO string,
-          // and it isolates "engine alive" from "indication ran" — the
-          // two used to be conflated which made stall detection unreliable.
-          last_processor_heartbeat: Date.now(),
-          connection_id: this.connectionId,
-        })
+        const now = Date.now()
+        await Promise.all([
+          setSettings(stateKey, {
+            status: "running",
+            last_indication_run: new Date().toISOString(),
+            // STABILITY: dedicated millis-epoch heartbeat read by the
+            // coordinator's stall watchdog. Numeric form is much cheaper
+            // for the watchdog to compare than re-parsing an ISO string,
+            // and it isolates "engine alive" from "indication ran" — the
+            // two used to be conflated which made stall detection unreliable.
+            last_processor_heartbeat: now,
+            connection_id: this.connectionId,
+          }),
+          getRedisClient().hset("trade_engine:global", {
+            actual_status: "running",
+            active_worker_id: `engine-manager:${process.pid}`,
+            last_heartbeat_at: String(now),
+            last_heartbeat_iso: new Date(now).toISOString(),
+            updated_at: new Date(now).toISOString(),
+          }).catch(() => undefined),
+        ])
       } catch {
         // Silent fail - heartbeat is non-critical
       }

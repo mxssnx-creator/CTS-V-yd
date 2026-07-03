@@ -247,14 +247,18 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           active_connections: String(activeDashboardCount),
         })
         
-        // Start/reconcile in-process only in dev or explicit diagnostics.
-        // Production API workers queue the durable start for the coordinator worker.
+        // Queue/reconcile by default in production so API workers stay responsive.
+        // Local foreground start is reserved for non-production or explicit
+        // production opt-in via ALLOW_API_TRADE_ENGINE_FOREGROUND +
+        // ENABLE_TRADE_ENGINE_IN_PROCESS.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           const localStartAllowed =
-            process.env.NODE_ENV !== "production" ||
-            process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
-            process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+            process.env.DISABLE_TRADE_ENGINE_IN_PROCESS !== "1" &&
+            process.env.NEXT_RUNTIME !== "edge" &&
+            (process.env.NODE_ENV !== "production" ||
+              (process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
+                process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"))
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -268,12 +272,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
-            if (!started && !coordinator.isEngineRunning(resolvedId)) {
+            const engineStarted = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
+            if (!engineStarted && !coordinator.isEngineRunning(resolvedId)) {
               throw new Error("Coordinator did not start the engine after enable; startup lock may be held by another worker")
             }
             
-            console.log(`[v0] [Toggle] ✓ Engine ${started ? "started" : "already running"} directly for ${connection.name}`)
+            console.log(`[v0] [Toggle] ✓ Engine ${engineStarted ? "started" : "already running"} directly for ${connection.name}`)
             await logProgressionEvent(resolvedId, "engine_started_direct", "info", "Main Trade Engine started directly from enable", {
               connectionId: resolvedId,
               connectionName: connection.name,

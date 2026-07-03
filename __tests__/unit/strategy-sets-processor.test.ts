@@ -1,6 +1,7 @@
 import { StrategySetsProcessor, MAX_INPUT_MULTIPLIER } from "@/lib/strategy-sets-processor"
 import { loadCompactionConfig } from "@/lib/sets-compaction"
 import { setSettings } from "@/lib/redis-db"
+import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
 const mockRedisStore = new Map<string, unknown>()
 const mockClientStore = new Map<string, string>()
@@ -109,5 +110,43 @@ describe("StrategySetsProcessor", () => {
     expect(mainEntries).toHaveLength(301)
     expect(Math.min(...baseEntries.map((entry: any) => entry.profitFactor))).toBeCloseTo(1.9)
     expect(Math.min(...mainEntries.map((entry: any) => entry.profitFactor))).toBeCloseTo(1.99)
+  })
+
+  test("aggregates each strategy stage qualified count exactly once", async () => {
+    const processor = new StrategySetsProcessor("conn-aggregation")
+    const stageResults = {
+      base: { type: "base", rawTotal: 1, selectedTotal: 1, qualified: 1 },
+      main: { type: "main", rawTotal: 1, selectedTotal: 1, qualified: 2 },
+      real: { type: "real", rawTotal: 1, selectedTotal: 1, qualified: 3 },
+      live: { type: "live", rawTotal: 1, selectedTotal: 1, qualified: 4 },
+    }
+
+    jest.spyOn(processor as any, "processBaseStrategySet").mockResolvedValue(stageResults.base)
+    jest.spyOn(processor as any, "processMainStrategySet").mockResolvedValue(stageResults.main)
+    jest.spyOn(processor as any, "processRealStrategySet").mockResolvedValue(stageResults.real)
+    jest.spyOn(processor as any, "processLiveStrategySet").mockResolvedValue(stageResults.live)
+
+    await processor.processAllStrategySets("ETHUSDT", [
+      {
+        type: "mock",
+        confidence: 0.9,
+        profitFactor: 2,
+        metadata: {},
+      },
+    ])
+
+    expect(logProgressionEvent).toHaveBeenCalledWith(
+      "conn-aggregation",
+      "strategies_sets",
+      "info",
+      "All strategy types evaluated for ETHUSDT",
+      expect.objectContaining({
+        totalQualified: 10,
+        base: stageResults.base,
+        main: stageResults.main,
+        real: stageResults.real,
+        live: stageResults.live,
+      }),
+    )
   })
 })

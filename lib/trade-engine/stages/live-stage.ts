@@ -3979,6 +3979,9 @@ export async function updateLivePositionFill(
     position.updatedAt = Date.now()
 
     await client.setex(key, 604800, JSON.stringify(position))
+    await client.lpush(`live:positions:${position.connectionId}`, position.id)
+    await client.ltrim(`live:positions:${position.connectionId}`, 0, 999)
+    await client.expire(`live:positions:${position.connectionId}`, 604800)
     return position
   } catch (err) {
     console.error(`${LOG_PREFIX} Error updating fill:`, err)
@@ -4421,17 +4424,6 @@ export async function getLivePositions(connectionId: string): Promise<LivePositi
         if (!data) continue
         try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
       }
-    }
-    if (positions.length > 0) return positions
-
-    // Fallback scan if the index is empty.
-    const keys = ((await client.keys(`live:position:live:${connectionId}:*`).catch(() => [])) || []) as string[]
-    if (keys.length === 0) return positions
-
-    const rawFallback = await Promise.all(keys.map((k) => client.get(k).catch(() => null)))
-    for (const data of rawFallback) {
-      if (!data) continue
-      try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
     }
     return positions
   } catch (err) {
@@ -6372,6 +6364,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
 
         const key = `live:position:${position.id}`
         await client.setex(key, 604800, JSON.stringify(position))
+        await client.lpush(`live:positions:${position.connectionId}`, position.id)
+        await client.ltrim(`live:positions:${position.connectionId}`, 0, 999)
+        await client.expire(`live:positions:${position.connectionId}`, 604800)
       } catch (err) {
         console.warn(`${LOG_PREFIX} Error syncing ${position.id}:`, err)
       }
@@ -6755,19 +6750,34 @@ export async function syncLiveFromPseudo(
     })
     if (slotMatches.length === 0) return
 
-    // Prefer live positions whose setKey/parentSetKey matches this pseudo's
-    // owning Set. Only fall back to the unscoped slot matches when NONE of
-    // them carry a setKey we can compare against (legacy positions written
+    // Prefer live positions whose setKey/parentSetKey/accumulatedSetKeys
+    // match this pseudo's owning Set. Accumulated live positions can carry
+    // multiple Base/trailing/axis Sets; every owning Set must be allowed to
+    // advance its trailing ratchet and rebuild the correct control orders.
+    // Only fall back to the unscoped slot matches when NONE of them carry a
+    // set key we can compare against (legacy positions written
     // before setKey propagation) or when the pseudo itself has no set id —
     // in those cases symbol+side is the best signal available, preserving
     // backward-compatible behaviour without silently dropping the sync.
     let matches = slotMatches
     if (pseudoSetKey) {
       const scoped = slotMatches.filter((p: any) => {
-        const liveKey = String(p.setKey || p.parentSetKey || "").trim()
-        return liveKey === pseudoSetKey
+        const liveKeys = new Set<string>()
+        for (const key of [p.setKey, p.parentSetKey]) {
+          const normalized = String(key || "").trim()
+          if (normalized) liveKeys.add(normalized)
+        }
+        const accumulated = Array.isArray(p.accumulatedSetKeys) ? p.accumulatedSetKeys : []
+        for (const key of accumulated) {
+          const normalized = String(key || "").trim()
+          if (normalized) liveKeys.add(normalized)
+        }
+        return liveKeys.has(pseudoSetKey)
       })
-      const anyLiveKeyed = slotMatches.some((p: any) => String(p.setKey || p.parentSetKey || "").trim().length > 0)
+      const anyLiveKeyed = slotMatches.some((p: any) => {
+        if (String(p.setKey || p.parentSetKey || "").trim().length > 0) return true
+        return Array.isArray(p.accumulatedSetKeys) && p.accumulatedSetKeys.some((key: any) => String(key || "").trim().length > 0)
+      })
       if (scoped.length > 0) {
         matches = scoped
       } else if (anyLiveKeyed) {

@@ -102,7 +102,7 @@ export function CreateConfigurationSetDialog({
   const [baseSettings, setBaseSettings] = useState<BaseSettings>({
     trailingEnabled: true,
     blockEnabled: true,
-    dcaEnabled: true,
+    dcaEnabled: false,
   })
 
   // Evaluation settings
@@ -148,7 +148,7 @@ export function CreateConfigurationSetDialog({
         setBaseSettings({
           trailingEnabled: settings.trailingEnabled !== false,
           blockEnabled: settings.blockEnabled !== false,
-          dcaEnabled: settings.dcaEnabled !== false,
+          dcaEnabled: settings.dcaEnabled === true,
         })
       }
     } catch (error) {

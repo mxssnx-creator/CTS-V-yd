@@ -136,12 +136,9 @@ export interface StrategySet {
    * 0 means "axis not active for this Set" — we still emit it so consumers
    * can dimensionalise stats by axis without re-deriving from ctx.
    *
-   * Block + DCA Sets are **independent of these axes** (they fire on
-   * `continuousCount >= 1` and `prevLosses >= 1` respectively, which
-   * are intrinsic to the variant gates, not on a tagged window). Their
-   * axisWindows are still emitted (with `prev`/`pause` populated from
-   * ctx, `cont`/`last` left at 0) so the dashboard's per-variant
-   * counter blocks can roll up cleanly without special-casing.
+   * DCA Sets are independent per parent Set and are NOT position-count
+   * axis Sets. They therefore leave axisWindows at zero/undefined so the
+   * pos-count fan-out cannot multiply or retag DCA exposure.
    */
   axisWindows?: {
     prev:  number
@@ -779,6 +776,10 @@ export class StrategyCoordinator {
     pruneStrategy: "hybrid",
   }
 
+  private strategyMainAxisSetsCeiling = 50
+  private strategyRealSetsSafetyCeiling = 100
+  private strategyLiveSetsCeiling = 90
+
   /**
    * Per-cycle cached coordination settings (axes + variants toggles).
    * The coordinator loads this from connection settings on each flow and
@@ -992,7 +993,10 @@ export class StrategyCoordinator {
   // warmup cycles caused OOM kills before health probes could complete.
   // Scale with symbol count: 1 symbol → 600 slots; 10 symbols → 2000 slots.
   // Each slot ~2-5 KB → 600 slots ≈ 1.2-3 MB (was 16-40 MB at 8000).
-  private static readonly _AXIS_LRU_MAX = 2_000
+  private static readonly _AXIS_LRU_MAX = (() => {
+    const raw = Number(process.env.STRATEGY_AXIS_LRU_MAX ?? "")
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2_000
+  })()
   private static readonly _axisLruMap: Map<string, StrategySet> = new Map()
   private static _axisLruGet(key: string): StrategySet | undefined {
     const hit = StrategyCoordinator._axisLruMap.get(key)
@@ -1269,6 +1273,24 @@ export class StrategyCoordinator {
       }
       this._coordinationSettings.mainEvalPosCount = evalCount((s as any).mainEvalPosCount) ?? 15
       this._coordinationSettings.realEvalPosCount = evalCount((s as any).realEvalPosCount) ?? 10
+
+      // ── Strategy pipeline ceilings (Settings → System) ────────────────
+      // These used to be production-only env constants, so the UI could show
+      // `maxRealSets=12000` while the runtime hard-clamped to 100. Load all
+      // strategy ceilings from app/connection settings in the same 5s refresh
+      // path as the PF/DDT gates so production tuning does not require a
+      // redeploy and the System tab reflects the actual enforced limits.
+      const intSetting = (raw: unknown, fallback: number, min: number, max: number): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n <= 0) return fallback
+        return Math.max(min, Math.min(max, Math.floor(n)))
+      }
+      this.config.maxEntriesPerSet = intSetting((s as any).strategyMaxEntriesPerSet, 250, 50, 750)
+      this.strategyMainAxisSetsCeiling = intSetting((s as any).strategyMainAxisSetsCeiling, 50, 10, 50_000)
+      this.strategyRealSetsSafetyCeiling = intSetting((s as any).strategyRealSetsSafetyCeiling, 100, 25, 50_000)
+      this.config.maxRealSets = intSetting((s as any).maxRealSets, this.strategyRealSetsSafetyCeiling, 1, this.strategyRealSetsSafetyCeiling)
+      this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 90, 1, 1_000)
+      this.config.maxLiveSets = this.strategyLiveSetsCeiling
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -2421,6 +2443,7 @@ export class StrategyCoordinator {
                 avgDrawdownTime: built.avgDrawdownTime,
                 avgConfidence:   built.avgConfidence,
                 entryCount:      built.entryCount,
+                trailingProfile: built.trailingProfile,
               }
               nextFpCache[fingerprint] = JSON.stringify(slimDelta)
               StrategyCoordinator._fpLruSet(fingerprint, built)
@@ -2532,7 +2555,7 @@ export class StrategyCoordinator {
       // full Cartesian materialization.
       // Scale with symbol count so multi-symbol dev runs don't OOM.
       // Base: 300 sets per symbol in dev, 50 in prod by default.
-      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING for controlled load tests.
+      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING for controlled load tests (production default: 50).
       // V0_DEV_SYMBOL_COUNT controls the dev symbol count (default 1).
       // At 10 symbols: 10 × 300 = 3000 ceiling (well within 4GB heap with
       // the new per-symbol eviction caps in redis-db).
@@ -2546,7 +2569,10 @@ export class StrategyCoordinator {
       // ≈ 2 on 8 GB. 5000 × 2 = 10000 on the actual 8.6 GB VM.
       const _axGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
-      const MAIN_AXIS_SETS_CEILING = configuredAxisCeiling ?? Math.round(5_000 * _axMemScale)
+      const MAIN_AXIS_SETS_CEILING =
+        configuredAxisCeiling ??
+        this.strategyMainAxisSetsCeiling ??
+        (process.env.NODE_ENV === "production" ? 50 : Math.round(5_000 * _axMemScale))
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -2907,12 +2933,12 @@ export class StrategyCoordinator {
       const workingSets = realSets
 
       const client = getRedisClient()
-      // PERFORMANCE: previous implementation looped serially with one GET
-      // per set followed by 3 sequential writes per surviving set — at N
-      // Real Sets per symbol per cycle that was 4N round-trips on the
-      // hot path. Now: (1) fan out all dedup GETs into a single Promise.all,
-      // (2) batch the 3 writes per surviving set into one Promise.all,
-      // collapsing per-set latency to one RTT window each.
+      // PERFORMANCE / CORRECTNESS: pseudo-position dedup is an atomic Redis
+      // claim per Set. A separate GET pre-check allowed concurrent REAL-stage
+      // creators to observe an empty mapping and both create positions. We now
+      // claim `pseudo_position_set_mapping:{conn}:{setKey}` with SET NX EX,
+      // create only when that claim succeeds, and release the claim if the
+      // follow-up position write fails so a later cycle can retry.
 
       // Pre-compute every set's deterministic identifiers once.
       // (workingSets == realSets in prod; capped top-N by PF in dev.)
@@ -2922,20 +2948,25 @@ export class StrategyCoordinator {
         return { set, setKey, existingKey }
       })
 
-      // Phase 1 — parallel dedup check (N GETs in one batch).
-      const existing = await Promise.all(
-        setMeta.map((m) => getSettings(m.existingKey).catch(() => null))
-      )
+      const toRedisHash = (value: Record<string, any>): Record<string, string> => {
+        const out: Record<string, string> = {}
+        for (const [key, fieldValue] of Object.entries(value)) {
+          if (fieldValue === undefined || fieldValue === null) continue
+          out[key] = typeof fieldValue === "object" ? JSON.stringify(fieldValue) : String(fieldValue)
+        }
+        return out
+      }
 
-      // Phase 2 �� for sets that need creation, fan out the 3 writes per set.
+      // Atomic claims are intentionally long-lived: the mapping is the
+      // idempotency record for this Set, not just a short mutex. TTL bounds stale
+      // claims if a process dies after SET NX but before the position hash lands.
+      const CLAIM_TTL_SECONDS = 7 * 24 * 60 * 60
       const createdAtIso = new Date().toISOString()
       const nowMs = Date.now()
       const writeBatches: Promise<any>[] = []
       let createdCount = 0
 
-      for (let i = 0; i < setMeta.length; i++) {
-        if (existing[i]) continue
-        const { set, setKey, existingKey } = setMeta[i]
+      for (const { set, setKey, existingKey } of setMeta) {
         try {
           const avgPF       = set.avgProfitFactor || 1
           const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
@@ -2964,23 +2995,42 @@ export class StrategyCoordinator {
             confidence: set.avgConfidence || 0,
           }
 
-          // 3 writes per set, executed concurrently (one RTT window).
-          writeBatches.push(
-            Promise.all([
-              setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos),
-              client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id),
-              setSettings(existingKey, { posId: pseudoPos.id, createdAt: nowMs }),
-            ]).catch((err) => {
-              console.warn(`[StrategyFlow] Failed to create pseudo position for set ${setKey}:`, err)
-            })
-          )
-          createdCount++
+          const mappingValue = (status: "claimed" | "created") => JSON.stringify({
+            posId: pseudoPos.id,
+            createdAt: nowMs,
+            status,
+            set_id: setKey,
+            config_set_key: setKey,
+            source_set_key: setKey,
+          })
+          const claimed = await client.set(existingKey, mappingValue("claimed"), { NX: true, EX: CLAIM_TTL_SECONDS }).catch(() => null)
+          if (claimed !== "OK") continue
+
+          writeBatches.push((async () => {
+            try {
+              const pipeline = client.pipeline()
+              pipeline.hset(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, toRedisHash(pseudoPos))
+              pipeline.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id)
+              pipeline.set(existingKey, mappingValue("created"), { XX: true, EX: CLAIM_TTL_SECONDS })
+              const results = await pipeline.exec()
+              const failed = results.some((r: any) => r instanceof Error || (Array.isArray(r) && r[0]))
+              if (failed) throw new Error("pseudo-position pipeline returned an error")
+              createdCount++
+            } catch (err) {
+              await Promise.allSettled([
+                client.del(existingKey),
+                client.del(`pseudo_position:${this.connectionId}:${pseudoPos.id}`),
+                client.srem(`pseudo_positions:${this.connectionId}`, pseudoPos.id),
+              ])
+              console.warn(`[StrategyFlow] Failed to create pseudo position for set ${setKey}; released claim for retry:`, err)
+            }
+          })())
         } catch (err) {
           console.warn(`[StrategyFlow] Failed to prep pseudo position for set ${setKey}:`, err)
         }
       }
 
-      // Final fan-in — all surviving sets' writes execute together.
+      // Final fan-in — all successful claims' related writes execute together.
       if (writeBatches.length > 0) {
         await Promise.all(writeBatches)
       }
@@ -3441,6 +3491,12 @@ export class StrategyCoordinator {
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
 
+    // Real-stage related-created fan-out is the number of Sets materialized
+    // inside Real beyond the upstream PF-eligible Main input. It is intentionally
+    // independent from the final passed-output count, because PF/DDT, hedge-net,
+    // and caps can still reduce the output after fan-out.
+    let realStageRelatedCreated = 0
+
     try {
       const activePositionBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
         symbol,
@@ -3449,6 +3505,7 @@ export class StrategyCoordinator {
         coordIndex,
       )
       if (activePositionBlockOverlays.length > 0) {
+        realStageRelatedCreated += activePositionBlockOverlays.length
         realPostHedge = realPostHedge
           .concat(activePositionBlockOverlays)
           .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
@@ -3513,7 +3570,7 @@ export class StrategyCoordinator {
     // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
     // candidates for the live dispatch to find qualifying PF-positive sets.
-    // Scale with dev symbol count: 60 real sets per symbol in dev, 100 in prod.
+    // Scale with dev symbol count: 60 real sets per symbol in dev, production default: 100.
     const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_SAFETY_CEILING ?? "")
     const configuredRealCeiling =
       Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
@@ -3522,7 +3579,10 @@ export class StrategyCoordinator {
     // Default scales with VM RAM just like the axis ceiling.
     const _rsGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
     const _rsMemScale = _rsGl ? Math.max(1, _rsGl.heapMB / 2_048) : 1
-    const REAL_SETS_SAFETY_CEILING = configuredRealCeiling ?? Math.round(5_000 * _rsMemScale)
+    const REAL_SETS_SAFETY_CEILING =
+      configuredRealCeiling ??
+      this.strategyRealSetsSafetyCeiling ??
+      (process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale))
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at
@@ -3778,10 +3838,17 @@ export class StrategyCoordinator {
     })
 
     // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
-    // pre-gated sets). Used for correct passRatioReal and evaluated counters.
-    // After the merged pos-gate + PF/DDT pass, `realQualifying` is the survivor list;
-    // `skippedRealLowPos` is the count of pos-gated rejects. PF-eligible = total - pos-gated.
+    // pre-gated sets). After the merged pos-gate + PF/DDT pass, `realQualifying`
+    // is the survivor list; `skippedRealLowPos` is the count of pos-gated rejects.
+    // PF-eligible = total - pos-gated.
     const mainPFEligible = mainSets.length - skippedRealLowPos
+
+    // Real can fan out additional related/axis-created outputs beyond the PF-eligible
+    // Main inputs. Use a denominator that includes both terms so pass-rate and
+    // failure metrics never go negative when Real outputs exceed Main inputs.
+    const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)
+    const realTotalEvaluated = mainPFEligible + realRelatedCreated
+    const realEvaluatedAfterFanOut = realTotalEvaluated
 
     // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
@@ -3805,8 +3872,11 @@ export class StrategyCoordinator {
       const realAvgConf      = n > 0 ? _sumConf / n : 0
       const realEntriesTotal = _sumEC
       const realAvgPosPerSet = n > 0 ? _sumEC   / n : 0
-      // passRatioReal = fraction of ELIGIBLE Main Sets that passed into Real.
-      const passRatioReal = mainPFEligible > 0 ? n / mainPFEligible : 0
+      // passRatioReal = fraction of Real evaluated work that passed into Real.
+      // Denominator includes both PF-eligible Main inputs and Real related/axis
+      // fan-out outputs, keeping the ratio bounded when fan-out creates more
+      // Real Sets than the original Main input count.
+      const passRatioReal = realTotalEvaluated > 0 ? n / realTotalEvaluated : 0
       // Average entryCount per Real Set ��� identical to realAvgPosPerSet.
       // The previous formula used Math.max(1, entryCount||1) which biased
       // Sets with entryCount=0 upward. Reuse the already-correct value.
@@ -3883,9 +3953,11 @@ export class StrategyCoordinator {
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
           avg_pos_eval_real:  String(realAvgPosEval.toFixed(4)),
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
-          // evaluated = Sets that entered the PF/DDT gate (not pre-gated by pos-count).
-          // Using mainSets.length inflates this by the full axis fan-out.
-          evaluated:          String(mainPFEligible),
+          // evaluated = public Real denominator after fan-out; separate upstream
+          // input remains in strategies_active as {symbol}:real:input.
+          // evaluated = PF-eligible Main inputs plus Real related/axis-created outputs;
+          // separate upstream input remains in strategies_active as {symbol}:real:input.
+          evaluated:          String(realEvaluatedAfterFanOut),
           passed_sets:        String(realSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
@@ -3917,7 +3989,7 @@ export class StrategyCoordinator {
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
           [`s:${symbol}:passed`]:     String(realSets.length),
-          [`s:${symbol}:evaluated`]:  String(mainPFEligible),
+          [`s:${symbol}:evaluated`]:  String(realTotalEvaluated),
           [`s:${symbol}:apf`]:        String(realAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(realAvgDDT)),
           [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
@@ -3931,7 +4003,7 @@ export class StrategyCoordinator {
         // Overwriting them with Real's realSets.length would corrupt MAIN's
         // pass statistics and make passed_sets > evaluated impossible to read.
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
-        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
+        client.set(`strategies:${this.connectionId}:real:evaluated`, String(realTotalEvaluated)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
         client.expire(`strategies:${this.connectionId}:real:count`, 86400),
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
@@ -3946,19 +4018,22 @@ export class StrategyCoordinator {
       // real:sets persistence path and the reader at createLiveSets uses getSettings()
       // which resolves the settings:-prefixed path correctly.
 
-      // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
-      // strategies_real_evaluated = Main Sets that entered REAL (input count).
-      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
-      if (mainPFEligible > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainPFEligible))
-
       // strategies_real_related_created = Real Sets created via axis/variant
       // fan-out BEYOND the Main Sets that entered (mirrors the Main stage's
       // `strategies_main_related_created = mainSets.length - reused`). This is
-      // the "additionally created" term the dashboard's Real Eval% funnel needs
-      // for its denominator: Real% = real_total / (real_evaluated + real_related_created).
-      // Without it the Real funnel had no fan-out term and read inconsistently
-      // vs. Main. max(0, …) because Real can also net-filter below the input.
-      const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)
+      // the "additionally created" term the dashboard can display alongside the
+      // Real evaluated pool. `strategies_real_evaluated` already includes this
+      // fan-out term so Real pass denominators stay consistent across Redis/detail
+      // fields. max(0, …) because Real can also net-filter below the input.
+      // strategies_real_total = cumulative Sets PROMOTED by REAL (passed output count).
+      // strategies_real_evaluated = every Real Set considered after current-cycle
+      // fan-out (upstream PF-eligible Main input + Real related-created fan-out).
+      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
+      if (realTotalEvaluated > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realTotalEvaluated))
+
+      // strategies_real_related_created = Real Sets created via axis/variant
+      // fan-out BEYOND the upstream Main PF-eligible input. max(0, …) because
+      // Real can also net-filter below the input.
       if (realRelatedCreated > 0) {
         writes.push(client.hincrby(redisKey, "strategies_real_related_created", realRelatedCreated))
       }
@@ -3972,10 +4047,14 @@ export class StrategyCoordinator {
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
           [`${symbol}:real`]:           String(realSets.length),
-          // real:evaluated = Main Sets that entered PF evaluation (excludes
-          // pos-count pre-gated Sets). Cross-symbol sum in stats route will
-          // match stratCounts.real denominator exactly.
-          [`${symbol}:real:evaluated`]: String(mainPFEligible),
+          // real:evaluated = PF-eligible Main inputs plus Real related/axis-created
+          // outputs. Cross-symbol sum in stats route matches the Real pass denominator.
+          [`${symbol}:real:evaluated`]: String(realTotalEvaluated),
+          // real:input = upstream Main Sets that entered Real PF eligibility
+          // before Real's current-cycle related-created fan-out.
+          [`${symbol}:real:input`]: String(mainPFEligible),
+          // real:relatedCreated = Real fan-out created this cycle beyond input.
+          [`${symbol}:real:relatedCreated`]: String(realRelatedCreated),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
@@ -4175,10 +4254,10 @@ export class StrategyCoordinator {
         type: "real",
         symbol,
         timestamp: new Date(),
-        // totalCreated = Sets that entered PF evaluation (axis fan-out excluded from denominator).
-        totalCreated: mainPFEligible,
+        // totalCreated = PF-eligible Main inputs plus Real related/axis-created outputs.
+        totalCreated: realTotalEvaluated,
         passedEvaluation: realSets.length,
-        failedEvaluation: mainPFEligible - realSets.length,
+        failedEvaluation: Math.max(0, realTotalEvaluated - realSets.length),
         avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgProfitFactor, 0) / realSets.length : 0,
         avgDrawdownTime: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / realSets.length : 0,
       },
@@ -4274,7 +4353,10 @@ export class StrategyCoordinator {
         // can carry two reduce-only control orders (SL + TP), so cap dispatch to
         // 90 positions per cycle (≤180 controls) and leave room for manual orders,
         // in-flight cancels, and venue-side lag.
-        this._cachedExchangeMaxLive = exchange === "bingx" ? 90 : (this.config.maxLiveSets || 500)
+        const configuredLiveCap = this.config.maxLiveSets || this.strategyLiveSetsCeiling || 90
+        this._cachedExchangeMaxLive = exchange === "bingx"
+          ? Math.min(configuredLiveCap, 90)
+          : configuredLiveCap
         this._cachedExchangeMaxLiveAt = now
       }
       maxLive = this._cachedExchangeMaxLive || 500
@@ -5687,6 +5769,13 @@ export class StrategyCoordinator {
     const lP   = Math.min(8,  Math.max(0, ctx.lastPosCount))
     const pP   = Math.min(12, Math.max(0, ctx.prevPosCount))
     const pL   = Math.min(12, Math.max(0, ctx.prevLosses))
+    // DCA is an independent adjust Set for each parent Set, not a
+    // position-count Set. Do not include live/closed position-count context
+    // in its fingerprint or it will be recreated/rebucketed as counts change.
+    if (variant === "dca") {
+      return `${baseSet.setKey}#${variant}#pf=${bPF}#ec=${bEC}`
+    }
+
     const bCtx = `c${cont}/lw${lW}/ll${lL}/lp${lP}/pp${pP}/pl${pL}`
     return `${baseSet.setKey}#${variant}#pf=${bPF}#ec=${bEC}#ctx=${bCtx}`
   }
@@ -5754,14 +5843,16 @@ export class StrategyCoordinator {
     const avgDDT = sumDDT / count
     const avgCnf = sumCnf / count
 
-    const axisWindows = ctx
-      ? {
-          prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
-          last:  Math.max(0, Math.min(4,  ctx.lastPosCount)),
-          cont:  Math.max(0, Math.min(8,  ctx.continuousCount)),
-          pause: Math.max(0, Math.min(8,  ctx.lastPosCount)),
-        }
-      : { prev: 0, last: 0, cont: 0, pause: 0 }
+    const axisWindows = profile.name === "dca"
+      ? { prev: 0, last: 0, cont: 0, pause: 0 }
+      : ctx
+        ? {
+            prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
+            last:  Math.max(0, Math.min(4,  ctx.lastPosCount)),
+            cont:  Math.max(0, Math.min(8,  ctx.continuousCount)),
+            pause: Math.max(0, Math.min(8,  ctx.lastPosCount)),
+          }
+        : { prev: 0, last: 0, cont: 0, pause: 0 }
 
     return {
       setKey:          `${baseSet.setKey}#${profile.name}`,
@@ -5792,6 +5883,12 @@ export class StrategyCoordinator {
         variantSizeMultiplier: repConfig.size,
         variantLeverage:       repConfig.leverage,
       }),
+      // Trailing is a Base-stage range coordination profile. Preserve it on
+      // every Main projection (default and adjust) so cached/recoordinated
+      // Sets, axis fan-out, Real dispatch and live control-order SL anchoring
+      // all resolve the exact same trailing range without relying on a later
+      // mutable cache patch.
+      ...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile }),
       ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }

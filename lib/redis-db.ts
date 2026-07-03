@@ -12,12 +12,22 @@
 const REDIS_DB_VERSION = "3.0.0"
 void REDIS_DB_VERSION
 
+interface SortedSetEntry {
+  score: number
+  member: string
+}
+
+interface SortedSetData {
+  entries: SortedSetEntry[]
+  memberIndex: Map<string, SortedSetEntry>
+}
+
 interface RedisData {
   strings: Map<string, string>
   hashes: Map<string, Record<string, string>>
   sets: Map<string, Set<string>>
   lists: Map<string, string[]>
-  sorted_sets: Map<string, Array<{ score: number; member: string }>>
+  sorted_sets: Map<string, SortedSetData>
   ttl: Map<string, number> // key -> expiration timestamp in ms
   requestStats: {
     lastSecond: number
@@ -90,6 +100,7 @@ export interface RedisClientLike {
   lpos(key: string, value: string): Promise<number | null>
   lpop(key: string): Promise<string | null>
   rpop(key: string): Promise<string | null>
+  eval?(script: string, options: { keys: string[]; arguments: string[] }): Promise<any>
   dbSize(): Promise<number>
   keys(pattern: string): Promise<string[]>
   zadd(key: string, score: number, member: string): Promise<number>
@@ -245,7 +256,7 @@ export class InlineLocalRedis implements RedisClientLike {
       hashes: Array.from(d.hashes.entries()),
       sets: Array.from(d.sets.entries()).map(([k, s]) => [k, Array.from(s)]),
       lists: Array.from(d.lists.entries()),
-      sorted_sets: Array.from(d.sorted_sets.entries()),
+      sorted_sets: Array.from(d.sorted_sets.entries()).map(([k, z]) => [k, z.entries]),
       ttl: Array.from(d.ttl.entries()),
     })
   }
@@ -264,7 +275,12 @@ export class InlineLocalRedis implements RedisClientLike {
       if (Array.isArray(parsed.lists))
         d.lists = new Map(parsed.lists)
       if (Array.isArray(parsed.sorted_sets))
-        d.sorted_sets = new Map(parsed.sorted_sets)
+        d.sorted_sets = new Map(
+          parsed.sorted_sets.map(([k, z]: [string, SortedSetEntry[] | { entries?: SortedSetEntry[] }]) => [
+            k,
+            this.createSortedSet(Array.isArray(z) ? z : z?.entries || []),
+          ]),
+        )
       if (Array.isArray(parsed.ttl))
         d.ttl = new Map(parsed.ttl)
       return true
@@ -560,15 +576,20 @@ export class InlineLocalRedis implements RedisClientLike {
     // that accumulate across hot-reload cycles.
     void this.cleanupVolatileRuntimeState({ reason: "inline-startup" })
 
+    // Keep the once-per-second timer cheap: memoryUsage() and Map.size reads are
+    // O(1), while TTL expiry and eviction each scan key maps. Run those full
+    // scans at a slower cadence during normal operation, but bypass the cadence
+    // immediately when memory crosses the configured heap/RSS thresholds.
+    const FULL_CLEANUP_INTERVAL_MS = 15_000
+    let _lastFullCleanupMs = 0
+
     // Throttle eviction log output: only print once per 60 s when stuck above
     // the threshold so the server log stays readable.
     let _lastEvictionLogMs = 0
 
     const ttlCleanupTimer = setInterval(() => {
       try {
-        // First, clean up expired keys
-        this.cleanupExpiredKeys()
-
+        const now        = Date.now()
         const mem        = process.memoryUsage?.() || { heapUsed: 0, rss: 0 }
         const heapUsedMB = mem.heapUsed / 1024 / 1024
         const rssMB      = mem.rss      / 1024 / 1024
@@ -576,15 +597,22 @@ export class InlineLocalRedis implements RedisClientLike {
                            this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
 
         // Three-tier pressure response:
-        //   NORMAL  → no action
-        //   WARM    → evict + GC
-        //   CRITICAL → volatile cleanup + 3× evict passes + GC + throttle sleep
+        //   NORMAL  → TTL cleanup only on the slower full-scan cadence
+        //   WARM    → immediately evict + GC when heap/RSS/key pressure is high
+        //   CRITICAL → immediately volatile cleanup + 3× evict passes + GC
         const isCritical = rssMB > MEM.rssHardMB
         const isWarm     = isCritical || heapUsedMB > MEM.heapMB || rssMB > MEM.rssSoftMB || totalKeys > MEM.maxKeys
+        const shouldRunFullCleanup = isWarm || now - _lastFullCleanupMs >= FULL_CLEANUP_INTERVAL_MS
+
+        if (!shouldRunFullCleanup) return
+        _lastFullCleanupMs = now
+
+        // Expired-key cleanup scans the TTL map, so avoid doing it every second
+        // unless pressure requires immediate cleanup.
+        this.cleanupExpiredKeys()
 
         if (!isWarm) return
 
-        const now = Date.now()
         if (now - _lastEvictionLogMs > 60_000) {
           _lastEvictionLogMs = now
           const reason = isCritical
@@ -594,7 +622,10 @@ export class InlineLocalRedis implements RedisClientLike {
               : heapUsedMB > MEM.heapMB
                 ? `Heap=${heapUsedMB.toFixed(0)}MB >${MEM.heapMB}MB`
                 : `Keys=${totalKeys} >${MEM.maxKeys}`
-          console.log(`[v0] [Redis Memory] ${reason} — evicting. Families: ${this.describeKeyFamilies()}`)
+          // describeKeyFamilies() performs full key-family scans; only pay that
+          // cost when a log line will actually be emitted.
+          const families = this.describeKeyFamilies()
+          console.log(`[v0] [Redis Memory] ${reason} — evicting. Families: ${families}`)
         }
 
         if (isCritical) {
@@ -644,7 +675,7 @@ export class InlineLocalRedis implements RedisClientLike {
         for (const item of l) bytes += (item?.length ?? 0) + 16
         bump(k, bytes)
       }
-      for (const [k, z] of this.data.sorted_sets.entries()) bump(k, z.length * 64)
+      for (const [k, z] of this.data.sorted_sets.entries()) bump(k, z.entries.length * 64)
       const top = [...counts.entries()]
         .sort((a, b) => b[1].approxBytes - a[1].approxBytes)
         .slice(0, 8)
@@ -951,12 +982,120 @@ export class InlineLocalRedis implements RedisClientLike {
   }
   
   private deleteKey(key: string): void {
+    this.cleanupSecondaryIndexesForDeletedKey(key)
     this.data.strings.delete(key)
     this.data.hashes.delete(key)
     this.data.sets.delete(key)
     this.data.lists.delete(key)
     this.data.sorted_sets.delete(key)
     this.data.ttl?.delete(key)
+  }
+
+  private cleanupSecondaryIndexesForDeletedKey(key: string): void {
+    const removeFromConnectionIndexes = (prefix: string, id: string) => {
+      for (const [setKey, members] of this.data.sets.entries()) {
+        if (setKey.startsWith(prefix)) {
+          members.delete(id)
+          if (members.size === 0) this.data.sets.delete(setKey)
+        }
+      }
+    }
+
+    if (key.startsWith("position:")) {
+      const id = key.slice("position:".length)
+      this.data.sets.get("idx:positions")?.delete(id)
+      removeFromConnectionIndexes("idx:positions:connection:", id)
+    } else if (key.startsWith("trade:")) {
+      const id = key.slice("trade:".length)
+      this.data.sets.get("idx:trades")?.delete(id)
+      removeFromConnectionIndexes("idx:trades:connection:", id)
+    } else if (key.startsWith("indication:")) {
+      const id = key.slice("indication:".length)
+      this.data.sets.get("idx:indications")?.delete(id)
+    } else if (key.startsWith("strategy:")) {
+      const id = key.slice("strategy:".length)
+      this.data.sets.get("idx:strategies")?.delete(id)
+    }
+  }
+
+  private compareSortedSetEntries(a: SortedSetEntry, b: SortedSetEntry): number {
+    return a.score - b.score || a.member.localeCompare(b.member)
+  }
+
+  private createSortedSet(entries: SortedSetEntry[] = []): SortedSetData {
+    const memberIndex = new Map<string, SortedSetEntry>()
+    const sortedEntries: SortedSetEntry[] = []
+
+    for (const entry of entries) {
+      if (!entry || typeof entry.member !== "string") continue
+      const normalized = { score: Number(entry.score), member: entry.member }
+      if (!Number.isFinite(normalized.score)) continue
+      memberIndex.set(normalized.member, normalized)
+    }
+
+    sortedEntries.push(...memberIndex.values())
+    sortedEntries.sort((a, b) => this.compareSortedSetEntries(a, b))
+    return { entries: sortedEntries, memberIndex }
+  }
+
+  private getSortedSet(key: string): SortedSetData | undefined {
+    const zset = this.data.sorted_sets.get(key)
+    if (!zset) return undefined
+
+    // Tolerate in-memory data created by older module versions during hot reload.
+    if (Array.isArray(zset)) {
+      const migrated = this.createSortedSet(zset)
+      this.data.sorted_sets.set(key, migrated)
+      return migrated
+    }
+
+    if (!zset.memberIndex) {
+      const rebuilt = this.createSortedSet(zset.entries || [])
+      this.data.sorted_sets.set(key, rebuilt)
+      return rebuilt
+    }
+
+    return zset
+  }
+
+  private lowerBoundByScore(entries: SortedSetEntry[], score: number): number {
+    let low = 0
+    let high = entries.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (entries[mid].score < score) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+
+  private upperBoundByScore(entries: SortedSetEntry[], score: number): number {
+    let low = 0
+    let high = entries.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (entries[mid].score <= score) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+
+  private insertionIndex(entries: SortedSetEntry[], entry: SortedSetEntry): number {
+    let low = 0
+    let high = entries.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (this.compareSortedSetEntries(entries[mid], entry) < 0) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+
+  private parseSortedSetScore(value: number | string, fallbackInfinity: number): number {
+    if (value === "-inf") return Number.NEGATIVE_INFINITY
+    if (value === "+inf") return Number.POSITIVE_INFINITY
+    const parsed = Number(value)
+    return Number.isNaN(parsed) ? fallbackInfinity : parsed
   }
   
   private setKeyTTL(key: string, seconds: number): void {
@@ -1449,68 +1588,81 @@ export class InlineLocalRedis implements RedisClientLike {
   }
 
   async zadd(key: string, score: number, member: string): Promise<number> {
-    const set = this.data.sorted_sets.get(key) || []
-    const existingIndex = set.findIndex((entry) => entry.member === member)
-    if (existingIndex >= 0) {
-      set[existingIndex] = { score, member }
-      this.data.sorted_sets.set(key, set.sort((a, b) => a.score - b.score))
+    const zset = this.getSortedSet(key) || this.createSortedSet()
+    const existing = zset.memberIndex.get(member)
+    const entry = { score, member }
+
+    if (existing) {
+      const existingIndex = this.insertionIndex(zset.entries, existing)
+      if (zset.entries[existingIndex]?.member === member) {
+        zset.entries.splice(existingIndex, 1)
+      }
+      zset.memberIndex.set(member, entry)
+      zset.entries.splice(this.insertionIndex(zset.entries, entry), 0, entry)
+      this.data.sorted_sets.set(key, zset)
       return 0
     }
-    set.push({ score, member })
-    this.data.sorted_sets.set(key, set.sort((a, b) => a.score - b.score))
+
+    zset.memberIndex.set(member, entry)
+    zset.entries.splice(this.insertionIndex(zset.entries, entry), 0, entry)
+    this.data.sorted_sets.set(key, zset)
     return 1
   }
 
   async zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]> {
     if (this.isExpired(key)) return []
-    const set = this.data.sorted_sets.get(key) || []
-    const minValue = min === "-inf" ? Number.NEGATIVE_INFINITY : Number(min)
-    const maxValue = max === "+inf" ? Number.POSITIVE_INFINITY : Number(max)
-    return set.filter((entry) => entry.score >= minValue && entry.score <= maxValue).map((entry) => entry.member)
+    const entries = this.getSortedSet(key)?.entries || []
+    const minValue = this.parseSortedSetScore(min, Number.NEGATIVE_INFINITY)
+    const maxValue = this.parseSortedSetScore(max, Number.POSITIVE_INFINITY)
+    const start = this.lowerBoundByScore(entries, minValue)
+    const end = this.upperBoundByScore(entries, maxValue)
+    return entries.slice(start, end).map((entry) => entry.member)
   }
 
   async zremrangebyscore(key: string, min: number | string, max: number | string): Promise<number> {
-    const set = this.data.sorted_sets.get(key) || []
-    const minValue = min === "-inf" ? Number.NEGATIVE_INFINITY : Number(min)
-    const maxValue = max === "+inf" ? Number.POSITIVE_INFINITY : Number(max)
-    const before = set.length
-    const remaining = set.filter((entry) => entry.score < minValue || entry.score > maxValue)
-    if (remaining.length === 0) this.data.sorted_sets.delete(key)
-    else this.data.sorted_sets.set(key, remaining)
-    return before - remaining.length
+    const zset = this.getSortedSet(key)
+    if (!zset) return 0
+    const minValue = this.parseSortedSetScore(min, Number.NEGATIVE_INFINITY)
+    const maxValue = this.parseSortedSetScore(max, Number.POSITIVE_INFINITY)
+    const start = this.lowerBoundByScore(zset.entries, minValue)
+    const end = this.upperBoundByScore(zset.entries, maxValue)
+    const removed = zset.entries.slice(start, end)
+    if (removed.length === 0) return 0
+    for (const entry of removed) zset.memberIndex.delete(entry.member)
+    zset.entries.splice(start, removed.length)
+    if (zset.entries.length === 0) this.data.sorted_sets.delete(key)
+    else this.data.sorted_sets.set(key, zset)
+    return removed.length
   }
 
   /** Return members in ascending score order between indices start and stop (inclusive). */
   async zrange(key: string, start: number, stop: number): Promise<string[]> {
     if (this.isExpired(key)) return []
-    const set = this.data.sorted_sets.get(key) || []
-    const sorted = [...set].sort((a, b) => a.score - b.score)
-    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
-    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+    const entries = this.getSortedSet(key)?.entries || []
+    const end = stop < 0 ? entries.length + stop + 1 : stop + 1
+    return entries.slice(start < 0 ? Math.max(0, entries.length + start) : start, end).map(e => e.member)
   }
 
   /** Return members in descending score order between indices start and stop (inclusive). */
   async zrevrange(key: string, start: number, stop: number): Promise<string[]> {
     if (this.isExpired(key)) return []
-    const set = this.data.sorted_sets.get(key) || []
-    const sorted = [...set].sort((a, b) => b.score - a.score)
-    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
-    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+    const entries = this.getSortedSet(key)?.entries || []
+    const reversed = [...entries].reverse()
+    const end = stop < 0 ? reversed.length + stop + 1 : stop + 1
+    return reversed.slice(start < 0 ? Math.max(0, reversed.length + start) : start, end).map(e => e.member)
   }
 
   /** Return the score of a member in a sorted set. */
   async zscore(key: string, member: string): Promise<string | null> {
     if (this.isExpired(key)) return null
-    const set = this.data.sorted_sets.get(key)
-    if (!set) return null
-    const entry = set.find(e => e.member === member)
+    const entry = this.getSortedSet(key)?.memberIndex.get(member)
     return entry !== undefined ? String(entry.score) : null
   }
 
   /** Return the cardinality (number of members) of a sorted set. */
   async zcard(key: string): Promise<number> {
     if (this.isExpired(key)) return 0
-    return (this.data.sorted_sets.get(key) || []).length
+    return (this.getSortedSet(key)?.entries || []).length
   }
 
   async trackDatabaseOperation(limit: number): Promise<{ current: number; limit: number; exceeded: boolean }> {
@@ -1719,6 +1871,7 @@ class NodeRedisClientAdapter implements RedisClientLike {
   async lpos(key: string, value: string) { return await (await this.c()).lPos(key, value) }
   async lpop(key: string) { return await (await this.c()).lPop(key) }
   async rpop(key: string) { return await (await this.c()).rPop(key) }
+  async eval(script: string, options: { keys: string[]; arguments: string[] }) { return await (await this.c()).eval(script, options) }
   async dbSize() { return await (await this.c()).dbSize() }
   async keys(pattern: string) { return await (await this.c()).keys(pattern) }
   async zadd(key: string, score: number, member: string) { return await (await this.c()).zAdd(key, { score, value: member }) }
@@ -1813,6 +1966,7 @@ class UpstashRestRedisClient implements RedisClientLike {
   async lpos(key: string, value: string) { return await this.command<number | null>(["LPOS", key, value]) }
   async lpop(key: string) { return await this.command<string | null>(["LPOP", key]) }
   async rpop(key: string) { return await this.command<string | null>(["RPOP", key]) }
+  async eval(script: string, options: { keys: string[]; arguments: string[] }) { return await this.command<any>(["EVAL", script, options.keys.length, ...options.keys, ...options.arguments]) }
   async dbSize() { return await this.command<number>(["DBSIZE"]) }
   async keys(pattern: string) { return await this.command<string[]>(["KEYS", pattern]) }
   async zadd(key: string, score: number, member: string) { return await this.command<number>(["ZADD", key, score, member]) }
@@ -1909,21 +2063,27 @@ export async function ensureCoreRedis(): Promise<void> {
     }
 
     // Load the on-disk snapshot EXACTLY ONCE per process, gated on the global
-    // snapshot flag (not on data-map presence). This runs even when a sync
-    // getter built the empty instance first, and is skipped on hot-reload (the
-    // flag persists on globalThis), so we never overwrite live post-migration
-    // state. Concurrent callers across module scopes share one load promise.
+    // snapshot flag. If a sync getter built the instance and callers already
+    // wrote data before initRedis(), do not reload from disk over those live
+    // writes; mark the snapshot as handled instead. This keeps tests and
+    // pre-init bootstrap code from having settings overwritten by a stale
+    // dev snapshot while still loading snapshots for truly empty instances.
     if (!globalForRedis.__redis_snapshot_loaded) {
-      if (!globalForRedis.__redis_load_promise) {
-        globalForRedis.__redis_load_promise = redisInstance instanceof InlineLocalRedis ? redisInstance
-          .loadFromDisk()
-          .then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
-          .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false }) : Promise.resolve(false).then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
-        globalForRedis.__redis_load_promise.finally(() => {
-          globalForRedis.__redis_load_promise = undefined
-        })
+      const existingKeys = await redisInstance.dbSize().catch(() => 0)
+      if (existingKeys > 0) {
+        globalForRedis.__redis_snapshot_loaded = true
+      } else {
+        if (!globalForRedis.__redis_load_promise) {
+          globalForRedis.__redis_load_promise = redisInstance instanceof InlineLocalRedis ? redisInstance
+            .loadFromDisk()
+            .then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
+            .catch(() => { globalForRedis.__redis_snapshot_loaded = true; return false }) : Promise.resolve(false).then((ok) => { globalForRedis.__redis_snapshot_loaded = true; return ok })
+          globalForRedis.__redis_load_promise.finally(() => {
+            globalForRedis.__redis_load_promise = undefined
+          })
+        }
+        await globalForRedis.__redis_load_promise
       }
-      await globalForRedis.__redis_load_promise
     }
 
     const pong = await redisInstance.ping()
@@ -2289,6 +2449,178 @@ function parseHash(hash: Record<string, string> | null): Record<string, any> | n
   return result
 }
 
+
+const SECONDARY_INDEX_KEYS = {
+  positions: "idx:positions",
+  trades: "idx:trades",
+  indications: "idx:indications",
+  strategies: "idx:strategies",
+} as const
+
+function positionConnectionIndexKey(connectionId: string): string {
+  return `idx:positions:connection:${connectionId}`
+}
+
+function tradeConnectionIndexKey(connectionId: string): string {
+  return `idx:trades:connection:${connectionId}`
+}
+
+function getRecordConnectionId(record: Record<string, any> | null | undefined): string {
+  return String(record?.connectionId ?? record?.connection_id ?? "").trim()
+}
+
+async function readIndexedHashes(client: RedisClientLike, indexKey: string, keyPrefix: string): Promise<any[]> {
+  const ids = await client.smembers(indexKey).catch(() => [] as string[])
+  if (ids.length === 0) return []
+
+  const hashes = await Promise.all(
+    ids.map((id) => client.hgetall(`${keyPrefix}${id}`).catch(() => ({} as Record<string, string>))),
+  )
+
+  const records: any[] = []
+  const staleIds: string[] = []
+  for (let i = 0; i < ids.length; i++) {
+    const hash = hashes[i]
+    if (!hash || Object.keys(hash).length === 0) {
+      staleIds.push(ids[i])
+      continue
+    }
+    const parsed = parseHash(hash)
+    if (parsed) records.push(parsed)
+  }
+
+  if (staleIds.length > 0) {
+    await client.srem(indexKey, ...staleIds).catch(() => 0)
+  }
+
+  return records
+}
+
+async function updatePositionIndexes(client: RedisClientLike, id: string, position: Record<string, any>): Promise<void> {
+  const key = `position:${id}`
+  const previous = await client.hgetall(key).catch(() => ({} as Record<string, string>))
+  const previousConnectionId = getRecordConnectionId(previous)
+  const nextConnectionId = getRecordConnectionId(position)
+  await client.sadd(SECONDARY_INDEX_KEYS.positions, id)
+  if (previousConnectionId && previousConnectionId !== nextConnectionId) {
+    await client.srem(positionConnectionIndexKey(previousConnectionId), id).catch(() => 0)
+  }
+  if (nextConnectionId) {
+    await client.sadd(positionConnectionIndexKey(nextConnectionId), id)
+  }
+}
+
+async function removePositionIndexes(client: RedisClientLike, id: string): Promise<void> {
+  const existing = await client.hgetall(`position:${id}`).catch(() => ({} as Record<string, string>))
+  const connectionId = getRecordConnectionId(existing)
+  await client.srem(SECONDARY_INDEX_KEYS.positions, id).catch(() => 0)
+  if (connectionId) await client.srem(positionConnectionIndexKey(connectionId), id).catch(() => 0)
+}
+
+async function updateTradeIndexes(client: RedisClientLike, id: string, trade: Record<string, any>): Promise<void> {
+  const key = `trade:${id}`
+  const previous = await client.hgetall(key).catch(() => ({} as Record<string, string>))
+  const previousConnectionId = getRecordConnectionId(previous)
+  const nextConnectionId = getRecordConnectionId(trade)
+  await client.sadd(SECONDARY_INDEX_KEYS.trades, id)
+  if (previousConnectionId && previousConnectionId !== nextConnectionId) {
+    await client.srem(tradeConnectionIndexKey(previousConnectionId), id).catch(() => 0)
+  }
+  if (nextConnectionId) {
+    await client.sadd(tradeConnectionIndexKey(nextConnectionId), id)
+  }
+}
+
+async function removeTradeIndexes(client: RedisClientLike, id: string): Promise<void> {
+  const existing = await client.hgetall(`trade:${id}`).catch(() => ({} as Record<string, string>))
+  const connectionId = getRecordConnectionId(existing)
+  await client.srem(SECONDARY_INDEX_KEYS.trades, id).catch(() => 0)
+  if (connectionId) await client.srem(tradeConnectionIndexKey(connectionId), id).catch(() => 0)
+}
+
+export class DatabaseWriteRateLimitError extends Error {
+  readonly code = "DATABASE_WRITE_RATE_LIMIT_EXCEEDED"
+  readonly operationName: string
+  readonly scope: "second" | "minute"
+  readonly current: number
+  readonly limit: number
+
+  constructor(operationName: string, scope: "second" | "minute", current: number, limit: number) {
+    super(`Database write budget exceeded for ${operationName}: ${current}/${limit} per ${scope}`)
+    this.name = "DatabaseWriteRateLimitError"
+    this.operationName = operationName
+    this.scope = scope
+    this.current = current
+    this.limit = limit
+  }
+}
+
+type DatabaseWriteBudgetOptions = { optional?: boolean }
+type DatabaseWriteBudgetResult = { allowed: boolean; reason?: DatabaseWriteRateLimitError }
+
+const DATABASE_WRITE_LIMIT_LOG_INTERVAL_MS = 60_000
+
+function parseDatabaseLimit(value: unknown): number {
+  const parsed = Number(value ?? 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0
+}
+
+function warnDatabaseWriteBudgetExceeded(error: DatabaseWriteRateLimitError, optional: boolean): void {
+  const globalBudget = globalThis as unknown as { __db_write_budget_last_warn?: Record<string, number> }
+  if (!globalBudget.__db_write_budget_last_warn) globalBudget.__db_write_budget_last_warn = {}
+  const logKey = `${error.operationName}:${error.scope}:${optional ? "optional" : "required"}`
+  const now = Date.now()
+  if (now - (globalBudget.__db_write_budget_last_warn[logKey] || 0) < DATABASE_WRITE_LIMIT_LOG_INTERVAL_MS) return
+  globalBudget.__db_write_budget_last_warn[logKey] = now
+  console.warn(
+    `[v0] [Redis Write Budget] ${optional ? "Skipping optional" : "Blocking required"} write ${error.operationName}: ${error.current}/${error.limit} per ${error.scope}`,
+  )
+}
+
+async function readDatabaseWriteLimits(client: RedisClientLike): Promise<{ perSecond: number; perMinute: number }> {
+  try {
+    const systemSettings = parseHash(await client.hgetall("settings:system")) || {}
+    return {
+      perSecond: parseDatabaseLimit((systemSettings as any).databaseLimitPerSecond),
+      perMinute: parseDatabaseLimit((systemSettings as any).databaseLimitPerMinute),
+    }
+  } catch {
+    return { perSecond: 0, perMinute: 0 }
+  }
+}
+
+function trackDatabaseSecondOperation(limit: number): { current: number; limit: number; exceeded: boolean } {
+  const globalTracker = globalThis as unknown as { __db_ops_second_tracker?: { second: number; count: number } }
+  const currentSecond = Math.floor(Date.now() / 1000)
+  if (!globalTracker.__db_ops_second_tracker || globalTracker.__db_ops_second_tracker.second !== currentSecond) {
+    globalTracker.__db_ops_second_tracker = { second: currentSecond, count: 0 }
+  }
+  globalTracker.__db_ops_second_tracker.count++
+  const current = globalTracker.__db_ops_second_tracker.count
+  return { current, limit, exceeded: limit > 0 && current > limit }
+}
+
+export async function assertDatabaseWriteBudget(
+  operationName: string,
+  options: DatabaseWriteBudgetOptions = {},
+): Promise<DatabaseWriteBudgetResult> {
+  const client = getClient()
+  const { perSecond, perMinute } = await readDatabaseWriteLimits(client)
+
+  const secondResult = trackDatabaseSecondOperation(perSecond)
+  const minuteResult = await client.trackDatabaseOperation(perMinute)
+  const exceeded = secondResult.exceeded
+    ? new DatabaseWriteRateLimitError(operationName, "second", secondResult.current, secondResult.limit)
+    : minuteResult.exceeded
+      ? new DatabaseWriteRateLimitError(operationName, "minute", minuteResult.current, minuteResult.limit)
+      : null
+
+  if (!exceeded) return { allowed: true }
+  warnDatabaseWriteBudgetExceeded(exceeded, !!options.optional)
+  if (options.optional) return { allowed: false, reason: exceeded }
+  throw exceeded
+}
+
 // ========== Connection Operations ==========
 
 export async function getConnection(id: string): Promise<any | null> {
@@ -2447,6 +2779,7 @@ export async function saveConnection(connection: any): Promise<void> {
   await Promise.all([
     client.hset(`connection:${id}`, data),
     client.sadd("connections", id),
+    syncMainEnabledConnectionIndex(client, { ...data, id }),
   ])
   invalidateConnectionsCache()
 }
@@ -2457,6 +2790,7 @@ export async function deleteConnection(id: string): Promise<void> {
   await Promise.all([
     client.del(`connection:${id}`),
     client.srem("connections", id),
+    client.srem("connections:main:enabled", id),
   ])
   invalidateConnectionsCache()
 }
@@ -2801,18 +3135,7 @@ export async function getPosition(id: string): Promise<any | null> {
 export async function getAllPositions(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("position:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const positions: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    positions.push(parseHash(hash))
-  }
-  return positions
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.positions, "position:")
 }
 
 export async function savePosition(position: any): Promise<void> {
@@ -2822,6 +3145,7 @@ export async function savePosition(position: any): Promise<void> {
   if (!id) {
     throw new Error("Position must have an id")
   }
+  await assertDatabaseWriteBudget("savePosition")
 
   // Special-case live positions (keys prefixed with "live:") — the live
   // pipeline uses JSON-string keys and open/closed indices under
@@ -2954,12 +3278,14 @@ export async function savePosition(position: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
 
+  await updatePositionIndexes(client, id, data)
   await client.hset(`position:${id}`, data)
 }
 
 export async function deletePosition(id: string): Promise<void> {
   await initRedis()
   const client = getClient()
+  await removePositionIndexes(client, id)
   await client.del(`position:${id}`)
 }
 
@@ -2975,18 +3301,7 @@ export async function getTrade(id: string): Promise<any | null> {
 export async function getAllTrades(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("trade:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const trades: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    trades.push(parseHash(hash))
-  }
-  return trades
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.trades, "trade:")
 }
 
 export async function saveTrade(trade: any): Promise<void> {
@@ -2996,12 +3311,14 @@ export async function saveTrade(trade: any): Promise<void> {
   if (!id) {
     throw new Error("Trade must have an id")
   }
+  await assertDatabaseWriteBudget("saveTrade")
   
   const data = flattenForHmset({
     ...trade,
     updated_at: new Date().toISOString(),
   })
   
+  await updateTradeIndexes(client, id, data)
   await client.hset(`trade:${id}`, data)
 }
 
@@ -3017,18 +3334,7 @@ export async function getIndication(id: string): Promise<any | null> {
 export async function getAllIndications(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("indication:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const indications: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    indications.push(parseHash(hash))
-  }
-  return indications
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.indications, "indication:")
 }
 
 export async function saveIndication(indication: any): Promise<void> {
@@ -3038,6 +3344,8 @@ export async function saveIndication(indication: any): Promise<void> {
   if (!id) {
     throw new Error("Indication must have an id")
   }
+  const budget = await assertDatabaseWriteBudget("saveIndication", { optional: true })
+  if (!budget.allowed) return
   
   const data = flattenForHmset({
     ...indication,
@@ -3045,6 +3353,7 @@ export async function saveIndication(indication: any): Promise<void> {
   })
   
   const key = `indication:${id}`
+  await client.sadd(SECONDARY_INDEX_KEYS.indications, id)
   await client.hset(key, data)
   // Bound retention: prehistoric/realtime can mint hundreds of thousands
   // of these. Without a TTL the in-process Redis snapshot grows
@@ -3067,18 +3376,7 @@ export async function getStrategy(id: string): Promise<any | null> {
 export async function getAllStrategies(): Promise<any[]> {
   await initRedis()
   const client = getClient()
-  const keys = await client.keys("strategy:*")
-  if (keys.length === 0) return []
-
-  const hashes = await Promise.all(
-    keys.map((k) => client.hgetall(k).catch(() => null)),
-  )
-  const strategies: any[] = []
-  for (const hash of hashes) {
-    if (!hash) continue
-    strategies.push(parseHash(hash))
-  }
-  return strategies
+  return readIndexedHashes(client, SECONDARY_INDEX_KEYS.strategies, "strategy:")
 }
 
 export async function saveStrategy(strategy: any): Promise<void> {
@@ -3088,12 +3386,14 @@ export async function saveStrategy(strategy: any): Promise<void> {
   if (!id) {
     throw new Error("Strategy must have an id")
   }
+  await assertDatabaseWriteBudget("saveStrategy")
   
   const data = flattenForHmset({
     ...strategy,
     updated_at: new Date().toISOString(),
   })
   
+  await client.sadd(SECONDARY_INDEX_KEYS.strategies, id)
   await client.hset(`strategy:${id}`, data)
 }
 
@@ -3132,6 +3432,16 @@ export function isConnectionAssignedToMain(connection: any): boolean {
 
 export function isConnectionMainEnabled(connection: any): boolean {
   return isConnectionAssignedToMain(connection) && isEnabledFlag(connection.is_enabled_dashboard)
+}
+
+async function syncMainEnabledConnectionIndex(client: RedisClientLike, connection: any): Promise<void> {
+  const id = String(connection?.id || "").trim()
+  if (!id) return
+  if (isConnectionMainEnabled(connection)) {
+    await client.sadd("connections:main:enabled", id)
+  } else {
+    await client.srem("connections:main:enabled", id)
+  }
 }
 
 export function isConnectionProcessingEnabled(connection: any): boolean {
@@ -3344,19 +3654,33 @@ export async function getCurrentSiteInstanceId(): Promise<string | null> {
 
 export async function getActiveConnectionsForEngine(): Promise<any[]> {
   const client = getRedisClient()
-  const keys = await client.keys("connection:*")
+  const indexedIds = await client.smembers("connections:main:enabled").catch(() => [] as string[])
   const connections: any[] = []
 
-  for (const key of keys) {
-    if (key.includes(":settings") || key.includes(":state")) continue
-    const data = await client.hgetall(key)
+  if (indexedIds.length > 0) {
+    await Promise.all(indexedIds.map(async (id) => {
+      const data = await client.hgetall(`connection:${id}`).catch(() => ({}))
+      const connection = { id, ...data }
+      if (data && Object.keys(data).length > 0 && isConnectionMainEnabled(connection)) {
+        connections.push(connection)
+      } else {
+        await client.srem("connections:main:enabled", id).catch(() => 0)
+      }
+    }))
+    return connections
+  }
+
+  const ids = await client.smembers("connections").catch(() => [] as string[])
+  for (const id of ids) {
+    const data = await client.hgetall(`connection:${id}`)
     if (data && Object.keys(data).length > 0) {
       const connection = {
-        id: key.replace("connection:", ""),
+        id,
         ...data,
       }
       if (isConnectionMainEnabled(connection)) {
         connections.push(connection)
+        await client.sadd("connections:main:enabled", id).catch(() => 0)
       }
     }
   }
@@ -3404,7 +3728,11 @@ export async function createConnection(data: any): Promise<any> {
       id,
       updated_at: new Date().toISOString(),
     }
-    await client.hset(`connection:${id}`, merged)
+    await Promise.all([
+      client.hset(`connection:${id}`, merged),
+      client.sadd("connections", id),
+      syncMainEnabledConnectionIndex(client, merged),
+    ])
     invalidateConnectionsCache()
     return merged
   }
@@ -3415,7 +3743,11 @@ export async function createConnection(data: any): Promise<any> {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
-  await client.hset(`connection:${id}`, connectionData)
+  await Promise.all([
+    client.hset(`connection:${id}`, connectionData),
+    client.sadd("connections", id),
+    syncMainEnabledConnectionIndex(client, connectionData),
+  ])
   invalidateConnectionsCache()
   return connectionData
 }
@@ -3431,7 +3763,10 @@ export async function updateConnection(id: string, updates: any): Promise<any> {
     ...updates,
     updated_at: new Date().toISOString(),
   }
-  await client.hset(`connection:${id}`, updated)
+  await Promise.all([
+    client.hset(`connection:${id}`, updated),
+    syncMainEnabledConnectionIndex(client, updated),
+  ])
   invalidateConnectionsCache()
   return updated
 }
@@ -3450,6 +3785,7 @@ export async function createPosition(data: any): Promise<any> {
   // 30 days is a reasonable retention window for trade history.
   const POSITION_TTL_SEC = 30 * 24 * 60 * 60
   await Promise.all([
+    updatePositionIndexes(client, id, positionData),
     client.hset(`position:${id}`, positionData),
     client.expire(`position:${id}`, POSITION_TTL_SEC),
     client.sadd("positions:all", id),
@@ -3628,66 +3964,12 @@ export async function verifyRedisHealth(): Promise<{ healthy: boolean; latency: 
 
 export async function getConnectionPositions(connectionId: string): Promise<any[]> {
   const client = getRedisClient()
-  const keys = await client.keys(`position:${connectionId}:*`)
-  const positions: any[] = []
-  
-  for (const key of keys) {
-    const data = await client.hgetall(key)
-    if (data && Object.keys(data).length > 0) {
-      positions.push({
-        id: key.replace(`position:${connectionId}:`, ""),
-        connection_id: connectionId,
-        ...data,
-      })
-    }
-  }
-  
-  // Also check global positions that reference this connection
-  const globalKeys = await client.keys("position:*")
-  for (const key of globalKeys) {
-    if (key.startsWith(`position:${connectionId}:`)) continue // Already processed
-    const data = await client.hgetall(key)
-    if (data && data.connection_id === connectionId) {
-      positions.push({
-        id: key.replace("position:", ""),
-        ...data,
-      })
-    }
-  }
-  
-  return positions
+  return readIndexedHashes(client, positionConnectionIndexKey(connectionId), "position:")
 }
 
 export async function getConnectionTrades(connectionId: string): Promise<any[]> {
   const client = getRedisClient()
-  const keys = await client.keys(`trade:${connectionId}:*`)
-  const trades: any[] = []
-  
-  for (const key of keys) {
-    const data = await client.hgetall(key)
-    if (data && Object.keys(data).length > 0) {
-      trades.push({
-        id: key.replace(`trade:${connectionId}:`, ""),
-        connection_id: connectionId,
-        ...data,
-      })
-    }
-  }
-  
-  // Also check global trades that reference this connection
-  const globalKeys = await client.keys("trade:*")
-  for (const key of globalKeys) {
-    if (key.startsWith(`trade:${connectionId}:`)) continue // Already processed
-    const data = await client.hgetall(key)
-    if (data && data.connection_id === connectionId) {
-      trades.push({
-        id: key.replace("trade:", ""),
-        ...data,
-      })
-    }
-  }
-  
-  return trades
+  return readIndexedHashes(client, tradeConnectionIndexKey(connectionId), "trade:")
 }
 
 export async function getProgressionLogs(connectionId: string, limit: number = 50): Promise<any[]> {
@@ -3717,6 +3999,8 @@ export async function logProgressionEvent(
   metadata?: Record<string, any>
 ): Promise<void> {
   const client = getRedisClient()
+  const budget = await assertDatabaseWriteBudget("logProgressionEvent", { optional: true })
+  if (!budget.allowed) return
   const logsKey = `progression:${connectionId}:logs`
   
   const logEntry = JSON.stringify({
@@ -3743,17 +4027,7 @@ export async function getEnabledConnections(): Promise<any[]> {
 }
 
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
-  const allConnections = await getAllConnections()
-  return allConnections.filter(conn => {
-    // Canonical engine eligibility: assigned to Main Connections and
-    // enabled via is_enabled_dashboard.
-    return isConnectionMainEnabled(conn)
-    // Keep this eligibility in sync with isConnectionReadyForEngine(), which
-    // startEngine() re-checks immediately before acquiring startup locks.
-    // Live-trade intent is deliberately not part of engine-processing
-    // eligibility; it only controls whether live orders may be placed.
-    return isConnectionMainEnabled(conn) && !!conn?.exchange && !!conn?.api_type
-  })
+  return getActiveConnectionsForEngine()
 }
 
 export async function getConnectionsByExchange(exchange: string): Promise<any[]> {
@@ -3776,10 +4050,10 @@ export async function flushAll(): Promise<void> {
   await client.flushDb()
 }
 
-// Cache getRedisStats for 5 s. The underlying `client.keys("*")` is an
-// O(N) scan over the entire keyspace, so hammering it from a polling
-// monitoring dashboard would be a foot-gun. The cached value is plenty
-// fresh for a "connected + key count" display.
+// Cache getRedisStats for 5 s. The key count comes from `client.dbSize()`
+// rather than `client.keys("*")`, so this health/stat path avoids
+// materializing the full key list while still protecting polling dashboards
+// from repeatedly hitting Redis.
 let _redisStatsCache: {
   value: { connected: boolean; memoryUsage: number; keyCount: number; uptime: number }
   ts: number
@@ -3798,11 +4072,11 @@ export async function getRedisStats(): Promise<{
   }
   try {
     const client = getRedisClient()
-    const keys = await client.keys("*")
+    const keyCount = await client.dbSize()
     const value = {
       connected: true,
       memoryUsage: 0, // In-memory implementation doesn't track this
-      keyCount: keys.length,
+      keyCount,
       uptime: Date.now() - (globalThis as any).__redis_start_time || 0,
     }
     _redisStatsCache = { value, ts: now }

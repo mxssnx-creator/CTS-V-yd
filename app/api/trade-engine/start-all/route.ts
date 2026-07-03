@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { initRedis, getAssignedAndEnabledConnections, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
-import { SystemLogger } from "@/lib/system-logger"
 
 async function handleStartAll() {
   try {
@@ -86,23 +85,19 @@ async function handleStartAll() {
           strategyInterval,
           realtimeInterval,
         }
-        setImmediate(() => {
-          coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true }).catch(async (error: unknown) => {
-            console.error(`[START-ALL] Background start failed for ${connection.id}:`, error)
-            await client.set(`engine_is_running:${connection.id}`, "0").catch(() => {})
-            await SystemLogger.logError(error, "api", `Background start-all engine ${connection.id}`).catch(() => {})
-          })
-        })
+        const engineStarted = await coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true })
 
         results.push({
           connectionId: connection.id,
           connectionName: connection.name,
           exchange: connection.exchange,
-          success: true,
-          message: "Engine start dispatched",
+          success: engineStarted,
+          message: engineStarted ? "Engine started" : "Engine start skipped by coordinator",
         })
 
-        successCount++
+        if (engineStarted) {
+          successCount++
+        }
       } catch (error) {
         results.push({
           connectionId: connection.id,

@@ -32,7 +32,6 @@ import { getRedisClient, initRedis, getSettings, getAppSettings, setSettings } f
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { emitIndicationUpdate } from "@/lib/broadcast-helpers"
 import {
-  compact,
   compactionCeiling,
   loadCompactionConfig,
   type CompactionConfig,
@@ -71,6 +70,83 @@ const DEFAULT_POSITION_LIMITS = {
 
 // Indication timeout after valid evaluation (100ms - 3000ms)
 const DEFAULT_INDICATION_TIMEOUT_MS = 1000
+
+const DEFAULT_OUTCOME_ATTACHMENT_CONCURRENCY = 20
+
+const RECORD_OUTCOME_SAMPLE_SCRIPT = `
+local sampleKey = KEYS[1]
+local statsKey = KEYS[2]
+local sampleJson = ARGV[1]
+local sampleProfit = tonumber(ARGV[2]) or 0
+local sampleLoss = tonumber(ARGV[3]) or 0
+local cap = tonumber(ARGV[4]) or 1000
+
+redis.call("RPUSH", sampleKey, sampleJson)
+local len = redis.call("LLEN", sampleKey)
+local overflow = len - cap
+local evictedProfit = 0
+local evictedLoss = 0
+local evictedCount = 0
+
+if overflow > 0 then
+  local evicted = redis.call("LRANGE", sampleKey, 0, overflow - 1)
+  for _, raw in ipairs(evicted) do
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+      evictedProfit = evictedProfit + math.max(tonumber(decoded["profit"]) or 0, 0)
+      evictedLoss = evictedLoss + math.max(tonumber(decoded["loss"]) or 0, 0)
+      evictedCount = evictedCount + 1
+    end
+  end
+  redis.call("LTRIM", sampleKey, -cap, -1)
+end
+
+local grossProfit = tonumber(redis.call("HGET", statsKey, "grossProfit"))
+local grossLoss = tonumber(redis.call("HGET", statsKey, "grossLoss"))
+local count = tonumber(redis.call("HGET", statsKey, "count"))
+
+if grossProfit == nil or grossLoss == nil or count == nil or grossProfit < 0 or grossLoss < 0 or count < 0 then
+  grossProfit = 0
+  grossLoss = 0
+  count = 0
+  local samples = redis.call("LRANGE", sampleKey, 0, -1)
+  for _, raw in ipairs(samples) do
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+      grossProfit = grossProfit + math.max(tonumber(decoded["profit"]) or 0, 0)
+      grossLoss = grossLoss + math.max(tonumber(decoded["loss"]) or 0, 0)
+      count = count + 1
+    end
+  end
+else
+  grossProfit = math.max(grossProfit + sampleProfit - evictedProfit, 0)
+  grossLoss = math.max(grossLoss + sampleLoss - evictedLoss, 0)
+  count = math.max(count + 1 - evictedCount, 0)
+end
+
+redis.call("HSET", statsKey, "grossProfit", tostring(grossProfit), "grossLoss", tostring(grossLoss), "count", tostring(count))
+return { tostring(grossProfit), tostring(grossLoss), tostring(count) }
+`
+
+type IndicationCandidate = { setKey: string; indication: any; config: any }
+
+async function mapLimit<T, R>(items: T[], limit: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) return []
+
+  const concurrency = Math.max(1, Math.min(Math.floor(limit) || 1, items.length))
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex++
+      results[index] = await mapper(items[index], index)
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  return results
+}
 
 export interface IndicationSetLimits {
   direction: number
@@ -123,8 +199,8 @@ export class IndicationSetsProcessor {
   /**
    * Per-type compaction config, resolved once per ~5s via the cached
    * `loadCompactionConfig` helper. Keeping a per-processor copy lets the
-   * hot-path `saveIndicationToSet` call `compact()` without touching the
-   * settings hash on every fill.
+   * hot-path append helper enforce compaction without touching the settings
+   * hash on every fill.
    */
   private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
   // Dev mode uses a minimal range grid so the 4-GB v0 sandbox VM can run the
@@ -149,10 +225,54 @@ export class IndicationSetsProcessor {
   private outcomeStopLossPct = 0.01
   private outcomeTakerFeePct = 0.001
   private outcomeSlippagePct = 0.0006
+  private outcomeAttachmentConcurrency = DEFAULT_OUTCOME_ATTACHMENT_CONCURRENCY
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.loadSettings()
+  }
+
+  private getSetIndexKeys(symbol: string, type: string): string[] {
+    return [
+      `indication_sets:index:${this.connectionId}`,
+      `indication_sets:index:${this.connectionId}:${symbol}`,
+      `indication_sets:index:${this.connectionId}:${symbol}:${type}`,
+    ]
+  }
+
+  private async indexSetKey(client: any, setKey: string, symbol: string, type: string): Promise<void> {
+    const indexes = this.getSetIndexKeys(symbol, type)
+    const pipeline = client.multi()
+    for (const indexKey of indexes) pipeline.sadd(indexKey, setKey)
+    await pipeline.exec().catch(() => {})
+  }
+
+  private async getIndexedSetKeys(client: any, symbol: string, type: string): Promise<string[]> {
+    const typeIndexKey = `indication_sets:index:${this.connectionId}:${symbol}:${type}`
+    let keys = ((await client.smembers(typeIndexKey).catch(() => [])) || []) as string[]
+    if (keys.length > 0) return keys
+
+    // Startup/repair fallback only: bounded SCAN is used to backfill the
+    // maintained per-connection/per-symbol/per-type indexes for legacy keys.
+    // Dashboard polling paths normally read only the index set above.
+    const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
+    if (typeof client.scan !== "function") return keys
+    let cursor = "0"
+    do {
+      const result = await client.scan(cursor, "MATCH", `${prefix}*`, "COUNT", 100).catch(() => null)
+      if (!result) break
+      cursor = String(result[0] ?? "0")
+      keys.push(...((result[1] || []) as string[]))
+    } while (cursor !== "0")
+
+    if (keys.length > 0) {
+      const pipeline = client.multi()
+      for (const setKey of keys) {
+        for (const indexKey of this.getSetIndexKeys(symbol, type)) pipeline.sadd(indexKey, setKey)
+      }
+      await pipeline.exec().catch(() => {})
+    }
+    return keys
   }
 
   private async loadSettings(): Promise<void> {
@@ -213,6 +333,7 @@ export class IndicationSetsProcessor {
         this.outcomeStopLossPct = this.parsePositiveNumber(settings.indicationOutcomeStopLossPct, this.outcomeStopLossPct)
         this.outcomeTakerFeePct = this.parseNonNegativeNumber(settings.indicationOutcomeTakerFeePct, this.outcomeTakerFeePct)
         this.outcomeSlippagePct = this.parseNonNegativeNumber(settings.indicationOutcomeSlippagePct ?? settings.slippageTolerance, this.outcomeSlippagePct)
+        this.outcomeAttachmentConcurrency = Math.max(1, Math.min(50, Math.round(this.parsePositiveNumber(settings.indicationOutcomeAttachmentConcurrency, this.outcomeAttachmentConcurrency))))
         
         // Fallback: legacy maxEntriesPerSet applies to all
         if (settings.maxEntriesPerSet && !settings.databaseSizeDirection) {
@@ -274,6 +395,65 @@ export class IndicationSetsProcessor {
         : cfg
     this.compactionCfgs[ckey] = finalCfg
     return finalCfg
+  }
+
+  /**
+   * Append one or more entries to an indication-set Redis LIST.
+   *
+   * The previous implementation performed GET → JSON.parse → push → SET for
+   * every write, so concurrent writers could overwrite each other. Lists let
+   * Redis perform the append server-side with RPUSH. We only LTRIM when the
+   * post-push length crosses the configured compaction ceiling, preserving the
+   * same "grow to floor + threshold%, then compact back to floor" policy and
+   * the newest-at-last ordering required by downstream readers.
+   */
+  private async appendIndicationEntries(
+    client: any,
+    setKey: string,
+    serializedEntries: string[],
+    cfg: CompactionConfig,
+  ): Promise<number> {
+    if (serializedEntries.length === 0) return 0
+    let length: number
+    try {
+      length = await client.rpush(setKey, ...serializedEntries)
+    } catch {
+      // Migration path for legacy JSON-array keys. Convert once by reading the
+      // string, deleting it, and recreating the same key as a Redis LIST.
+      const legacy = await this.readIndicationSetEntries(client, setKey)
+      await client.del(setKey)
+      const migrated = [...legacy.map((entry) => JSON.stringify(entry)), ...serializedEntries]
+      length = migrated.length > 0 ? await client.rpush(setKey, ...migrated) : 0
+    }
+    if (length >= compactionCeiling(cfg)) {
+      await client.ltrim(setKey, -cfg.floor, -1)
+      return Math.min(length, cfg.floor)
+    }
+    return length
+  }
+
+  private async readIndicationSetEntries(client: any, setKey: string): Promise<any[]> {
+    try {
+      const listValues: string[] = await client.lrange(setKey, 0, -1)
+      if (Array.isArray(listValues) && listValues.length > 0) {
+        return listValues
+          .map((raw) => {
+            try { return JSON.parse(raw) } catch { return null }
+          })
+          .filter(Boolean)
+      }
+    } catch {
+      // Legacy keys are JSON strings; real Redis raises WRONGTYPE for LRANGE.
+    }
+
+    try {
+      const raw = await client.get(setKey)
+      if (!raw) return []
+      const entries = JSON.parse(raw as string)
+      return Array.isArray(entries) ? entries : []
+    } catch {
+      return []
+    }
   }
 
   private parseRangeSettings(startRaw: any, endRaw: any, stepRaw: any, fallback: number[]): number[] {
@@ -527,6 +707,24 @@ export class IndicationSetsProcessor {
     }
   }
 
+  private async attachQualifiedCandidates(
+    symbol: string,
+    marketData: any,
+    candidates: IndicationCandidate[],
+  ): Promise<IndicationCandidate[]> {
+    const attached = await mapLimit(candidates, this.outcomeAttachmentConcurrency, async (candidate) => {
+      const profitFactor = await this.attachOutcomeBackedProfitFactor(
+        symbol,
+        marketData,
+        candidate.setKey,
+        candidate.indication,
+      )
+      return profitFactor >= 1.0 ? candidate : null
+    })
+
+    return attached.filter((candidate): candidate is IndicationCandidate => candidate !== null)
+  }
+
   /**
    * Process Direction Indication Set (ranges 2-30)
    * OPTIMIZED: Process all ranges in batch, minimize Redis calls
@@ -538,7 +736,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const drawdownRatio of drawdownRatios) {
@@ -563,18 +761,18 @@ export class IndicationSetsProcessor {
             // other's JSON array, producing identical (wrong) values for L and S.
             const setKey = `indication_set:${this.connectionId}:${symbol}:direction:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
-            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-              qualified++
-              pendingWrites.push({
-                setKey,
-                indication,
-                config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
-              })
-            }
+            candidates.push({
+              setKey,
+              indication,
+              config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
+            })
           }
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     // Batch write all qualified indications
     if (pendingWrites.length > 0) {
@@ -595,7 +793,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const drawdownRatio of drawdownRatios) {
@@ -616,18 +814,18 @@ export class IndicationSetsProcessor {
             indication.direction = direction
             const setKey = `indication_set:${this.connectionId}:${symbol}:move:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
-            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-              qualified++
-              pendingWrites.push({
-                setKey,
-                indication,
-                config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
-              })
-            }
+            candidates.push({
+              setKey,
+              indication,
+              config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
+            })
           }
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "move")
@@ -647,7 +845,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const threshold of thresholds) {
       for (const drawdownRatio of drawdownRatios) {
@@ -665,14 +863,11 @@ export class IndicationSetsProcessor {
                 if (indication) {
                   total++
                   const setKey = `indication_set:${this.connectionId}:${symbol}:active:t${threshold}:dd${drawdownRatio}:ar${activeTimeRatio}:lp${lastPartRatio}:f${factorMultiplier}`
-                  if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-                    qualified++
-                    pendingWrites.push({
-                      setKey,
-                      indication,
-                      config: { threshold, drawdownRatio, activeTimeRatio, lastPartRatio, factorMultiplier },
-                    })
-                  }
+                  candidates.push({
+                    setKey,
+                    indication,
+                    config: { threshold, drawdownRatio, activeTimeRatio, lastPartRatio, factorMultiplier },
+                  })
                 }
               } catch (error) {
                 console.error(`[v0] [IndicationSets] Active config error:`, error)
@@ -682,6 +877,9 @@ export class IndicationSetsProcessor {
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "active")
@@ -705,7 +903,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const activityRatio of activityRatios) {
       for (const factorMultiplier of factorMultipliers) {
@@ -718,12 +916,12 @@ export class IndicationSetsProcessor {
         indication.direction = direction
         const setKey = `indication_set:${this.connectionId}:${symbol}:active_advanced:ar${activityRatio}:min${minPositions}:cr${continuationRatio}:f${factorMultiplier}`
 
-        if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-          qualified++
-          pendingWrites.push({ setKey, indication, config })
-        }
+        candidates.push({ setKey, indication, config })
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "active_advanced")
@@ -741,7 +939,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const factorMultiplier of factorMultipliers) {
@@ -750,18 +948,18 @@ export class IndicationSetsProcessor {
         
         total++
         const setKey = `indication_set:${this.connectionId}:${symbol}:optimal:range${range}:factor${factorMultiplier}`
-        if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-          qualified++
-          pendingWrites.push({ setKey, indication, config: { range, factorMultiplier } })
-        }
+        candidates.push({ setKey, indication, config: { range, factorMultiplier } })
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "optimal")
     }
 
-    return { type: "optimal", total, qualified }
+    return { type: "optimal", total, qualified, configs: pendingWrites.length }
   }
 
   /**
@@ -792,77 +990,53 @@ export class IndicationSetsProcessor {
     try {
       const client = await getCachedClient()
 
-      // DEV MODE: overwrite each indication_set key with only the LATEST single
-      // entry instead of appending to a growing 250-item JSON array.
-      // Full grid:  250 entries × ~300 B/entry × 144 keys = ~11 MB per cycle.
-      // Dev  mode:  1 entry     × ~300 B/entry × 144 keys =  43 KB per cycle.
-      // The strategy-coordinator reads these keys to build Real-stage sets; it
-      // only needs the most-recent entry (it re-evaluates from scratch each cycle)
-      // so overwriting loses no functional data.
       const now = Date.now()
       const timestamp = new Date().toISOString()
 
-      // Process writes in bounded parallel chunks for high-frequency throughput.
-      const concurrency = 20
       // Resolve compaction config once for the whole batch — type is
       // fixed for all writes in this call (the public batchSave API
       // takes a single `type`), so a single async resolution covers
       // every chunk and keeps the inner loop synchronous w.r.t. config
       // lookup.
       const compactionCfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
-      for (let i = 0; i < writes.length; i += concurrency) {
-        const chunk = writes.slice(i, i + concurrency)
-        await Promise.all(
-          chunk.map(async ({ setKey, indication, config }, idx) => {
-            // Resolve direction with progressive fallbacks. The strategy
-            // coordinator + live-stage both use this field, so it MUST
-            // be on the persisted entry to avoid silent "long" fallback.
-            const direction: "long" | "short" =
-              indication.direction === "short"
-                ? "short"
-                : indication.direction === "long"
-                ? "long"
-                : indication?.metadata?.firstDir < 0
-                ? "short"
-                : "long"
+      const grouped = new Map<string, string[]>()
+      writes.forEach(({ setKey, indication, config }, idx) => {
+        // Resolve direction with progressive fallbacks. The strategy
+        // coordinator + live-stage both use this field, so it MUST
+        // be on the persisted entry to avoid silent "long" fallback.
+        const direction: "long" | "short" =
+          indication.direction === "short"
+            ? "short"
+            : indication.direction === "long"
+            ? "long"
+            : indication?.metadata?.firstDir < 0
+            ? "short"
+            : "long"
 
-            const entry = {
-              id: `${type}_${now}_${i + idx}_${Math.random().toString(36).slice(2, 6)}`,
-              timestamp,
-              type,
-              direction,
-              profitFactor: indication.profitFactor,
-              signalScore: indication.signalScore,
-              rawSignalStrength: indication.rawSignalStrength,
-              confidence: indication.confidence,
-              config,
-              metadata: indication.metadata,
-            }
+        const entry = {
+          id: `${type}_${now}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp,
+          type,
+          direction,
+          profitFactor: indication.profitFactor,
+          signalScore: indication.signalScore,
+          rawSignalStrength: indication.rawSignalStrength,
+          confidence: indication.confidence,
+          config,
+          metadata: indication.metadata,
+        }
 
-            const existing = await client.get(setKey)
-            let entries = existing ? JSON.parse(existing) : []
-            // ── Newest-at-last (per spec) ──���─────────────────────────
-            // The compaction policy drops oldest by `slice(-floor)`,
-            // which requires chronological order. Use `push`, never
-            // `unshift`. Switching from the prior unshift+slice(0, n)
-            // pattern keeps reads in the same order downstream
-            // consumers expected, just from the *other end* of the
-            // array — and the dashboard's "newest first" surfaces all
-            // already reverse the array on read, so no UI change is
-            // needed.
-            entries.push(entry)
-            // ── Debounced threshold compaction ───────────────────────
-            // `compact` returns the original array if length < ceiling
-            // (cheap O(1) check). When it does fire, it returns a
-            // fresh `slice(-floor)` — same big-O as the old
-            // `slice(0, limit)` path but only every (ceiling-floor)
-            // cycles instead of every cycle. We use the per-batch
-            // resolved config (compactionCfg) so the inner loop avoids
-            // any async hop.
-            entries = compact(entries, compactionCfg, "recent")
-            await client.set(setKey, JSON.stringify(entries))
-          }),
-        )
+        const bucket = grouped.get(setKey)
+        if (bucket) bucket.push(JSON.stringify(entry))
+        else grouped.set(setKey, [JSON.stringify(entry)])
+      })
+
+      // Append each grouped set through the shared helper so legacy JSON-array
+      // keys are migrated to Redis LISTs consistently with the single-save path.
+      const groupedEntries = Array.from(grouped.entries())
+      for (const [setKey, serializedEntries] of groupedEntries) {
+        await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
+        await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
       }
     } catch (error) {
       // Silent fail for non-critical batch operations
@@ -890,9 +1064,6 @@ export class IndicationSetsProcessor {
   ): Promise<void> {
     try {
       const client = await getCachedClient()
-      
-      const existing = await client.get(setKey)
-      let entries = existing ? JSON.parse(existing) : []
 
       // Same direction-resolution logic as batchSaveIndications — see comment there.
       const direction: "long" | "short" =
@@ -905,10 +1076,10 @@ export class IndicationSetsProcessor {
           : "long"
 
       const id = `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-      // Newest-at-last per spec — see compaction module docs. The
-      // chronological invariant is required by the `mode: "recent"`
-      // compactor below (it does `slice(-floor)`).
-      entries.push({
+      // Newest-at-last per spec. Redis RPUSH appends at the tail, matching
+      // the previous chronological JSON-array invariant without a
+      // GET/parse/append/SET round-trip.
+      const entry = {
         id,
         timestamp: new Date().toISOString(),
         type,
@@ -919,22 +1090,22 @@ export class IndicationSetsProcessor {
         confidence: indication.confidence,
         config,
         metadata: indication.metadata,
-      })
+      }
 
       // Debounced threshold compaction. The cfg lookup is cached on
       // the processor instance with a 5s TTL so this single-save path
       // pays at most one Redis round-trip every 5s for config — every
       // subsequent call is a synchronous map lookup + a comparison.
       const cfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
-      entries = compact(entries, cfg, "recent")
+      await this.appendIndicationEntries(client, setKey, [JSON.stringify(entry)], cfg)
 
-      await client.set(setKey, JSON.stringify(entries))
-      
       // Broadcast indication update to connected clients. Direction is
       // derived from the actual indication signal — directional types
       // (direction/move) report UP/DOWN, all other types (active /
       // optimal / active_advanced) report NEUTRAL.
       const symbol = setKey.split(':')[2]
+      await this.indexSetKey(client, setKey, symbol, type)
+
       const broadcastDirection: "UP" | "DOWN" | "NEUTRAL" =
         type === "direction" || type === "move"
           ? direction === "long"
@@ -996,35 +1167,171 @@ export class IndicationSetsProcessor {
   /**
    * Record a realized outcome sample and return the current profit factor.
    *
-   * Previous impl: read entire JSON blob (up to ~300 KB for 1000 samples),
-   * push, trim, write back — O(N) parse+stringify on every indication hit.
-   *
-   * New impl: store samples as a Redis LIST (rpush + ltrim = 2 O(1) ops).
-   * Profit factor is recomputed from the list, which costs one LRANGE but
-   * avoids the full JSON round-trip on every write.  The list cap (1000)
-   * matches the previous blob cap so downstream PF values are identical.
+   * Outcome samples stay in the capped Redis LIST for audit/debug consumers,
+   * while `${setKey}:outcome_stats` maintains the rolling aggregate used for
+   * profit-factor reads. This avoids an LRANGE + full-window recomputation on
+   * every sample. If the aggregate hash is missing or malformed, rebuild it
+   * once from the capped list and continue from the repaired values.
    */
   private async recordOutcomeSample(setKey: string, sample: any): Promise<number> {
     const client = await getCachedClient()
     const key = `${setKey}:outcomes`
+    const statsKey = `${setKey}:outcome_stats`
+    const cap = 1000
+    const serializedSample = JSON.stringify(sample)
+    const sampleProfit = this.toOutcomeAmount(sample?.profit)
+    const sampleLoss = this.toOutcomeAmount(sample?.loss)
 
-    // Append new sample and cap to 1000 entries atomically.
-    const pipe = client.multi()
-    pipe.rpush(key, JSON.stringify(sample))
-    pipe.ltrim(key, -1000, -1)
-    await pipe.exec()
+    const evalLua = (client as any)?.eval as
+      | ((script: string, options: { keys: string[]; arguments: string[] }) => Promise<any>)
+      | undefined
+    if (typeof evalLua === "function") {
+      const result = await evalLua.call(client, RECORD_OUTCOME_SAMPLE_SCRIPT, {
+        keys: [key, statsKey],
+        arguments: [serializedSample, String(sampleProfit), String(sampleLoss), String(cap)],
+      })
+      const grossProfit = Number(result?.[0] ?? 0)
+      const grossLoss = Number(result?.[1] ?? 0)
+      return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+    }
 
-    // Compute PF from the full window (one LRANGE).
+    return this.recordOutcomeSampleWithWatch(client, key, statsKey, serializedSample, sampleProfit, sampleLoss, cap)
+  }
+
+  private async recordOutcomeSampleWithWatch(
+    client: any,
+    key: string,
+    statsKey: string,
+    serializedSample: string,
+    sampleProfit: number,
+    sampleLoss: number,
+    cap: number,
+  ): Promise<number> {
+    const canWatch = typeof client?.watch === "function" && typeof client?.unwatch === "function"
+    const maxAttempts = canWatch ? 8 : 1
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (canWatch) await client.watch(key, statsKey)
+      try {
+        const rawStats = await client.hgetall(statsKey)
+        const existingStats = this.parseOutcomeStats(rawStats)
+
+        const currentLength = Number(await client.llen(key)) || 0
+        const evictCount = Math.max(0, currentLength + 1 - cap)
+
+        if (!existingStats) {
+          const tx = client.multi()
+          tx.rpush(key, serializedSample)
+          if (evictCount > 0) tx.ltrim(key, -cap, -1)
+          const execResult = await tx.exec()
+          if (!canWatch || execResult !== null) {
+            return this.repairOutcomeStatsFromSamples(client, key, statsKey)
+          }
+          continue
+        }
+        let evictedProfit = 0
+        let evictedLoss = 0
+        let evictedCount = 0
+        if (evictCount > 0) {
+          const evictedRaw: string[] = await client.lrange(key, 0, evictCount - 1)
+          for (const item of evictedRaw) {
+            const parsed = this.parseOutcomeSample(item)
+            if (!parsed) continue
+            evictedProfit += parsed.profit
+            evictedLoss += parsed.loss
+            evictedCount++
+          }
+        }
+
+        const grossProfit = Math.max(0, existingStats.grossProfit + sampleProfit - evictedProfit)
+        const grossLoss = Math.max(0, existingStats.grossLoss + sampleLoss - evictedLoss)
+        const count = Math.max(0, existingStats.count + 1 - evictedCount)
+
+        const tx = client.multi()
+        tx.rpush(key, serializedSample)
+        if (evictCount > 0) tx.ltrim(key, -cap, -1)
+        tx.hset(statsKey, {
+          grossProfit: String(grossProfit),
+          grossLoss: String(grossLoss),
+          count: String(count),
+        })
+        const execResult = await tx.exec()
+        if (!canWatch || execResult !== null) {
+          return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+        }
+      } finally {
+        if (canWatch) await client.unwatch().catch(() => {})
+      }
+    }
+
+    throw new Error(`[IndicationSets] Failed to atomically record outcome sample for ${key} after retries`)
+  }
+
+  private toOutcomeAmount(value: any): number {
+    const amount = Number(value || 0)
+    return Number.isFinite(amount) && amount > 0 ? amount : 0
+  }
+
+  private parseOutcomeSample(raw: string): { profit: number; loss: number } | null {
+    try {
+      const sample = JSON.parse(raw)
+      return {
+        profit: this.toOutcomeAmount(sample?.profit),
+        loss: this.toOutcomeAmount(sample?.loss),
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private parseOutcomeStats(
+    stats: Record<string, string> | null | undefined,
+  ): { grossProfit: number; grossLoss: number; count: number } | null {
+    if (
+      !stats ||
+      !Object.prototype.hasOwnProperty.call(stats, "grossProfit") ||
+      !Object.prototype.hasOwnProperty.call(stats, "grossLoss") ||
+      !Object.prototype.hasOwnProperty.call(stats, "count")
+    ) {
+      return null
+    }
+    const grossProfit = Number(stats.grossProfit)
+    const grossLoss = Number(stats.grossLoss)
+    const count = Number(stats.count)
+    if (
+      !Number.isFinite(grossProfit) ||
+      !Number.isFinite(grossLoss) ||
+      !Number.isFinite(count) ||
+      grossProfit < 0 ||
+      grossLoss < 0 ||
+      count < 0
+    ) {
+      return null
+    }
+    return { grossProfit, grossLoss, count }
+  }
+
+  private async repairOutcomeStatsFromSamples(client: any, key: string, statsKey: string): Promise<number> {
     const raw: string[] = await client.lrange(key, 0, -1)
     let grossProfit = 0
-    let grossLoss   = 0
+    let grossLoss = 0
+    let count = 0
     for (const item of raw) {
-      try {
-        const s = JSON.parse(item)
-        grossProfit += Number(s.profit || 0)
-        grossLoss   += Number(s.loss   || 0)
-      } catch { /* skip malformed */ }
+      const parsed = this.parseOutcomeSample(item)
+      if (!parsed) continue
+      grossProfit += parsed.profit
+      grossLoss += parsed.loss
+      count++
     }
+    await client.hset(statsKey, {
+      grossProfit: String(grossProfit),
+      grossLoss: String(grossLoss),
+      count: String(count),
+    })
+    return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+  }
+
+  private profitFactorFromOutcomeStats(grossProfit: number, grossLoss: number): number {
     if (grossLoss <= 0) return grossProfit > 0 ? grossProfit / 0.000001 : 0
     return grossProfit / grossLoss
   }
@@ -1107,20 +1414,36 @@ export class IndicationSetsProcessor {
             })
           }
           // Single read-modify-write per setKey regardless of how many
-          // pending items referenced it.
-          const existing = await client.get(setKey)
-          let entries: any[] = []
-          try { entries = existing ? JSON.parse(existing as string) : [] } catch { /* keep [] */ }
+          // pending items referenced it. Read through the shared helper so
+          // LIST-backed sets stay in the modern representation and legacy
+          // JSON-array strings are still readable during migration.
+          const entries = await this.readIndicationSetEntries(client, setKey)
           let patchCount = items.length
+          let patched = false
           for (let i = entries.length - 1; i >= 0 && patchCount > 0; i--) {
             if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
               const closed = items[items.length - patchCount].closed
               entries[i].profitFactor = pf
               entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
               patchCount--
+              patched = true
             }
           }
-          await client.set(setKey, JSON.stringify(entries))
+          if (!patched) return
+
+          // Preserve LIST-backed indication_set:* keys when closing pending
+          // realtime outcomes. DEL + RPUSH recreates the key as a Redis LIST
+          // instead of SET-ing a legacy JSON string, then applies the same
+          // compaction and index policy used by appendIndicationEntries().
+          const type = (setKey.split(":")[3] || "direction") as keyof IndicationSetLimits
+          const cfg = await this.resolveCompaction(type)
+          const serializedEntries = entries.map((entry) => JSON.stringify(entry))
+          await client.del(setKey)
+          const length = serializedEntries.length > 0 ? await client.rpush(setKey, ...serializedEntries) : 0
+          if (length >= compactionCeiling(cfg)) {
+            await client.ltrim(setKey, -cfg.floor, -1)
+          }
+          await this.indexSetKey(client, setKey, setKey.split(":")[2], type)
         }),
       )
 
@@ -1477,8 +1800,7 @@ export class IndicationSetsProcessor {
           error: "Redis client not available",
         }
       }
-      const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
-      const keys = await client.keys(`${prefix}*`)
+      const keys = await this.getIndexedSetKeys(client, symbol, type)
       if (!keys || keys.length === 0) {
         return {
           type,
@@ -1489,18 +1811,16 @@ export class IndicationSetsProcessor {
         }
       }
 
-      // Fan out all GETs in parallel — was N serial round-trips per stats call.
-      const rawValues = await Promise.all(keys.map((k: string) => client.get(k).catch(() => null)))
+      // Fan out all reads in parallel. New keys are Redis LISTs; legacy keys
+      // may still be JSON arrays, so the helper falls back to GET/JSON parse.
+      const values = await Promise.all(keys.map((k: string) => this.readIndicationSetEntries(client, k)))
 
       let totalEntries = 0
       let totalProfitFactor = 0
       let totalConfidence = 0
       let sampleCount = 0
 
-      for (const raw of rawValues) {
-        if (!raw) continue
-        let entries: any[]
-        try { entries = JSON.parse(raw as string) } catch { continue }
+      for (const entries of values) {
         if (!Array.isArray(entries)) continue
 
         totalEntries += entries.length
@@ -1530,31 +1850,17 @@ export class IndicationSetsProcessor {
   async getSetEntries(symbol: string, type: string, limit = 50): Promise<any[]> {
     try {
       const client = await getCachedClient()
-      const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
-      // NOTE: client.keys() is a full-keyspace scan. Acceptable here because
-      // this method is called only for the dashboard "Indications" detail
-      // panel (low frequency) and because the InlineLocalRedis Map scan is
-      // O(N) in the number of stored keys but bounded by per-symbol type
-      // ceiling (at most ~144 keys in dev / ~522 in prod per type×symbol).
-      // A SCAN-based alternative would be equivalent — InlineLocalRedis has
-      // no SCAN, so keys() is the only option for the in-process client.
-      const keys = await client.keys(`${prefix}*`)
+      const keys = await this.getIndexedSetKeys(client, symbol, type)
       if (!keys || keys.length === 0) return []
 
-      // Fan out all GETs in parallel — same pattern as getCurrentIndications
-      // in indication-stage.ts to avoid sequential await latency.
-      const rawValues = await Promise.all(
-        keys.map((k: string) => client.get(k).catch(() => null)),
-      )
+      // Fan out all reads in parallel. New keys are Redis LISTs; legacy keys
+      // may still be JSON arrays, so the helper falls back to GET/JSON parse.
+      const values = await Promise.all(keys.map((k: string) => this.readIndicationSetEntries(client, k)))
       const allEntries: any[] = []
-      for (let i = 0; i < rawValues.length; i++) {
-        const raw = rawValues[i]
-        if (!raw) continue
-        try {
-          const entries = JSON.parse(raw as string)
-          if (!Array.isArray(entries)) continue
-          allEntries.push(...entries.map((entry) => ({ ...entry, setKey: keys[i] })))
-        } catch { /* skip malformed entries */ }
+      for (let i = 0; i < values.length; i++) {
+        const entries = values[i]
+        if (!Array.isArray(entries)) continue
+        allEntries.push(...entries.map((entry) => ({ ...entry, setKey: keys[i] })))
       }
 
       return allEntries
