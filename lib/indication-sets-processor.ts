@@ -969,8 +969,14 @@ export class IndicationSetsProcessor {
       const groupedEntries = Array.from(grouped.entries())
       for (const [setKey, serializedEntries] of groupedEntries) {
         pipe.rpush(setKey, ...serializedEntries)
+      for (const [_setKey, serializedEntries] of groupedEntries) {
+        pipe.rpush(_setKey, ...serializedEntries)
       }
       const lengths = await pipe.exec()
+
+      for (const [setKey] of groupedEntries) {
+        await this.indexSetKey(client, setKey, setKey.split(":")[2], type)
+      }
 
       // Apply the same thresholded compaction policy, but with Redis-side
       // LTRIM on the list rather than JSON array rewrites.
