@@ -539,6 +539,22 @@ describe("requested regression guardrails", () => {
     expect(rawProcessor).toContain("pipe.hset(w5Key, fields)")
     expect(rawProcessor).toContain("pipe.hset(w60Key, fields)")
   })
+  test("closing pending realtime outcomes preserves LIST-backed indication sets", () => {
+    const setProcessor = read("lib/indication-sets-processor.ts")
+    const closeStart = setProcessor.indexOf("private async closePendingRealtimeOutcomes")
+    const closeEnd = setProcessor.indexOf("private evaluateForwardOutcome", closeStart)
+    const closeBlock = setProcessor.slice(closeStart, closeEnd)
+
+    expect(closeBlock).toContain("await this.readIndicationSetEntries(client, setKey)")
+    expect(closeBlock).toContain("await client.del(setKey)")
+    expect(closeBlock).toContain("await client.rpush(setKey, ...serializedEntries)")
+    expect(closeBlock).toContain("compactionCeiling(cfg)")
+    expect(closeBlock).toContain("await client.ltrim(setKey, -cfg.floor, -1)")
+    expect(closeBlock).toContain("await this.indexSetKey(client, setKey")
+    expect(closeBlock).not.toContain("await client.set(setKey, JSON.stringify(entries))")
+    expect(closeBlock).not.toContain("const existing = await client.get(setKey)")
+  })
+
 
   test("server continuity cron awaits direct healing sweep instead of relying on auto-start timers", () => {
     const cronRoute = read("app/api/cron/server-continuity/route.ts")
