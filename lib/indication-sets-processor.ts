@@ -969,6 +969,39 @@ export class IndicationSetsProcessor {
         await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
         await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
       }
+        pipe.rpush(setKey, ...serializedEntries)
+      for (const [_setKey, serializedEntries] of groupedEntries) {
+        pipe.rpush(_setKey, ...serializedEntries)
+      }
+      const lengths = await pipe.exec()
+
+      for (const [setKey] of groupedEntries) {
+        await this.indexSetKey(client, setKey, setKey.split(":")[2], type)
+      }
+
+      // Apply the same thresholded compaction policy, but with Redis-side
+      // LTRIM on the list rather than JSON array rewrites.
+      const trimPipe = client.pipeline ? client.pipeline() : client.multi()
+      let trimCount = 0
+      let idx = 0
+      for (const [setKey, serializedEntries] of groupedEntries) {
+        const slot = lengths?.[idx]
+        if (slot instanceof Error || (Array.isArray(slot) && slot[0] instanceof Error)) {
+          await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
+          await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
+          idx++
+          continue
+        }
+        const rawLength = Array.isArray(slot) ? slot[1] : slot
+        const length = Number(rawLength) || 0
+        if (length >= compactionCeiling(compactionCfg)) {
+          trimPipe.ltrim(setKey, -compactionCfg.floor, -1)
+          trimCount++
+        }
+        await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
+        idx++
+      }
+      if (trimCount > 0) await trimPipe.exec()
     } catch (error) {
       // Silent fail for non-critical batch operations
     }

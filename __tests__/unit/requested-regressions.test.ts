@@ -5,6 +5,34 @@ const repo = path.resolve(__dirname, "../..")
 const read = (file: string) => fs.readFileSync(path.join(repo, file), "utf8")
 
 describe("requested regression guardrails", () => {
+  test("real progression evaluated includes fan-out without impossible-state clamp", () => {
+    const coordinator = read("lib/strategy-coordinator.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+
+    expect(coordinator).toContain("let realStageRelatedCreated = 0")
+    expect(coordinator).toContain("realStageRelatedCreated += activePositionBlockOverlays.length")
+    expect(coordinator).toContain("const realRelatedCreated = realStageRelatedCreated")
+    expect(coordinator).toContain("const realEvaluatedAfterFanOut = mainPFEligible + realRelatedCreated")
+    expect(coordinator).toContain('`${symbol}:real:input`')
+    expect(coordinator).toContain('`${symbol}:real:relatedCreated`')
+    expect(coordinator).toContain('`${symbol}:real:evaluated`]: String(realEvaluatedAfterFanOut)')
+
+    expect(statsRoute).toContain("let activeRealInput = 0")
+    expect(statsRoute).toContain("let activeRealRelatedCreated = 0")
+    expect(statsRoute).toContain("const realUpstreamInput = activeRealInput || stratCounts.main")
+    expect(statsRoute).toContain('suffix === "real:input"')
+    expect(statsRoute).toContain('suffix === "real:relatedCreated"')
+    expect(statsRoute).toContain("const afterFanOut = activeRealInput + activeRealRelatedCreated")
+    expect(statsRoute).toContain("const realMaxAfterFanOut = realUpstreamInput + activeRealRelatedCreated")
+    expect(statsRoute).not.toContain("stratCounts.real > stratCounts.main) {")
+
+    const snapshot = { main: 10, realRelatedCreated: 5, real: 12 }
+    const realEvaluated = snapshot.main + snapshot.realRelatedCreated
+    const shouldClampImpossibleState = snapshot.real > snapshot.main + snapshot.realRelatedCreated
+    expect(realEvaluated).toBe(15)
+    expect(shouldClampImpossibleState).toBe(false)
+  })
+
 
   test("live order test endpoints require explicit server and request safety gates", () => {
     const safety = read("lib/live-order-safety.ts")

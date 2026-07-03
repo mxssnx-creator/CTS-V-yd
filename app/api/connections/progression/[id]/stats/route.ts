@@ -1041,6 +1041,8 @@ export async function GET(
     // occurred when a single-symbol standalone key was compared against
     // the cross-symbol active sum.
     const activeStratEvaluated: Record<string, number> = { base: 0, main: 0, real: 0 }
+    let activeRealInput = 0
+    let activeRealRelatedCreated = 0
     // Hoisted so the raw hash is accessible in the return block for `strategiesActive`.
     let stratActiveHash: Record<string, string> | null = null
     try {
@@ -1061,8 +1063,10 @@ export async function GET(
       }
       if (stratActiveHash && typeof stratActiveHash === "object") {
         for (const [field, val] of Object.entries(stratActiveHash)) {
-          // Field shape: "{SYMBOL}:{stage}" or "{SYMBOL}:{stage}:evaluated"
-          // e.g. "BTCUSDT:base", "BTCUSDT:base:evaluated", "ETHUSDT:real:evaluated"
+          // Field shape: "{SYMBOL}:{stage}" or Real accounting fields such as
+          // "{SYMBOL}:real:input", "{SYMBOL}:real:relatedCreated",
+          // and "{SYMBOL}:{stage}:evaluated".
+          // e.g. "BTCUSDT:base", "BTCUSDT:base:evaluated", "ETHUSDT:real:relatedCreated"
           // Strip the symbol prefix by slicing from the FIRST colon, not the last.
           // Using lastIndexOf would split "BTCUSDT:base:evaluated" into suffix="evaluated"
           // which never matches "base:evaluated" — the root cause of baseEvaluated=0.
@@ -1076,6 +1080,14 @@ export async function GET(
           if (suffix === "base:evaluated" || suffix === "main:evaluated" || suffix === "real:evaluated") {
             const stage = suffix.replace(":evaluated", "") as "base" | "main" | "real"
             activeStratEvaluated[stage] = (activeStratEvaluated[stage] ?? 0) + numVal
+            continue
+          }
+          if (suffix === "real:input") {
+            activeRealInput += numVal
+            continue
+          }
+          if (suffix === "real:relatedCreated") {
+            activeRealRelatedCreated += numVal
             continue
           }
           if (suffix in activeStratByStage) {
@@ -1140,18 +1152,38 @@ export async function GET(
       })
     )
     // Enforce cascade invariants for all public progression counters:
-    // BASE expands into MAIN variants, REAL is a filtered subset of MAIN, and
-    // LIVE is a dispatch subset of REAL. During live runs, per-stage writers can
-    // briefly update different fields in separate Redis calls, so a stats read
-    // may observe `real > main` (or `live > real`) for one request. Normalize the
-    // snapshot here instead of exposing an impossible state to the dashboard,
-    // validation scripts, and operators watching long-running progressions.
-    if (stratCounts.main > 0 && stratCounts.real > stratCounts.main) {
+    // BASE expands into MAIN variants, REAL filters MAIN inputs and may also
+    // create additional Real Sets through related/axis fan-out, and LIVE is a
+    // dispatch subset of REAL. During live runs, per-stage writers can briefly
+    // update different fields in separate Redis calls, so a stats read may
+    // observe impossible overages. Normalize only when REAL exceeds the
+    // pipeline-aware ceiling: main inputs + Real Sets created at the Real stage.
+    // `strategies_real_related_created` is cumulative, so do not use it as
+    // the per-snapshot allowance; `strategies_real_last_created` is the
+    // coordinator's current-cycle related/axis-created Real fan-out.
+    const realRelatedCreatedForCurrentSnapshot = n(progHash.strategies_real_last_created)
+    const realCeiling = stratCounts.main + realRelatedCreatedForCurrentSnapshot
+    if (stratCounts.main > 0 && stratCounts.real > realCeiling) {
       console.warn(
-        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > main (${stratCounts.main}). ` +
-        `Clamping real to main for cascade consistency.`,
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > ` +
+        `main (${stratCounts.main}) + realRelatedCreated (${realRelatedCreatedForCurrentSnapshot}). ` +
+        `Clamping real to pipeline-aware ceiling (${realCeiling}).`,
       )
-      stratCounts.real = stratCounts.main
+      stratCounts.real = realCeiling
+    // Enforce cascade invariants for public progression counters. REAL may fan
+    // out from upstream PF-eligible Main input, so real passed output can exceed
+    // main as long as it does not exceed input + real:relatedCreated. During live
+    // runs, per-stage writers can briefly update different fields in separate
+    // Redis calls, so normalize only truly impossible snapshots.
+    const realUpstreamInput = activeRealInput || stratCounts.main
+    const realMaxAfterFanOut = realUpstreamInput + activeRealRelatedCreated
+    if (realUpstreamInput > 0 && realMaxAfterFanOut > 0 && stratCounts.real > realMaxAfterFanOut) {
+      console.warn(
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > Real max after fan-out ` +
+        `(${realMaxAfterFanOut}; main=${stratCounts.main}, input=${activeRealInput}, ` +
+        `relatedCreated=${activeRealRelatedCreated}). Clamping real to fan-out max.`,
+      )
+      stratCounts.real = realMaxAfterFanOut
       activeStratByStage.real = Math.min(activeStratByStage.real || 0, stratCounts.real)
       activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
     }
@@ -2508,9 +2540,20 @@ export async function GET(
             // NOTE: realEvaluated = Main sets that ENTERED Real-stage PF evaluation
             // (the INPUT count, written as mainPFEligible by the coordinator).
             // stratCounts.real = Real sets that PASSED and survived to dispatch
-            // (the OUTPUT count). Input is always >= output after filtering, so
-            // realEvaluated > real is CORRECT and expected — do NOT clamp here.
+            // (the OUTPUT count), plus any related/axis-created fan-out that
+            // the Real stage materialized for this snapshot. With fan-out
+            // enabled, output can legitimately exceed the upstream input by
+            // that related-created amount, so do NOT clamp realEvaluated here.
             return stratEvaluated.real || 0
+            // NOTE: Real accounting has three meanings:
+            // - real:input = upstream Main PF-eligible input before Real fan-out.
+            // - real:relatedCreated = current-cycle Real fan-out added to input.
+            // - stratCounts.real = Real passed output after PF/DDT filtering.
+            // Public realEvaluated is every Real Set considered after fan-out, so
+            // prefer input + relatedCreated and fall back to the writer's evaluated
+            // field for mixed deploys. It may exceed passed output; do not clamp.
+            const afterFanOut = activeRealInput + activeRealRelatedCreated
+            return afterFanOut || stratEvaluated.real || 0
           })(),
         },
       },
