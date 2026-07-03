@@ -134,10 +134,10 @@ export function classifyChange(changedFields: string[]): ChangeType {
     const f = String(field || "")
     return f.startsWith("connection_settings.") ? [f, f.slice("connection_settings.".length)] : [f]
   })
-  if (normalized.some(f => RESTART_REQUIRED_FIELDS.includes(f) || PROGRESSION_RESTART_FIELDS.includes(f))) {
+  if (normalized.some(f => RESTART_REQUIRED_FIELDS.includes(f))) {
     return "restart"
   }
-  if (normalized.some(f => HOT_RELOAD_FIELDS.includes(f))) {
+  if (normalized.some(f => HOT_RELOAD_FIELDS.includes(f) || PROGRESSION_RESTART_FIELDS.includes(f))) {
     return "reload"
   }
   return "cosmetic"
