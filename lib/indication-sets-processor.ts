@@ -72,6 +72,28 @@ const DEFAULT_POSITION_LIMITS = {
 // Indication timeout after valid evaluation (100ms - 3000ms)
 const DEFAULT_INDICATION_TIMEOUT_MS = 1000
 
+const DEFAULT_OUTCOME_ATTACHMENT_CONCURRENCY = 20
+
+type IndicationCandidate = { setKey: string; indication: any; config: any }
+
+async function mapLimit<T, R>(items: T[], limit: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) return []
+
+  const concurrency = Math.max(1, Math.min(Math.floor(limit) || 1, items.length))
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex++
+      results[index] = await mapper(items[index], index)
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  return results
+}
+
 export interface IndicationSetLimits {
   direction: number
   move: number
@@ -149,6 +171,7 @@ export class IndicationSetsProcessor {
   private outcomeStopLossPct = 0.01
   private outcomeTakerFeePct = 0.001
   private outcomeSlippagePct = 0.0006
+  private outcomeAttachmentConcurrency = DEFAULT_OUTCOME_ATTACHMENT_CONCURRENCY
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -213,6 +236,7 @@ export class IndicationSetsProcessor {
         this.outcomeStopLossPct = this.parsePositiveNumber(settings.indicationOutcomeStopLossPct, this.outcomeStopLossPct)
         this.outcomeTakerFeePct = this.parseNonNegativeNumber(settings.indicationOutcomeTakerFeePct, this.outcomeTakerFeePct)
         this.outcomeSlippagePct = this.parseNonNegativeNumber(settings.indicationOutcomeSlippagePct ?? settings.slippageTolerance, this.outcomeSlippagePct)
+        this.outcomeAttachmentConcurrency = Math.max(1, Math.min(50, Math.round(this.parsePositiveNumber(settings.indicationOutcomeAttachmentConcurrency, this.outcomeAttachmentConcurrency))))
         
         // Fallback: legacy maxEntriesPerSet applies to all
         if (settings.maxEntriesPerSet && !settings.databaseSizeDirection) {
@@ -513,6 +537,24 @@ export class IndicationSetsProcessor {
     }
   }
 
+  private async attachQualifiedCandidates(
+    symbol: string,
+    marketData: any,
+    candidates: IndicationCandidate[],
+  ): Promise<IndicationCandidate[]> {
+    const attached = await mapLimit(candidates, this.outcomeAttachmentConcurrency, async (candidate) => {
+      const profitFactor = await this.attachOutcomeBackedProfitFactor(
+        symbol,
+        marketData,
+        candidate.setKey,
+        candidate.indication,
+      )
+      return profitFactor >= 1.0 ? candidate : null
+    })
+
+    return attached.filter((candidate): candidate is IndicationCandidate => candidate !== null)
+  }
+
   /**
    * Process Direction Indication Set (ranges 2-30)
    * OPTIMIZED: Process all ranges in batch, minimize Redis calls
@@ -524,7 +566,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const drawdownRatio of drawdownRatios) {
@@ -549,18 +591,18 @@ export class IndicationSetsProcessor {
             // other's JSON array, producing identical (wrong) values for L and S.
             const setKey = `indication_set:${this.connectionId}:${symbol}:direction:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
-            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-              qualified++
-              pendingWrites.push({
-                setKey,
-                indication,
-                config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
-              })
-            }
+            candidates.push({
+              setKey,
+              indication,
+              config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
+            })
           }
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     // Batch write all qualified indications
     if (pendingWrites.length > 0) {
@@ -581,7 +623,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const drawdownRatio of drawdownRatios) {
@@ -602,18 +644,18 @@ export class IndicationSetsProcessor {
             indication.direction = direction
             const setKey = `indication_set:${this.connectionId}:${symbol}:move:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
-            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-              qualified++
-              pendingWrites.push({
-                setKey,
-                indication,
-                config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
-              })
-            }
+            candidates.push({
+              setKey,
+              indication,
+              config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
+            })
           }
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "move")
@@ -633,7 +675,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const threshold of thresholds) {
       for (const drawdownRatio of drawdownRatios) {
@@ -651,14 +693,11 @@ export class IndicationSetsProcessor {
                 if (indication) {
                   total++
                   const setKey = `indication_set:${this.connectionId}:${symbol}:active:t${threshold}:dd${drawdownRatio}:ar${activeTimeRatio}:lp${lastPartRatio}:f${factorMultiplier}`
-                  if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-                    qualified++
-                    pendingWrites.push({
-                      setKey,
-                      indication,
-                      config: { threshold, drawdownRatio, activeTimeRatio, lastPartRatio, factorMultiplier },
-                    })
-                  }
+                  candidates.push({
+                    setKey,
+                    indication,
+                    config: { threshold, drawdownRatio, activeTimeRatio, lastPartRatio, factorMultiplier },
+                  })
                 }
               } catch (error) {
                 console.error(`[v0] [IndicationSets] Active config error:`, error)
@@ -668,6 +707,9 @@ export class IndicationSetsProcessor {
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "active")
@@ -691,7 +733,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const activityRatio of activityRatios) {
       for (const factorMultiplier of factorMultipliers) {
@@ -704,12 +746,12 @@ export class IndicationSetsProcessor {
         indication.direction = direction
         const setKey = `indication_set:${this.connectionId}:${symbol}:active_advanced:ar${activityRatio}:min${minPositions}:cr${continuationRatio}:f${factorMultiplier}`
 
-        if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-          qualified++
-          pendingWrites.push({ setKey, indication, config })
-        }
+        candidates.push({ setKey, indication, config })
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "active_advanced")
@@ -727,7 +769,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const factorMultiplier of factorMultipliers) {
@@ -736,18 +778,18 @@ export class IndicationSetsProcessor {
         
         total++
         const setKey = `indication_set:${this.connectionId}:${symbol}:optimal:range${range}:factor${factorMultiplier}`
-        if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-          qualified++
-          pendingWrites.push({ setKey, indication, config: { range, factorMultiplier } })
-        }
+        candidates.push({ setKey, indication, config: { range, factorMultiplier } })
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "optimal")
     }
 
-    return { type: "optimal", total, qualified }
+    return { type: "optimal", total, qualified, configs: pendingWrites.length }
   }
 
   /**
