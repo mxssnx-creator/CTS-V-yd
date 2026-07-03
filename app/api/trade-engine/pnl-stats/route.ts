@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
-import { query } from "@/lib/db-helpers"
+import { query } from "@/lib/db"
 
 export const dynamic = "force-dynamic"
 
@@ -190,7 +190,7 @@ export async function GET(request: NextRequest) {
       profit_factor: parseFloat(profitFactor.toFixed(2)),
       expectancy: parseFloat(expectancy.toFixed(8)),
       avg_holding_time_min: avgHoldingTime,
-      last_25_positions,
+      last_25_positions: last25Positions,
       last_25_pnl: parseFloat(last25PnL.toFixed(8)),
       last_25_win_rate: parseFloat(last25WinRate.toFixed(2)),
     }
@@ -199,7 +199,7 @@ export async function GET(request: NextRequest) {
       success: true,
       stats,
       duration: Date.now() - startTime,
-    })
+    } satisfies { success: boolean; stats: PnLStats; duration: number })
   } catch (error) {
     console.error("[PnL Stats] Error:", error)
     return NextResponse.json(
