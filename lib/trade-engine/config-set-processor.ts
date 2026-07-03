@@ -18,6 +18,39 @@ async function yieldToEventLoop(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve))
 }
 
+function groupConfigsByType<T extends { type?: string }>(configs: T[]): Array<[string, T[]]> {
+  const grouped = new Map<string, T[]>()
+  for (const config of configs) {
+    const type = config.type || "unknown"
+    const bucket = grouped.get(type)
+    if (bucket) bucket.push(config)
+    else grouped.set(type, [config])
+  }
+  return Array.from(grouped.entries())
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return []
+
+  const limit = Math.max(1, Math.min(concurrency, items.length))
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  const workers = Array.from({ length: limit }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++
+      results[index] = await mapper(items[index], index)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
+
 export interface ProcessingResult {
   indicationConfigs: number
   indicationResults: number
@@ -151,6 +184,14 @@ export class ConfigSetProcessor {
       1,
       Math.min(32, Number(process.env.PREHISTORIC_SYMBOL_CONCURRENCY) || 8)
     )
+    const CONFIG_CONCURRENCY = Math.max(
+      1,
+      Math.min(64, Number(process.env.PREHISTORIC_CONFIG_CONCURRENCY) || 24)
+    )
+    const CONFIG_TYPE_CONCURRENCY = Math.max(
+      1,
+      Math.min(16, Number(process.env.PREHISTORIC_CONFIG_TYPE_CONCURRENCY) || 8)
+    )
 
     const initialSelection = await getCanonicalSymbolSelection(this.connectionId)
     const writerSelectionEpoch = initialSelection?.epoch || ""
@@ -161,7 +202,7 @@ export class ConfigSetProcessor {
     console.log(
       `[v0] [ConfigSetProcessor] ▶ prehistoric start | symbols=${symbols.length} canonicalTotal=${canonicalSymbolsTotal} | ` +
       `range=${effectiveStart.toISOString()} → ${effectiveEnd.toISOString()} | ` +
-      `timeframe=${timeframeSec}s | concurrency=${SYMBOL_CONCURRENCY}`
+      `timeframe=${timeframeSec}s | symbolConcurrency=${SYMBOL_CONCURRENCY} | configTypeConcurrency=${CONFIG_TYPE_CONCURRENCY} | configConcurrency=${CONFIG_CONCURRENCY}`
     )
 
     await initRedis()
@@ -213,8 +254,10 @@ export class ConfigSetProcessor {
           symbols_total: String(canonicalSymbolsTotal),
         } : {}),
         symbol_concurrency: String(SYMBOL_CONCURRENCY),
+        config_type_concurrency: String(CONFIG_TYPE_CONCURRENCY),
         indication_configs: String(indicationConfigs.length),
         strategy_configs: String(strategyConfigs.length),
+        config_concurrency: String(CONFIG_CONCURRENCY),
         updated_at: new Date().toISOString(),
       })
     } catch { /* non-critical */ }
@@ -408,8 +451,8 @@ export class ConfigSetProcessor {
         // --- Run indications + strategies in parallel for this symbol ---
         const tCalcStart = Date.now()
         const [indicationResults, strategyPositions] = await Promise.all([
-          this.processIndicationConfigs(symbol, combinedCandles, indicationConfigs),
-          this.processStrategyConfigs(symbol, combinedCandles, strategyConfigs),
+          this.processIndicationConfigs(symbol, combinedCandles, indicationConfigs, CONFIG_CONCURRENCY, CONFIG_TYPE_CONCURRENCY),
+          this.processStrategyConfigs(symbol, combinedCandles, strategyConfigs, CONFIG_CONCURRENCY, CONFIG_TYPE_CONCURRENCY),
         ])
         const tCalcMs = Date.now() - tCalcStart
 
@@ -830,34 +873,46 @@ export class ConfigSetProcessor {
   private async processIndicationConfigs(
     symbol: string,
     candles: any[],
-    configs: IndicationConfig[]
+    configs: IndicationConfig[],
+    concurrency: number,
+    typeConcurrency: number,
   ): Promise<number> {
     if (configs.length === 0) return 0
 
-    const perConfigResults = await Promise.all(
-      configs.map(async (config) => {
-        try {
-          await yieldToEventLoop()
-          const results = this.calculateIndicationResults(symbol, candles, config)
-          if (results.length === 0) return 0
-          if (typeof (this.indicationManager as any).addResults === "function") {
-            await (this.indicationManager as any).addResults(config.id, results)
-          } else {
-            // Fallback: fire in parallel instead of sequential awaits.
-            await Promise.all(results.map((r) => this.indicationManager.addResult(config.id, r)))
-          }
-          return results.length
-        } catch (error) {
-          console.error(
-            `[v0] [ConfigSetProcessor] ✗ indication config ${config.id}:`,
-            error instanceof Error ? error.message : String(error),
-          )
-          return 0
-        }
-      })
+    const configTypeGroups = groupConfigsByType(configs)
+    const perTypeResults = await mapWithConcurrency(
+      configTypeGroups,
+      typeConcurrency,
+      async ([type, typeConfigs]) => {
+        const perConfigResults = await mapWithConcurrency(
+          typeConfigs,
+          concurrency,
+          async (config) => {
+            try {
+              await yieldToEventLoop()
+              const results = this.calculateIndicationResults(symbol, candles, config)
+              if (results.length === 0) return 0
+              if (typeof (this.indicationManager as any).addResults === "function") {
+                await (this.indicationManager as any).addResults(config.id, results)
+              } else {
+                // Fallback: fire in parallel instead of sequential awaits.
+                await Promise.all(results.map((r) => this.indicationManager.addResult(config.id, r)))
+              }
+              return results.length
+            } catch (error) {
+              console.error(
+                `[v0] [ConfigSetProcessor] ✗ indication config ${config.id} (${type}):`,
+                error instanceof Error ? error.message : String(error),
+              )
+              return 0
+            }
+          },
+        )
+        return perConfigResults.reduce((sum, n) => sum + n, 0)
+      },
     )
 
-    return perConfigResults.reduce((sum, n) => sum + n, 0)
+    return perTypeResults.reduce((sum, n) => sum + n, 0)
   }
 
   /**
@@ -870,15 +925,19 @@ export class ConfigSetProcessor {
     config: IndicationConfig
   ): IndicationResult[] {
     const results: IndicationResult[] = []
-    const { steps, drawdown_ratio, active_ratio, last_part_ratio, type } = config
+    const { steps, drawdown_ratio, active_ratio } = config
 
     if (!candles || candles.length < steps) {
       return results
     }
 
-    const prices = candles.slice(0, steps * 2).map((c: any) => 
-      parseFloat(c.close || c.price || 0)
-    ).filter((p: number) => p > 0)
+    const pricePoints = candles
+      .map((c: any) => ({
+        price: parseFloat(c.close || c.price || 0),
+        timestamp: c?.timestamp || c?.time || new Date().toISOString(),
+      }))
+      .filter((p: any) => p.price > 0)
+    const prices = pricePoints.map((p: any) => p.price)
 
     if (prices.length < steps) {
       return results
@@ -914,7 +973,7 @@ export class ConfigSetProcessor {
     // lower clamp keeps a noise floor so a dead-flat series still gates out.
     const signalThreshold = Math.min(0.005, Math.max(0.0002, avgBarVol * 1.5))
 
-    for (let i = 0; i < Math.min(prices.length - steps, 50); i++) {
+    for (let i = 0; i <= prices.length - steps; i++) {
       const windowPrices = prices.slice(i, i + steps)
       const firstHalf = windowPrices.slice(0, Math.floor(steps / 2))
       const secondHalf = windowPrices.slice(Math.floor(steps / 2))
@@ -943,9 +1002,9 @@ export class ConfigSetProcessor {
       }
 
       if (signal !== "neutral") {
-        const candle = candles[i]
+        const candle = pricePoints[i + steps - 1] || pricePoints[i]
         results.push({
-          timestamp: candle?.timestamp || candle?.time || new Date().toISOString(),
+          timestamp: candle?.timestamp || new Date().toISOString(),
           symbol,
           value,
           signal,
@@ -968,7 +1027,9 @@ export class ConfigSetProcessor {
   private async processStrategyConfigs(
     symbol: string,
     candles: any[],
-    configs: StrategyConfig[]
+    configs: StrategyConfig[],
+    concurrency: number,
+    typeConcurrency: number,
   ): Promise<number> {
     if (configs.length === 0) return 0
 
@@ -993,95 +1054,105 @@ export class ConfigSetProcessor {
     const { recordPosClosed } = await import("@/lib/pos-history")
     const piClient = getRedisClient()
 
-    const perConfigCounts = await Promise.all(
-      configs.map(async (config) => {
-        try {
-          await yieldToEventLoop()
-          const positions = this.calculateStrategyPositions(symbol, candles, config)
-          if (positions.length === 0) return 0
-          if (typeof (this.strategyManager as any).addPositions === "function") {
-            await (this.strategyManager as any).addPositions(config.id, positions)
-          } else {
-            await Promise.all(positions.map((p) => this.strategyManager.addPosition(config.id, p)))
-          }
-
-          // ── Mirror closed positions into pos_history (systemwide fix) ──
-          // Compose every closed historic position into ONE pipeline so
-          // the per-config cost is one round-trip regardless of fill
-          // count. Open prehistoric tails (the trailing in-position row
-          // emitted at end-of-range) are excluded — recordPosClosed
-          // semantically means "one closed trade observed", and
-          // including open tails would over-count the count/wins/loss
-          // accumulators feeding the Main gate.
-          const closed = positions.filter((p) => p.status === "closed")
-          if (closed.length > 0) {
+    const configTypeGroups = groupConfigsByType(configs)
+    const perTypeCounts = await mapWithConcurrency(
+      configTypeGroups,
+      typeConcurrency,
+      async ([type, typeConfigs]) => {
+        const perConfigCounts = await mapWithConcurrency(
+          typeConfigs,
+          concurrency,
+          async (config) => {
             try {
-              const pipeline = piClient.multi()
-              for (const p of closed) {
-                const direction = p.direction === "short" ? "short" : "long"
-                const indicationType = p.indication_type || config.type || "unknown"
-                const resultPct = Number(p.result) || 0
-                // Per-position drawdown TIME = how long the trade was held
-                // (entry → exit), in minutes. Both fields are either epoch-ms
-                // numbers or ISO strings (see the prices[].time origin), so we
-                // normalise to ms before differencing. Previously this was
-                // hardcoded to 0, which made the downstream DDT gate a dead
-                // no-op (Set.avgDrawdownTime was always 0). The realised
-                // duration is the correct signal: a Set that sits in trades
-                // for hours has materially worse drawdown-time risk than one
-                // that resolves in minutes, and the Main/Real gate is meant
-                // to reject the former.
-                const toMs = (t: unknown): number => {
-                  if (typeof t === "number") return t
-                  if (typeof t === "string") {
-                    const n = Number(t)
-                    if (Number.isFinite(n) && n > 0) return n
-                    const parsed = Date.parse(t)
-                    return Number.isFinite(parsed) ? parsed : 0
-                  }
-                  return 0
-                }
-                const entryMs = toMs(p.entry_time)
-                const exitMs = toMs(p.exit_time)
-                const drawdownMinutes =
-                  entryMs > 0 && exitMs > entryMs ? (exitMs - entryMs) / 60000 : 0
-                recordPosClosed({
-                  connectionId: this.connectionId,
-                  symbol: p.symbol || symbol,
-                  indicationType,
-                  direction,
-                  pnl: resultPct,
-                  drawdownMinutes,
-                  // Prehistoric backtest positions don't track quantity,
-                  // so position cost is not available. Live positions in
-                  // pseudo-position-manager pass both entryPrice and quantity.
-                  entryPrice: p.entry_price,
-                  pipeline,
-                })
+              await yieldToEventLoop()
+              const positions = this.calculateStrategyPositions(symbol, candles, config)
+              if (positions.length === 0) return 0
+              if (typeof (this.strategyManager as any).addPositions === "function") {
+                await (this.strategyManager as any).addPositions(config.id, positions)
+              } else {
+                await Promise.all(positions.map((p) => this.strategyManager.addPosition(config.id, p)))
               }
-              await (pipeline as any).exec()
-            } catch (piErr) {
-              // Non-critical — pos_history is observability/gate metadata.
-              // We never let it block the prehistoric run.
-              console.warn(
-                `[v0] [ConfigSetProcessor] pos_history mirror failed for ${config.id}:`,
-                piErr instanceof Error ? piErr.message : String(piErr),
-              )
-            }
-          }
 
-          return positions.length
-        } catch (error) {
-          console.error(
-            `[v0] [ConfigSetProcessor] ✗ strategy config ${config.id}:`,
-            error instanceof Error ? error.message : String(error),
-          )
-          return 0
-        }
-      })
+              // ── Mirror closed positions into pos_history (systemwide fix) ──
+              // Compose every closed historic position into ONE pipeline so
+              // the per-config cost is one round-trip regardless of fill
+              // count. Open prehistoric tails (the trailing in-position row
+              // emitted at end-of-range) are excluded — recordPosClosed
+              // semantically means "one closed trade observed", and
+              // including open tails would over-count the count/wins/loss
+              // accumulators feeding the Main gate.
+              const closed = positions.filter((p) => p.status === "closed")
+              if (closed.length > 0) {
+                try {
+                  const pipeline = piClient.multi()
+                  for (const p of closed) {
+                    const direction = p.direction === "short" ? "short" : "long"
+                    const indicationType = p.indication_type || config.type || "unknown"
+                    const resultPct = Number(p.result) || 0
+                    // Per-position drawdown TIME = how long the trade was held
+                    // (entry → exit), in minutes. Both fields are either epoch-ms
+                    // numbers or ISO strings (see the prices[].time origin), so we
+                    // normalise to ms before differencing. Previously this was
+                    // hardcoded to 0, which made the downstream DDT gate a dead
+                    // no-op (Set.avgDrawdownTime was always 0). The realised
+                    // duration is the correct signal: a Set that sits in trades
+                    // for hours has materially worse drawdown-time risk than one
+                    // that resolves in minutes, and the Main/Real gate is meant
+                    // to reject the former.
+                    const toMs = (t: unknown): number => {
+                      if (typeof t === "number") return t
+                      if (typeof t === "string") {
+                        const n = Number(t)
+                        if (Number.isFinite(n) && n > 0) return n
+                        const parsed = Date.parse(t)
+                        return Number.isFinite(parsed) ? parsed : 0
+                      }
+                      return 0
+                    }
+                    const entryMs = toMs(p.entry_time)
+                    const exitMs = toMs(p.exit_time)
+                    const drawdownMinutes =
+                      entryMs > 0 && exitMs > entryMs ? (exitMs - entryMs) / 60000 : 0
+                    recordPosClosed({
+                      connectionId: this.connectionId,
+                      symbol: p.symbol || symbol,
+                      indicationType,
+                      direction,
+                      pnl: resultPct,
+                      drawdownMinutes,
+                      // Prehistoric backtest positions don't track quantity,
+                      // so position cost is not available. Live positions in
+                      // pseudo-position-manager pass both entryPrice and quantity.
+                      entryPrice: p.entry_price,
+                      pipeline,
+                    })
+                  }
+                  await (pipeline as any).exec()
+                } catch (piErr) {
+                  // Non-critical — pos_history is observability/gate metadata.
+                  // We never let it block the prehistoric run.
+                  console.warn(
+                    `[v0] [ConfigSetProcessor] pos_history mirror failed for ${config.id}:`,
+                    piErr instanceof Error ? piErr.message : String(piErr),
+                  )
+                }
+              }
+
+              return positions.length
+            } catch (error) {
+              console.error(
+                `[v0] [ConfigSetProcessor] ✗ strategy config ${config.id} (${type}):`,
+                error instanceof Error ? error.message : String(error),
+              )
+              return 0
+            }
+          },
+        )
+        return perConfigCounts.reduce((sum, n) => sum + n, 0)
+      },
     )
 
-    return perConfigCounts.reduce((sum, n) => sum + n, 0)
+    return perTypeCounts.reduce((sum, n) => sum + n, 0)
   }
 
   /**
@@ -1191,6 +1262,8 @@ export class ConfigSetProcessor {
         stop_loss: entryPrice * (1 + (positionSide === "long" ? -stoploss : stoploss)),
         status: "open",
         result: netPnlPct,
+        direction: positionSide,
+        indication_type: type,
       })
     }
 

@@ -3933,8 +3933,6 @@ export class StrategyCoordinator {
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
           avg_pos_eval_real:  String(realAvgPosEval.toFixed(4)),
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
-          // evaluated = PF-eligible Main inputs + Real related/axis-created outputs.
-          evaluated:          String(realTotalEvaluated),
           // evaluated = public Real denominator after fan-out; separate upstream
           // input remains in strategies_active as {symbol}:real:input.
           evaluated:          String(realEvaluatedAfterFanOut),
