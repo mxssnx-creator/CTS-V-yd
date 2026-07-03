@@ -1190,25 +1190,13 @@ async function cancelProtectionOrder(
   if (!orderId) return false
   try {
     if (typeof connector?.cancelOrder !== "function") return false
-    // Use AbortController so the underlying HTTP connection is cancelled at
-    // the timeout boundary. Plain withTimeout leaves the fetch running after
-    // the Promise race resolves, producing zombie requests in the rate-limiter
-    // queue that block subsequent cancel/place calls.
-    const cancelAbort = new AbortController()
-    const cancelTimer = setTimeout(() => cancelAbort.abort(), EXCHANGE_TIMEOUT_CANCEL_ORDER_MS)
-    let res: any
-    try {
-      res = await (connector.cancelOrder(symbol, orderId, { signal: cancelAbort.signal } as any) as Promise<any>)
-    } catch (e: any) {
-      const msg = String(e?.message || e || "")
-      if (msg.includes("AbortError") || msg.includes("aborted") || msg.includes("abort")) {
-        console.warn(`${LOG_PREFIX} ${label} cancel timed out after ${EXCHANGE_TIMEOUT_CANCEL_ORDER_MS}ms — will retry on next sweep`)
-        return false
-      }
-      throw e
-    } finally {
-      clearTimeout(cancelTimer)
-    }
+    // withTimeout wraps cancelOrder; actual HTTP timeout is enforced by the
+    // rate-limiter's executeTimeoutMs (dispatch-time only, not enqueue-time).
+    const res = await withTimeout(
+      connector.cancelOrder(symbol, orderId) as Promise<any>,
+      EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
+      `cancelOrder(${label} ${orderId})`,
+    )
     if (res?.success) {
       console.log(`${LOG_PREFIX} ${label} cancelled: ${orderId}`)
       return true
@@ -1378,18 +1366,14 @@ async function placeProtectionOrder(
     // well-shaped result object.
     const placeStop = async (qty: number): Promise<any> => {
       // Acquire the global semaphore before calling the exchange.
+      // EXCHANGE_TIMEOUT_PLACE_STOP_MS is applied via the rate-limiter's
+      // executeTimeoutMs (starts from dispatch time, not enqueue time) so the
+      // timeout only covers actual HTTP time — not queue-wait time. This prevents
+      // "Aborted while queued" errors from killing requests before they start.
       await acquireStopSem()
       try {
-        // Create an AbortController that fires at EXCHANGE_TIMEOUT_PLACE_STOP_MS.
-        // This signal is threaded all the way into the underlying fetch call via
-        // PlaceOrderOptions.signal → rateLimitedFetch, so the HTTP connection is
-        // actually cancelled on timeout rather than just the Promise being raced.
-        // Without this the fetch continues running long after withTimeout fires,
-        // producing latency=71-118s in logs even though the caller gave up at 45s.
-        const abortCtrl = new AbortController()
-        const abortTimer = setTimeout(() => abortCtrl.abort(), EXCHANGE_TIMEOUT_PLACE_STOP_MS)
-        try {
-          const result = await connector.placeStopOrder(
+        return await withTimeout(
+          connector.placeStopOrder(
             symbol,
             closeSide,
             qty,
@@ -1398,19 +1382,13 @@ async function placeProtectionOrder(
             {
               reduceOnly: true,
               positionSide: positionDirection === "long" ? "LONG" : "SHORT",
-              signal: abortCtrl.signal,
             },
-          )
-          clearTimeout(abortTimer)
-          return result
-        } catch (e: any) {
-          clearTimeout(abortTimer)
-          const msg = String(e?.message || e)
-          if (msg.includes("AbortError") || msg.includes("aborted") || msg.includes("abort")) {
-            return { success: false, error: `[placeStopOrder(${orderLabel} ${symbol})] Timeout after ${EXCHANGE_TIMEOUT_PLACE_STOP_MS}ms` }
-          }
-          return { success: false, error: msg }
-        }
+          ) as Promise<any>,
+          EXCHANGE_TIMEOUT_PLACE_STOP_MS,
+          `placeStopOrder(${orderLabel} ${symbol})`,
+        )
+      } catch (e: any) {
+        return { success: false, error: String(e?.message || e) }
       } finally {
         releaseStopSem()
       }
@@ -2257,7 +2235,7 @@ export async function executeLivePosition(
   const client = getRedisClient()
   const connectionTrackingId = makeConnectionTrackingId(connectionId)
 
-  // ── Exchange circuit-breaker gate (per-symbol) ───────────────────────
+  // ── Exchange circuit-breaker gate (per-symbol) ──────────────���────────
   // BingX code 109400 — "API orders temporarily disabled due to market
   // volatility" — affects a specific symbol for ~1-5 minutes. Skip it
   // silently rather than counting it as a margin/balance failure.
@@ -3740,7 +3718,7 @@ export async function executeLivePosition(
           `${LOG_PREFIX} ${crossedLeg} PRICE_CROSSED for ${realPosition.symbol} — triggering immediate force-close`,
         )
         livePosition.closeReason = "protection_price_crossed_at_placement"
-        await closeLivePosition(livePosition, connectionId, exchangeConnector, `${crossedLeg} price crossed market at initial placement`)
+        await closeLivePosition(connectionId, livePosition.id, 0, exchangeConnector, `${crossedLeg} price crossed market at initial placement`)
         return livePosition
       }
 
@@ -6654,7 +6632,7 @@ export async function recalculateAndApplySLTP(
     // `if (liveOrderIds && …)`). If a SL/TP order silently disappeared on the
     // exchange (filled early, cancelled, expired), `pos.stopLossOrderId` is
     // still set, `priceDrifted()` returns false, and the leg is never
-    // re-armed — leaving the position unprotected. Passing liveOrderIds here
+    // re-armed �� leaving the position unprotected. Passing liveOrderIds here
     // ensures the verify step runs on every operator-triggered recalc.
     const liveOrderIds = await fetchLiveOrderIdSet(exchangeConnector)
     await updateProtectionOrders(exchangeConnector, position, "manual_recalc", liveOrderIds ?? undefined)

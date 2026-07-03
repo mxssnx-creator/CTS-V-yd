@@ -108,11 +108,6 @@ export interface PlaceOrderOptions {
   positionSide?: "LONG" | "SHORT"
   hedgeMode?: boolean
   clientOrderId?: string
-  /** AbortSignal from the caller's timeout controller. Threaded into the
-   *  underlying fetch so the HTTP connection is physically cancelled when
-   *  the timeout fires, preventing zombie requests from completing 60-90s
-   *  after the caller has already given up. */
-  signal?: AbortSignal
 }
 
 export abstract class BaseExchangeConnector {
@@ -252,43 +247,38 @@ export abstract class BaseExchangeConnector {
   protected async rateLimitedFetch(
     url: string | (() => string),
     options?: RequestInit,
-    outerSignal?: AbortSignal,
   ): Promise<Response> {
-    // outerSignal — provided by the caller's withTimeout wrapper.  Passed to
-    // the rate-limiter so that if withTimeout fires while the request is still
-    // in the queue (can happen when 16 SL/TP calls queue simultaneously), the
-    // queued slot is dropped immediately rather than running stale work after
-    // the timeout has already fired.
-    return this.rateLimiter.execute(async () => {
-      // Resolve the URL INSIDE the rate-limit slot so lazily-built signed
-      // URLs carry a timestamp from send time, not queue-entry time.
-      const resolvedUrl = typeof url === "function" ? url() : url
+    // this.timeout is enforced via the rate-limiter's executeTimeoutMs parameter.
+    // The timeout starts at dispatch time (when the request leaves the queue and
+    // begins executing), NOT at enqueue time. This prevents abort signals from
+    // firing during legitimate queue-wait periods and killing requests before
+    // they reach BingX.
+    return this.rateLimiter.execute(
+      async () => {
+        // Resolve the URL INSIDE the rate-limit slot so lazily-built signed
+        // URLs carry a timestamp from send time, not queue-entry time.
+        const resolvedUrl = typeof url === "function" ? url() : url
 
-      // Combine the outer abort signal with an internal per-fetch timeout so
-      // either side can cancel the HTTP connection.
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout)
-      if (outerSignal) {
-        if (outerSignal.aborted) {
+        const controller = new AbortController()
+        // The rate-limiter's executeTimeoutMs fires Promise.race at this.timeout
+        // already; this AbortController is a belt-and-suspenders abort so the
+        // underlying TCP connection is also cleaned up on timeout.
+        const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+        try {
+          const response = await fetch(resolvedUrl, {
+            ...options,
+            signal: controller.signal,
+          })
           clearTimeout(timeoutId)
-          controller.abort()
-        } else {
-          outerSignal.addEventListener("abort", () => controller.abort(), { once: true })
+          return response
+        } catch (error) {
+          clearTimeout(timeoutId)
+          throw error
         }
-      }
-
-      try {
-        const response = await fetch(resolvedUrl, {
-          ...options,
-          signal: controller.signal,
-        })
-        clearTimeout(timeoutId)
-        return response
-      } catch (error) {
-        clearTimeout(timeoutId)
-        throw error
-      }
-    }, outerSignal)
+      },
+      undefined, // no caller AbortSignal — timeouts are managed by executeTimeoutMs
+      this.timeout, // executeTimeoutMs: starts at dispatch, not enqueue
+    )
   }
 
   abstract testConnection(): Promise<ExchangeConnectorResult>

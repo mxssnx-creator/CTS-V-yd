@@ -2,11 +2,15 @@
  * Rate Limiter for Exchange API Calls
  * Prevents API rate limit violations with intelligent queuing.
  *
- * Key fix (session 35): processQueue was serial — it awaited every request
- * before dequeuing the next, so maxConcurrent=3 was never used and all
- * requests serialised.  The rewrite fires up to maxConcurrent requests
- * simultaneously; each slot releases itself when done, then the queue
- * drains as fast as BingX's per-second and per-minute limits allow.
+ * Key fixes (session 35):
+ * - processQueue is now concurrent: fires up to maxConcurrent requests
+ *   simultaneously instead of serial await.
+ * - Per-request executeTimeout: applied from dispatch time (when the request
+ *   leaves the queue and starts running), NOT from enqueue time. This prevents
+ *   the abort signal from firing during legitimate queue-wait time.
+ * - Caller AbortSignal: still supported for cancelling while queued. It only
+ *   removes the request from the queue; it does NOT cancel the HTTP fetch once
+ *   execution has started (use executeTimeoutMs for that).
  */
 
 interface RateLimitConfig {
@@ -22,6 +26,8 @@ interface QueuedRequest {
   reject: (error: any) => void
   timestamp: number
   signal?: AbortSignal
+  /** Timeout (ms) applied from dispatch time — covers only actual HTTP time. */
+  executeTimeoutMs?: number
 }
 
 export class RateLimiter {
@@ -41,7 +47,7 @@ export class RateLimiter {
     bingx: {
       requestsPerSecond: 5,
       requestsPerMinute: 100,
-      maxConcurrent: 5,   // raised from 3; semaphore in live-stage is the outer cap
+      maxConcurrent: 5, // raised from 3; semaphore in live-stage is the outer cap
     },
     binance: {
       requestsPerSecond: 10,
@@ -74,7 +80,24 @@ export class RateLimiter {
     }
   }
 
-  async execute<T>(request: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  /**
+   * Execute a request through the rate limiter.
+   *
+   * @param request - The async function to execute (the actual HTTP call).
+   * @param signal  - Optional caller AbortSignal. Removes the request from the
+   *                  queue if it fires while waiting. Does NOT cancel an
+   *                  in-flight fetch — use executeTimeoutMs for that.
+   * @param executeTimeoutMs - Optional timeout applied from dispatch time.
+   *                  Wraps request() in a Promise.race so it rejects if the
+   *                  exchange call itself takes too long. Does not count queue
+   *                  wait time. Defaults to no timeout (connector's own fetch
+   *                  timeout applies instead).
+   */
+  async execute<T>(
+    request: () => Promise<T>,
+    signal?: AbortSignal,
+    executeTimeoutMs?: number,
+  ): Promise<T> {
     return new Promise((resolve, reject) => {
       // If the caller already aborted before we even enqueue, bail fast.
       if (signal?.aborted) {
@@ -89,15 +112,25 @@ export class RateLimiter {
         reject,
         timestamp: Date.now(),
         signal,
+        executeTimeoutMs,
       }
 
-      // Remove from queue if the caller aborts while waiting.
+      // Remove from queue if the caller aborts while still waiting for a slot.
+      // This does NOT cancel an already-dispatched request.
       if (signal) {
-        signal.addEventListener("abort", () => {
-          const idx = this.queue.indexOf(queuedRequest)
-          if (idx !== -1) this.queue.splice(idx, 1)
-          reject(new DOMException("Aborted while queued", "AbortError"))
-        }, { once: true })
+        signal.addEventListener(
+          "abort",
+          () => {
+            const idx = this.queue.indexOf(queuedRequest)
+            if (idx !== -1) {
+              this.queue.splice(idx, 1)
+              reject(new DOMException("Aborted while queued", "AbortError"))
+            }
+            // If already dispatched (not in queue), the reject above is a no-op
+            // and the request runs to completion (or times out via executeTimeoutMs).
+          },
+          { once: true },
+        )
       }
 
       this.queue.push(queuedRequest)
@@ -107,7 +140,7 @@ export class RateLimiter {
 
   /**
    * Drain the queue: fire as many requests as rate limits allow,
-   * concurrently up to maxConcurrent.  Each slot calls drainQueue again
+   * concurrently up to maxConcurrent. Each slot calls drainQueue again
    * when it finishes so the queue stays moving without any global loop.
    */
   private drainQueue(): void {
@@ -130,7 +163,23 @@ export class RateLimiter {
             request.reject(new DOMException("Aborted before dispatch", "AbortError"))
             return
           }
-          const result = await request.execute()
+
+          // Apply per-request execute timeout (measured from dispatch, not enqueue).
+          // This is the right place to enforce HTTP-level timeouts: the request
+          // has a slot and is about to make the actual exchange call.
+          let result: any
+          if (request.executeTimeoutMs && request.executeTimeoutMs > 0) {
+            const timeoutPromise = new Promise<never>((_, rej) =>
+              setTimeout(
+                () => rej(new Error(`Execute timeout after ${request.executeTimeoutMs}ms`)),
+                request.executeTimeoutMs,
+              ),
+            )
+            result = await Promise.race([request.execute(), timeoutPromise])
+          } else {
+            result = await request.execute()
+          }
+
           request.resolve(result)
         } catch (error) {
           request.reject(error)

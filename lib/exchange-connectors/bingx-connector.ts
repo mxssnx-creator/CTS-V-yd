@@ -949,13 +949,10 @@ export class BingXConnector extends BaseExchangeConnector {
         return `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
       }
 
-      // Thread the optional abort signal from the caller (e.g. closePosition's
-      // 25s AbortController, or placeStopOrder's 45s AbortController).
-      const callerSignal = options?.signal
       const response = await this.rateLimitedFetch(buildOrderUrl, {
         method: "POST",
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
-      }, callerSignal)
+      })
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
@@ -1147,8 +1144,6 @@ export class BingXConnector extends BaseExchangeConnector {
       )
 
       const endpoint = "/openApi/swap/v2/trade/order"
-      // Thread optional AbortSignal from caller (set by placeStop's 45s AbortController).
-      const callerSignal = options?.signal
       const buildStopUrl = (): string => {
         params.timestamp = this.getTimestamp()
         const { signature, queryString: signedQs } = this.signParams(params)
@@ -1157,7 +1152,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const response = await this.rateLimitedFetch(buildStopUrl, {
         method: "POST",
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
-      }, callerSignal)
+      })
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
@@ -1282,39 +1277,32 @@ export class BingXConnector extends BaseExchangeConnector {
   async cancelOrder(
     symbol: string,
     orderId: string,
-    opts?: { signal?: AbortSignal },
   ): Promise<{ success: boolean; error?: string }> {
-    const callerSignal = opts?.signal
     try {
-      // Abort early if signal already fired (caller timed out while we were queued).
-      if (callerSignal?.aborted) return { success: false, error: "cancelOrder: aborted before start" }
-
       // Sync server time before any signed request.
       await this.syncServerTime()
 
       this.log(`Cancelling order ${orderId} for ${symbol}`)
 
-      // Perp swap: DELETE /openApi/swap/v2/trade/order (no separate cancel path).
-      // Spot: POST /openApi/spot/v1/trade/cancel (v1 spot still uses a subpath).
       const isSpot = this.credentials.apiType === "spot"
       const endpoint = isSpot ? "/openApi/spot/v1/trade/cancel" : "/openApi/swap/v2/trade/order"
       const method = isSpot ? "POST" : "DELETE"
       const bingxSymbol = this.toBingXSymbol(symbol)
       const baseUrl = this.getBaseUrl()
 
+      // LAZY URL BUILD: compute timestamp + signature inside the rate-limit slot
+      // at send time so they are always fresh (avoids 100421 timestamp errors).
       const buildUrl = () => {
         const params = { symbol: bingxSymbol, orderId, timestamp: this.getTimestamp() }
         const { signature, queryString: signedQs } = this.signParams(params)
         return `${baseUrl}${endpoint}?${signedQs}&signature=${signature}`
       }
 
-      // LAZY URL BUILD + callerSignal so the HTTP connection is physically
-      // cancelled when the caller's AbortController fires (20s cancel budget).
-      const doRequest = (sig?: AbortSignal) =>
+      const doRequest = () =>
         this.rateLimitedFetch(buildUrl, {
           method,
           headers: { "X-BX-APIKEY": this.credentials.apiKey },
-        }, sig ?? callerSignal)
+        })
 
       let response = await doRequest()
 
@@ -1338,7 +1326,7 @@ export class BingXConnector extends BaseExchangeConnector {
           this.lastTimeSync = 0
           this.syncPromise = null
           await this.syncServerTime()
-          const retryResponse = await doRequest(callerSignal)
+          const retryResponse = await doRequest()
           if (!retryResponse.ok) throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`)
           data = await this.safeJson(retryResponse)
 
@@ -1690,15 +1678,8 @@ export class BingXConnector extends BaseExchangeConnector {
   async closePosition(
     symbol: string,
     positionSide?: "long" | "short",
-    opts?: { signal?: AbortSignal },
   ): Promise<{ success: boolean; error?: string }> {
-    const signal = opts?.signal
     try {
-      this.log(`Closing position ${symbol}${positionSide ? ` (${positionSide})` : ""}`)
-
-      // Abort early if the caller already cancelled.
-      if (signal?.aborted) return { success: false, error: "closePosition: aborted before start" }
-
       // Pass the requested direction so getPosition() returns the correct
       // hedge-mode slot (LONG vs SHORT) rather than the first entry in the
       // array (which may be the opposite side or a zero-sized slot).
@@ -1706,8 +1687,6 @@ export class BingXConnector extends BaseExchangeConnector {
       if (!position) {
         return { success: false, error: "Position not found" }
       }
-
-      if (signal?.aborted) return { success: false, error: "closePosition: aborted after getPosition" }
 
       // Determine the effective side of the *position* we are closing so the
       // reduce-only close order carries the correct `positionSide` on hedge
@@ -1736,7 +1715,6 @@ export class BingXConnector extends BaseExchangeConnector {
           reduceOnly: true,
           positionSide: posSideNormalised,
           hedgeMode: true,
-          signal,
         },
       )
 
