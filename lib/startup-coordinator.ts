@@ -242,10 +242,23 @@ export async function completeStartup() {
       console.log(`[v0] [Startup] ✓ Continuing without consolidation (engine works without it)\n`)
     }
 
-    // Step 6: Initialize coordinator (don't start engines)
+    // Step 6: Initialize coordinator and start engines in dev mode
     console.log(`[v0] [Startup] Step 6/8: Initializing engine coordinator...`)
     const coordinator = getGlobalTradeEngineCoordinator()
-    console.log(`[v0] [Startup] ✓ Engine coordinator initialized (ready for manual start)\n`)
+    console.log(`[v0] [Startup] ✓ Engine coordinator initialized\n`)
+    
+    // In dev/test environments, automatically start enabled connections
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[v0] [Startup] Starting enabled connections (dev mode)...`)
+      try {
+        // Fire and forget - don't block startup on engine starts
+        coordinator.startMissingEngines().catch(err => 
+          console.warn(`[v0] [Startup] Failed to start engines in dev mode:`, err)
+        )
+      } catch (err) {
+        console.warn(`[v0] [Startup] Dev mode auto-start error (non-fatal):`, err)
+      }
+    }
 
     // Step 6b: Initialize boot metadata without claiming runtime liveness.
     // `trade_engine:global.status` is legacy operator intent in several routes;
