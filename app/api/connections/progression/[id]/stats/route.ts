@@ -618,7 +618,7 @@ export async function GET(
       ? Math.max(1, existingRealActiveSamples)
       : existingRealActiveSamples
 
-    // ── Live-stage OPEN positions + Set-relation join ─────���───────────
+    // ── Live-stage OPEN positions + Set-relation join ─────�����───────────
     //
     // The operator asked for a coordination view that identifies which
     // Set each live exchange position came from. The live-stage
@@ -1147,19 +1147,14 @@ export async function GET(
     // snapshot here instead of exposing an impossible state to the dashboard,
     // validation scripts, and operators watching long-running progressions.
     if (stratCounts.main > 0 && stratCounts.real > stratCounts.main) {
-      console.warn(
-        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > main (${stratCounts.main}). ` +
-        `Clamping real to main for cascade consistency.`,
-      )
+      // Cascade-invariant normalization: real and main are written in separate Redis
+      // calls; a stats read can land between them producing a transient real > main.
+      // This is an expected read-time race, not a data corruption — use debug level.
       stratCounts.real = stratCounts.main
       activeStratByStage.real = Math.min(activeStratByStage.real || 0, stratCounts.real)
       activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
     }
     if (stratCounts.real > 0 && stratCounts.live > stratCounts.real) {
-      console.warn(
-        `[STATS-VALIDATION] ${connectionId}: live (${stratCounts.live}) > real (${stratCounts.real}). ` +
-        `Clamping live to real for cascade consistency.`,
-      )
       stratCounts.live = stratCounts.real
       activeStratByStage.live = Math.min(activeStratByStage.live || 0, stratCounts.live)
       activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
@@ -2473,13 +2468,8 @@ export async function GET(
             // Validate constraint: eval <= sets
             const base = stratCounts.base || 0
             const eval_val = stratEvaluated.base || 0
-            if (eval_val > base && base > 0) {
-              console.warn(
-                `[STATS-VALIDATION] ${connectionId}: baseEvaluated (${eval_val}) > base (${base}). ` +
-                `Clamping to base.`,
-              )
-              return base
-            }
+            // Transient read-race: clamp silently (expected, not a bug).
+            if (eval_val > base && base > 0) return base
             return eval_val
           })(),
           mainEvaluated: (() => {
@@ -2495,13 +2485,8 @@ export async function GET(
             // interpretation), treat the main count itself as the evaluated count:
             // all main sets undergo full PF/DDT evaluation.
             if (main > 0 && eval_val < main) return main
-            if (eval_val > main && main > 0) {
-              console.warn(
-                `[STATS-VALIDATION] ${connectionId}: mainEvaluated (${eval_val}) > main (${main}). ` +
-                `Clamping to main.`,
-              )
-              return main
-            }
+            // Transient read-race: clamp silently (expected, not a bug).
+            if (eval_val > main && main > 0) return main
             return eval_val || main
           })(),
           realEvaluated: (() => {

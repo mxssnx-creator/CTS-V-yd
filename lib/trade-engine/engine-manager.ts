@@ -288,9 +288,12 @@ import { fetchTopSymbols } from "@/lib/top-symbols"
 const _devSymCount = process.env.NODE_ENV === "development"
   ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
   : 0
+// For 8 symbols: ceil(8/2)=4 — 2 batches instead of 4 batches.
+// Per-phase timeouts in shared-ind-strat-pipeline.ts (Phase1=20s, Phase2=8s, Phase3=25s)
+// prevent any single stuck symbol from blocking the batch indefinitely.
 const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development"
-  ? Math.min(3, Math.max(1, Math.ceil(_devSymCount / 4)))
-  : 3
+  ? Math.min(4, Math.max(1, Math.ceil(_devSymCount / 2)))
+  : 4
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -1009,7 +1012,7 @@ export class TradeEngineManager {
       // will run and the onFirstPassComplete callback will arm them later.
       if (cacheHit) {
         console.log(
-          `[v0] [Engine ${this.connectionId}] Cache hit — arming live processors immediately (prehistoric data already complete)`,
+          `[v0] [Engine ${this.connectionId}] Cache hit �� arming live processors immediately (prehistoric data already complete)`,
         )
         this.armLiveProgressions("cached prehistoric")
       }
