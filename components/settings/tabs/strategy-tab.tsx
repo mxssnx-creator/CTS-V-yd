@@ -374,7 +374,7 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
                         </p>
                       </div>
                       <Switch
-                        checked={settings.dcaAdjustment !== false}
+                        checked={settings.dcaAdjustment === true}
                         onCheckedChange={(checked) => handleSettingChange("dcaAdjustment", checked)}
                       />
                     </div>

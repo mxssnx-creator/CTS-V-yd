@@ -136,12 +136,9 @@ export interface StrategySet {
    * 0 means "axis not active for this Set" — we still emit it so consumers
    * can dimensionalise stats by axis without re-deriving from ctx.
    *
-   * Block + DCA Sets are **independent of these axes** (they fire on
-   * `continuousCount >= 1` and `prevLosses >= 1` respectively, which
-   * are intrinsic to the variant gates, not on a tagged window). Their
-   * axisWindows are still emitted (with `prev`/`pause` populated from
-   * ctx, `cont`/`last` left at 0) so the dashboard's per-variant
-   * counter blocks can roll up cleanly without special-casing.
+   * DCA Sets are independent per parent Set and are NOT position-count
+   * axis Sets. They therefore leave axisWindows at zero/undefined so the
+   * pos-count fan-out cannot multiply or retag DCA exposure.
    */
   axisWindows?: {
     prev:  number
@@ -4022,7 +4019,7 @@ export class StrategyCoordinator {
           [`${symbol}:real`]:           String(realSets.length),
           // real:evaluated = PF-eligible Main inputs plus Real related/axis-created
           // outputs. Cross-symbol sum in stats route matches the Real pass denominator.
-          [`${symbol}:real:evaluated`]: String(realEvaluatedAfterFanOut),
+          [`${symbol}:real:evaluated`]: String(realTotalEvaluated),
           // real:input = upstream Main Sets that entered Real PF eligibility
           // before Real's current-cycle related-created fan-out.
           [`${symbol}:real:input`]: String(mainPFEligible),
@@ -5739,6 +5736,13 @@ export class StrategyCoordinator {
     const lP   = Math.min(8,  Math.max(0, ctx.lastPosCount))
     const pP   = Math.min(12, Math.max(0, ctx.prevPosCount))
     const pL   = Math.min(12, Math.max(0, ctx.prevLosses))
+    // DCA is an independent adjust Set for each parent Set, not a
+    // position-count Set. Do not include live/closed position-count context
+    // in its fingerprint or it will be recreated/rebucketed as counts change.
+    if (variant === "dca") {
+      return `${baseSet.setKey}#${variant}#pf=${bPF}#ec=${bEC}`
+    }
+
     const bCtx = `c${cont}/lw${lW}/ll${lL}/lp${lP}/pp${pP}/pl${pL}`
     return `${baseSet.setKey}#${variant}#pf=${bPF}#ec=${bEC}#ctx=${bCtx}`
   }
@@ -5806,14 +5810,16 @@ export class StrategyCoordinator {
     const avgDDT = sumDDT / count
     const avgCnf = sumCnf / count
 
-    const axisWindows = ctx
-      ? {
-          prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
-          last:  Math.max(0, Math.min(4,  ctx.lastPosCount)),
-          cont:  Math.max(0, Math.min(8,  ctx.continuousCount)),
-          pause: Math.max(0, Math.min(8,  ctx.lastPosCount)),
-        }
-      : { prev: 0, last: 0, cont: 0, pause: 0 }
+    const axisWindows = profile.name === "dca"
+      ? { prev: 0, last: 0, cont: 0, pause: 0 }
+      : ctx
+        ? {
+            prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
+            last:  Math.max(0, Math.min(4,  ctx.lastPosCount)),
+            cont:  Math.max(0, Math.min(8,  ctx.continuousCount)),
+            pause: Math.max(0, Math.min(8,  ctx.lastPosCount)),
+          }
+        : { prev: 0, last: 0, cont: 0, pause: 0 }
 
     return {
       setKey:          `${baseSet.setKey}#${profile.name}`,

@@ -754,7 +754,6 @@ export async function POST(request: Request) {
             const settings = await loadSettingsAsync()
             const coord = getGlobalTradeEngineCoordinator()
 
-            const started = await coord.startEngine(connectionId, {
             const engineStarted = await coord.startEngine(connectionId, {
               connectionId,
               connection_name: connection.name,
@@ -766,15 +765,9 @@ export async function POST(request: Request) {
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }, { markAssigned: true, forceLocalTakeover: true })
 
-            if (!started) {
-              console.warn(`${LOG_PREFIX} Main Engine start skipped for ${connection.name} (async)`)
-              await logProgressionEvent(connectionId, "engine_start_skipped", "warning", "Main Trade Engine start skipped via QuickStart", {
-                connectionId,
-                connectionName: connection.name,
-                exchange: exchangeName,
-                testPassed,
             if (!engineStarted) {
               const skippedAt = new Date().toISOString()
+              console.warn(`${LOG_PREFIX} Main Engine start skipped or queued for ${connection.name} (async)`)
               await logProgressionEvent(connectionId, "engine_start_skipped", "warning", "Main Trade Engine start skipped or queued via QuickStart", {
                 connectionId,
                 connectionName: connection.name,
