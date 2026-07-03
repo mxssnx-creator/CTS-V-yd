@@ -114,11 +114,13 @@ function getDefaultSettings(): Record<string, any> {
     // (Long / Short). Kept in the defaults so fresh installs boot with the
     // spec-mandated value instead of an undefined sentinel.
     maxActiveBasePseudoPositionsPerDirection: 1,
-    // Hard ceiling on REAL-stage Sets passed through to Live each cycle.
-    // 12000 is the operational default — see Settings → System for the
-    // user-facing slider. Seeded so fresh installs match what the Strategy
-    // Coordinator's `evaluateRealSets` falls back to internally.
-    maxRealSets: 12000,
+    // Strategy pipeline ceilings. Seeded here so fresh installs expose the
+    // same limits the coordinator enforces in production.
+    strategyMaxEntriesPerSet: 250,
+    strategyMainAxisSetsCeiling: 50,
+    strategyRealSetsSafetyCeiling: 100,
+    maxRealSets: 100,
+    strategyLiveSetsCeiling: 90,
     positionCost: POSITION_COST_MIN_PERCENT,
     exchangePositionCost: POSITION_COST_MIN_PERCENT,
   }
@@ -142,6 +144,23 @@ export async function GET() {
       await setAppSettings(defaults)
       settings = defaults
       console.log("[v0] Settings auto-seeded with", Object.keys(defaults).length, "default keys")
+    } else {
+      // Merge in newly-added defaults for existing installations. Without this
+      // the Settings UI shows fallback values that never get persisted, while
+      // engine code reading Redis sees undefined and falls back independently.
+      // Persisting the missing keys keeps System ceilings and runtime ceilings
+      // in lock-step after deploys.
+      const defaults = getDefaultSettings()
+      const missingDefaults: Record<string, any> = {}
+      for (const [key, value] of Object.entries(defaults)) {
+        if ((settings as Record<string, any>)[key] === undefined) {
+          missingDefaults[key] = value
+        }
+      }
+      if (Object.keys(missingDefaults).length > 0) {
+        settings = { ...defaults, ...(settings as Record<string, any>) }
+        await setAppSettings(settings)
+      }
     }
 
     return NextResponse.json({ settings })
