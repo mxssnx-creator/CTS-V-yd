@@ -618,7 +618,7 @@ export async function GET(
       ? Math.max(1, existingRealActiveSamples)
       : existingRealActiveSamples
 
-    // ── Live-stage OPEN positions + Set-relation join ─────────────────
+    // ── Live-stage OPEN positions + Set-relation join ─────���───────────
     //
     // The operator asked for a coordination view that identifies which
     // Set each live exchange position came from. The live-stage
@@ -1590,16 +1590,17 @@ export async function GET(
     }
 
     // ── SINGLE closed-archive fetch shared by stratDetail.live and
-    //    closedPositionsForHistory (below) ───��───────���────────────────────
-    // Previously the archive was fetched TWICE:
-    //   1. lrange(0, 199) for stratDetail.live PF/hold/ROI numbers.
-    //   2. lrange(0, 499) for closedPositionsForHistory rows + perf tiers.
-    // Both fetches scanned the SAME key and parsed the SAME JSON.
-    // Now we do one 0–499 lrange here (outer scope), share the parsed
-    // array across both consumers, and slice as needed. This removes one
-    // full round-trip + 200–500 GET fan-outs from every /stats call.
+    //    closedPositionsForHistory (below) ─────────────────────────────────
+    // CRITICAL FIX: Fetch from BOTH Redis live positions AND database persisted
+    // positions to ensure complete trade history. Previously only Redis was checked,
+    // missing positions that were synced to the database by data-cleanup-manager.
+    // Now we fetch from Redis first (for freshest data), then supplement from
+    // database to capture any that may have been archived/cleaned.
     const sharedClosedParsed: Array<Record<string, any>> = []
+    const seenIds = new Set<string>()
+    
     try {
+      // Fetch from Redis live:positions:${connectionId}:closed list
       const closedIds = ((await client
         .lrange(`live:positions:${connectionId}:closed`, 0, 499)
         .catch(() => [])) || []) as string[]
@@ -1608,9 +1609,49 @@ export async function GET(
       )
       for (const raw of rawList) {
         if (!raw) continue
-        try { sharedClosedParsed.push(JSON.parse(raw as string)) } catch { /* skip malformed */ }
+        try {
+          const pos = JSON.parse(raw as string)
+          sharedClosedParsed.push(pos)
+          if (pos.id) seenIds.add(pos.id)
+        } catch { /* skip malformed */ }
       }
     } catch { /* archive empty */ }
+    
+    // Supplement with positions from database that may have been synced and not
+    // in the Redis live list (e.g., archived/cleaned or from previous sessions)
+    try {
+      const { query } = await import("@/lib/db")
+      const dbPositions = await query(
+        `SELECT 
+          id, symbol, direction, entry_price as "entryPrice", exit_price as "exitPrice",
+          quantity, realized_pnl as "realizedPnL", opened_at as "openedAt", 
+          closed_at as "closedAt", status
+        FROM positions 
+        WHERE connection_id = $1 AND status = 'closed'
+        ORDER BY closed_at DESC LIMIT 500`,
+        [connectionId]
+      )
+      for (const pos of dbPositions || []) {
+        // Skip if already in Redis (avoid duplicates)
+        if (pos.id && seenIds.has(pos.id)) continue
+        // Only add if it has minimum required fields for display
+        if (pos.symbol && pos.direction && pos.entryPrice && pos.realizedPnL !== null) {
+          sharedClosedParsed.push({
+            id: pos.id || "",
+            symbol: pos.symbol,
+            direction: pos.direction,
+            entryPrice: pos.entryPrice,
+            exitPrice: pos.exitPrice || 0,
+            quantity: pos.quantity,
+            realizedPnL: pos.realizedPnL,
+            openedAt: pos.openedAt ? new Date(pos.openedAt).getTime() : 0,
+            closedAt: pos.closedAt ? new Date(pos.closedAt).getTime() : 0,
+            status: pos.status,
+          })
+          if (pos.id) seenIds.add(pos.id)
+        }
+      }
+    } catch { /* database query failed */ }
 
     type DispatchSummaryRow = {
       bucket: string
