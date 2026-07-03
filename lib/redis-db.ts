@@ -100,6 +100,7 @@ export interface RedisClientLike {
   lpos(key: string, value: string): Promise<number | null>
   lpop(key: string): Promise<string | null>
   rpop(key: string): Promise<string | null>
+  eval?(script: string, options: { keys: string[]; arguments: string[] }): Promise<any>
   dbSize(): Promise<number>
   keys(pattern: string): Promise<string[]>
   zadd(key: string, score: number, member: string): Promise<number>
@@ -1870,6 +1871,7 @@ class NodeRedisClientAdapter implements RedisClientLike {
   async lpos(key: string, value: string) { return await (await this.c()).lPos(key, value) }
   async lpop(key: string) { return await (await this.c()).lPop(key) }
   async rpop(key: string) { return await (await this.c()).rPop(key) }
+  async eval(script: string, options: { keys: string[]; arguments: string[] }) { return await (await this.c()).eval(script, options) }
   async dbSize() { return await (await this.c()).dbSize() }
   async keys(pattern: string) { return await (await this.c()).keys(pattern) }
   async zadd(key: string, score: number, member: string) { return await (await this.c()).zAdd(key, { score, value: member }) }
@@ -1964,6 +1966,7 @@ class UpstashRestRedisClient implements RedisClientLike {
   async lpos(key: string, value: string) { return await this.command<number | null>(["LPOS", key, value]) }
   async lpop(key: string) { return await this.command<string | null>(["LPOP", key]) }
   async rpop(key: string) { return await this.command<string | null>(["RPOP", key]) }
+  async eval(script: string, options: { keys: string[]; arguments: string[] }) { return await this.command<any>(["EVAL", script, options.keys.length, ...options.keys, ...options.arguments]) }
   async dbSize() { return await this.command<number>(["DBSIZE"]) }
   async keys(pattern: string) { return await this.command<string[]>(["KEYS", pattern]) }
   async zadd(key: string, score: number, member: string) { return await this.command<number>(["ZADD", key, score, member]) }
