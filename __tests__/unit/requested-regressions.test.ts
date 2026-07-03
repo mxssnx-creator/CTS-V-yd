@@ -1020,6 +1020,35 @@ describe("requested regression guardrails", () => {
     expect(coordinator).toContain("restart escalation disabled")
   })
 
+  test("QuickStart commits running Redis intent before dispatching engine starts", () => {
+    const quickStart = read("app/api/trade-engine/quick-start/route.ts")
+    const step4 = quickStart.slice(
+      quickStart.indexOf("// Step 4: Start engine"),
+      quickStart.indexOf("// Store in global quickstart state"),
+    )
+    const intentWriteIndex = step4.indexOf('await client.hset("trade_engine:global", {')
+    const startAllIndex = step4.indexOf("coordinator.startAll()")
+    const targetedStartIndex = step4.indexOf("const engineStarted = await coord.startEngine")
+
+    expect(intentWriteIndex).toBeGreaterThanOrEqual(0)
+    expect(intentWriteIndex).toBeLessThan(startAllIndex)
+    expect(intentWriteIndex).toBeLessThan(targetedStartIndex)
+    expect(step4).toContain('operator_stopped: "0"')
+    expect(step4).toContain("updated_at: quickstartGlobalStartedAt")
+    expect(step4).toContain("const quickstartGlobalStartedAt = new Date().toISOString()")
+
+    const intentBlock = step4.slice(intentWriteIndex, step4.indexOf("})", intentWriteIndex))
+    expect(intentBlock).toContain('status: "running"')
+    expect(intentBlock).toContain('desired_status: "running"')
+    expect(intentBlock).toContain('operator_intent: "running"')
+
+    const targetedStartBlock = step4.slice(targetedStartIndex)
+    expect(targetedStartBlock).toContain("if (!engineStarted)")
+    expect(targetedStartBlock).toContain('"engine_start_skipped"')
+    expect(targetedStartBlock).toContain('phase: "queued"')
+    expect(targetedStartBlock).toContain('status: "skipped_queued"')
+  })
+
   test("Real-stage evaluation denominator includes related outputs and never reports negative failures", () => {
     const source = read("lib/strategy-coordinator.ts")
 
