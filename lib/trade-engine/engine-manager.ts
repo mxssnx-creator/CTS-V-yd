@@ -352,9 +352,10 @@ async function _createExchangeConnectorLazy() {
 // when cron indication requests (13-17s each) run concurrently. A 40s
 // deadline was observed aborting cycles that WOULD have completed
 // (attemptedCycles=2 successfulCycles=0), wasting all their work and
-// amplifying load. 75s dev / 60s prod gives slow-but-progressing cycles
-// room to finish while still catching genuinely hung awaits.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 75_000
+// amplifying load. For live trading with 8+ symbols, increased to 120s dev / 90s prod
+// to prevent timeout failures during position fetching and strategy evaluation.
+// Cycles with real BingX API calls need more time for network latency and position reconciliation.
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 90_000 : 120_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {

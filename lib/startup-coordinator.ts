@@ -198,6 +198,15 @@ export async function completeStartup() {
     const volatileCleanup = await cleanupVolatileRuntimeState({ reason: "completeStartup" })
     console.log(`[v0] [Startup] ✓ Volatile runtime cleanup complete (deleted ${volatileCleanup.deleted}, preserved ${volatileCleanup.preserved})\n`)
 
+    // Initialize memory management for long-term stability
+    try {
+      const { initMemoryManager } = await import("@/lib/memory-manager")
+      const maxHeapMB = process.env.NODE_ENV === "production" ? 2048 : 1024
+      initMemoryManager(maxHeapMB)
+    } catch (e) {
+      console.warn(`[v0] [Startup] Memory manager initialization skipped (non-fatal):`, e instanceof Error ? e.message : e)
+    }
+
     // Step 2: Migrations already ran inside initRedis() above.
     // Seed default settings and placeholder market data — both are no-ops when
     // data already exists, so safe to call on every boot including hot-reloads.

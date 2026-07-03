@@ -11,8 +11,11 @@
 const _INDICATION_BUILD_VERSION = "5.0.1"
 const _BUILD_TIMESTAMP = 1712361660000 // Updated to force rebuild at 13:21
 
-// Log immediately on module load to confirm new code is running
-console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
+// Log exactly once per process (guarded by a globalThis flag so HMR reloads are silent)
+if (!(globalThis as any).__IND_PROC_LOGGED__) {
+  ;(globalThis as any).__IND_PROC_LOGGED__ = true
+  console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
+}
 
 // CRITICAL: Create a shared Map that will be used by ALL instances
 // This fixes the issue where class field initialization fails in cached bundles
@@ -52,9 +55,11 @@ const FALLBACK_CACHE = new Map<string, any>()
 ;(globalThis as any).__FALLBACK_MARKET_DATA_CACHE__ = FALLBACK_CACHE
 
 // Override Map methods to be more defensive - if called on undefined, use fallback
+// Guard with globalThis flag so this logs exactly once per process even if the
+// module is re-evaluated due to Next.js hot-module-replacement.
 if (!(globalThis as any).__MAP_PATCHED__) {
-  (globalThis as any).__MAP_PATCHED__ = true
-  console.log("[v0] Applying Map prototype patch for undefined cache fix")
+  ;(globalThis as any).__MAP_PATCHED__ = true
+  // Intentionally silent after first load — repeated logging drowns out real errors.
 }
 
 // Patch to make the shared cache available globally for old cached code

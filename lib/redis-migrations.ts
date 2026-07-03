@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ���������������
+          // ── Cycle Counters (hincrby discipline — never overwrite!) �����������������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -3852,8 +3852,21 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       }
     }
 
+    // CRITICAL: Also purge the open-index and closed-index LISTS for every
+    // connection. These lists contain position IDs from the previous run.
+    // After purging position hashes above, these IDs are dangling references —
+    // getLivePositions() fetches each ID and gets null (deleted hash), which
+    // the sync-tick then treats as a terminal position stuck in the open index.
+    // Clearing both lists on boot prevents this every-cycle purge noise.
+    const posIndexKeys: string[] = await client.keys("live:positions:*").catch(() => [])
+    let indexPurged = 0
+    for (const k of posIndexKeys) {
+      await client.del(k).catch(() => 0)
+      indexPurged++
+    }
+
     const symDesc = devSymCount === 1 ? "force_symbols=BTCUSDT" : `symbol_count=${devSymCount} (volatility_1h)`
-    console.log(`[v0] [Boot] Pinned ${symDesc} across all key namespaces${purged > 0 ? `, purged ${purged} stale live:position keys` : ""}`)
+    console.log(`[v0] [Boot] Pinned ${symDesc} across all key namespaces${purged > 0 ? `, purged ${purged} stale live:position keys` : ""}${indexPurged > 0 ? `, cleared ${indexPurged} stale position index lists` : ""}`)
   }
 
   return { createdOrUpdated, credentialsInjected }

@@ -1372,7 +1372,7 @@ async function placeProtectionOrder(
         const availableQty = extract110424Available(errMsg)
         if (availableQty !== null && availableQty < effectiveQty) {
           console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ���������� retrying with exact available qty`,
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ������������ retrying with exact available qty`,
           )
           result = await placeStop(availableQty)
           if (result?.success) {
@@ -5557,18 +5557,26 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       try {
         const openIndexKey = `live:positions:${connectionId}`
         const closedIndexKey = `live:positions:${connectionId}:closed`
+        let newlyMoved = 0
         await Promise.all(
           stuckTerminal.map(async (p) => {
             await client.lrem(openIndexKey, 0, p.id).catch(() => 0)
             const already = await client.lpos(closedIndexKey, p.id).catch(() => null)
             if (already === null || already === undefined) {
               await client.lpush(closedIndexKey, p.id).catch(() => 0)
+              newlyMoved++
             }
           }),
         )
-        console.log(
-          `${LOG_PREFIX} [sync-tick] purged ${stuckTerminal.length} terminal position(s) stuck in open index for ${connectionId}`,
-        )
+        // Only log when positions are newly moved — suppress repetitive noise when
+        // the same terminal positions appear in the open index every cycle
+        // (e.g. Redis snapshot restored stale open-index entries that are already
+        // in the closed list; they are safe to silently discard).
+        if (newlyMoved > 0) {
+          console.log(
+            `${LOG_PREFIX} [sync-tick] purged ${newlyMoved} terminal position(s) stuck in open index for ${connectionId}`,
+          )
+        }
       } catch { /* best-effort self-heal */ }
     }
     const allOpen = allOpenRaw.filter((p) => !TERMINAL_SYNC_STATUSES.has(String(p.status)))
