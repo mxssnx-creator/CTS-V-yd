@@ -1015,6 +1015,8 @@ export class InlineLocalRedis implements RedisClientLike {
       const id = key.slice("strategy:".length)
       this.data.sets.get("idx:strategies")?.delete(id)
     }
+  }
+
   private compareSortedSetEntries(a: SortedSetEntry, b: SortedSetEntry): number {
     return a.score - b.score || a.member.localeCompare(b.member)
   }
@@ -2525,6 +2527,8 @@ async function removeTradeIndexes(client: RedisClientLike, id: string): Promise<
   const connectionId = getRecordConnectionId(existing)
   await client.srem(SECONDARY_INDEX_KEYS.trades, id).catch(() => 0)
   if (connectionId) await client.srem(tradeConnectionIndexKey(connectionId), id).catch(() => 0)
+}
+
 export class DatabaseWriteRateLimitError extends Error {
   readonly code = "DATABASE_WRITE_RATE_LIMIT_EXCEEDED"
   readonly operationName: string
