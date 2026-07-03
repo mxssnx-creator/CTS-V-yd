@@ -114,6 +114,8 @@ export async function evaluateToMainPositions(
       // Store main position
       const storageKey = `main:position:${mainPosition.id}`
       await client.setex(storageKey, 604800, JSON.stringify(mainPosition)) // 7 days
+      await client.sadd(`main:positions:index:${connectionId}`, mainPosition.id)
+      await client.expire(`main:positions:index:${connectionId}`, 604800)
 
       console.log(
         `${LOG_PREFIX} Created main position: ${symbol} ${direction} (strength=${avgStrength.toFixed(
@@ -299,14 +301,13 @@ export async function getMainPositions(connectionId: string): Promise<MainPositi
   const client = getRedisClient()
 
   try {
-    const keys = await client.keys(`main:position:main:${connectionId}:*`)
-    if (keys.length === 0) return []
+    const ids = ((await client.smembers(`main:positions:index:${connectionId}`).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return []
 
-    // Batch GETs into a single fan-out. The prior sequential loop paid
-    // one Redis round-trip per position, which dominated cycle latency
-    // when positions accumulated. Matches the live-stage pattern.
+    // Batch GETs from the explicit index. Avoid Redis KEYS here: this accessor
+    // runs in engine/runtime paths and may be polled frequently.
     const rawValues = await Promise.all(
-      keys.map((k: string) => client.get(k).catch(() => null)),
+      ids.map((id: string) => client.get(`main:position:${id}`).catch(() => null)),
     )
     const positions: MainPosition[] = []
     for (const data of rawValues) {

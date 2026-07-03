@@ -3891,6 +3891,9 @@ export async function updateLivePositionFill(
     position.updatedAt = Date.now()
 
     await client.setex(key, 604800, JSON.stringify(position))
+    await client.lpush(`live:positions:${position.connectionId}`, position.id)
+    await client.ltrim(`live:positions:${position.connectionId}`, 0, 999)
+    await client.expire(`live:positions:${position.connectionId}`, 604800)
     return position
   } catch (err) {
     console.error(`${LOG_PREFIX} Error updating fill:`, err)
@@ -4336,17 +4339,6 @@ export async function getLivePositions(connectionId: string): Promise<LivePositi
         if (!data) continue
         try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
       }
-    }
-    if (positions.length > 0) return positions
-
-    // Fallback scan if the index is empty.
-    const keys = ((await client.keys(`live:position:live:${connectionId}:*`).catch(() => [])) || []) as string[]
-    if (keys.length === 0) return positions
-
-    const rawFallback = await Promise.all(keys.map((k) => client.get(k).catch(() => null)))
-    for (const data of rawFallback) {
-      if (!data) continue
-      try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
     }
     return positions
   } catch (err) {
@@ -6279,6 +6271,9 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
 
         const key = `live:position:${position.id}`
         await client.setex(key, 604800, JSON.stringify(position))
+        await client.lpush(`live:positions:${position.connectionId}`, position.id)
+        await client.ltrim(`live:positions:${position.connectionId}`, 0, 999)
+        await client.expire(`live:positions:${position.connectionId}`, 604800)
       } catch (err) {
         console.warn(`${LOG_PREFIX} Error syncing ${position.id}:`, err)
       }

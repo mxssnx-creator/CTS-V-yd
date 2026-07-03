@@ -10,6 +10,20 @@ import {
   isConnectionPresetTradeEnabled,
 } from "@/lib/connection-state-utils"
 
+
+async function scanKeys(client: any, pattern: string, limit = 500): Promise<string[]> {
+  const keys: string[] = []
+  let cursor = "0"
+  do {
+    const result = await client.scan(cursor, "MATCH", pattern, "COUNT", 100).catch(() => null)
+    if (!result) break
+    cursor = String(Array.isArray(result) ? result[0] : result.cursor || "0")
+    const batch = (Array.isArray(result) ? result[1] : result.keys || []) as string[]
+    keys.push(...batch)
+  } while (cursor !== "0" && keys.length < limit)
+  return keys.slice(0, limit)
+}
+
 type WorkflowConnection = {
   id: string
   name: string
@@ -151,7 +165,7 @@ async function buildDashboardWorkflowSnapshot(preferredConnectionId?: string) {
     // Strategy set counts from settings:strategies:* hash keys
     let baseSets = 0, mainSets = 0, realSets = 0
     try {
-      const stratKeys = await client.keys(`settings:strategies:${connId}:*:sets`)
+      const stratKeys = await scanKeys(client, `settings:strategies:${connId}:*:sets`, 250)
       for (const k of stratKeys) {
         const h = await client.hgetall(k).catch(() => ({})) || {}
         const c = parseInt((h as Record<string, string>).count || "0", 10)
@@ -165,7 +179,7 @@ async function buildDashboardWorkflowSnapshot(preferredConnectionId?: string) {
     const prehistoricSymbols = await client.scard(`prehistoric:${connId}:symbols`).catch(() => 0)
     let prehistoricDataSize = 0
     try {
-      const keys = await client.keys(`prehistoric:${connId}:*`)
+      const keys = await scanKeys(client, `prehistoric:${connId}:*`, 1000)
       prehistoricDataSize = keys.length
     } catch { /* ignore */ }
 

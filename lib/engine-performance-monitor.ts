@@ -5,6 +5,20 @@
 
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 
+
+async function scanKeys(client: any, pattern: string, limit = 500): Promise<string[]> {
+  const keys: string[] = []
+  let cursor = "0"
+  do {
+    const result = await client.scan(cursor, "MATCH", pattern, "COUNT", 100).catch(() => null)
+    if (!result) break
+    cursor = String(Array.isArray(result) ? result[0] : result.cursor || "0")
+    const batch = (Array.isArray(result) ? result[1] : result.keys || []) as string[]
+    keys.push(...batch)
+  } while (cursor !== "0" && keys.length < limit)
+  return keys.slice(0, limit)
+}
+
 export interface CycleMetrics {
   cycleNumber: number
   startTime: number
@@ -194,21 +208,21 @@ class EnginePerformanceMonitor {
     ])
 
     // Get data sizes
-    const dataSizeKeys = await client.keys(`market_data:*`)
+    const dataSizeKeys = await scanKeys(client, `market_data:*`, 50)
     let marketDataBytes = 0
     for (const key of dataSizeKeys.slice(0, 50)) {
       const data = await client.get(key)
       marketDataBytes += data ? data.length : 0
     }
 
-    const indicationKeys = await client.keys(`indication_set:*`)
+    const indicationKeys = await scanKeys(client, `indication_set:*`, 50)
     let indicationBytes = 0
     for (const key of indicationKeys.slice(0, 50)) {
       const size = await client.scard(key)
       indicationBytes += (size || 0) * 100 // Approximate bytes per indication
     }
 
-    const positionKeys = await client.keys(`pseudo_position:${connectionId}:*`)
+    const positionKeys = await scanKeys(client, `pseudo_position:${connectionId}:*`, 1000)
     const positionBytes = positionKeys.length * 500 // Approximate
 
     // Get symbols
@@ -216,7 +230,7 @@ class EnginePerformanceMonitor {
     const symbols = engineState?.symbols ? JSON.parse(engineState.symbols) : []
 
     // Count active timers/processes
-    const timerKeys = await client.keys(`timer:*:${connectionId}:*`)
+    const timerKeys = await scanKeys(client, `timer:*:${connectionId}:*`, 1000)
     const activeTimers = timerKeys.length
 
     return {

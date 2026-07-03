@@ -178,6 +178,8 @@ export async function evaluateToRealPositions(
         // Store real position
         const key = `real:position:${realPosition.id}`
         await client.setex(key, 604800, JSON.stringify(realPosition))
+        await client.sadd(`real:positions:index:${connectionId}`, realPosition.id)
+        await client.expire(`real:positions:index:${connectionId}`, 604800)
 
         console.log(
           `${LOG_PREFIX} ✓ APPROVED: ${mainPos.symbol} ${mainPos.direction} (score: ${evaluationScore.toFixed(2)})`
@@ -379,15 +381,13 @@ export async function getRealPositions(connectionId: string): Promise<RealPositi
   const client = getRedisClient()
 
   try {
-    const keys = await client.keys(`real:position:*`)
-    if (keys.length === 0) return []
+    const ids = ((await client.smembers(`real:positions:index:${connectionId}`).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return []
 
-    // Batch all GETs into a single fan-out. The prior sequential loop
-    // paid one Redis round-trip per position — at 200 positions that's
-    // ~200 sequential awaits. `Promise.all` collapses them into one RTT
-    // window, matching the live-stage pattern.
+    // Batch GETs from the explicit per-connection index. Avoid Redis KEYS here:
+    // this accessor runs in engine/runtime paths and may be polled frequently.
     const rawValues = await Promise.all(
-      keys.map((k: string) => client.get(k).catch(() => null)),
+      ids.map((id: string) => client.get(`real:position:${id}`).catch(() => null)),
     )
     const positions: RealPosition[] = []
     for (const data of rawValues) {
@@ -425,6 +425,8 @@ export async function updateRealPositionStatus(
       const position: RealPosition = JSON.parse(data)
       position.status = status
       await client.setex(key, 604800, JSON.stringify(position))
+      await client.sadd(`real:positions:index:${position.connectionId}`, position.id)
+      await client.expire(`real:positions:index:${position.connectionId}`, 604800)
 
       console.log(`${LOG_PREFIX} Updated position ${positionId} status to ${status}`)
     }
