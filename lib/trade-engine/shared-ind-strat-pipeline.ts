@@ -81,6 +81,8 @@ export interface PipelineDeps {
   asOfMs?: number
   asOfCandle?: any
   setsProcessor?: IndicationSetsProcessor
+  skipLiveDispatch?: boolean
+  enableStrategyFlow?: boolean
 }
 
 // ── Lazy-import cache for Phase 4 live-order path ───────────────────
@@ -388,10 +390,11 @@ export async function runIndStratCycle(
     const apiStrategyFlowEnabled =
       process.env.NODE_ENV !== "production" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "1" ||
-      process.env.ENABLE_API_STRATEGY_FLOW === "true"
+      process.env.ENABLE_API_STRATEGY_FLOW === "true" ||
+      deps.enableStrategyFlow === true
     if (result.indicationCount > 0 && apiStrategyFlowEnabled) {
       const stratResult = await deps.strategy
-        .processStrategy(symbol, indications)
+        .processStrategy(symbol, indications, deps.skipLiveDispatch === true)
         .catch((err) => {
           console.error(
             `[v0] [SharedPipeline] processStrategy failed for ${symbol} (mode=${mode}):`,
