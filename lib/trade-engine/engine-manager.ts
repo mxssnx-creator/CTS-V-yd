@@ -355,12 +355,6 @@ async function _createExchangeConnectorLazy() {
 // amplifying load. 75s dev / 60s prod gives slow-but-progressing cycles
 // room to finish while still catching genuinely hung awaits.
 const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 75_000
-// Dev gets 55 s (same budget as prod) — the deadline is a stuck-await safety
-// net, not a performance target. With the dev 1-symbol cap (migration 057)
-// the indication cycle finishes well under 10 s normally; the extra headroom
-// prevents false deadline fires when the VM is under memory pressure or
-// the strategy flow is unusually large on a cold start.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 5_000 : 55_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
