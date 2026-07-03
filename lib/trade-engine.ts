@@ -127,6 +127,14 @@ export class GlobalTradeEngineCoordinator {
    * the coordinator worker. Development keeps foreground ownership for local UX.
    */
   private canOwnEngineRuntime(): boolean {
+    // In dev/test environments, always allow owning engine runtime
+    // In production, require explicit opt-in via environment variables
+    const isDev = process.env.NODE_ENV !== "production"
+    const allowExplicit = 
+      process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
+      process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+    
+    return isDev || allowExplicit
     if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1") return false
     if (process.env.NEXT_RUNTIME === "edge") return false
     return process.env.NODE_ENV !== "production" ||

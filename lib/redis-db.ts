@@ -3214,9 +3214,12 @@ export async function savePosition(position: any): Promise<void> {
       try {
         // Remove any existing entries from open list
         await client.lrem(`live:positions:${connId}`, 0, id).catch(() => 0)
-        // Check if already in closed list to avoid duplicates
+        // Check if already in closed list to avoid duplicates.
+        // IMPORTANT: lpos returns 0 (integer) when found at index 0 — truthy check
+        // `!alreadyClosed` treats 0 as falsy and incorrectly re-adds the entry.
+        // Use explicit null/undefined check instead.
         const alreadyClosed = await client.lpos(`live:positions:${connId}:closed`, id).catch(() => null)
-        if (!alreadyClosed) {
+        if (alreadyClosed === null || alreadyClosed === undefined) {
           // Only add if not already present
           await client.lpush(`live:positions:${connId}:closed`, id).catch(() => 0)
         }

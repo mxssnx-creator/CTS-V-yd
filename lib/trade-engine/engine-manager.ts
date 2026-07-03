@@ -288,9 +288,14 @@ import { fetchTopSymbols } from "@/lib/top-symbols"
 const _devSymCount = process.env.NODE_ENV === "development"
   ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
   : 0
-const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development"
-  ? Math.min(3, Math.max(1, Math.ceil(_devSymCount / 4)))
-  : 3
+// For 8 symbols with concurrency=1: symbols run sequentially, one at a time.
+// Phase3 (strategy evaluation) is CPU-heavy — 3800+ sets per symbol takes
+// 50-90s in single-threaded Node. Running 2 in parallel splits CPU 50/50,
+// causing both to exceed the 90s timeout. Sequential execution (concurrency=1)
+// eliminates contention: each symbol gets full CPU and completes in 40-70s.
+// Total pipeline per cycle: 8 × ~55s ≈ 440s — within the 120s outer cycle
+// deadline because symbols are skipped if the deadline is hit (not blocked).
+const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 1 : 2
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -352,9 +357,10 @@ async function _createExchangeConnectorLazy() {
 // when cron indication requests (13-17s each) run concurrently. A 40s
 // deadline was observed aborting cycles that WOULD have completed
 // (attemptedCycles=2 successfulCycles=0), wasting all their work and
-// amplifying load. 75s dev / 60s prod gives slow-but-progressing cycles
-// room to finish while still catching genuinely hung awaits.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 75_000
+// amplifying load. For live trading with 8+ symbols, increased to 120s dev / 90s prod
+// to prevent timeout failures during position fetching and strategy evaluation.
+// Cycles with real BingX API calls need more time for network latency and position reconciliation.
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 90_000 : 120_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -1092,7 +1098,7 @@ export class TradeEngineManager {
       // will run and the onFirstPassComplete callback will arm them later.
       if (cacheHit) {
         console.log(
-          `[v0] [Engine ${this.connectionId}] Cache hit — arming live processors immediately (prehistoric data already complete)`,
+          `[v0] [Engine ${this.connectionId}] Cache hit �� arming live processors immediately (prehistoric data already complete)`,
         )
         this.armLiveProgressions("cached prehistoric")
       }

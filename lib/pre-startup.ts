@@ -28,6 +28,40 @@ async function initializeDefaultSettings() {
 
 async function seedPredefinedConnections() {
   // Base connections are seeded by redis-db and migrations.
+  // In dev environments, configure trading symbols for enabled connections
+  if (process.env.NODE_ENV !== "production") {
+    try {
+      const allConnections = await getAllConnections()
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      
+      // Configuration: 8 high-liquidity trading symbols for BingX
+      const devSymbols = ["BTCUSDT", "ETHUSDT", "TAIKO", "VELVET", "BEAT", "ZROU", "WLD", "JTO"]
+      
+      for (const conn of allConnections) {
+        if (conn.exchange === "bingx") {
+          // Write symbols to BOTH locations:
+          // 1. Main connection:{id} hash (where getConnection() reads symbol_count from)
+          await client.hset(`connection:${conn.id}`, {
+            symbol_count: String(devSymbols.length),
+            symbols: devSymbols.join(","),
+            force_symbols: JSON.stringify(devSymbols),
+          })
+          
+          // 2. trade_engine_state:{id} hash (where getSymbols() reads force_symbols from)
+          await client.hset(`trade_engine_state:${conn.id}`, {
+            symbols: JSON.stringify(devSymbols),
+            force_symbols: JSON.stringify(devSymbols),
+            symbol_count: String(devSymbols.length),
+          })
+          
+          console.log(`[v0] [PreStartup] Configured ${devSymbols.length} trading symbols for ${conn.id}`)
+        }
+      }
+    } catch (e) {
+      console.warn(`[v0] [PreStartup] Warning during symbol seeding (non-fatal): ${e instanceof Error ? e.message : e}`)
+    }
+  }
 }
 
 async function seedMarketData() {

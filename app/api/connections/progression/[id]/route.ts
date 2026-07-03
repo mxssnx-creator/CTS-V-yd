@@ -420,6 +420,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         phase,
         progress,
         message,
+        timestamp: new Date().toISOString(),
         subPhase: subItem || null,
         subProgress: {
           current: subCurrent,
