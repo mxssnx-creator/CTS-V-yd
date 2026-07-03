@@ -1372,7 +1372,7 @@ async function placeProtectionOrder(
         const availableQty = extract110424Available(errMsg)
         if (availableQty !== null && availableQty < effectiveQty) {
           console.warn(
-            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ������ retrying with exact available qty`,
+            `${tag} 110424 retry: floored qty=${effectiveQty} > available=${availableQty} ������� retrying with exact available qty`,
           )
           result = await placeStop(availableQty)
           if (result?.success) {
@@ -1751,6 +1751,24 @@ async function updateProtectionOrders(
   if (!connector) return result
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
+
+  // ─── CRITICAL GUARD: Skip SL/TP placement if position closed externally ───
+  // If the position status is "closed" or force-close reasons are set, the
+  // position is no longer open on the exchange. Attempting to place SL/TP
+  // on a closed position will fail and cause repeated retry spam in logs.
+  // The reconciliation loop detected external close; cleanup happens next.
+  // Return early so we don't waste exchange calls on already-dead orders.
+  if (pos.status === "closed" || 
+      (pos.closeReason && pos.closedAt) ||
+      (pos.statusReason && pos.statusReason.includes("closed")) ||
+      (pos.statusReason && pos.statusReason.includes("EXTERNALLY"))) {
+    // Position is dead; skip SL/TP work. The position will be archived
+    // by the next reconciliation step (no position found on exchange).
+    console.log(
+      `${LOG_PREFIX} [${reason}] SKIPPED SL/TP for ${pos.symbol} (status=${pos.status}, closeReason=${pos.closeReason})`
+    )
+    return result
+  }
 
   // ── System-close-only mode (cached) ────────────────────────────��──�������
   // Reconcile fans out across every live position on every tick, so
