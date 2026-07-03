@@ -220,8 +220,25 @@ export class GlobalTradeEngineCoordinator {
    */
   async startEngine(connectionId: string, config: EngineConfig, options: StartEngineOptions = {}): Promise<boolean> {
     const forceLocalTakeover = options.forceLocalTakeover === true || config.allowInProcessStart === true
+    const explicitForegroundAllowed =
+      process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
+      process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
 
-    if (!this.canOwnEngineRuntime()) {
+    if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1" || process.env.NEXT_RUNTIME === "edge") {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) skipped — in-process trade engine runtime is disabled or running on edge.`,
+      )
+      return false
+    }
+
+    if (process.env.VERCEL === "1" && !explicitForegroundAllowed) {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) skipped — Vercel serverless workers are queued-only without explicit foreground worker flags. Leaving start request queued.`,
+      )
+      return false
+    }
+
+    if (!forceLocalTakeover && !this.canOwnEngineRuntime()) {
       console.warn(
         `[v0] [Coordinator] startEngine(${connectionId}) skipped — queued-only in this production API worker. Leaving start request queued.`,
       )

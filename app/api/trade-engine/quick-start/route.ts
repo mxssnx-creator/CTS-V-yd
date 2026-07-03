@@ -750,7 +750,7 @@ export async function POST(request: Request) {
             const settings = await loadSettingsAsync()
             const coord = getGlobalTradeEngineCoordinator()
 
-            await coord.startEngine(connectionId, {
+            const started = await coord.startEngine(connectionId, {
               connectionId,
               connection_name: connection.name,
               exchange: exchangeName,
@@ -760,6 +760,17 @@ export async function POST(request: Request) {
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }, { markAssigned: true, forceLocalTakeover: true })
+
+            if (!started) {
+              console.warn(`${LOG_PREFIX} Main Engine start skipped for ${connection.name} (async)`)
+              await logProgressionEvent(connectionId, "engine_start_skipped", "warning", "Main Trade Engine start skipped via QuickStart", {
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                testPassed,
+              })
+              return
+            }
 
             // Re-persist the current QuickStart symbol/live gate after engine confirms start.
             // Do not spread the stale pre-QuickStart connection object here; it can

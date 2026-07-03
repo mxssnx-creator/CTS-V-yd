@@ -3916,13 +3916,6 @@ export class StrategyCoordinator {
         }
       } catch { /* fallback: 0 */ }
 
-      // Real input/fan-out accounting:
-      // - mainPFEligible is the upstream Main output eligible to enter Real PF.
-      // - realRelatedCreated is current-cycle Real fan-out beyond that input.
-      // - public real:evaluated counts every Real Set considered after fan-out.
-      const realRelatedCreated = realStageRelatedCreated
-      const realEvaluatedAfterFanOut = mainPFEligible + realRelatedCreated
-
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
         client.hset(realDetailKey, {
@@ -3935,7 +3928,7 @@ export class StrategyCoordinator {
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
           // evaluated = public Real denominator after fan-out; separate upstream
           // input remains in strategies_active as {symbol}:real:input.
-          evaluated:          String(realEvaluatedAfterFanOut),
+          evaluated:          String(realTotalEvaluated),
           passed_sets:        String(realSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
@@ -3968,7 +3961,6 @@ export class StrategyCoordinator {
           ),
           [`s:${symbol}:passed`]:     String(realSets.length),
           [`s:${symbol}:evaluated`]:  String(realTotalEvaluated),
-          [`s:${symbol}:evaluated`]:  String(realEvaluatedAfterFanOut),
           [`s:${symbol}:apf`]:        String(realAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(realAvgDDT)),
           [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
@@ -3983,7 +3975,6 @@ export class StrategyCoordinator {
         // pass statistics and make passed_sets > evaluated impossible to read.
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(realTotalEvaluated)),
-        client.set(`strategies:${this.connectionId}:real:evaluated`, String(realEvaluatedAfterFanOut)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
         client.expire(`strategies:${this.connectionId}:real:count`, 86400),
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
@@ -3998,23 +3989,11 @@ export class StrategyCoordinator {
       // real:sets persistence path and the reader at createLiveSets uses getSettings()
       // which resolves the settings:-prefixed path correctly.
 
-      // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
-      // strategies_real_evaluated = PF-eligible Main inputs plus Real related/axis-created outputs.
-      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
-      if (realTotalEvaluated > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realTotalEvaluated))
-
-      // strategies_real_related_created = Real Sets created via axis/variant
-      // fan-out BEYOND the Main Sets that entered (mirrors the Main stage's
-      // `strategies_main_related_created = mainSets.length - reused`). This is
-      // the "additionally created" term the dashboard can display alongside the
-      // Real evaluated pool. `strategies_real_evaluated` already includes this
-      // fan-out term so Real pass denominators stay consistent across Redis/detail
-      // fields. max(0, …) because Real can also net-filter below the input.
       // strategies_real_total = cumulative Sets PROMOTED by REAL (passed output count).
       // strategies_real_evaluated = every Real Set considered after current-cycle
       // fan-out (upstream PF-eligible Main input + Real related-created fan-out).
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
-      if (realEvaluatedAfterFanOut > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realEvaluatedAfterFanOut))
+      if (realTotalEvaluated > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realTotalEvaluated))
 
       // strategies_real_related_created = Real Sets created via axis/variant
       // fan-out BEYOND the upstream Main PF-eligible input. max(0, …) because
@@ -4040,9 +4019,6 @@ export class StrategyCoordinator {
           [`${symbol}:real:input`]: String(mainPFEligible),
           // real:relatedCreated = Real fan-out created this cycle beyond input.
           [`${symbol}:real:relatedCreated`]: String(realRelatedCreated),
-          // real:evaluated = public evaluated denominator: all Real Sets
-          // considered after fan-out (input + related-created).
-          [`${symbol}:real:evaluated`]: String(realEvaluatedAfterFanOut),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
