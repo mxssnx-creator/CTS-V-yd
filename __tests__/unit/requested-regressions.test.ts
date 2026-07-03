@@ -218,7 +218,7 @@ describe("requested regression guardrails", () => {
 
     expect(startBranch).toContain('status: "running"')
     expect(startBranch).toContain('coordinator_ready: "true"')
-    expect(startBranch).toContain("const started = await coordinator.startEngine")
+    expect(startBranch).toContain("const engineStarted = await coordinator.startEngine")
     expect(startBranch).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
     expect(startBranch).toContain('process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"')
     expect(startBranch).toContain('engineStatus = "queued"')
@@ -256,7 +256,7 @@ describe("requested regression guardrails", () => {
     const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
 
     expect(source).toContain('export const runtime = "nodejs"')
-    expect(source).toContain("const started = await coordinator.startEngine")
+    expect(source).toContain("const engineStarted = await coordinator.startEngine")
     expect(source).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
     expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"')
     expect(source).toContain('reason: "live_trade_enable"')
@@ -699,7 +699,7 @@ describe("requested regression guardrails", () => {
     expect(source).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
     expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"')
     expect(source).toContain('allowInProcessStart: true')
-    expect(source).toContain('const started = await coordinator.startEngine')
+    expect(source).toContain('const engineStarted = await coordinator.startEngine')
     expect(source).toContain('engineStatus = "queued"')
     expect(source).toContain('engineStatus = "started"')
   })

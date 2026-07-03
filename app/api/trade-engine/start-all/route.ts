@@ -85,17 +85,17 @@ async function handleStartAll() {
           strategyInterval,
           realtimeInterval,
         }
-        const started = await coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true })
+        const engineStarted = await coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true })
 
         results.push({
           connectionId: connection.id,
           connectionName: connection.name,
           exchange: connection.exchange,
-          success: started,
-          message: started ? "Engine started" : "Engine start skipped by coordinator",
+          success: engineStarted,
+          message: engineStarted ? "Engine started" : "Engine start skipped by coordinator",
         })
 
-        if (started) {
+        if (engineStarted) {
           successCount++
         }
       } catch (error) {

@@ -207,6 +207,8 @@ export class SymbolDataProcessor {
       void Promise.resolve(client.set(key, JSON.stringify(data))).catch(() => undefined)
 
       // Avoid unbounded realtime history growth; latest tick is sufficient here.
+    } catch {
+      // Best-effort realtime latest-tick persistence must never stall websocket processing.
       
     } catch (error) {
       await this.progressManager.addError(

@@ -22,12 +22,9 @@ const RESTART_REQUIRED_FIELDS = [
   // update Redis state without tearing down live trade.
 ]
 
-// Settings that alter the actual strategy/progression graph must start a
-// fresh generation. A hot reload can update scalar caches, but it cannot
-// safely cancel in-flight prehistoric/strategy/realtime work that was born
-// for the old axes, symbols, variants, thresholds, DCA/block state, or
-// sizing. Restarting preserves live exchange position/order records while
-// giving the computational progression a new epoch.
+// Settings that alter the strategy/progression graph must trigger a durable
+// progression reload/recoordination signal. They should not tear down a live
+// engine process unless a credential/runtime identity field also changed.
 const PROGRESSION_RESTART_FIELDS = [
   "connection_settings", "strategies", "indications", "active_indications",
   "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
