@@ -1099,4 +1099,34 @@ describe("requested regression guardrails", () => {
     expect(strategy).toContain("executeStrategyFlow(symbol, validIndications, false, undefined, skipLiveDispatch)")
   })
 
+
+  test("trailing coordination survives Main cache and accumulated live sync", () => {
+    const coordinator = read("lib/strategy-coordinator.ts")
+    const liveStage = read("lib/trade-engine/stages/live-stage.ts")
+
+    expect(coordinator).toContain("trailingProfile: built.trailingProfile")
+    expect(coordinator).toContain("Preserve it on")
+    expect(coordinator).toContain("every Main projection")
+    expect(coordinator).toContain("mutable cache patch")
+    expect(coordinator).toContain("...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile })")
+
+    expect(liveStage).toContain("setKey/parentSetKey/accumulatedSetKeys")
+    expect(liveStage).toContain("every owning Set must be allowed")
+    expect(liveStage).toContain("advance its trailing ratchet")
+    expect(liveStage).toContain("const liveKeys = new Set<string>()")
+    expect(liveStage).toContain("Array.isArray(p.accumulatedSetKeys)")
+    expect(liveStage).toContain("liveKeys.has(pseudoSetKey)")
+  })
+
+
+  test("dashboard footer shows session instance and running time", () => {
+    const source = read("components/dashboard/dashboard.tsx")
+
+    expect(source).toContain("function DashboardRuntimeFooter()")
+    expect(source).toContain("Unique Session / Instance ID")
+    expect(source).toContain("createSessionInstanceId")
+    expect(source).toContain("Running: {formatDuration")
+    expect(source).toContain("<DashboardRuntimeFooter />")
+  })
+
 })
