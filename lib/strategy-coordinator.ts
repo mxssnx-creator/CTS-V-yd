@@ -2910,12 +2910,12 @@ export class StrategyCoordinator {
       const workingSets = realSets
 
       const client = getRedisClient()
-      // PERFORMANCE: previous implementation looped serially with one GET
-      // per set followed by 3 sequential writes per surviving set — at N
-      // Real Sets per symbol per cycle that was 4N round-trips on the
-      // hot path. Now: (1) fan out all dedup GETs into a single Promise.all,
-      // (2) batch the 3 writes per surviving set into one Promise.all,
-      // collapsing per-set latency to one RTT window each.
+      // PERFORMANCE / CORRECTNESS: pseudo-position dedup is an atomic Redis
+      // claim per Set. A separate GET pre-check allowed concurrent REAL-stage
+      // creators to observe an empty mapping and both create positions. We now
+      // claim `pseudo_position_set_mapping:{conn}:{setKey}` with SET NX EX,
+      // create only when that claim succeeds, and release the claim if the
+      // follow-up position write fails so a later cycle can retry.
 
       // Pre-compute every set's deterministic identifiers once.
       // (workingSets == realSets in prod; capped top-N by PF in dev.)
@@ -2925,20 +2925,25 @@ export class StrategyCoordinator {
         return { set, setKey, existingKey }
       })
 
-      // Phase 1 — parallel dedup check (N GETs in one batch).
-      const existing = await Promise.all(
-        setMeta.map((m) => getSettings(m.existingKey).catch(() => null))
-      )
+      const toRedisHash = (value: Record<string, any>): Record<string, string> => {
+        const out: Record<string, string> = {}
+        for (const [key, fieldValue] of Object.entries(value)) {
+          if (fieldValue === undefined || fieldValue === null) continue
+          out[key] = typeof fieldValue === "object" ? JSON.stringify(fieldValue) : String(fieldValue)
+        }
+        return out
+      }
 
-      // Phase 2 �� for sets that need creation, fan out the 3 writes per set.
+      // Atomic claims are intentionally long-lived: the mapping is the
+      // idempotency record for this Set, not just a short mutex. TTL bounds stale
+      // claims if a process dies after SET NX but before the position hash lands.
+      const CLAIM_TTL_SECONDS = 7 * 24 * 60 * 60
       const createdAtIso = new Date().toISOString()
       const nowMs = Date.now()
       const writeBatches: Promise<any>[] = []
       let createdCount = 0
 
-      for (let i = 0; i < setMeta.length; i++) {
-        if (existing[i]) continue
-        const { set, setKey, existingKey } = setMeta[i]
+      for (const { set, setKey, existingKey } of setMeta) {
         try {
           const avgPF       = set.avgProfitFactor || 1
           const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
@@ -2967,23 +2972,42 @@ export class StrategyCoordinator {
             confidence: set.avgConfidence || 0,
           }
 
-          // 3 writes per set, executed concurrently (one RTT window).
-          writeBatches.push(
-            Promise.all([
-              setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos),
-              client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id),
-              setSettings(existingKey, { posId: pseudoPos.id, createdAt: nowMs }),
-            ]).catch((err) => {
-              console.warn(`[StrategyFlow] Failed to create pseudo position for set ${setKey}:`, err)
-            })
-          )
-          createdCount++
+          const mappingValue = (status: "claimed" | "created") => JSON.stringify({
+            posId: pseudoPos.id,
+            createdAt: nowMs,
+            status,
+            set_id: setKey,
+            config_set_key: setKey,
+            source_set_key: setKey,
+          })
+          const claimed = await client.set(existingKey, mappingValue("claimed"), { NX: true, EX: CLAIM_TTL_SECONDS }).catch(() => null)
+          if (claimed !== "OK") continue
+
+          writeBatches.push((async () => {
+            try {
+              const pipeline = client.pipeline()
+              pipeline.hset(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, toRedisHash(pseudoPos))
+              pipeline.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id)
+              pipeline.set(existingKey, mappingValue("created"), { XX: true, EX: CLAIM_TTL_SECONDS })
+              const results = await pipeline.exec()
+              const failed = results.some((r: any) => r instanceof Error || (Array.isArray(r) && r[0]))
+              if (failed) throw new Error("pseudo-position pipeline returned an error")
+              createdCount++
+            } catch (err) {
+              await Promise.allSettled([
+                client.del(existingKey),
+                client.del(`pseudo_position:${this.connectionId}:${pseudoPos.id}`),
+                client.srem(`pseudo_positions:${this.connectionId}`, pseudoPos.id),
+              ])
+              console.warn(`[StrategyFlow] Failed to create pseudo position for set ${setKey}; released claim for retry:`, err)
+            }
+          })())
         } catch (err) {
           console.warn(`[StrategyFlow] Failed to prep pseudo position for set ${setKey}:`, err)
         }
       }
 
-      // Final fan-in — all surviving sets' writes execute together.
+      // Final fan-in — all successful claims' related writes execute together.
       if (writeBatches.length > 0) {
         await Promise.all(writeBatches)
       }

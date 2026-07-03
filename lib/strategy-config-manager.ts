@@ -95,6 +95,27 @@ export class StrategyConfigManager {
     return `strategy:${this.connectionId}:config:${configId}:positions`
   }
 
+  private getConfigIndexKey(): string {
+    return `strategy:${this.connectionId}:configs:index`
+  }
+
+  private async scanConfigKeys(client: any): Promise<string[]> {
+    // Startup/repair fallback only: bounded SCAN backfills the maintained
+    // strategy config index for legacy configs. Normal reads never scan.
+    const pattern = `strategy:${this.connectionId}:config:*`
+    const keys: string[] = []
+    if (typeof client.scan !== "function") return keys
+    let cursor = "0"
+    do {
+      const result = await client.scan(cursor, "MATCH", pattern, "COUNT", 100).catch(() => null)
+      if (!result) break
+      cursor = String(result[0] ?? "0")
+      const batch = (result[1] || []).filter((k: string) => !k.endsWith(":positions"))
+      keys.push(...batch)
+    } while (cursor !== "0")
+    return keys
+  }
+
   async createConfig(config: Omit<StrategyConfig, "connectionId" | "createdAt">): Promise<StrategyConfig> {
     await initRedis()
     const client = getRedisClient()
@@ -106,7 +127,10 @@ export class StrategyConfigManager {
     }
 
     const key = this.getConfigKey(config.id)
-    await client.set(key, JSON.stringify(fullConfig))
+    const pipeline = client.multi()
+    pipeline.set(key, JSON.stringify(fullConfig))
+    pipeline.sadd(this.getConfigIndexKey(), key)
+    await pipeline.exec()
 
     console.log(`[v0] [StrategyConfigManager] Created config ${config.id} for ${this.connectionId}`)
     return fullConfig
@@ -127,16 +151,20 @@ export class StrategyConfigManager {
     await initRedis()
     const client = getRedisClient()
 
-    const pattern = `strategy:${this.connectionId}:config:*`
-    const keys = await client.keys(pattern)
+    let keys = ((await client.smembers(this.getConfigIndexKey()).catch(() => [])) || []) as string[]
+    if (keys.length === 0) {
+      keys = await this.scanConfigKeys(client)
+      if (keys.length > 0) await client.sadd(this.getConfigIndexKey(), ...keys).catch(() => 0)
+    }
+    if (keys.length === 0) return []
 
+    const values = await Promise.all(keys.map((key: string) => client.get(key).catch(() => null)))
     const configs: StrategyConfig[] = []
-    for (const key of keys) {
-      if (key.endsWith(":positions")) continue
-      const data = await client.get(key)
-      if (data) {
+    for (const data of values) {
+      if (!data) continue
+      try {
         configs.push(JSON.parse(typeof data === "string" ? data : JSON.stringify(data)))
-      }
+      } catch { /* skip malformed */ }
     }
 
     return configs
@@ -153,7 +181,10 @@ export class StrategyConfigManager {
 
     const updated = { ...config, ...updates }
     const key = this.getConfigKey(configId)
-    await client.set(key, JSON.stringify(updated))
+    const pipeline = client.multi()
+    pipeline.set(key, JSON.stringify(updated))
+    pipeline.sadd(this.getConfigIndexKey(), key)
+    await pipeline.exec()
 
     console.log(`[v0] [StrategyConfigManager] Updated config ${configId}`)
   }
@@ -165,8 +196,11 @@ export class StrategyConfigManager {
     const configKey = this.getConfigKey(configId)
     const positionsKey = this.getPositionsKey(configId)
 
-    await client.del(configKey)
-    await client.del(positionsKey)
+    const pipeline = client.multi()
+    pipeline.del(configKey)
+    pipeline.del(positionsKey)
+    pipeline.srem(this.getConfigIndexKey(), configKey)
+    await pipeline.exec()
 
     console.log(`[v0] [StrategyConfigManager] Deleted config ${configId}`)
   }
