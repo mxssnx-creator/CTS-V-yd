@@ -2304,6 +2304,90 @@ function parseHash(hash: Record<string, string> | null): Record<string, any> | n
   return result
 }
 
+
+export class DatabaseWriteRateLimitError extends Error {
+  readonly code = "DATABASE_WRITE_RATE_LIMIT_EXCEEDED"
+  readonly operationName: string
+  readonly scope: "second" | "minute"
+  readonly current: number
+  readonly limit: number
+
+  constructor(operationName: string, scope: "second" | "minute", current: number, limit: number) {
+    super(`Database write budget exceeded for ${operationName}: ${current}/${limit} per ${scope}`)
+    this.name = "DatabaseWriteRateLimitError"
+    this.operationName = operationName
+    this.scope = scope
+    this.current = current
+    this.limit = limit
+  }
+}
+
+type DatabaseWriteBudgetOptions = { optional?: boolean }
+type DatabaseWriteBudgetResult = { allowed: boolean; reason?: DatabaseWriteRateLimitError }
+
+const DATABASE_WRITE_LIMIT_LOG_INTERVAL_MS = 60_000
+
+function parseDatabaseLimit(value: unknown): number {
+  const parsed = Number(value ?? 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0
+}
+
+function warnDatabaseWriteBudgetExceeded(error: DatabaseWriteRateLimitError, optional: boolean): void {
+  const globalBudget = globalThis as unknown as { __db_write_budget_last_warn?: Record<string, number> }
+  if (!globalBudget.__db_write_budget_last_warn) globalBudget.__db_write_budget_last_warn = {}
+  const logKey = `${error.operationName}:${error.scope}:${optional ? "optional" : "required"}`
+  const now = Date.now()
+  if (now - (globalBudget.__db_write_budget_last_warn[logKey] || 0) < DATABASE_WRITE_LIMIT_LOG_INTERVAL_MS) return
+  globalBudget.__db_write_budget_last_warn[logKey] = now
+  console.warn(
+    `[v0] [Redis Write Budget] ${optional ? "Skipping optional" : "Blocking required"} write ${error.operationName}: ${error.current}/${error.limit} per ${error.scope}`,
+  )
+}
+
+async function readDatabaseWriteLimits(client: RedisClientLike): Promise<{ perSecond: number; perMinute: number }> {
+  try {
+    const systemSettings = parseHash(await client.hgetall("settings:system")) || {}
+    return {
+      perSecond: parseDatabaseLimit((systemSettings as any).databaseLimitPerSecond),
+      perMinute: parseDatabaseLimit((systemSettings as any).databaseLimitPerMinute),
+    }
+  } catch {
+    return { perSecond: 0, perMinute: 0 }
+  }
+}
+
+function trackDatabaseSecondOperation(limit: number): { current: number; limit: number; exceeded: boolean } {
+  const globalTracker = globalThis as unknown as { __db_ops_second_tracker?: { second: number; count: number } }
+  const currentSecond = Math.floor(Date.now() / 1000)
+  if (!globalTracker.__db_ops_second_tracker || globalTracker.__db_ops_second_tracker.second !== currentSecond) {
+    globalTracker.__db_ops_second_tracker = { second: currentSecond, count: 0 }
+  }
+  globalTracker.__db_ops_second_tracker.count++
+  const current = globalTracker.__db_ops_second_tracker.count
+  return { current, limit, exceeded: limit > 0 && current > limit }
+}
+
+export async function assertDatabaseWriteBudget(
+  operationName: string,
+  options: DatabaseWriteBudgetOptions = {},
+): Promise<DatabaseWriteBudgetResult> {
+  const client = getClient()
+  const { perSecond, perMinute } = await readDatabaseWriteLimits(client)
+
+  const secondResult = trackDatabaseSecondOperation(perSecond)
+  const minuteResult = await client.trackDatabaseOperation(perMinute)
+  const exceeded = secondResult.exceeded
+    ? new DatabaseWriteRateLimitError(operationName, "second", secondResult.current, secondResult.limit)
+    : minuteResult.exceeded
+      ? new DatabaseWriteRateLimitError(operationName, "minute", minuteResult.current, minuteResult.limit)
+      : null
+
+  if (!exceeded) return { allowed: true }
+  warnDatabaseWriteBudgetExceeded(exceeded, !!options.optional)
+  if (options.optional) return { allowed: false, reason: exceeded }
+  throw exceeded
+}
+
 // ========== Connection Operations ==========
 
 export async function getConnection(id: string): Promise<any | null> {
@@ -2839,6 +2923,7 @@ export async function savePosition(position: any): Promise<void> {
   if (!id) {
     throw new Error("Position must have an id")
   }
+  await assertDatabaseWriteBudget("savePosition")
 
   // Special-case live positions (keys prefixed with "live:") — the live
   // pipeline uses JSON-string keys and open/closed indices under
@@ -3010,6 +3095,7 @@ export async function saveTrade(trade: any): Promise<void> {
   if (!id) {
     throw new Error("Trade must have an id")
   }
+  await assertDatabaseWriteBudget("saveTrade")
   
   const data = flattenForHmset({
     ...trade,
@@ -3052,6 +3138,8 @@ export async function saveIndication(indication: any): Promise<void> {
   if (!id) {
     throw new Error("Indication must have an id")
   }
+  const budget = await assertDatabaseWriteBudget("saveIndication", { optional: true })
+  if (!budget.allowed) return
   
   const data = flattenForHmset({
     ...indication,
@@ -3102,6 +3190,7 @@ export async function saveStrategy(strategy: any): Promise<void> {
   if (!id) {
     throw new Error("Strategy must have an id")
   }
+  await assertDatabaseWriteBudget("saveStrategy")
   
   const data = flattenForHmset({
     ...strategy,
@@ -3766,6 +3855,8 @@ export async function logProgressionEvent(
   metadata?: Record<string, any>
 ): Promise<void> {
   const client = getRedisClient()
+  const budget = await assertDatabaseWriteBudget("logProgressionEvent", { optional: true })
+  if (!budget.allowed) return
   const logsKey = `progression:${connectionId}:logs`
   
   const logEntry = JSON.stringify({
