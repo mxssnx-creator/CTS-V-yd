@@ -18,7 +18,7 @@
  *   last_update              — HSET (ISO timestamp)
  */
 import { NextResponse } from "next/server"
-import { isTruthyFlag, isConnectionInActivePanel } from "@/lib/connection-state-utils"
+import { getCronEngineEligibleConnections } from "@/lib/cron-engine-eligibility"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { fetchTopSymbols } from "@/lib/top-symbols"
 import { RealtimeProcessor } from "@/lib/trade-engine/realtime-processor"
@@ -595,7 +595,8 @@ export async function GET() {
   let acquiredCronLock = false
 
   try {
-    const { initRedis, getRedisClient, getAllConnections } = await import("@/lib/redis-db")
+    const { initRedis, getRedisClient, getAssignedAndEnabledConnections, getConnection } = await import("@/lib/redis-db")
+    const { getQueuedEngineRefreshRequests } = await import("@/lib/engine-refresh-queue")
     await initRedis()
     const client = getRedisClient()
 
@@ -618,27 +619,15 @@ export async function GET() {
 
     _cronInFlight = true
 
-    const connections = await getAllConnections()
-
-    // Use active-inserted connections — same eligibility as the trade engine
-    let activeConnections = connections.filter(
-      (c: any) =>
-        isConnectionInActivePanel(c) ||
-        isTruthyFlag(c.is_active_inserted) ||
-        isTruthyFlag(c.is_assigned)
+    const activeConnections = await getCronEngineEligibleConnections(
+      getAssignedAndEnabledConnections,
+      getQueuedEngineRefreshRequests,
+      getConnection,
     )
 
-    // ── DEV ONE-CONNECTION CAP (mirror of the engine's one-engine guard) ──────
-    // This cron is the realtime driver. Both bingx-x01 and bybit-x03 are always
-    // inited + active-inserted, but on the low-RAM dev VM running the realtime
-    // pass (indication generation + RealtimeProcessor SL/TP sweep) for BOTH every
-    // few seconds doubles per-tick work and re-bloats indication_outcomes_pending.
-    // In DEV we process only the connection the operator explicitly enabled
-    // (is_enabled_dashboard="1"), defaulting to the primary bingx-x01, so bybit
-    // stays truly idle until enabled. Production processes every active connection.
-    // NOTE: Always process all active connections. Filtering to single connection
-    // in dev mode caused inconsistent behavior and masked bugs that only appeared in prod.
-    // For performance tuning, use connection enable/disable settings instead.
+    // Cron intentionally uses the same assigned-and-enabled connection set as
+    // the engine coordinator, with only fresh queued start requests merged after
+    // the same readiness re-check used by startEngine().
 
     if (activeConnections.length === 0) {
       return NextResponse.json({
