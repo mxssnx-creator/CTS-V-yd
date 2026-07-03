@@ -247,15 +247,18 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           active_connections: String(activeDashboardCount),
         })
         
-        // Start/reconcile in-process for every Node runtime by default so
-        // production toggles do not wait forever for an optional external
-        // worker. Edge runtimes and explicitly disabled API workers still use
-        // the durable queue/continuity fallback.
+        // Queue/reconcile by default in production so API workers stay responsive.
+        // Local foreground start is reserved for non-production or explicit
+        // production opt-in via ALLOW_API_TRADE_ENGINE_FOREGROUND +
+        // ENABLE_TRADE_ENGINE_IN_PROCESS.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           const localStartAllowed =
             process.env.DISABLE_TRADE_ENGINE_IN_PROCESS !== "1" &&
-            process.env.NEXT_RUNTIME !== "edge"
+            process.env.NEXT_RUNTIME !== "edge" &&
+            (process.env.NODE_ENV !== "production" ||
+              (process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
+                process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"))
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
