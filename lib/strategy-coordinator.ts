@@ -3381,6 +3381,28 @@ export class StrategyCoordinator {
     // downstream stages (hedge-net, Real cap, Live dispatch) always see the
     // highest-quality Sets first. In-place sort avoids the spread-copy.
     realQualifying.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+    
+    // ── EARLY CAP: Apply before hedge netting to prevent memory accumulation ──
+    // The old cap applied AFTER hedge netting, wasting memory on thousands of sets
+    // that would be discarded. Cap the top-PF sets here so hedge netting works with
+    // a bounded input. This prevents 3244→60 set reduction happening after memory
+    // is already allocated. Constant defined inline since we need it before hedge-net.
+    const _defaultRealCap = process.env.NODE_ENV === "production" ? 100 : 60
+    const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_CEILING ?? "")
+    const _realOutputCap =
+      (Number.isFinite(rawRealCeiling) && rawRealCeiling > 0 ? Math.floor(rawRealCeiling) : null) ??
+      (this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
+        ? this.strategyRealSetsSafetyCeiling
+        : _defaultRealCap)
+    const _realSetsCap = Math.min(this.config.maxRealSets ?? _realOutputCap, _realOutputCap)
+    
+    if (realQualifying.length > _realSetsCap) {
+      console.warn(
+        `[v0] [RealStage] ${this.connectionId}: Capping ${realQualifying.length} → ${_realSetsCap} before hedge netting`
+      )
+      realQualifying.length = _realSetsCap  // Truncate in-place
+    }
+    
     const realSorted = realQualifying   // alias — hedge-net reads realSorted
 
     // ── HEDGE NETTING (operator spec: Real stage only) ─────────────────────
@@ -3608,26 +3630,9 @@ export class StrategyCoordinator {
     // keeping the full Real-stage pipeline exercised.
     // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
-    // ── REAL OUTPUT CAP ─────────────────────────────────────────────────────
-    // This caps the number of StrategySet objects that REAL stage outputs to
-    // Live dispatch. This is NOT a heap safety ceiling (that's axis ceiling).
-    // This is a quality filter: we want the top N sets by PF, not all sets.
-    // Dev: 60 per symbol (240 for 4 symbols). Prod: 100 per symbol.
-    // User can override via maxRealSets or STRATEGY_REAL_SETS_CEILING env var.
-    const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_CEILING ?? "")
-    const configuredRealCeiling =
-      Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
-        ? Math.floor(rawRealCeiling)
-        : null
-    // Reasonable default output cap (NOT heap ceiling): per-symbol basis.
-    // Dev is lower to keep heap under control during development; Prod can be higher.
-    const _defaultRealOutputCap = process.env.NODE_ENV === "production" ? 100 : 60
-    const REAL_SETS_OUTPUT_CAP =
-      configuredRealCeiling ??
-      (this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
-        ? this.strategyRealSetsSafetyCeiling
-        : _defaultRealOutputCap)
-    const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_OUTPUT_CAP, REAL_SETS_OUTPUT_CAP)
+    // ── REAL OUTPUT CAP (moved to earlier point in evaluateRealSets) ─────────
+    // Cap is now applied BEFORE hedge netting at line ~3400 to prevent memory
+    // bloat from thousands of sets that would later be discarded.
     // ── Variant-fair cap (operator spec: each activated variant independent) ──
     // `realPostHedge` is PF-desc sorted. A pure top-N slice lets the large
     // `default` axis fan-out (up to MAIN_AXIS_SETS_CEILING Sets, ALL tagged
@@ -3744,7 +3749,7 @@ export class StrategyCoordinator {
           externalPipeline: accPipeline,
         })
 
-        // ── Per-axis-Set continuous-count ledger (operator spec) ─────
+        // ��─ Per-axis-Set continuous-count ledger (operator spec) ─────
         // For axis Sets (the prev × last × cont × outcome × dir
         // Cartesian fan-out at Main), record the rolling continuous
         // count of Pis that have actually accumulated onto this axis
@@ -4097,7 +4102,7 @@ export class StrategyCoordinator {
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
 
-      // ── P1-1: Real-stage per-variant aggregation ───────────���────────
+      // ── P1-1: Real-stage per-variant aggregation ──��────────���────────
       // ── Real-stage rolling sample (for averaged count stats) ──────────
       // Push one timestamped sample of the live Real counts per (symbol,
       // cycle) onto a bounded ring list. The tracking layer averages all
