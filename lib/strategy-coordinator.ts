@@ -1574,11 +1574,6 @@ export class StrategyCoordinator {
           ? this.neutralPositionContext()
           : await this.getPositionContext())
 
-      // Cache posCtx for REAL stage lazy variant generation. The REAL stage
-      // creates trailing/dca variants on-demand from qualifying Main sets,
-      // and needs the position context to compute axisWindows correctly.
-      ;(this as any)._lastPositionCtx = posCtx
-
       // ── OPTIMIZATION: Skip processing if position state unchanged ──
       // Check fingerprint of position counts to skip redundant calculations when
       // no new positions have opened/closed. Prevents recalculating P&F/DDT every
@@ -3696,82 +3691,6 @@ export class StrategyCoordinator {
         }
       }
     }
-
-    // ── LAZY VARIANT GENERATION (after cap: efficiency & memory) ───────────
-    // Only create trailing/DCA variants from the surviving (capped) Real sets.
-    // Previously this happened at MAIN stage before cap, wasting memory on
-    // variants that would be discarded. Now: cap first (60 sets per symbol),
-    // then create variants only from survivors. This keeps REAL output tight.
-    // Variants are generated on-demand so they're only created if needed.
-    const variantProfiles = this.variantProfiles()
-    const trailingProfile = variantProfiles.find((p) => p.name === "trailing")
-    const dcaProfile = variantProfiles.find((p) => p.name === "dca")
-    const ctx = (this as any)._lastPositionCtx
-
-    if (trailingProfile && ctx && realSets.length > 0) {
-      // Build trailing variants from surviving defaults (only non-default variants from cap)
-      const defaultSets = realSets.filter((s) => !s.variant || s.variant === "default")
-      const variantsCreated = []
-      for (const baseSet of defaultSets) {
-        const trailing = await this.buildVariantSet(baseSet, trailingProfile, metrics, 250, ctx)
-        if (trailing) {
-          trailing.status = "valid_real"
-          variantsCreated.push(trailing)
-          if (coordIndex && !coordIndex.byCoordKey.has(trailing.setKey)) {
-            registerCoordRecord(coordIndex, {
-              coordKey: trailing.setKey,
-              parentKey: trailing.parentSetKey || baseSet.setKey,
-              variant: "trailing",
-              axisWindows: trailing.axisWindows ?? null,
-              status: "valid_real",
-              avgProfitFactor: trailing.avgProfitFactor,
-              avgDrawdownTime: trailing.avgDrawdownTime,
-              avgConfidence: trailing.avgConfidence,
-              entryCount: trailing.entryCount,
-              indicationType: trailing.indicationType,
-              direction: trailing.direction,
-              prevPos: trailing.prevPos,
-              trailingProfile: trailing.trailingProfile,
-            })
-          }
-        }
-      }
-      realSets = realSets.concat(variantsCreated)
-    }
-
-    if (dcaProfile && ctx && realSets.length > 0) {
-      // Build DCA variants from surviving defaults
-      const defaultSets = realSets.filter((s) => !s.variant || s.variant === "default")
-      const variantsCreated = []
-      for (const baseSet of defaultSets) {
-        const dca = await this.buildVariantSet(baseSet, dcaProfile, metrics, 250, ctx)
-        if (dca) {
-          dca.status = "valid_real"
-          variantsCreated.push(dca)
-          if (coordIndex && !coordIndex.byCoordKey.has(dca.setKey)) {
-            registerCoordRecord(coordIndex, {
-              coordKey: dca.setKey,
-              parentKey: dca.parentSetKey || baseSet.setKey,
-              variant: "dca",
-              axisWindows: dca.axisWindows ?? null,
-              status: "valid_real",
-              avgProfitFactor: dca.avgProfitFactor,
-              avgDrawdownTime: dca.avgDrawdownTime,
-              avgConfidence: dca.avgConfidence,
-              entryCount: dca.entryCount,
-              indicationType: dca.indicationType,
-              direction: dca.direction,
-              prevPos: dca.prevPos,
-              trailingProfile: dca.trailingProfile,
-            })
-          }
-        }
-      }
-      realSets = realSets.concat(variantsCreated)
-    }
-
-    // Re-sort after variant injection to maintain PF-desc order for downstream processing
-    realSets.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
 
     // ── Real-stage tuner — per-variant adjustments from Base prev-pos ──
     //
