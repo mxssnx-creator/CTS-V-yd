@@ -1571,6 +1571,11 @@ export class StrategyCoordinator {
           ? this.neutralPositionContext()
           : await this.getPositionContext())
 
+      // Cache posCtx for REAL stage lazy variant generation. The REAL stage
+      // creates trailing/dca variants on-demand from qualifying Main sets,
+      // and needs the position context to compute axisWindows correctly.
+      ;(this as any)._lastPositionCtx = posCtx
+
       // ── OPTIMIZATION: Skip processing if position state unchanged ──
       // Check fingerprint of position counts to skip redundant calculations when
       // no new positions have opened/closed. Prevents recalculating P&F/DDT every
@@ -2375,15 +2380,16 @@ export class StrategyCoordinator {
       // Mark as valid for BASE→MAIN evaluation
       baseSet.status = "valid_base"
 
-      // Trailing is a BASE range-coordination profile, not a Main variant.
-      // Once a trailing Base Set exists it must behave like any other Base Set:
-      // Standard/default validates it, then active Adjust strategies (block/dca)
-      // may layer on top. Block is an execution overlay on the already-selected
-      // Set (not an independent Main Set), while DCA remains materialized so its
-      // reduce/close stats and Real-stage evaluation stay independently visible.
-      // selectActiveVariants() already excludes the deprecated Main-stage
-      // `trailing` profile, so do not special-case trailingProfile here.
-      const variantsForThisBase = activeVariants.filter((p) => p.name !== "block")
+      // ── OPTIMIZATION: Skip non-default variants at MAIN stage ───────────────
+      // Trailing/block/DCA variants were created here, causing a 3× explosion
+      // (base sets × 3 variants) before axis fan-out applied. Axis ceiling was
+      // then hit, discarding thousands of variant combinations. New approach:
+      // Only create `default` variants at MAIN, apply axis fan-out, cap at 1619.
+      // Then at REAL stage, create trailing/block/dca variants ONLY from
+      // surviving Main Sets. This keeps MAIN set count 1/3 the previous peak.
+      // Spec-note: Trailing is a Base-level profile (trailingProfile metadata),
+      // not a Main variant; it flows unchanged through any downstream variant.
+      const variantsForThisBase = activeVariants.filter((p) => p.name === "default")
 
       for (const profile of variantsForThisBase) {
         // Spawn async build task for this variant
@@ -3379,7 +3385,81 @@ export class StrategyCoordinator {
     realQualifying.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
     const realSorted = realQualifying   // alias — hedge-net reads realSorted
 
-    // ── HEDGE NETTING (operator spec: Real stage only) ─────────���─────────
+    // ── LAZY VARIANT GENERATION (optimization: moved from MAIN stage) ──────
+    // Previously: variant expansion happened at MAIN, creating 3 sets per
+    // base (default + trailing + dca) before axis fan-out, then axis ceiling
+    // discarded most of them. Now: only default sets at MAIN, then at REAL
+    // stage create variants ONLY from qualifying Main sets. This reduces
+    // MAIN peak from 4,869 sets/symbol to ~500-600, a 8-9x improvement.
+    // Trailing is a Base profile (flows unchanged). Block and DCA are created
+    // here from realSorted's qualifying sets if the variants are active.
+    const variantProfiles = this.variantProfiles()
+    const trailingProfile = variantProfiles.find((p) => p.name === "trailing")
+    const dcaProfile = variantProfiles.find((p) => p.name === "dca")
+    const ctx = (this as any)._lastPositionCtx  // from getPositionContext call in executeStrategyFlow
+    
+    if (trailingProfile && ctx && realSorted.length > 0) {
+      // Build trailing variants from qualifying Main defaults (only)
+      const defaultSets = realSorted.filter((s) => !s.variant || s.variant === "default")
+      for (const baseSet of defaultSets) {
+        const trailing = await this.buildVariantSet(baseSet, trailingProfile, metrics, 250, ctx)
+        if (trailing) {
+          trailing.status = "valid_real"
+          realSorted.push(trailing)
+          if (coordIndex && !coordIndex.byCoordKey.has(trailing.setKey)) {
+            registerCoordRecord(coordIndex, {
+              coordKey: trailing.setKey,
+              parentKey: trailing.parentSetKey || baseSet.setKey,
+              variant: "trailing",
+              axisWindows: trailing.axisWindows ?? null,
+              status: "valid_real",
+              avgProfitFactor: trailing.avgProfitFactor,
+              avgDrawdownTime: trailing.avgDrawdownTime,
+              avgConfidence: trailing.avgConfidence,
+              entryCount: trailing.entryCount,
+              indicationType: trailing.indicationType,
+              direction: trailing.direction,
+              prevPos: trailing.prevPos,
+              trailingProfile: trailing.trailingProfile,
+            })
+          }
+        }
+      }
+    }
+
+    if (dcaProfile && ctx && realSorted.length > 0) {
+      // Build DCA variants from qualifying Main defaults
+      const defaultSets = realSorted.filter((s) => !s.variant || s.variant === "default")
+      for (const baseSet of defaultSets) {
+        const dca = await this.buildVariantSet(baseSet, dcaProfile, metrics, 250, ctx)
+        if (dca) {
+          dca.status = "valid_real"
+          realSorted.push(dca)
+          if (coordIndex && !coordIndex.byCoordKey.has(dca.setKey)) {
+            registerCoordRecord(coordIndex, {
+              coordKey: dca.setKey,
+              parentKey: dca.parentSetKey || baseSet.setKey,
+              variant: "dca",
+              axisWindows: dca.axisWindows ?? null,
+              status: "valid_real",
+              avgProfitFactor: dca.avgProfitFactor,
+              avgDrawdownTime: dca.avgDrawdownTime,
+              avgConfidence: dca.avgConfidence,
+              entryCount: dca.entryCount,
+              indicationType: dca.indicationType,
+              direction: dca.direction,
+              prevPos: dca.prevPos,
+              trailingProfile: dca.trailingProfile,
+            })
+          }
+        }
+      }
+    }
+
+    // Re-sort after variant injection so hedge netting sees PF-desc order
+    realSorted.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+
+    // ── HEDGE NETTING (operator spec: Real stage only) ─────────────────────
     //
     // The Main-stage Position-Count Cartesian emits a long/short pair for
     // every (prev × last × cont × outcome) tuple. Real collapses that to
@@ -4312,7 +4392,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����─���────────��─────�����───��─────��─────��──────���───────��
+  // ──�� STAGE 4: LIVE ─────────����─���────────��─────�����───��─────��─────��──────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
