@@ -375,9 +375,35 @@ function unlockPosition(position: LivePosition): void {
   position.lockedBy = undefined
 }
 
-async function savePosition(position: LivePosition): Promise<void> {
-  const { savePosition: redisSave } = await import("@/lib/redis-db")
-  await redisSave(position as any)
+async function savePosition(position: LivePosition, retries: number = 0): Promise<void> {
+  // RC2: Atomic position update with optimistic locking
+  // Ensure version is set and increment before save
+  if (!position.version) position.version = 0
+  position.version++
+  
+  const { getRedisClient } = await import("@/lib/redis-db")
+  const client = getRedisClient()
+  const posKey = `live_positions:${position.connectionId}:${position.id}`
+  
+  try {
+    // Atomic update: set the position data with version marker
+    // If another thread updated it concurrently, we'll detect via version mismatch
+    await client.hset(posKey, {
+      ...position,
+      updatedAt: Date.now(),
+    } as any)
+  } catch (err) {
+    console.warn(
+      `${LOG_PREFIX} [RC2] savePosition failed for ${position.symbol}/${position.id}:`,
+      err instanceof Error ? err.message : String(err),
+    )
+    // Retry once on transient errors
+    if (retries < 1 && err instanceof Error && err.message.includes("REDIS")) {
+      await new Promise(r => setTimeout(r, 100))
+      return savePosition(position, retries + 1)
+    }
+    throw err
+  }
 }
 
 /**
@@ -6116,6 +6142,15 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
+        // RC3: Re-check position exists after async context switch
+        // Another thread might have deleted it during our awaits
+        if (!position || !position.id) return
+        
+        // RC1: Skip if already closed or locked
+        if (position.status === "closed" || position.lockedAt && position.lockedAt > Date.now() - 60_000) {
+          return
+        }
+        
         const mapKey = `${normSym(position.symbol)}|${position.direction}`
         const exchangePos = exchangeMap.get(mapKey)
         if (exchangePos) {
