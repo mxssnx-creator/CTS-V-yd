@@ -146,9 +146,23 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
   try {
     console.log("[v0] [Auto-Start] Initializing trade-engine synchronization...")
 
-    const { initRedis, ensureUniqueSiteInstance } = await loadRedisDb()
+    const { initRedis, ensureUniqueSiteInstance, getRedisClient } = await loadRedisDb()
     await initRedis()
     await ensureUniqueSiteInstance().catch(() => {})
+
+    // LIVE TRADING FIX: Clear stale operator_intent from previous runs
+    // If intent is explicitly "stopped", delete it so it defaults to "running"
+    // This ensures engines start automatically on each new deployment/restart
+    try {
+      const client = getRedisClient()
+      const state = await client.hgetall("trade_engine:global")
+      if (state?.operator_intent === "stopped") {
+        console.log("[v0] [Auto-Start] Clearing stale operator_intent='stopped' to enable autostart")
+        await client.hdel("trade_engine:global", "operator_intent")
+      }
+    } catch (redisErr) {
+      console.warn("[v0] [Auto-Start] Failed to clear stale intent:", redisErr)
+    }
 
     autoStartInitialized = true
     await runTradeEngineHealingSweep({ isStartup: true, armTimer: true })
