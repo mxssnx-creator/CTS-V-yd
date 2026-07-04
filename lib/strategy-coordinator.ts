@@ -2576,10 +2576,18 @@ export class StrategyCoordinator {
       // memScale ≈ 1.7 on the 8.4 GB VM (heapMB ≈ 3500 after the 75% rssHard update).
       // Default ceiling: 300 × memScale per symbol → ~510 on this VM.
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
+      const _dynAxisCeiling = Math.round(300 * _axMemScale)
+      // Instance field is null when unconfigured (new code) or 50 when the
+      // singleton was constructed under old code. Treat null OR the old sentinel
+      // 50 as "not explicitly set" so the dynamic default applies.
+      const _instanceCeiling =
+        this.strategyMainAxisSetsCeiling !== null && this.strategyMainAxisSetsCeiling > 50
+          ? this.strategyMainAxisSetsCeiling
+          : null
       const MAIN_AXIS_SETS_CEILING =
         configuredAxisCeiling ??
-        this.strategyMainAxisSetsCeiling ??
-        Math.round(300 * _axMemScale)
+        _instanceCeiling ??
+        _dynAxisCeiling
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3979,7 +3987,7 @@ export class StrategyCoordinator {
           sets_progressing:         String(
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          // ── 4-perspective Real stats ──────────────────────────────
+          // ── 4-perspective Real stats ───────────────────────��──────
           // These are connection-wide (not per-symbol) so writing them
           // once per (symbol, cycle) is fine — every symbol computes the
           // same `realAccumulatedSum` and the same `strategies_real_total`.

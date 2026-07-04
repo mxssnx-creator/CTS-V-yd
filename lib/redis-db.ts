@@ -166,7 +166,7 @@ export class InlineLocalRedis implements RedisClientLike {
 
   // ──────────────────────────────────────────────────────────────────────
   // Disk persistence (snapshot-based, single instance)
-  // ─────────────────────────────────���────────────────────────────────────
+  // ─────────────────────────────────�����────────────────────────────────────
   //
   // The "local Redis" is in-memory only, so without a snapshot every
   // deploy / container restart / serverless cold-start wipes EVERYTHING:
@@ -626,12 +626,12 @@ export class InlineLocalRedis implements RedisClientLike {
         if (now - _lastEvictionLogMs > 60_000) {
           _lastEvictionLogMs = now
           const reason = isCritical
-            ? `CRITICAL RSS=${rssMB.toFixed(0)}MB >hard ${MEM.rssHardMB}MB`
-            : rssMB > MEM.rssSoftMB
-              ? `RSS=${rssMB.toFixed(0)}MB >soft ${MEM.rssSoftMB}MB`
-              : heapUsedMB > MEM.heapMB
-                ? `Heap=${heapUsedMB.toFixed(0)}MB >${MEM.heapMB}MB`
-                : `Keys=${totalKeys} >${MEM.maxKeys}`
+            ? `CRITICAL RSS=${rssMB.toFixed(0)}MB >hard ${CMEM.rssHardMB}MB`
+            : rssMB > CMEM.rssSoftMB
+              ? `RSS=${rssMB.toFixed(0)}MB >soft ${CMEM.rssSoftMB}MB`
+              : heapUsedMB > CMEM.heapMB
+                ? `Heap=${heapUsedMB.toFixed(0)}MB >${CMEM.heapMB}MB`
+                : `Keys=${totalKeys} >${CMEM.maxKeys}`
           // describeKeyFamilies() performs full key-family scans; only pay that
           // cost when a log line will actually be emitted.
           const families = this.describeKeyFamilies()
