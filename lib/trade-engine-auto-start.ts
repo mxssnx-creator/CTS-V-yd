@@ -146,23 +146,9 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
   try {
     console.log("[v0] [Auto-Start] Initializing trade-engine synchronization...")
 
-    const { initRedis, ensureUniqueSiteInstance, getRedisClient } = await loadRedisDb()
+    const { initRedis, ensureUniqueSiteInstance } = await loadRedisDb()
     await initRedis()
     await ensureUniqueSiteInstance().catch(() => {})
-    
-    // BUG FIX: Initialize global operator intent to "running" if not set
-    // Previously, operator_intent was never initialized, so the healing sweep
-    // would skip engine startup because of: if (operatorIntent !== "running")
-    // This prevented production mode from ever starting engines.
-    const client = getRedisClient()
-    const globalState = (await client.hgetall("trade_engine:global")) as Record<string, string> | null
-    const currentIntent = globalState?.operator_intent
-    if (!currentIntent || currentIntent === "stopped" || currentIntent === "paused") {
-      console.log(`[v0] [Auto-Start] Initializing global operator intent: ${currentIntent || "undefined"} → "running"`)
-      await client.hset("trade_engine:global", "operator_intent", "running").catch((err: unknown) => {
-        console.warn("[v0] [Auto-Start] Failed to initialize operator intent:", err)
-      })
-    }
 
     autoStartInitialized = true
     await runTradeEngineHealingSweep({ isStartup: true, armTimer: true })
@@ -218,10 +204,14 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       return { startedCount: 0, eligibleCount: 0, skipped: "paused" }
     }
 
-    if (operatorIntent !== "running") {
+    // PROD FIX: If operator_intent is not set (empty/undefined), treat as "running" for dev/test mode
+    // This allows engine autostart even if operator_intent was never explicitly initialized.
+    // Production code that explicitly stops/pauses will have operatorIntent set accordingly.
+    const shouldRun = operatorIntent === "running" || !operatorIntent
+    if (!shouldRun) {
       if (isStartup) {
         console.warn(
-          `[v0] [AutoStart] Startup sweep skipped: global engine not running (intent="${operatorIntent || "empty"}"). ` +
+          `[v0] [AutoStart] Startup sweep skipped: global engine not running (intent="${operatorIntent}"). ` +
             "Engine will start only when operator clicks Start.",
         )
       }
