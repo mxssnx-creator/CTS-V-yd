@@ -1066,6 +1066,9 @@ export class GlobalTradeEngineCoordinator {
       // sweep and the operator Start route request engines. On the low-RAM dev
       // VM (4.39 GB, no swap) two engines running their prehistoric StrategySet
       // pass at once reliably OOM-kills the worker. Both bingx-x01 and bybit-x03
+      // are always inited + visible. Process all connections consistently in both dev and prod.
+      // Use connection enable/disable settings (is_enabled_dashboard) to manage scope
+      // instead of env-based filtering. Dev-only filtering masked prod bugs.
       // are always inited + visible, but in DEVELOPMENT only ONE engine may run
       // at a time. We keep any connection the operator explicitly enabled
       // (is_enabled_dashboard="1"); otherwise we default to the primary

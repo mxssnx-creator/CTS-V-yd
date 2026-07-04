@@ -46,6 +46,11 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  // bingx-api is externalized because it transitively requires @nestjs/common,
+  // whose ValidationPipe lazily requires optional peers (class-validator,
+  // class-transformer). Webpack bundling fails on those optional requires;
+  // loading via Node require at runtime handles them gracefully.
+  serverExternalPackages: ["redis", "@redis/client", "bingx-api"],
   serverExternalPackages: [
     "redis",
     "@redis/client",
