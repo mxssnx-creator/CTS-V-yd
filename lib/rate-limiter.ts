@@ -47,7 +47,10 @@ export class RateLimiter {
     bingx: {
       requestsPerSecond: 5,
       requestsPerMinute: 100,
-      maxConcurrent: 5, // raised from 3; semaphore in live-stage is the outer cap
+      // 3 concurrent: matches STOP_SEM_LIMIT in live-stage so SL/TP placement
+      // can saturate the pool without leaving room for additional requests that
+      // would queue up and exhaust stuck-placed cancelOrder withTimeout budgets.
+      maxConcurrent: 3,
     },
     binance: {
       requestsPerSecond: 10,

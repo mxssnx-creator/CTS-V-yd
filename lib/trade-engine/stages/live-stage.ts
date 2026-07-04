@@ -4002,7 +4002,7 @@ export async function updateLivePositionFill(
  *      next pass — better than leaking the lock).
  *   3. Compute realized PnL + margin-based ROI (matches exchange ROE).
  *   4. Persist via savePosition() �� that helper already handles the
- *      open-index → closed-archive move idempotently. We do NOT touch
+ *      open-index �� closed-archive move idempotently. We do NOT touch
  *      Redis directly any more (which previously left the position in
  *      the open index forever on manual close).
  *   5. Release the dedup lock so a subsequent signal can re-enter.
@@ -5157,7 +5157,7 @@ export async function reconcileLivePositions(
 
           // ── Ownership guard ────────────────────�����─────���──────────────
           // Only arm SL/TP and issue force-closes on positions that carry
-          // a system orderId — proof WE placed the entry order.
+          // a system orderId ��� proof WE placed the entry order.
           // If orderId is absent, the exchange position at this
           // symbol+direction may have been opened manually by the operator
           // or by another system. We must not arm reduce-only orders or
@@ -6432,6 +6432,10 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             },
           ).catch(() => {})
           // Best-effort cancel of the entry order (bounded timeout).
+          // Track whether the cancel succeeded — if it timed out we skip
+          // the exchange-close leg to avoid blocking another 70 s (2 × 35 s)
+          // on an already-unresponsive exchange.
+          let cancelSucceeded = false
           if (position.orderId && exchangeConnector?.cancelOrder) {
             try {
               await withTimeout(
@@ -6439,6 +6443,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                 EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
                 `stuck-placed cancelOrder(${position.symbol} ${position.orderId})`,
               )
+              cancelSucceeded = true
             } catch (cancelErr) {
               console.warn(
                 `${LOG_PREFIX} [stuck-placed] cancel entry order failed for ${position.id}:`,
@@ -6447,12 +6452,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             }
           }
           // Mark position rejected and remove from open index.
+          // If cancelOrder timed out the exchange is unresponsive — skip
+          // the exchange-close (pass null connector) to avoid another 70 s
+          // wait. The position is DB-closed immediately; the exchange side
+          // will self-heal when the order expires or the next sync detects it.
+          const closeConnector = cancelSucceeded ? exchangeConnector : null
           try {
             await closeLivePosition(
               connectionId,
               position.id,
               position.entryPrice || 0,
-              exchangeConnector,
+              closeConnector,
               "stuck_in_placed",
             )
           } catch (closeErr) {
