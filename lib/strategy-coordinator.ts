@@ -2577,6 +2577,13 @@ export class StrategyCoordinator {
       // Default ceiling: 300 × memScale per symbol → ~510 on this VM.
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
       const _dynAxisCeiling = Math.round(300 * _axMemScale)
+      // Store the computed ceiling on globalThis so old singleton prototype
+      // instances (still running after HMR) read the updated value on every
+      // call. The global is only written when unconfigured (no env override,
+      // no explicit instance setting > 50).
+      if (!configuredAxisCeiling) {
+        ;(globalThis as any).__axis_sets_ceiling = _dynAxisCeiling
+      }
       // Instance field is null when unconfigured (new code) or 50 when the
       // singleton was constructed under old code. Treat null OR the old sentinel
       // 50 as "not explicitly set" so the dynamic default applies.
@@ -2587,6 +2594,8 @@ export class StrategyCoordinator {
       const MAIN_AXIS_SETS_CEILING =
         configuredAxisCeiling ??
         _instanceCeiling ??
+        // Also read from globalThis so old singleton instances get the new value
+        ((globalThis as any).__axis_sets_ceiling as number | undefined) ??
         _dynAxisCeiling
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
