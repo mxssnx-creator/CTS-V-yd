@@ -1,4 +1,4 @@
-// Migration 025 deadlock fix applied — forces full server restart
+// Migration 026 — force full restart to apply MemGuard/axis-ceiling/close-skip fixes
 
 const localServerActionAllowedOrigins = ["localhost:3002", "127.0.0.1:3002"]
 
