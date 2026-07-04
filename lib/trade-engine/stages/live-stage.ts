@@ -146,14 +146,14 @@ const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 15_000  // 15 s — position fetch for
 const EXCHANGE_TIMEOUT_GET_ORDER_MS     = 12_000  // 12 s — fill detection; retry via next sync tick on miss
 
 // ── Global SL/TP placement semaphore ─────────────────────────────────────
-// With 8 symbols each opening long+short positions, up to 16 SL+TP calls
-// can be queued simultaneously.  BingX allows ~5 order-write req/s per IP.
-// Limit=6 lets 6 calls run in parallel; with p99 latency of ~5s each,
-// 16 calls flush in ~27s (ceil(16/3) = 6 passes × ~4.5s).
-// Lower concurrency means each BingX request gets more bandwidth.
-// EXCHANGE_TIMEOUT_PLACE_STOP_MS (60s) covers worst-case queue wait.
+// 4 symbols × 2 directions × 2 stops (SL+TP) = up to 16 concurrent stop calls.
+// BingX rate limiter now allows 5 concurrent requests (maxConcurrent=5).
+// Limit=6 lets 6 stop calls run in parallel; ceil(16/6)=3 passes at ~5s p99
+// each = ~15s total flush — vs ceil(16/3)=6 passes × 5s = ~30s at the old limit.
+// Raising from 3 to 6 halves SL/TP arming latency when all symbols open simultaneously.
+// EXCHANGE_TIMEOUT_PLACE_STOP_MS (60s) covers worst-case queue + BingX RTT.
 let __stopSemCount = 0
-const __STOP_SEM_LIMIT = 3
+const __STOP_SEM_LIMIT = 6
 const __stopSemQueue: Array<() => void> = []
 function acquireStopSem(): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -2748,7 +2748,7 @@ export async function executeLivePosition(
       livePosition.statusReason = "live_trade disabled — no exchange execution"
       pushStep(livePosition, "simulate", true, `qty=${simQty} @ ${simEntryPrice}`)
       await savePosition(livePosition)
-      // Run counters in parallel — they're independent.
+      // Run counters in parallel �� they're independent.
       await Promise.all([
         incrementMetric(connectionId, "live_orders_simulated_count"),
         // Track simulated positions in created counter as well so the

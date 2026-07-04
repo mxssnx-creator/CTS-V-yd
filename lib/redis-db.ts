@@ -166,7 +166,7 @@ export class InlineLocalRedis implements RedisClientLike {
 
   // ──────────────────────────────────────────────────────────────────────
   // Disk persistence (snapshot-based, single instance)
-  // ─────────────────────────────────�����────────────────────────────────────
+  // ─────────────────────────────────�������────────────────────────────────────
   //
   // The "local Redis" is in-memory only, so without a snapshot every
   // deploy / container restart / serverless cold-start wipes EVERYTHING:
@@ -550,14 +550,19 @@ export class InlineLocalRedis implements RedisClientLike {
         }
       }
       const vmTotalMB   = _readVmTotalMB()
-      // Reserve 2 GB for OS, other processes, and headroom before kernel OOM.
-      const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
-      // Heap trigger: 55% of usable
-      const heapMB      = Math.round(usableMB * 0.55)
-      // RSS soft: 65% of usable — force GC above this.
-      const rssSoftMB   = Math.round(usableMB * 0.65)
-      // RSS hard: 75% of usable — critical eviction + sleep above this.
-      const rssHardMB   = Math.round(usableMB * 0.75)
+      // Reserve 1.5 GB for OS + other processes. On the 8.4 GB VM usable = 6.9 GB.
+      // Kernel OOM on Linux typically fires at ~95% physical RAM consumption;
+      // we keep a ~18% buffer (rssHard at 82%) so the EMERGENCY pause (×1.07)
+      // fires at ~88%, well below kernel OOM. With SYMBOL_CONCURRENCY=1 and
+      // exchange-close retries eliminated, working RSS is ~3-4 GB; the old
+      // 75% rssHard (4769 MB) was tripping CRITICAL evictions on normal traffic.
+      const usableMB    = Math.max(1_500, vmTotalMB - 1_500)
+      // Heap trigger: 60% of usable (was 55%)
+      const heapMB      = Math.round(usableMB * 0.60)
+      // RSS soft: 72% of usable — force GC above this (was 65%).
+      const rssSoftMB   = Math.round(usableMB * 0.72)
+      // RSS hard: 82% of usable — critical eviction + sleep above this (was 75%).
+      const rssHardMB   = Math.round(usableMB * 0.82)
       const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
       const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))
       const prev = globalCleanup.__redis_mem_limits

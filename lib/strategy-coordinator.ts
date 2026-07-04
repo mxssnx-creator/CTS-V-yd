@@ -779,7 +779,11 @@ export class StrategyCoordinator {
   // null = use the dynamic VM-memory-scaled default (300 × memScale).
   // Set to a number via connection settings or STRATEGY_MAIN_AXIS_SETS_CEILING env var.
   private strategyMainAxisSetsCeiling: number | null = null
-  private strategyRealSetsSafetyCeiling = 100
+  // null = use the dynamic VM-memory-scaled default from evaluateRealSets.
+  // Set to a number via connection settings or STRATEGY_REAL_SETS_SAFETY_CEILING env var.
+  // Old code had hardcoded 100; treat ≤100 as unset so the singleton picks up
+  // the dynamic default (5000 × memScale ≈ 8540 on the 8.4 GB VM) after restart.
+  private strategyRealSetsSafetyCeiling: number | null = null
   private strategyLiveSetsCeiling = 90
 
   /**
@@ -1295,8 +1299,15 @@ export class StrategyCoordinator {
         _rawAxisCeil != null && Number.isFinite(Number(_rawAxisCeil)) && Number(_rawAxisCeil) > 0
           ? intSetting(_rawAxisCeil, 50, 10, 50_000)
           : null
-      this.strategyRealSetsSafetyCeiling = intSetting((s as any).strategyRealSetsSafetyCeiling, 100, 25, 50_000)
-      this.config.maxRealSets = intSetting((s as any).maxRealSets, this.strategyRealSetsSafetyCeiling, 1, this.strategyRealSetsSafetyCeiling)
+      // Only set when the connection explicitly provides a value; otherwise
+      // leave null so the VM-memory-scaled dynamic default applies per cycle.
+      const _rawRealCeil = (s as any).strategyRealSetsSafetyCeiling
+      this.strategyRealSetsSafetyCeiling =
+        _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
+          ? intSetting(_rawRealCeil, 100, 25, 50_000)
+          : null
+      const _effectiveRealCeil = this.strategyRealSetsSafetyCeiling ?? Infinity
+      this.config.maxRealSets = intSetting((s as any).maxRealSets, _effectiveRealCeil, 1, _effectiveRealCeil)
       this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 90, 1, 1_000)
       this.config.maxLiveSets = this.strategyLiveSetsCeiling
     } catch (err) {
@@ -2573,14 +2584,17 @@ export class StrategyCoordinator {
           ? Math.floor(rawAxisCeiling)
           : null
       const _axGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
-      // memScale ≈ 1.7 on the 8.4 GB VM (heapMB ≈ 3500 after the 75% rssHard update).
-      // Default ceiling: 300 × memScale per symbol → ~510 on this VM.
+      // memScale ≈ 1.7 on the 8.4 GB VM (heapMB ≈ 3500).
+      // Default ceiling: 800 × memScale per symbol → ~1366 on the 8.4 GB VM.
+      // Raised from 300 (≈512) — with SYMBOL_CONCURRENCY=1 and exchange-close
+      // retries eliminated, peak instantaneous heap is dominated by axis-set
+      // JS objects (~1 KB each). 1366 axis sets × ~1 KB × 4 symbols = ~5.5 MB,
+      // well within the 3497 MB heap trigger. The old 300× was sized for the
+      // pre-session-36 state where concurrent symbols + OOM pauses amplified
+      // memory pressure. Now safe to expand for much richer strategy coverage.
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
-      const _dynAxisCeiling = Math.round(300 * _axMemScale)
-      // Store the computed ceiling on globalThis so old singleton prototype
-      // instances (still running after HMR) read the updated value on every
-      // call. The global is only written when unconfigured (no env override,
-      // no explicit instance setting > 50).
+      const _dynAxisCeiling = Math.round(800 * _axMemScale)
+      // Store on globalThis so HMR-lagged prototype instances pick up the new value.
       if (!configuredAxisCeiling) {
         ;(globalThis as any).__axis_sets_ceiling = _dynAxisCeiling
       }
@@ -3603,10 +3617,22 @@ export class StrategyCoordinator {
     // Default scales with VM RAM just like the axis ceiling.
     const _rsGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
     const _rsMemScale = _rsGl ? Math.max(1, _rsGl.heapMB / 2_048) : 1
+    // Instance field is null when unconfigured (new code) or ≤100 when the
+    // singleton was built under old code where 100 was the class default.
+    // Treat null OR the old sentinel ≤100 as "not explicitly set" so the
+    // dynamic VM-scaled default applies (5000 × memScale ≈ 8540 on 8.4 GB VM).
+    const _instanceRealCeiling =
+      this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
+        ? this.strategyRealSetsSafetyCeiling
+        : null
+    const _dynRealCeiling = process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale)
+    // Write to globalThis so HMR-lagged singleton instances pick up the new value.
+    ;(globalThis as any).__real_sets_ceiling = _dynRealCeiling
     const REAL_SETS_SAFETY_CEILING =
       configuredRealCeiling ??
-      this.strategyRealSetsSafetyCeiling ??
-      (process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale))
+      _instanceRealCeiling ??
+      ((globalThis as any).__real_sets_ceiling as number | undefined) ??
+      _dynRealCeiling
     // HARD ENFORCE with Math.min: the config default is Infinity, and
     // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
     // the safety ceiling NEVER engaged and the process was OOM-killed at

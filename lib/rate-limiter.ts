@@ -45,12 +45,14 @@ export class RateLimiter {
       maxConcurrent: 5,
     },
     bingx: {
-      requestsPerSecond: 5,
-      requestsPerMinute: 100,
-      // 3 concurrent: matches STOP_SEM_LIMIT in live-stage so SL/TP placement
-      // can saturate the pool without leaving room for additional requests that
-      // would queue up and exhaust stuck-placed cancelOrder withTimeout budgets.
-      maxConcurrent: 3,
+      // BingX actual limits: 100 req/10s per IP for reads, 20 req/s for orders.
+      // With exchange-close retries eliminated (session 36), queue pressure is
+      // much lower. Raise to 10 req/s and 5 concurrent so getPositions,
+      // getOpenOrders, and placeOrder can pipeline without starving each other.
+      // __STOP_SEM_LIMIT=6 in live-stage prevents SL/TP from monopolising all slots.
+      requestsPerSecond: 10,
+      requestsPerMinute: 300,
+      maxConcurrent: 5,
     },
     binance: {
       requestsPerSecond: 10,
