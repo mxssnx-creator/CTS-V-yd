@@ -4002,7 +4002,7 @@ export async function updateLivePositionFill(
  *      next pass — better than leaking the lock).
  *   3. Compute realized PnL + margin-based ROI (matches exchange ROE).
  *   4. Persist via savePosition() �� that helper already handles the
- *      open-index �� closed-archive move idempotently. We do NOT touch
+ *      open-index ��� closed-archive move idempotently. We do NOT touch
  *      Redis directly any more (which previously left the position in
  *      the open index forever on manual close).
  *   5. Release the dedup lock so a subsequent signal can re-enter.
@@ -6046,9 +6046,15 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const SYNC_CONCURRENCY = 5
     
     // SYNC_PER_POS_TIMEOUT_MS: Per-position sync timeout.
-    // Individual operation timeouts: getOrder=12s, placeStop=60s, close=35s×2.
-    // Per-position cap at 80s gives close 2 full attempts plus a getOrder check.
-    const SYNC_PER_POS_TIMEOUT_MS = 80_000
+    // Individual operation timeouts: getOrder=12s, placeStop=60s.
+    // exchange-close (35s×2=70s) is now skipped for stuck_in_placed and
+    // exchange_externally_closed paths, so the worst case is a single
+    // placeStop(60s) + getPositions(~3s) = 63s. Use 45s as the cap:
+    // placeStop already has executeTimeoutMs inside the rate-limiter slot
+    // (starts at dispatch, not at enqueue), so the effective cap is higher
+    // than it appears. Positions that need a full close still use the
+    // closeLivePosition path with its own 35s internal timeout.
+    const SYNC_PER_POS_TIMEOUT_MS = 45_000
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
@@ -6133,16 +6139,20 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             },
           ).catch(() => {})
           // closeLivePosition does the full terminal-state pipeline:
-          // best-effort exchange close (no-op when already gone), cancel
-          // orphan SL/TP, compute PnL/ROI, archive, release lock,
+          // cancel orphan SL/TP, compute PnL/ROI, archive, release lock,
           // increment counters. Reason "exchange_externally_closed"
           // distinguishes it in the audit trail from cross-fires.
+          //
+          // Pass null connector: the position is already closed on the
+          // exchange (SL/TP triggered), so the 2×35s exchange-close retry
+          // inside closeLivePosition is guaranteed to either fail or be a
+          // no-op. Skipping it keeps sync-done latency under 30s vs 70s+.
           try {
             await closeLivePosition(
               connectionId,
               position.id,
               exitPrice,
-              exchangeConnector,
+              null, // exchange already closed it — skip exchange-close leg
               "exchange_externally_closed",
             )
           } catch (closeErr) {
@@ -6175,7 +6185,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
 
-        // ── Delayed-fill SL/TP arming ────����────────────────────���───────
+        // ── Delayed-fill SL/TP arming ────����────────────────────���──��────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
         // and the position ended up `placed` with no protection orders.
