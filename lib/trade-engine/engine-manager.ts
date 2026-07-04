@@ -293,9 +293,12 @@ const _devSymCount = process.env.NODE_ENV === "development"
 // 50-90s in single-threaded Node. Running 2 in parallel splits CPU 50/50,
 // causing both to exceed the 90s timeout. Sequential execution (concurrency=1)
 // eliminates contention: each symbol gets full CPU and completes in 40-70s.
-// Total pipeline per cycle: 8 × ~55s ≈ 440s — within the 120s outer cycle
-// deadline because symbols are skipped if the deadline is hit (not blocked).
-const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 1 : 2
+// Process one symbol at a time. Concurrent processing was causing RSS to
+// spike to 5.2 GB (above the EMERGENCY threshold) when two BTCUSDT cycles
+// ran simultaneously, triggering MemGuard pauses that stalled BingX requests
+// and caused the 120s cycle deadline to fire. Sequential processing keeps
+// peak RSS ~1 GB lower with negligible throughput impact on 4 symbols.
+const SYMBOL_CONCURRENCY = 1
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -360,7 +363,10 @@ async function _createExchangeConnectorLazy() {
 // amplifying load. For live trading with 8+ symbols, increased to 120s dev / 90s prod
 // to prevent timeout failures during position fetching and strategy evaluation.
 // Cycles with real BingX API calls need more time for network latency and position reconciliation.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 90_000 : 120_000
+// Dev deadline is 180 s: the live pipeline (leverage + placeOrder + awaitFill + placeStop) needs
+// up to ~100 s when the rate-limiter queue is saturated by concurrent sync-tick getPositions calls.
+// Production is tighter at 90 s because the dedicated worker has lower queue pressure.
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 90_000 : 180_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -998,7 +1004,7 @@ export class TradeEngineManager {
           )
         }
 
-        // ── INTENSIVE PRODUCTION SELF-HEAL: VERIFY CACHE INTEGRITY ───────
+        // ── INTENSIVE PRODUCTION SELF-HEAL: VERIFY CACHE INTEGRITY ───��───
         // Auto-start / deploy recovery / monitor paths (production) trust the
         // 24 h `prehistoric_loaded:{id}` marker and skip the one-time historic
         // fill (ConfigSetProcessor full-range simulation + first-pass that

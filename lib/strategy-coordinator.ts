@@ -776,8 +776,14 @@ export class StrategyCoordinator {
     pruneStrategy: "hybrid",
   }
 
-  private strategyMainAxisSetsCeiling = 50
-  private strategyRealSetsSafetyCeiling = 100
+  // null = use the dynamic VM-memory-scaled default (300 × memScale).
+  // Set to a number via connection settings or STRATEGY_MAIN_AXIS_SETS_CEILING env var.
+  private strategyMainAxisSetsCeiling: number | null = null
+  // null = use the dynamic VM-memory-scaled default from evaluateRealSets.
+  // Set to a number via connection settings or STRATEGY_REAL_SETS_SAFETY_CEILING env var.
+  // Old code had hardcoded 100; treat ≤100 as unset so the singleton picks up
+  // the dynamic default (5000 × memScale ≈ 8540 on the 8.4 GB VM) after restart.
+  private strategyRealSetsSafetyCeiling: number | null = null
   private strategyLiveSetsCeiling = 90
 
   /**
@@ -1286,9 +1292,25 @@ export class StrategyCoordinator {
         return Math.max(min, Math.min(max, Math.floor(n)))
       }
       this.config.maxEntriesPerSet = intSetting((s as any).strategyMaxEntriesPerSet, 250, 50, 750)
-      this.strategyMainAxisSetsCeiling = intSetting((s as any).strategyMainAxisSetsCeiling, 50, 10, 50_000)
-      this.strategyRealSetsSafetyCeiling = intSetting((s as any).strategyRealSetsSafetyCeiling, 100, 25, 50_000)
-      this.config.maxRealSets = intSetting((s as any).maxRealSets, this.strategyRealSetsSafetyCeiling, 1, this.strategyRealSetsSafetyCeiling)
+      // Only set when the connection explicitly provides a value; otherwise
+      // leave null so the VM-memory-scaled dynamic default applies per cycle.
+      const _rawAxisCeil = (s as any).strategyMainAxisSetsCeiling
+      this.strategyMainAxisSetsCeiling =
+        _rawAxisCeil != null && Number.isFinite(Number(_rawAxisCeil)) && Number(_rawAxisCeil) > 0
+          ? intSetting(_rawAxisCeil, 50, 10, 50_000)
+          : null
+    // Only set when the connection explicitly provides a value; otherwise
+    // leave null so the standard dev/prod defaults (60/100 per symbol) apply.
+    const _rawRealCeil = (s as any).strategyRealSetsSafetyCeiling
+    this.strategyRealSetsSafetyCeiling =
+      _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
+        ? intSetting(_rawRealCeil, 100, 25, 50_000)
+        : null
+    // maxRealSets is uncapped (no Infinity default); let _realSetsCap enforce the limit.
+    this.config.maxRealSets = 
+      _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
+        ? intSetting((s as any).maxRealSets, Number(_rawRealCeil), 1, 50_000)
+        : undefined
       this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 90, 1, 1_000)
       this.config.maxLiveSets = this.strategyLiveSetsCeiling
     } catch (err) {
@@ -1597,7 +1619,7 @@ export class StrategyCoordinator {
       const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex, isPrehistoric)
       results.push(mainResult)
 
-      // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
+      // STAGE 3: REAL ��� promote Sets with avgPF >= 1.4 (base-promoted AND
       // additional related variants flow uniformly through this filter).
       // CoordIndex.validRealKeys is populated here; Real tuner writes sizeDelta
       // / tunedAvgPF onto each record for O(1) access at Live dispatch.
@@ -2356,15 +2378,16 @@ export class StrategyCoordinator {
       // Mark as valid for BASE→MAIN evaluation
       baseSet.status = "valid_base"
 
-      // Trailing is a BASE range-coordination profile, not a Main variant.
-      // Once a trailing Base Set exists it must behave like any other Base Set:
-      // Standard/default validates it, then active Adjust strategies (block/dca)
-      // may layer on top. Block is an execution overlay on the already-selected
-      // Set (not an independent Main Set), while DCA remains materialized so its
-      // reduce/close stats and Real-stage evaluation stay independently visible.
-      // selectActiveVariants() already excludes the deprecated Main-stage
-      // `trailing` profile, so do not special-case trailingProfile here.
-      const variantsForThisBase = activeVariants.filter((p) => p.name !== "block")
+      // ── OPTIMIZATION: Skip non-default variants at MAIN stage ───────────────
+      // Trailing/block/DCA variants were created here, causing a 3× explosion
+      // (base sets × 3 variants) before axis fan-out applied. Axis ceiling was
+      // then hit, discarding thousands of variant combinations. New approach:
+      // Only create `default` variants at MAIN, apply axis fan-out, cap at 1619.
+      // Then at REAL stage, create trailing/block/dca variants ONLY from
+      // surviving Main Sets. This keeps MAIN set count 1/3 the previous peak.
+      // Spec-note: Trailing is a Base-level profile (trailingProfile metadata),
+      // not a Main variant; it flows unchanged through any downstream variant.
+      const variantsForThisBase = activeVariants.filter((p) => p.name === "default")
 
       for (const profile of variantsForThisBase) {
         // Spawn async build task for this variant
@@ -2553,26 +2576,45 @@ export class StrategyCoordinator {
       // then stayed too CPU-bound for UI health/API requests at 800 and 200. Startup
       // must prioritize worker liveness and top-ranked axis candidates over
       // full Cartesian materialization.
-      // Scale with symbol count so multi-symbol dev runs don't OOM.
-      // Base: 300 sets per symbol in dev, 50 in prod by default.
-      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING for controlled load tests (production default: 50).
-      // V0_DEV_SYMBOL_COUNT controls the dev symbol count (default 1).
-      // At 10 symbols: 10 × 300 = 3000 ceiling (well within 4GB heap with
-      // the new per-symbol eviction caps in redis-db).
+      // Scale with VM memory so large machines can afford more axis fan-out
+      // while small machines stay safe. memScale ≈ 1 on 4 GB, ≈ 2 on 8 GB.
+      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING env var for load tests.
+      // Previous prod hardcap of 50 was designed for 4 GB VMs and caused
+      // BTCUSDT to always hit the ceiling on the actual 8.4 GB VM, generating
+      // a noisy log every cycle without actually preventing OOM.
       const rawAxisCeiling = Number(process.env.STRATEGY_MAIN_AXIS_SETS_CEILING ?? "")
       const configuredAxisCeiling =
         Number.isFinite(rawAxisCeiling) && rawAxisCeiling > 0
           ? Math.floor(rawAxisCeiling)
           : null
-      // Scale the default ceiling with VM memory so large machines can afford
-      // more axis fan-out while small machines stay safe. memScale ≈ 1 on 4 GB,
-      // ≈ 2 on 8 GB. 5000 × 2 = 10000 on the actual 8.6 GB VM.
       const _axGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
+      // memScale ≈ 1.7 on the 8.4 GB VM (heapMB ≈ 3500).
+      // Default ceiling: 800 × memScale per symbol → ~1366 on the 8.4 GB VM.
+      // Raised from 300 (≈512) — with SYMBOL_CONCURRENCY=1 and exchange-close
+      // retries eliminated, peak instantaneous heap is dominated by axis-set
+      // JS objects (~1 KB each). 1366 axis sets × ~1 KB × 4 symbols = ~5.5 MB,
+      // well within the 3497 MB heap trigger. The old 300× was sized for the
+      // pre-session-36 state where concurrent symbols + OOM pauses amplified
+      // memory pressure. Now safe to expand for much richer strategy coverage.
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
+      const _dynAxisCeiling = Math.round(800 * _axMemScale)
+      // Store on globalThis so HMR-lagged prototype instances pick up the new value.
+      if (!configuredAxisCeiling) {
+        ;(globalThis as any).__axis_sets_ceiling = _dynAxisCeiling
+      }
+      // Instance field is null when unconfigured (new code) or 50 when the
+      // singleton was constructed under old code. Treat null OR the old sentinel
+      // 50 as "not explicitly set" so the dynamic default applies.
+      const _instanceCeiling =
+        this.strategyMainAxisSetsCeiling !== null && this.strategyMainAxisSetsCeiling > 50
+          ? this.strategyMainAxisSetsCeiling
+          : null
       const MAIN_AXIS_SETS_CEILING =
         configuredAxisCeiling ??
-        this.strategyMainAxisSetsCeiling ??
-        (process.env.NODE_ENV === "production" ? 50 : Math.round(5_000 * _axMemScale))
+        _instanceCeiling ??
+        // Also read from globalThis so old singleton instances get the new value
+        ((globalThis as any).__axis_sets_ceiling as number | undefined) ??
+        _dynAxisCeiling
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3339,9 +3381,31 @@ export class StrategyCoordinator {
     // downstream stages (hedge-net, Real cap, Live dispatch) always see the
     // highest-quality Sets first. In-place sort avoids the spread-copy.
     realQualifying.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+    
+    // ── EARLY CAP: Apply before hedge netting to prevent memory accumulation ──
+    // The old cap applied AFTER hedge netting, wasting memory on thousands of sets
+    // that would be discarded. Cap the top-PF sets here so hedge netting works with
+    // a bounded input. This prevents 3244→60 set reduction happening after memory
+    // is already allocated. Constant defined inline since we need it before hedge-net.
+    const _defaultRealCap = process.env.NODE_ENV === "production" ? 100 : 60
+    const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_CEILING ?? "")
+    const _realOutputCap =
+      (Number.isFinite(rawRealCeiling) && rawRealCeiling > 0 ? Math.floor(rawRealCeiling) : null) ??
+      (this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
+        ? this.strategyRealSetsSafetyCeiling
+        : _defaultRealCap)
+    const __realSetsCap = Math.min(this.config.maxRealSets ?? _realOutputCap, _realOutputCap)
+    
+    if (realQualifying.length > __realSetsCap) {
+      console.warn(
+        `[v0] [RealStage] ${this.connectionId}: Capping ${realQualifying.length} → ${__realSetsCap} before hedge netting`
+      )
+      realQualifying.length = __realSetsCap  // Truncate in-place
+    }
+    
     const realSorted = realQualifying   // alias — hedge-net reads realSorted
 
-    // ── HEDGE NETTING (operator spec: Real stage only) ─────────���─────────
+    // ── HEDGE NETTING (operator spec: Real stage only) ─────────────────────
     //
     // The Main-stage Position-Count Cartesian emits a long/short pair for
     // every (prev × last × cont × outcome) tuple. Real collapses that to
@@ -3403,7 +3467,7 @@ export class StrategyCoordinator {
       const outcome = aw?.outcome ?? "pos"
       const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
       // ── Variant-INDEPENDENT bucketing (operator spec: each activated
-      // variant is handled independently) ──────────────────────────────────
+      // variant is handled independently) ─────────���────────────────────────
       // The bucket key MUST include the variant. Without it, every variant
       // derived from the same Base Set + axis context (default/trailing/block/
       // dca/pause) collapsed into ONE hedge bucket and competed against each
@@ -3491,12 +3555,10 @@ export class StrategyCoordinator {
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
 
-    // Real-stage related-created fan-out is the number of Sets materialized
-    // inside Real beyond the upstream PF-eligible Main input. It is intentionally
-    // independent from the final passed-output count, because PF/DDT, hedge-net,
-    // and caps can still reduce the output after fan-out.
-    let realStageRelatedCreated = 0
-
+    // Active-position Block overlays: inject block Sets derived from currently
+    // running real positions before the Real-stage cap. These are counted
+    // automatically in realRelatedCreated = realSets.length - mainPFEligible
+    // since they flow through realPostHedge → realSets.
     try {
       const activePositionBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
         symbol,
@@ -3505,7 +3567,6 @@ export class StrategyCoordinator {
         coordIndex,
       )
       if (activePositionBlockOverlays.length > 0) {
-        realStageRelatedCreated += activePositionBlockOverlays.length
         realPostHedge = realPostHedge
           .concat(activePositionBlockOverlays)
           .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
@@ -3569,27 +3630,9 @@ export class StrategyCoordinator {
     // keeping the full Real-stage pipeline exercised.
     // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
-    // candidates for the live dispatch to find qualifying PF-positive sets.
-    // Scale with dev symbol count: 60 real sets per symbol in dev, production default: 100.
-    const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_SAFETY_CEILING ?? "")
-    const configuredRealCeiling =
-      Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
-        ? Math.floor(rawRealCeiling)
-        : null
-    // Default scales with VM RAM just like the axis ceiling.
-    const _rsGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
-    const _rsMemScale = _rsGl ? Math.max(1, _rsGl.heapMB / 2_048) : 1
-    const REAL_SETS_SAFETY_CEILING =
-      configuredRealCeiling ??
-      this.strategyRealSetsSafetyCeiling ??
-      (process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale))
-    // HARD ENFORCE with Math.min: the config default is Infinity, and
-    // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
-    // the safety ceiling NEVER engaged and the process was OOM-killed at
-    // ~4GB heap (verified: FATAL "Ineffective mark-compacts near heap limit"
-    // during a 5-symbol live run). The operator can LOWER the cap via
-    // maxRealSets but can never exceed the ceiling.
-    const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING, REAL_SETS_SAFETY_CEILING)
+    // ── REAL OUTPUT CAP (moved to earlier point in evaluateRealSets) ─────────
+    // Cap is now applied BEFORE hedge netting at line ~3400 to prevent memory
+    // bloat from thousands of sets that would later be discarded.
     // ── Variant-fair cap (operator spec: each activated variant independent) ──
     // `realPostHedge` is PF-desc sorted. A pure top-N slice lets the large
     // `default` axis fan-out (up to MAIN_AXIS_SETS_CEILING Sets, ALL tagged
@@ -3601,20 +3644,20 @@ export class StrategyCoordinator {
     // non-default variant (taken in PF order), then fill the remaining budget
     // with the global PF ranking (mostly `default`). Non-default variants get
     // NO axis fan-out, so their counts are small and reserving for them is
-    // cheap while keeping the total within `realSetsCap` (OOM ceiling intact).
+    // cheap while keeping the total within the real output cap (OOM ceiling intact).
     let realSets: StrategySet[]
-    if (realPostHedge.length <= realSetsCap) {
+    if (realPostHedge.length <= _realSetsCap) {
       realSets = realPostHedge
     } else {
       // Up to ~30% of the cap is split across the 4 non-default variant types;
       // the remaining ~70% goes to the global PF ranking. Floor of 1 ensures
       // every present variant survives even at a tiny cap.
-      const floorPerVariant = Math.max(1, Math.floor((realSetsCap * 0.3) / 4))
+      const floorPerVariant = Math.max(1, Math.floor((_realSetsCap * 0.3) / 4))
       const reserved: StrategySet[] = []
       const reservedKeys = new Set<string>()
       const keptPerVariant: Record<string, number> = {}
       for (const s of realPostHedge) {
-        if (reserved.length >= realSetsCap) break
+        if (reserved.length >= _realSetsCap) break
         const v = (s.variant as string) ?? "default"
         if (v === "default") continue
         const kept = keptPerVariant[v] ?? 0
@@ -3623,7 +3666,7 @@ export class StrategyCoordinator {
         reservedKeys.add(s.setKey)
         keptPerVariant[v] = kept + 1
       }
-      const remaining = Math.max(0, realSetsCap - reserved.length)
+      const remaining = Math.max(0, _realSetsCap - reserved.length)
       const fill: StrategySet[] = []
       for (const s of realPostHedge) {
         if (fill.length >= remaining) break
@@ -3634,7 +3677,7 @@ export class StrategyCoordinator {
       realSets = reserved.concat(fill).sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       console.warn(
         `[v0] [RealStage] ${this.connectionId}: ${realPostHedge.length} Real Sets exceeds ` +
-        `safety ceiling ${realSetsCap}; kept top ${realSetsCap} by rank with per-variant ` +
+        `safety ceiling ${_realSetsCap}; kept top ${_realSetsCap} by rank with per-variant ` +
         `reserve (floor ${floorPerVariant}/variant: ${JSON.stringify(keptPerVariant)}). ` +
         `Set maxRealSets in Settings to override.`,
       )
@@ -3706,7 +3749,7 @@ export class StrategyCoordinator {
           externalPipeline: accPipeline,
         })
 
-        // ── Per-axis-Set continuous-count ledger (operator spec) ─────
+        // ��─ Per-axis-Set continuous-count ledger (operator spec) ─────
         // For axis Sets (the prev × last × cont × outcome × dir
         // Cartesian fan-out at Main), record the rolling continuous
         // count of Pis that have actually accumulated onto this axis
@@ -3752,7 +3795,7 @@ export class StrategyCoordinator {
           let sizeDelta: number
           let leverageDelta: number | undefined
           if (s.variant === "block") {
-            // Block: attenuate via combined; floor at −0.5 keeps result ≥ 50% base.
+            // Block: attenuate via combined; floor at −0.5 keeps result �� 50% base.
             sizeDelta = Math.max(-0.5, combined - 1)
           } else if (s.variant === "dca") {
             // DCA: only attenuate when historic PF poor — never amplify.
@@ -3972,7 +4015,7 @@ export class StrategyCoordinator {
           sets_progressing:         String(
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          // ── 4-perspective Real stats ──────────────────────────────
+          // ── 4-perspective Real stats ───────────────────────��──────
           // These are connection-wide (not per-symbol) so writing them
           // once per (symbol, cycle) is fine — every symbol computes the
           // same `realAccumulatedSum` and the same `strategies_real_total`.
@@ -4059,7 +4102,7 @@ export class StrategyCoordinator {
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
 
-      // ── P1-1: Real-stage per-variant aggregation ───────────���────────
+      // ── P1-1: Real-stage per-variant aggregation ──��────────���────────
       // ── Real-stage rolling sample (for averaged count stats) ──────────
       // Push one timestamped sample of the live Real counts per (symbol,
       // cycle) onto a bounded ring list. The tracking layer averages all
@@ -4265,7 +4308,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����─���────────��─────�����───��─────��─────��──────���───────��
+  // ──�� STAGE 4: LIVE ─────────����─���────────��─────�����───��─────��─────��──────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -4716,7 +4759,7 @@ export class StrategyCoordinator {
                 if (blockConfig) {
                   const blockOverlays: StrategySet[] = []
                   for (const dir of ["long", "short"] as const) {
-                    const source = qualifying.find((s) => s.direction === dir && s.variant !== "dca")
+                    const source = qualifying.find((s) => s.direction === dir && s.variant !== "dca" && s.variant !== "block")
                     if (!source) continue
                     for (let blockCount = 1; blockCount <= maxStack; blockCount++) {
                       const blockMul = 1 + (blockCount - 1) * ratio
@@ -4939,7 +4982,7 @@ export class StrategyCoordinator {
                     // already incorporated the CoordRecord sizeDelta from the
                     // Real-stage tuner — no extra entry scan needed.
                     sizeMultiplier: effectiveSizeMult,
-                    // ── Set-config propagation to Live ───���──────────────────
+                    // ── Set-config propagation to Live ───������─────────────────
                     // Forward the Set's trailing profile and historical
                     // performance snapshot into the RealPosition so that
                     // `executeLivePosition` can (a) anchor the initial SL at

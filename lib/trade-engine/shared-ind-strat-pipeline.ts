@@ -434,19 +434,18 @@ export async function runIndStratCycle(
       deps.enableStrategyFlow === true
     if (result.indicationCount > 0 && apiStrategyFlowEnabled) {
       const stratResult = await withPhaseTimeout(
-        deps.strategy.processStrategy(symbol, indications),
+        deps.strategy
+          .processStrategy(symbol, indications, deps.skipLiveDispatch === true)
+          .catch((err) => {
+            console.error(
+              `[v0] [SharedPipeline] processStrategy failed for ${symbol} (mode=${mode}):`,
+              err instanceof Error ? err.message : String(err),
+            )
+            return { strategiesEvaluated: 0, liveReady: 0 }
+          }),
         `Phase3/processStrategy/${symbol}`,
         PHASE3_TIMEOUT_MS,
-      ).catch((err) => {
-      const stratResult = await deps.strategy
-        .processStrategy(symbol, indications, deps.skipLiveDispatch === true)
-        .catch((err) => {
-          console.error(
-            `[v0] [SharedPipeline] processStrategy failed for ${symbol} (mode=${mode}):`,
-            err instanceof Error ? err.message : String(err),
-          )
-          return { strategiesEvaluated: 0, liveReady: 0 }
-        })
+      )
       result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
       result.liveReady = stratResult.liveReady || 0
     }

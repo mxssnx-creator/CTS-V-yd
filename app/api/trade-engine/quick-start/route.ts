@@ -43,9 +43,11 @@ export const dynamic = "force-dynamic"
 const API_VERSION = API_VERSIONS.tradeEngine
 const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 
-// Default fallback symbol. Normal quickstart auto-picks up to MAX_QUICKSTART_SYMBOLS by volatility.
+// Default fallback symbol. Normal quickstart auto-picks top symbols by volatility (no hard cap).
 const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
-const MAX_QUICKSTART_SYMBOLS = 32
+// Max symbols limited only by exchange API response or memory constraints.
+// Reasonable default: 100 symbols for auto-picks; explicit lists can exceed this.
+const QUICKSTART_DEFAULT_SYMBOL_COUNT = 100
 const QUICKSTART_LIVE_VOLUME_FACTOR = "0.1"
 
 const QUICKSTART_ZERO_COUNTERS: Record<string, string> = {
@@ -322,18 +324,19 @@ export async function POST(request: Request) {
       symbols = [rawSymbols]
     }
     // requestedCount controls the eventual auto-pick count when no
-    // explicit symbols are provided. Operator live-test mode should exercise
-    // the maximum symbol fan-out by default while still bounding accidental
-    // absurd values.
-    let requestedCount = MAX_QUICKSTART_SYMBOLS
+    // explicit symbols are provided. Allow any count >= 1 without artificial caps.
+    // Very large counts (>500) are capped by exchange API response limits.
+    let requestedCount = QUICKSTART_DEFAULT_SYMBOL_COUNT
     if (typeof rawSymbols === "number" && Number.isFinite(rawSymbols) && rawSymbols > 0) {
-      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(rawSymbols)))
+      // Allow explicit requests up to 1000 symbols (will be capped by exchange API)
+      requestedCount = Math.max(1, Math.min(1000, Math.floor(rawSymbols)))
     } else if (
       typeof body.symbolCount === "number" &&
       Number.isFinite(body.symbolCount) &&
       body.symbolCount > 0
     ) {
-      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(body.symbolCount)))
+      // Allow explicit requests up to 1000 symbols
+      requestedCount = Math.max(1, Math.min(1000, Math.floor(body.symbolCount)))
     }
     // The auto-pick branches honour `requestedCount` so a caller that
     // posts `{ symbolCount: 2 }` (or `symbols: 2`) gets two symbols, not

@@ -20,12 +20,12 @@ export async function GET(request: NextRequest) {
     await initRedis()
 
     // Get symbols from cache or fetch fresh
-    const symbols = await fetchTopSymbols(exchange, { limit: 1000, sortBy: "volume" })
+    const symbols = await fetchTopSymbols(exchange, 1000)
 
     return NextResponse.json({
       exchange,
-      symbols: symbols.map(s => s.symbol),
-      count: symbols.length,
+      symbols: symbols.symbols || [],
+      count: (symbols.symbols || []).length,
       timestamp: new Date().toISOString(),
     })
   } catch (error) {

@@ -131,7 +131,7 @@ class MemoryManager {
    */
   destroy() {
     if (this.gcInterval) {
-      clearInterval(this.gcInterval)
+      clearInterval(this.gcInterval as any)
       this.gcInterval = null
     }
   }

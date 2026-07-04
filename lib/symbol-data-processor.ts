@@ -207,10 +207,8 @@ export class SymbolDataProcessor {
       void Promise.resolve(client.set(key, JSON.stringify(data))).catch(() => undefined)
 
       // Avoid unbounded realtime history growth; latest tick is sufficient here.
-    } catch {
-      // Best-effort realtime latest-tick persistence must never stall websocket processing.
-      
     } catch (error) {
+      // Best-effort realtime latest-tick persistence must never stall websocket processing.
       await this.progressManager.addError(
         'market_data_store',
         error instanceof Error ? error.message : 'Failed to store market data',

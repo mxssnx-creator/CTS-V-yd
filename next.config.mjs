@@ -1,4 +1,4 @@
-// Migration 025 deadlock fix applied — forces full server restart
+// Migration 028 — high-perf: axis 800×, real 5000×, rssHard 82%, BingX 5 concurrent, stopSem 6
 
 const localServerActionAllowedOrigins = ["localhost:3002", "127.0.0.1:3002"]
 

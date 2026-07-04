@@ -166,7 +166,7 @@ export class InlineLocalRedis implements RedisClientLike {
 
   // ──────────────────────────────────────────────────────────────────────
   // Disk persistence (snapshot-based, single instance)
-  // ──────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────�������────────────────────────────────────
   //
   // The "local Redis" is in-memory only, so without a snapshot every
   // deploy / container restart / serverless cold-start wipes EVERYTHING:
@@ -531,45 +531,54 @@ export class InlineLocalRedis implements RedisClientLike {
       __redis_cleanup_started?: boolean
       __redis_mem_limits?: { heapMB: number; rssSoftMB: number; rssHardMB: number; maxKeys: number }
     }
+
+    // ── Dynamic memory limits ────────────────────────────────────────────────
+    // Computed BEFORE the startup guard so the thresholds update on every
+    // HMR reload (the guard below only prevents the timer from being
+    // registered twice, not the threshold computation from re-running).
+    // Reads /proc/meminfo each time so values are always proportional to
+    // the actual VM; fallback 4096 MB for unknown environments.
+    {
+      const _readVmTotalMB = (): number => {
+        try {
+          const fs = require("fs") as typeof import("fs")
+          const raw = fs.readFileSync("/proc/meminfo", "utf8")
+          const match = raw.match(/MemTotal:\s+(\d+)\s+kB/)
+          return match ? Math.round(parseInt(match[1], 10) / 1024) : 4_096
+        } catch {
+          return 4_096
+        }
+      }
+      const vmTotalMB   = _readVmTotalMB()
+      // Reserve 1.5 GB for OS + other processes. On the 8.4 GB VM usable = 6.9 GB.
+      // Kernel OOM on Linux typically fires at ~95% physical RAM consumption;
+      // we keep a ~18% buffer (rssHard at 82%) so the EMERGENCY pause (×1.07)
+      // fires at ~88%, well below kernel OOM. With SYMBOL_CONCURRENCY=1 and
+      // exchange-close retries eliminated, working RSS is ~3-4 GB; the old
+      // 75% rssHard (4769 MB) was tripping CRITICAL evictions on normal traffic.
+      const usableMB    = Math.max(1_500, vmTotalMB - 1_500)
+      // Heap trigger: 60% of usable (was 55%)
+      const heapMB      = Math.round(usableMB * 0.60)
+      // RSS soft: 72% of usable — force GC above this (was 65%).
+      const rssSoftMB   = Math.round(usableMB * 0.72)
+      // RSS hard: 82% of usable — critical eviction + sleep above this (was 75%).
+      const rssHardMB   = Math.round(usableMB * 0.82)
+      const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
+      const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))
+      const prev = globalCleanup.__redis_mem_limits
+      const changed = !prev || prev.rssHardMB !== rssHardMB
+      globalCleanup.__redis_mem_limits = { heapMB, rssSoftMB, rssHardMB, maxKeys }
+      if (changed) {
+        console.log(
+          `[v0] [Redis Memory] VM=${vmTotalMB}MB usable=${usableMB}MB ` +
+          `→ heapTrigger=${heapMB}MB rssSoft=${rssSoftMB}MB rssHard=${rssHardMB}MB maxKeys=${maxKeys}`
+        )
+      }
+    }
+
     if (globalCleanup.__redis_cleanup_started) return
     globalCleanup.__redis_cleanup_started = true
 
-    // ── Dynamic memory limits ────────────────────────────────────────────────
-    // Read actual VM total RAM from /proc/meminfo once at startup so every
-    // threshold is proportional to the real machine instead of a hardcoded
-    // constant that may be wrong for the current deployment size.
-    // Fallback: 4096 MB (conservative for unknown environments).
-    const _readVmTotalMB = (): number => {
-      try {
-        const fs = require("fs") as typeof import("fs")
-        const raw = fs.readFileSync("/proc/meminfo", "utf8")
-        const match = raw.match(/MemTotal:\s+(\d+)\s+kB/)
-        return match ? Math.round(parseInt(match[1], 10) / 1024) : 4_096
-      } catch {
-        return 4_096
-      }
-    }
-    if (!globalCleanup.__redis_mem_limits) {
-      const vmTotalMB   = _readVmTotalMB()
-      // Reserve 2 GB for OS, other processes, and headroom before kernel OOM.
-      // V8 heap cap (--max-old-space-size) is set to 5632 in package.json for
-      // the actual 8606 MB VM, leaving ~3 GB of OS+slack buffer.
-      const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
-      // Heap trigger: fire at 45% of usable. On 8.6 GB VM → ~4.3 GB usable → ~1.9 GB heap trigger.
-      const heapMB      = Math.round(usableMB * 0.45)
-      // RSS soft: 50% of usable — force GC above this. Keeps us well clear of OOM.
-      const rssSoftMB   = Math.round(usableMB * 0.50)
-      // RSS hard: 65% of usable — critical eviction + sleep above this.
-      const rssHardMB   = Math.round(usableMB * 0.65)
-      const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
-      // Key count: scale with both symbol count and VM size.
-      const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))
-      globalCleanup.__redis_mem_limits = { heapMB, rssSoftMB, rssHardMB, maxKeys }
-      console.log(
-        `[v0] [Redis Memory] VM=${vmTotalMB}MB usable=${usableMB}MB ` +
-        `→ heapTrigger=${heapMB}MB rssSoft=${rssSoftMB}MB rssHard=${rssHardMB}MB maxKeys=${maxKeys}`
-      )
-    }
     const MEM = globalCleanup.__redis_mem_limits
 
     // Run an immediate targeted flush at startup to clear volatile key families
@@ -596,12 +605,18 @@ export class InlineLocalRedis implements RedisClientLike {
         const totalKeys  = this.data.strings.size + this.data.hashes.size +
                            this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
 
+        // Always read the current thresholds from globalThis so HMR reloads
+        // that update percentages are reflected immediately in the timer callback
+        // without needing a process restart. Fallback to the module-level MEM
+        // snapshot if the global was somehow cleared.
+        const CMEM = (globalThis as any).__redis_mem_limits as typeof MEM | undefined ?? MEM
+
         // Three-tier pressure response:
         //   NORMAL  → TTL cleanup only on the slower full-scan cadence
         //   WARM    → immediately evict + GC when heap/RSS/key pressure is high
         //   CRITICAL → immediately volatile cleanup + 3× evict passes + GC
-        const isCritical = rssMB > MEM.rssHardMB
-        const isWarm     = isCritical || heapUsedMB > MEM.heapMB || rssMB > MEM.rssSoftMB || totalKeys > MEM.maxKeys
+        const isCritical = rssMB > CMEM.rssHardMB
+        const isWarm     = isCritical || heapUsedMB > CMEM.heapMB || rssMB > CMEM.rssSoftMB || totalKeys > CMEM.maxKeys
         const shouldRunFullCleanup = isWarm || now - _lastFullCleanupMs >= FULL_CLEANUP_INTERVAL_MS
 
         if (!shouldRunFullCleanup) return
@@ -616,12 +631,12 @@ export class InlineLocalRedis implements RedisClientLike {
         if (now - _lastEvictionLogMs > 60_000) {
           _lastEvictionLogMs = now
           const reason = isCritical
-            ? `CRITICAL RSS=${rssMB.toFixed(0)}MB >hard ${MEM.rssHardMB}MB`
-            : rssMB > MEM.rssSoftMB
-              ? `RSS=${rssMB.toFixed(0)}MB >soft ${MEM.rssSoftMB}MB`
-              : heapUsedMB > MEM.heapMB
-                ? `Heap=${heapUsedMB.toFixed(0)}MB >${MEM.heapMB}MB`
-                : `Keys=${totalKeys} >${MEM.maxKeys}`
+            ? `CRITICAL RSS=${rssMB.toFixed(0)}MB >hard ${CMEM.rssHardMB}MB`
+            : rssMB > CMEM.rssSoftMB
+              ? `RSS=${rssMB.toFixed(0)}MB >soft ${CMEM.rssSoftMB}MB`
+              : heapUsedMB > CMEM.heapMB
+                ? `Heap=${heapUsedMB.toFixed(0)}MB >${CMEM.heapMB}MB`
+                : `Keys=${totalKeys} >${CMEM.maxKeys}`
           // describeKeyFamilies() performs full key-family scans; only pay that
           // cost when a log line will actually be emitted.
           const families = this.describeKeyFamilies()
