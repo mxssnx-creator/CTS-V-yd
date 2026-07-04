@@ -1,6 +1,6 @@
 "use client"
 
-import React, { type ReactNode, useEffect, useMemo, useState } from "react"
+import React, { type ReactNode, useEffect, useState } from "react"
 import { PageHeader } from "@/components/page-header"
 import { QuickstartSection } from "./quickstart-section"
 import { SystemOverview } from "./system-overview"
@@ -59,11 +59,18 @@ function createSessionInstanceId(): string {
 }
 
 function DashboardRuntimeFooter() {
-  const [startedAt] = useState(() => new Date())
-  const [now, setNow] = useState(() => new Date())
-  const instanceId = useMemo(createSessionInstanceId, [])
+  // All session-unique / time-dependent values are generated ONLY after mount.
+  // Generating them during render (useState initializer / useMemo) produces
+  // different values on the server vs the client, causing hydration mismatches.
+  const [startedAt, setStartedAt] = useState<Date | null>(null)
+  const [now, setNow] = useState<Date | null>(null)
+  const [instanceId, setInstanceId] = useState<string | null>(null)
 
   useEffect(() => {
+    const started = new Date()
+    setStartedAt(started)
+    setNow(started)
+    setInstanceId(createSessionInstanceId())
     const timer = window.setInterval(() => setNow(new Date()), 1000)
     return () => window.clearInterval(timer)
   }, [])
@@ -75,12 +82,14 @@ function DashboardRuntimeFooter() {
           <Badge variant="outline" className="font-mono">
             Unique Session / Instance ID
           </Badge>
-          <span className="font-mono text-foreground break-all">{instanceId}</span>
+          <span className="font-mono text-foreground break-all">{instanceId ?? "—"}</span>
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono">
-          <span>Started: {startedAt.toLocaleString()}</span>
-          <span>Now: {now.toLocaleString()}</span>
-          <span>Running: {formatDuration(now.getTime() - startedAt.getTime())}</span>
+          <span>Started: {startedAt ? startedAt.toLocaleString() : "—"}</span>
+          <span>Now: {now ? now.toLocaleString() : "—"}</span>
+          <span>
+            Running: {startedAt && now ? formatDuration(now.getTime() - startedAt.getTime()) : "—"}
+          </span>
         </div>
       </div>
     </Card>
