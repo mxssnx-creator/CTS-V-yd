@@ -1616,7 +1616,7 @@ export class StrategyCoordinator {
       const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx, coordIndex, isPrehistoric)
       results.push(mainResult)
 
-      // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
+      // STAGE 3: REAL ��� promote Sets with avgPF >= 1.4 (base-promoted AND
       // additional related variants flow uniformly through this filter).
       // CoordIndex.validRealKeys is populated here; Real tuner writes sizeDelta
       // / tunedAvgPF onto each record for O(1) access at Live dispatch.
@@ -3529,12 +3529,10 @@ export class StrategyCoordinator {
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
 
-    // Real-stage related-created fan-out is the number of Sets materialized
-    // inside Real beyond the upstream PF-eligible Main input. It is intentionally
-    // independent from the final passed-output count, because PF/DDT, hedge-net,
-    // and caps can still reduce the output after fan-out.
-    let realStageRelatedCreated = 0
-
+    // Active-position Block overlays: inject block Sets derived from currently
+    // running real positions before the Real-stage cap. These are counted
+    // automatically in realRelatedCreated = realSets.length - mainPFEligible
+    // since they flow through realPostHedge → realSets.
     try {
       const activePositionBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
         symbol,
@@ -3543,7 +3541,6 @@ export class StrategyCoordinator {
         coordIndex,
       )
       if (activePositionBlockOverlays.length > 0) {
-        realStageRelatedCreated += activePositionBlockOverlays.length
         realPostHedge = realPostHedge
           .concat(activePositionBlockOverlays)
           .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
@@ -4766,7 +4763,7 @@ export class StrategyCoordinator {
                 if (blockConfig) {
                   const blockOverlays: StrategySet[] = []
                   for (const dir of ["long", "short"] as const) {
-                    const source = qualifying.find((s) => s.direction === dir && s.variant !== "dca")
+                    const source = qualifying.find((s) => s.direction === dir && s.variant !== "dca" && s.variant !== "block")
                     if (!source) continue
                     for (let blockCount = 1; blockCount <= maxStack; blockCount++) {
                       const blockMul = 1 + (blockCount - 1) * ratio

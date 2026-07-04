@@ -786,6 +786,9 @@ export class BingXConnector extends BaseExchangeConnector {
         await this.sdkInitPromise.catch(() => {})
         this.sdkInitPromise = null
       }
+      // SDK is the DEFAULT path for mainnet perpetual entry orders.
+      // Set DISABLE_BINGX_SDK_ORDERS=1 to force REST fallback (e.g. for debugging).
+      // REST is always used for: testnet, spot, reduce-only (close/SL/TP) orders.
       const sdkOrderAllowed =
         process.env.DISABLE_BINGX_SDK_ORDERS !== "1" &&
         !this.credentials.isTestnet &&
@@ -793,16 +796,10 @@ export class BingXConnector extends BaseExchangeConnector {
         !options.reduceOnly &&
         !!this.sdkClient &&
         !!this.sdkAccount
-      // Prefer the audited REST path for real order placement unless explicitly
-      // enabled. The SDK fast-path has different position-mode semantics across
-      // versions and was a prod/dev mismatch source for live orders; REST below
-      // carries our recvWindow, timestamp-resync, hedge/one-way fallback, and
-      // signed-query diagnostics.
-      if (sdkOrderAllowed && process.env.ENABLE_BINGX_SDK_ORDERS === "1") {
+      if (sdkOrderAllowed) {
         try {
           const bingxSymbol = this.toBingXSymbol(symbol)
-          const apiType = this.credentials.apiType || "perpetual_futures"
-          
+
           // SDK encapsulates the order placement with optimal timeout and retry
           const tradeService = (this.sdkClient as any).getTradeService?.() || (this.sdkClient as any).services?.TradeService
           if (!tradeService?.tradeOrder) throw new Error("BingX SDK tradeOrder service unavailable")
@@ -2676,7 +2673,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const succeeded = data.data?.success || []
       const failed = data.data?.failed || []
       
-      this.log(`✓ Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
+      this.log(`�� Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
       return {
         success: true,
         successful: succeeded,
