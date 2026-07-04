@@ -176,7 +176,9 @@ export class PrehistoricProgressTracker {
         await client.expire(doneKey, 86400) // 24h ttl
         
         success = true
-        console.log(`[v0] Prehistoric complete for ${this.connectionId} at ${new Date(now).toISOString()}`)
+        if (process.env.NODE_ENV !== "test" && !process.env.JEST_WORKER_ID) {
+          console.log(`[v0] Prehistoric complete for ${this.connectionId} at ${new Date(now).toISOString()}`)
+        }
       } catch (err) {
         retries--
         if (retries === 0) {

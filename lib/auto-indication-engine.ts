@@ -540,7 +540,7 @@ export class AutoIndicationEngine {
       strategies: autoSettings.strategies || {
         block: { enabled: true },
         level: { enabled: true },
-        dca: { enabled: true },
+        dca: { enabled: false },
       },
       trailingOptimalRanges: autoSettings.trailingOptimalRanges !== false,
       simultaneousTrading: autoSettings.simultaneousTrading !== false,

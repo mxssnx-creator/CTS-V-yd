@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { useExchange } from "@/lib/exchange-context"
 import { TradeHistoryTable, type TradeHistoryRow } from "@/components/dashboard/trade-history-table"
@@ -586,6 +586,10 @@ export function StatisticsOverviewV2() {
   const { selectedConnectionId } = useExchange()
   const connectionId = selectedConnectionId || "default-bingx-001"
   const [stats, setStats] = useState<CompactStats>(EMPTY)
+  // Event-triggered refreshes can overlap with the 5s poll. Only the newest
+  // stats payload may update state, otherwise an older slow response can make
+  // the dashboard appear to stall or jump backward.
+  const statsFetchSeqRef = useRef(0)
 
   useEffect(() => {
     let mounted = true
@@ -596,13 +600,15 @@ export function StatisticsOverviewV2() {
     // local state. Called on mount, every 5s, and on global engine /
     // connection / live-trade toggle events for immediate refresh.
     const load = async () => {
+      const requestSeq = ++statsFetchSeqRef.current
       try {
         const res = await fetch(
           `/api/connections/progression/${connectionId}/stats`,
           { cache: "no-store" },
         )
-        if (!res.ok || !mounted) return
+        if (!res.ok || !mounted || requestSeq !== statsFetchSeqRef.current) return
         const d = await res.json()
+        if (!mounted || requestSeq !== statsFetchSeqRef.current) return
 
         // Live execution metrics are exposed at `liveExecution`
         // (preferred) and `strategyDetail.live` (extra fields) by the
@@ -680,7 +686,7 @@ export function StatisticsOverviewV2() {
         const opReal   = op.real   || {}
         const opLive   = op.live   || {}
 
-        if (!mounted) return
+        if (!mounted || requestSeq !== statsFetchSeqRef.current) return
         setStats({
           indicationCycles: d.realtime?.indicationCycles || 0,
           indicationsTotal: d.realtime?.indicationsTotal || 0,

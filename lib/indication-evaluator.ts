@@ -227,35 +227,34 @@ export class IndicationEvaluator {
   }
 
   /**
-   * Store indication in Redis
+   * Store indication in Redis.
+   *
+   * All writes for one indication are issued via a single MULTI/EXEC
+   * pipeline — 5 round-trips collapsed to 1. Previously each lpush,
+   * ltrim, and set was a separate await, serialising 5 TCP round-trips
+   * per indication. With pipeline they are sent in a single flush and
+   * the server processes them atomically.
    */
   private async storeIndication(indication: IndicationResult): Promise<void> {
-    // NOTE: Dev-mode bypass was removed. Indications MUST be stored to Redis so
-    // getIndications() can retrieve them for the strategy processor. Without this,
-    // strategy processor falls back to synthetic indications, preventing real
-    // indication-based strategy creation. (Triggering HMR reload)
     try {
       const client = getRedisClient()
-      
-      // Store in type-specific list
-      const typeKey = `indications:${this.connectionId}:${indication.type}`
-      await client.lpush(typeKey, JSON.stringify(indication))
-      await client.ltrim(typeKey, 0, 999) // Keep last 1000 per type
-
-      // Store in symbol-specific list
+      const payload = JSON.stringify(indication)
+      const typeKey   = `indications:${this.connectionId}:${indication.type}`
       const symbolKey = `indications:${this.connectionId}:${indication.symbol}`
-      await client.lpush(symbolKey, JSON.stringify(indication))
-      await client.ltrim(symbolKey, 0, 499) // Keep last 500 per symbol
-
-      // Store latest by type
       const latestKey = `indications:${this.connectionId}:latest:${indication.type}`
-      await client.set(latestKey, JSON.stringify(indication), { EX: 3600 })
 
+      const pipe = client.multi()
+      pipe.lpush(typeKey,   payload)
+      pipe.ltrim(typeKey,   0, 999)   // Keep last 1000 per type
+      pipe.lpush(symbolKey, payload)
+      pipe.ltrim(symbolKey, 0, 499)   // Keep last 500 per symbol
+      pipe.set(latestKey,   payload, { EX: 3600 })
+      await pipe.exec()
     } catch (error) {
       await this.progressManager.addError(
         'indication_store',
         error instanceof Error ? error.message : 'Failed to store indication',
-        indication.symbol
+        indication.symbol,
       )
     }
   }

@@ -109,4 +109,55 @@ describe("InlineLocalRedis compatibility and persistence", () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  it("keeps sorted sets ordered while updating duplicate members and slicing score ranges", async () => {
+    const redis = new InlineLocalRedis()
+
+    await expect(redis.zadd("z:updates", 30, "thirty")).resolves.toBe(1)
+    await expect(redis.zadd("z:updates", 10, "ten")).resolves.toBe(1)
+    await expect(redis.zadd("z:updates", 20, "twenty")).resolves.toBe(1)
+    await expect(redis.zadd("z:updates", 20, "twenty-b")).resolves.toBe(1)
+
+    await expect(redis.zrange("z:updates", 0, -1)).resolves.toEqual(["ten", "twenty", "twenty-b", "thirty"])
+    await expect(redis.zrangebyscore("z:updates", 15, 25)).resolves.toEqual(["twenty", "twenty-b"])
+
+    await expect(redis.zadd("z:updates", 5, "twenty")).resolves.toBe(0)
+    await expect(redis.zscore("z:updates", "twenty")).resolves.toBe("5")
+    await expect(redis.zrange("z:updates", 0, -1)).resolves.toEqual(["twenty", "ten", "twenty-b", "thirty"])
+    await expect(redis.zrangebyscore("z:updates", "-inf", 10)).resolves.toEqual(["twenty", "ten"])
+    await expect(redis.zcard("z:updates")).resolves.toBe(4)
+
+    await expect(redis.zremrangebyscore("z:updates", 10, 20)).resolves.toBe(2)
+    await expect(redis.zrange("z:updates", 0, -1)).resolves.toEqual(["twenty", "thirty"])
+    await expect(redis.zscore("z:updates", "ten")).resolves.toBeNull()
+    await expect(redis.zrangebyscore("z:updates", 0, "+inf")).resolves.toEqual(["twenty", "thirty"])
+  })
+
+  it("rebuilds sorted-set member indexes after snapshot reload", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "inline-redis-zset-"))
+    const snapshotPath = join(dir, "redis-snapshot.json")
+    process.env.V0_REDIS_SNAPSHOT_PATH = snapshotPath
+
+    try {
+      const writer = new InlineLocalRedis()
+      await writer.zadd("z:snapshot", 100, "hundred")
+      await writer.zadd("z:snapshot", 50, "fifty")
+      await writer.zadd("z:snapshot", 75, "seventy-five")
+      await writer.zadd("z:snapshot", 60, "fifty")
+      await expect(writer.saveToDisk()).resolves.toBe(true)
+
+      resetInlineGlobals()
+      const reader = new InlineLocalRedis()
+      await expect(reader.loadFromDisk()).resolves.toBe(true)
+
+      await expect(reader.zrange("z:snapshot", 0, -1)).resolves.toEqual(["fifty", "seventy-five", "hundred"])
+      await expect(reader.zscore("z:snapshot", "fifty")).resolves.toBe("60")
+      await expect(reader.zadd("z:snapshot", 40, "hundred")).resolves.toBe(0)
+      await expect(reader.zrangebyscore("z:snapshot", 0, 70)).resolves.toEqual(["hundred", "fifty"])
+      await expect(reader.zremrangebyscore("z:snapshot", 50, 80)).resolves.toBe(2)
+      await expect(reader.zrange("z:snapshot", 0, -1)).resolves.toEqual(["hundred"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

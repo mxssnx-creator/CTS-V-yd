@@ -67,4 +67,94 @@ describe("settings propagation", () => {
     })
     expect(hsets.find((w) => w.key === "progression:conn-main")?.value).toHaveProperty("settings_changed_at")
   })
+
+  test("in-process settings event fires after durable reload state is written", async () => {
+    const { notifySettingsChanged, onSettingsChanged } = await import("@/lib/settings-coordinator")
+    const observed: Array<{ hasReloadState: boolean; pendingExists: boolean }> = []
+    const unsubscribe = onSettingsChanged("conn-main", () => {
+      observed.push({
+        hasReloadState: writes.some(
+          (w) => w.key === "trade_engine_state:conn-main" && (w.value as any)?.reload_required === true,
+        ),
+        pendingExists: writes.some((w) => w.key === "settings_change:conn-main"),
+      })
+    })
+
+    try {
+      await notifySettingsChanged("conn-main", ["strategies"])
+      await Promise.resolve()
+    } finally {
+      unsubscribe()
+    }
+
+    expect(observed).toEqual([{ hasReloadState: true, pendingExists: true }])
+  })
+
+  test("in-process settings event handler failures do not fail durable settings save", async () => {
+    const { notifySettingsChanged, onSettingsChanged } = await import("@/lib/settings-coordinator")
+    const unsubscribe = onSettingsChanged("conn-main", () => {
+      throw new Error("subscriber failed")
+    })
+
+    try {
+      await expect(notifySettingsChanged("conn-main", ["strategies"])).resolves.toMatchObject({
+        connectionId: "conn-main",
+        changeType: "reload",
+      })
+    } finally {
+      unsubscribe()
+    }
+
+    expect(writes.some((w) => w.key === "settings_change:conn-main")).toBe(true)
+    expect(writes.some((w) => w.key === "trade_engine_state:conn-main")).toBe(true)
+  })
+})
+
+describe("System tab capacity controls", () => {
+  test("exposes capacity and stage controls using canonical settings keys", () => {
+    const fs = require("fs")
+    const path = require("path")
+    const source = fs.readFileSync(
+      path.join(process.cwd(), "components/settings/tabs/system-tab.tsx"),
+      "utf8",
+    )
+
+    expect(source).toContain("Capacity & Stage Limits")
+    for (const key of [
+      "symbolOrderType",
+      "numberOfSymbolsToSelect",
+      "mainSymbols",
+      "forcedSymbols",
+      "setCompactionFloor",
+      "setCompactionThresholdPct",
+      "setCompactionByType",
+      "indication.direction",
+      "indication.move",
+      "indication.active",
+      "indication.optimal",
+      "indication.active_advanced",
+      "strategy.base",
+      "strategy.main",
+      "strategy.real",
+      "strategy.live",
+      "indicationTimeoutMs",
+      "indication_state_retention_hours",
+      "maxRealSets",
+      "stageMinPosCountBase",
+      "stageMinPosCountMain",
+      "stageMinPosCountReal",
+      "baseProfitFactor",
+      "mainProfitFactor",
+      "realProfitFactor",
+      "liveProfitFactor",
+      "maxDrawdownTimeMainHours",
+      "maxDrawdownTimeRealHours",
+      "maxDrawdownTimeLiveHours",
+    ]) {
+      expect(source).toContain(key)
+    }
+
+    expect(source).not.toContain('handleSettingChange("symbolCount"')
+    expect(source).not.toContain('handleSettingChange("capacity')
+  })
 })

@@ -32,7 +32,6 @@ import { getRedisClient, initRedis, getSettings, getAppSettings, setSettings } f
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { emitIndicationUpdate } from "@/lib/broadcast-helpers"
 import {
-  compact,
   compactionCeiling,
   loadCompactionConfig,
   type CompactionConfig,
@@ -71,6 +70,83 @@ const DEFAULT_POSITION_LIMITS = {
 
 // Indication timeout after valid evaluation (100ms - 3000ms)
 const DEFAULT_INDICATION_TIMEOUT_MS = 1000
+
+const DEFAULT_OUTCOME_ATTACHMENT_CONCURRENCY = 20
+
+const RECORD_OUTCOME_SAMPLE_SCRIPT = `
+local sampleKey = KEYS[1]
+local statsKey = KEYS[2]
+local sampleJson = ARGV[1]
+local sampleProfit = tonumber(ARGV[2]) or 0
+local sampleLoss = tonumber(ARGV[3]) or 0
+local cap = tonumber(ARGV[4]) or 1000
+
+redis.call("RPUSH", sampleKey, sampleJson)
+local len = redis.call("LLEN", sampleKey)
+local overflow = len - cap
+local evictedProfit = 0
+local evictedLoss = 0
+local evictedCount = 0
+
+if overflow > 0 then
+  local evicted = redis.call("LRANGE", sampleKey, 0, overflow - 1)
+  for _, raw in ipairs(evicted) do
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+      evictedProfit = evictedProfit + math.max(tonumber(decoded["profit"]) or 0, 0)
+      evictedLoss = evictedLoss + math.max(tonumber(decoded["loss"]) or 0, 0)
+      evictedCount = evictedCount + 1
+    end
+  end
+  redis.call("LTRIM", sampleKey, -cap, -1)
+end
+
+local grossProfit = tonumber(redis.call("HGET", statsKey, "grossProfit"))
+local grossLoss = tonumber(redis.call("HGET", statsKey, "grossLoss"))
+local count = tonumber(redis.call("HGET", statsKey, "count"))
+
+if grossProfit == nil or grossLoss == nil or count == nil or grossProfit < 0 or grossLoss < 0 or count < 0 then
+  grossProfit = 0
+  grossLoss = 0
+  count = 0
+  local samples = redis.call("LRANGE", sampleKey, 0, -1)
+  for _, raw in ipairs(samples) do
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+      grossProfit = grossProfit + math.max(tonumber(decoded["profit"]) or 0, 0)
+      grossLoss = grossLoss + math.max(tonumber(decoded["loss"]) or 0, 0)
+      count = count + 1
+    end
+  end
+else
+  grossProfit = math.max(grossProfit + sampleProfit - evictedProfit, 0)
+  grossLoss = math.max(grossLoss + sampleLoss - evictedLoss, 0)
+  count = math.max(count + 1 - evictedCount, 0)
+end
+
+redis.call("HSET", statsKey, "grossProfit", tostring(grossProfit), "grossLoss", tostring(grossLoss), "count", tostring(count))
+return { tostring(grossProfit), tostring(grossLoss), tostring(count) }
+`
+
+type IndicationCandidate = { setKey: string; indication: any; config: any }
+
+async function mapLimit<T, R>(items: T[], limit: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) return []
+
+  const concurrency = Math.max(1, Math.min(Math.floor(limit) || 1, items.length))
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex++
+      results[index] = await mapper(items[index], index)
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  return results
+}
 
 export interface IndicationSetLimits {
   direction: number
@@ -123,38 +199,80 @@ export class IndicationSetsProcessor {
   /**
    * Per-type compaction config, resolved once per ~5s via the cached
    * `loadCompactionConfig` helper. Keeping a per-processor copy lets the
-   * hot-path `saveIndicationToSet` call `compact()` without touching the
-   * settings hash on every fill.
+   * hot-path append helper enforce compaction without touching the settings
+   * hash on every fill.
    */
   private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
   // Dev mode uses a minimal range grid so the 4-GB v0 sandbox VM can run the
   // full indication → strategy → live pipeline without OOM.
   //   Full grid: 29 ranges × 3 dd × 2 lp × 3 fm = 522 keys/type/symbol
-  //              × 4 types × 3 symbols = 6,264 keys/cycle → accumulates fast
+  //              × 5 types × 3 symbols = 7,830 keys/cycle → accumulates fast
   //   Dev  grid:  3 ranges × 2 dd × 1 lp × 2 fm = 12  keys/type/symbol
-  //              × 4 types × 3 symbols = 144 keys/cycle — easily evictable
-  private readonly _isDev = process.env.NODE_ENV === "development"
-  private directionMoveRanges: number[] = this._isDev
-    ? [5, 15, 25]                                        // 3 representative dev ranges
-    : Array.from({ length: 29 }, (_, i) => i + 2)       // 2..30 prod
-  private optimalRanges: number[] = this._isDev
-    ? [5, 15, 25]
-    : Array.from({ length: 29 }, (_, i) => i + 2)
-  private drawdownRatios: number[] = this._isDev ? [0.5, 1.5]           : [0.5, 1.0, 1.5]
-  private lastPartRatios: number[] = this._isDev ? [0.5]                : [0.25, 0.5]
-  private factorMultipliers: number[] = this._isDev ? [0.9, 1.1]        : [0.9, 1.0, 1.1]
-  private activeThresholds: number[] = this._isDev ? [0.5, 2.5]         : [0.5, 1.0, 1.5, 2.0, 2.5]
-  private activeTimeRatios: number[] = this._isDev ? [1.0]              : [0.5, 1.0]
+  //              × 5 types × 3 symbols = 180 keys/cycle — easily evictable
+  private directionMoveRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2) // 2..30
+  private optimalRanges: number[] = Array.from({ length: 29 }, (_, i) => i + 2)
+  private drawdownRatios: number[] = [0.5, 1.0, 1.5]
+  private lastPartRatios: number[] = [0.25, 0.5]
+  private factorMultipliers: number[] = [0.9, 1.0, 1.1]
+  private activeThresholds: number[] = [0.5, 1.0, 1.5, 2.0, 2.5]
+  private activeTimeRatios: number[] = [0.5, 1.0]
+  private activeAdvancedActivityRatios: number[] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  private activeAdvancedMinPositions = 3
+  private activeAdvancedContinuationRatio = 0.6
   private shortPriceHistoryWarnings: Set<string> = new Set()
   private outcomeHorizonCandles = 12
   private outcomeTakeProfitPct = 0.01
   private outcomeStopLossPct = 0.01
   private outcomeTakerFeePct = 0.001
   private outcomeSlippagePct = 0.0006
+  private outcomeAttachmentConcurrency = DEFAULT_OUTCOME_ATTACHMENT_CONCURRENCY
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.loadSettings()
+  }
+
+  private getSetIndexKeys(symbol: string, type: string): string[] {
+    return [
+      `indication_sets:index:${this.connectionId}`,
+      `indication_sets:index:${this.connectionId}:${symbol}`,
+      `indication_sets:index:${this.connectionId}:${symbol}:${type}`,
+    ]
+  }
+
+  private async indexSetKey(client: any, setKey: string, symbol: string, type: string): Promise<void> {
+    const indexes = this.getSetIndexKeys(symbol, type)
+    const pipeline = client.multi()
+    for (const indexKey of indexes) pipeline.sadd(indexKey, setKey)
+    await pipeline.exec().catch(() => {})
+  }
+
+  private async getIndexedSetKeys(client: any, symbol: string, type: string): Promise<string[]> {
+    const typeIndexKey = `indication_sets:index:${this.connectionId}:${symbol}:${type}`
+    let keys = ((await client.smembers(typeIndexKey).catch(() => [])) || []) as string[]
+    if (keys.length > 0) return keys
+
+    // Startup/repair fallback only: bounded SCAN is used to backfill the
+    // maintained per-connection/per-symbol/per-type indexes for legacy keys.
+    // Dashboard polling paths normally read only the index set above.
+    const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
+    if (typeof client.scan !== "function") return keys
+    let cursor = "0"
+    do {
+      const result = await client.scan(cursor, "MATCH", `${prefix}*`, "COUNT", 100).catch(() => null)
+      if (!result) break
+      cursor = String(result[0] ?? "0")
+      keys.push(...((result[1] || []) as string[]))
+    } while (cursor !== "0")
+
+    if (keys.length > 0) {
+      const pipeline = client.multi()
+      for (const setKey of keys) {
+        for (const indexKey of this.getSetIndexKeys(symbol, type)) pipeline.sadd(indexKey, setKey)
+      }
+      await pipeline.exec().catch(() => {})
+    }
+    return keys
   }
 
   private async loadSettings(): Promise<void> {
@@ -197,11 +315,25 @@ export class IndicationSetsProcessor {
         this.factorMultipliers = this.parseNumericList(settings.indicationFactorMultipliers, this.factorMultipliers)
         this.activeThresholds = this.parseNumericList(settings.activeThresholds, this.activeThresholds)
         this.activeTimeRatios = this.parseNumericList(settings.activeTimeRatios, this.activeTimeRatios)
+        const activeAdvanced = settings.active_advanced || settings.activeAdvanced || {}
+        this.activeAdvancedActivityRatios = this.parseRangeObject(
+          activeAdvanced.activity_ratios || settings.activeAdvancedActivityRatios,
+          this.activeAdvancedActivityRatios,
+        )
+        this.activeAdvancedMinPositions = Math.max(
+          2,
+          Math.round(this.parsePositiveNumber(activeAdvanced.min_positions ?? settings.activeAdvancedMinPositions, this.activeAdvancedMinPositions)),
+        )
+        this.activeAdvancedContinuationRatio = Math.max(
+          0,
+          Math.min(1, this.parsePositiveNumber(activeAdvanced.continuation_ratio ?? settings.activeAdvancedContinuationRatio, this.activeAdvancedContinuationRatio)),
+        )
         this.outcomeHorizonCandles = this.parsePositiveNumber(settings.indicationOutcomeHorizonCandles, this.outcomeHorizonCandles)
         this.outcomeTakeProfitPct = this.parsePositiveNumber(settings.indicationOutcomeTakeProfitPct, this.outcomeTakeProfitPct)
         this.outcomeStopLossPct = this.parsePositiveNumber(settings.indicationOutcomeStopLossPct, this.outcomeStopLossPct)
         this.outcomeTakerFeePct = this.parseNonNegativeNumber(settings.indicationOutcomeTakerFeePct, this.outcomeTakerFeePct)
         this.outcomeSlippagePct = this.parseNonNegativeNumber(settings.indicationOutcomeSlippagePct ?? settings.slippageTolerance, this.outcomeSlippagePct)
+        this.outcomeAttachmentConcurrency = Math.max(1, Math.min(50, Math.round(this.parsePositiveNumber(settings.indicationOutcomeAttachmentConcurrency, this.outcomeAttachmentConcurrency))))
         
         // Fallback: legacy maxEntriesPerSet applies to all
         if (settings.maxEntriesPerSet && !settings.databaseSizeDirection) {
@@ -216,6 +348,7 @@ export class IndicationSetsProcessor {
         if (setsConfig.direction) this.limits.direction = Number(setsConfig.direction)
         if (setsConfig.move) this.limits.move = Number(setsConfig.move)
         if (setsConfig.active) this.limits.active = Number(setsConfig.active)
+        if (setsConfig.active_advanced) this.limits.active_advanced = Number(setsConfig.active_advanced)
         if (setsConfig.optimal) this.limits.optimal = Number(setsConfig.optimal)
       }
     } catch (error) {
@@ -264,6 +397,65 @@ export class IndicationSetsProcessor {
     return finalCfg
   }
 
+  /**
+   * Append one or more entries to an indication-set Redis LIST.
+   *
+   * The previous implementation performed GET → JSON.parse → push → SET for
+   * every write, so concurrent writers could overwrite each other. Lists let
+   * Redis perform the append server-side with RPUSH. We only LTRIM when the
+   * post-push length crosses the configured compaction ceiling, preserving the
+   * same "grow to floor + threshold%, then compact back to floor" policy and
+   * the newest-at-last ordering required by downstream readers.
+   */
+  private async appendIndicationEntries(
+    client: any,
+    setKey: string,
+    serializedEntries: string[],
+    cfg: CompactionConfig,
+  ): Promise<number> {
+    if (serializedEntries.length === 0) return 0
+    let length: number
+    try {
+      length = await client.rpush(setKey, ...serializedEntries)
+    } catch {
+      // Migration path for legacy JSON-array keys. Convert once by reading the
+      // string, deleting it, and recreating the same key as a Redis LIST.
+      const legacy = await this.readIndicationSetEntries(client, setKey)
+      await client.del(setKey)
+      const migrated = [...legacy.map((entry) => JSON.stringify(entry)), ...serializedEntries]
+      length = migrated.length > 0 ? await client.rpush(setKey, ...migrated) : 0
+    }
+    if (length >= compactionCeiling(cfg)) {
+      await client.ltrim(setKey, -cfg.floor, -1)
+      return Math.min(length, cfg.floor)
+    }
+    return length
+  }
+
+  private async readIndicationSetEntries(client: any, setKey: string): Promise<any[]> {
+    try {
+      const listValues: string[] = await client.lrange(setKey, 0, -1)
+      if (Array.isArray(listValues) && listValues.length > 0) {
+        return listValues
+          .map((raw) => {
+            try { return JSON.parse(raw) } catch { return null }
+          })
+          .filter(Boolean)
+      }
+    } catch {
+      // Legacy keys are JSON strings; real Redis raises WRONGTYPE for LRANGE.
+    }
+
+    try {
+      const raw = await client.get(setKey)
+      if (!raw) return []
+      const entries = JSON.parse(raw as string)
+      return Array.isArray(entries) ? entries : []
+    } catch {
+      return []
+    }
+  }
+
   private parseRangeSettings(startRaw: any, endRaw: any, stepRaw: any, fallback: number[]): number[] {
     const start = Number(startRaw)
     const end = Number(endRaw)
@@ -300,6 +492,13 @@ export class IndicationSetsProcessor {
     }
     return fallback
   }
+
+  private parseRangeObject(raw: any, fallback: number[]): number[] {
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      return this.parseRangeSettings(raw.from, raw.to, raw.step, fallback)
+    }
+    return this.parseNumericList(raw, fallback)
+  }
   
   /** Get position limits */
   getPositionLimits(): PositionLimits {
@@ -330,10 +529,27 @@ export class IndicationSetsProcessor {
         return
       }
 
-      this.normalizePriceHistory(marketData)
-      await this.warnIfPriceHistoryTooShort(symbol, marketData)
+      const priceHistory = this.normalizePriceHistory(marketData)
+      const hasEnoughHistory = await this.warnIfPriceHistoryTooShort(symbol, marketData, priceHistory.length)
+      if (!hasEnoughHistory) {
+        // Warm-up ticks can arrive every few hundred milliseconds while the
+        // rolling history is still below the largest configured range. Running
+        // all Set calculators during that period produces no complete Sets and
+        // can monopolize the API worker in production. Return after the
+        // throttled warning so status/health endpoints remain responsive while
+        // history fills naturally.
+        return
+      }
 
-      // Process all 4 main types in parallel with independent logic.
+      const apiSetFillEnabled =
+        process.env.NODE_ENV !== "production" ||
+        process.env.ENABLE_API_INDICATION_SET_FILL === "1" ||
+        process.env.ENABLE_API_INDICATION_SET_FILL === "true"
+      if (!apiSetFillEnabled) {
+        return
+      }
+
+      // Process all 5 set-backed types in parallel with independent logic.
       // Use per-type isolation so an Optimal/Auto calculation failure never
       // aborts Direction/Move/Active for the same symbol and never crashes the
       // whole progression cycle.
@@ -353,10 +569,11 @@ export class IndicationSetsProcessor {
           return { type, total: 0, qualified: 0, configs: 0, error: true }
         }
       }
-      const [directionResults, moveResults, activeResults, optimalResults] = await Promise.all([
+      const [directionResults, moveResults, activeResults, activeAdvancedResults, optimalResults] = await Promise.all([
         runType("direction", () => this.processDirectionSet(symbol, marketData)),
         runType("move", () => this.processMoveSet(symbol, marketData)),
         runType("active", () => this.processActiveSet(symbol, marketData)),
+        runType("active_advanced", () => this.processActiveAdvancedSet(symbol, marketData)),
         runType("optimal", () => this.processOptimalSet(symbol, marketData)),
       ])
 
@@ -377,6 +594,7 @@ export class IndicationSetsProcessor {
         (directionResults?.qualified || 0) +
         (moveResults?.qualified || 0) +
         (activeResults?.qualified || 0) +
+        (activeAdvancedResults?.qualified || 0) +
         (optimalResults?.qualified || 0)
 
       // ── ACTIVE-VALID indication snapshot (per cycle, per (symbol, type)) ──
@@ -386,28 +604,24 @@ export class IndicationSetsProcessor {
       // single hash field per (symbol, type) on every cycle so the most
       // recent qualified count for that pair is always the one read.
       //
-      //   indications_active:{connectionId} → hash
+      //   indication_sets_active:{connectionId} → hash
       //     fields: "{symbol}:direction", "{symbol}:move", "{symbol}:active",
       //             "{symbol}:active_advanced", "{symbol}:optimal"
       //
-      // The stats API hgetalls this hash and aggregates by type — fields are
+      // Detailed set tracking hgetalls this hash and aggregates by type — fields are
       // O(symbols × types) total which is small (≤ 5 × 5 = 25 fields). TTL
       // is short so a stopped engine doesn't leave stale "active" rows
       // forever; the next cycle naturally refreshes them.
       try {
         const { getRedisClient: _getRedis } = await import("@/lib/redis-db")
         const client = _getRedis()
-        const activeKey = `indications_active:${this.connectionId}`
+        const activeKey = `indication_sets_active:${this.connectionId}`
         await client.hset(activeKey, {
           [`${symbol}:direction`]:       String(directionResults?.qualified ?? 0),
           [`${symbol}:move`]:            String(moveResults?.qualified      ?? 0),
           [`${symbol}:active`]:          String(activeResults?.qualified    ?? 0),
+          [`${symbol}:active_advanced`]: String(activeAdvancedResults?.qualified ?? 0),
           [`${symbol}:optimal`]:         String(optimalResults?.qualified   ?? 0),
-          // active_advanced is tracked in DEFAULT_LIMITS and the active hash schema
-          // but the processor has no separate processActiveAdvancedSet — write 0 so
-          // the reader always sees all expected type fields, preventing stale values
-          // from a previous hotter cycle from persisting for this symbol.
-          [`${symbol}:active_advanced`]: "0",
         })
         await client.expire(activeKey, 600) // 10 min — engine refreshes each cycle
 
@@ -420,36 +634,38 @@ export class IndicationSetsProcessor {
         // with every retry/overlap instead of reflecting the current window.
         // Per-symbol HSET keeps sibling symbols independent and idempotent.
         const progKey    = `progression:${this.connectionId}`
-        const w5Key      = `indications_window:${this.connectionId}:last5`
-        const w60Key     = `indications_window:${this.connectionId}:last60min`
+        const w5Key      = `indication_sets_window:${this.connectionId}:last5`
+        const w60Key     = `indication_sets_window:${this.connectionId}:last60min`
         const dirQ  = directionResults?.qualified  ?? 0
         const moveQ = moveResults?.qualified       ?? 0
         const actQ  = activeResults?.qualified     ?? 0
+        const advQ  = activeAdvancedResults?.qualified ?? 0
         const optQ  = optimalResults?.qualified    ?? 0
         const pipe = client.multi()
         pipe.hset(w5Key, {
           [`${symbol}:direction`]: String(dirQ),
           [`${symbol}:move`]: String(moveQ),
           [`${symbol}:active`]: String(actQ),
+          [`${symbol}:active_advanced`]: String(advQ),
           [`${symbol}:optimal`]: String(optQ),
-          [`${symbol}:active_advanced`]: "0",
         })
         pipe.expire(w5Key,   300) // 5 min rolling window
         pipe.hset(w60Key, {
           [`${symbol}:direction`]: String(dirQ),
           [`${symbol}:move`]: String(moveQ),
           [`${symbol}:active`]: String(actQ),
+          [`${symbol}:active_advanced`]: String(advQ),
           [`${symbol}:optimal`]: String(optQ),
-          [`${symbol}:active_advanced`]: "0",
         })
         pipe.expire(w60Key,  4200) // 70 min rolling window
-        if (dirQ > 0 || moveQ > 0 || actQ > 0 || optQ > 0) {
+        if (dirQ > 0 || moveQ > 0 || actQ > 0 || advQ > 0 || optQ > 0) {
           // Total indication Sets active this cycle: configs that qualified across
           // all types. Stored as a progression field so getIndicationTracking has
           // a non-zero totalIndicationSets without a separate keys() scan.
           const totalSetsThisCycle = (directionResults?.configs ?? dirQ) +
                                      (moveResults?.configs      ?? moveQ) +
                                      (activeResults?.configs    ?? actQ) +
+                                     (activeAdvancedResults?.configs ?? advQ) +
                                      (optimalResults?.configs   ?? optQ)
           if (totalSetsThisCycle > 0) {
             pipe.hincrby(progKey, "indication_sets_total", totalSetsThisCycle)
@@ -459,21 +675,54 @@ export class IndicationSetsProcessor {
       } catch { /* non-critical: dashboard falls back to cumulative */ }
 
       if (totalQualified > 0) {
-        console.log(
-          `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
-        )
+        // Throttle console log to once per 60 s per symbol.
+        // During historical replay a single cycle runs up to 30 steps; each
+        // step calls processAllIndicationSets and would emit this line, producing
+        // 30+ identical lines per symbol per cycle. One line per minute is enough.
+        const throttleKey = `${symbol}:${this.connectionId}`
+        const lastLogBucket = (this as any)._setsLogBucket
+        const nowBucket = Math.floor(Date.now() / 60_000)
+        if (!lastLogBucket || lastLogBucket[throttleKey] !== nowBucket) {
+          if (!(this as any)._setsLogBucket) (this as any)._setsLogBucket = {}
+          ;(this as any)._setsLogBucket[throttleKey] = nowBucket
+          console.log(
+            `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} ActiveAdvanced=${activeAdvancedResults?.qualified}/${activeAdvancedResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
+          )
+        }
 
-        await logProgressionEvent(this.connectionId, "indications_sets", "info", `All indication types processed for ${symbol}`, {
-          direction: directionResults,
-          move: moveResults,
-          active: activeResults,
-          optimal: optimalResults,
-          duration,
-        })
+        // Also throttle the Redis progression event — same 60s bucket.
+        if ((this as any)._setsLogBucket?.[throttleKey] === nowBucket) {
+          await logProgressionEvent(this.connectionId, "indications_sets", "info", `All indication types processed for ${symbol}`, {
+            direction: directionResults,
+            move: moveResults,
+            active: activeResults,
+            active_advanced: activeAdvancedResults,
+            optimal: optimalResults,
+            duration,
+          })
+        }
       }
     } catch (error) {
       console.error(`[v0] [IndicationSets] Failed to process sets for ${symbol}:`, error)
     }
+  }
+
+  private async attachQualifiedCandidates(
+    symbol: string,
+    marketData: any,
+    candidates: IndicationCandidate[],
+  ): Promise<IndicationCandidate[]> {
+    const attached = await mapLimit(candidates, this.outcomeAttachmentConcurrency, async (candidate) => {
+      const profitFactor = await this.attachOutcomeBackedProfitFactor(
+        symbol,
+        marketData,
+        candidate.setKey,
+        candidate.indication,
+      )
+      return profitFactor >= 1.0 ? candidate : null
+    })
+
+    return attached.filter((candidate): candidate is IndicationCandidate => candidate !== null)
   }
 
   /**
@@ -487,7 +736,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const drawdownRatio of drawdownRatios) {
@@ -502,22 +751,28 @@ export class IndicationSetsProcessor {
             if (!indication) continue
             
             total++
+            // Derive direction from the actual signal — firstDir > 0 means long,
+            // firstDir < 0 means short. This MUST be computed BEFORE building the
+            // set key so long and short signals write to INDEPENDENT Redis keys.
             const direction = indication.metadata?.firstDir > 0 ? "long" : "short"
             indication.direction = direction
-            const setKey = `indication_set:${this.connectionId}:${symbol}:direction:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+            // Key includes direction so long/short never share the same Redis key.
+            // Without :dir the same config combo for both directions overwrites each
+            // other's JSON array, producing identical (wrong) values for L and S.
+            const setKey = `indication_set:${this.connectionId}:${symbol}:direction:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
-            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-              qualified++
-              pendingWrites.push({
-                setKey,
-                indication,
-                config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
-              })
-            }
+            candidates.push({
+              setKey,
+              indication,
+              config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
+            })
           }
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     // Batch write all qualified indications
     if (pendingWrites.length > 0) {
@@ -538,7 +793,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const drawdownRatio of drawdownRatios) {
@@ -553,22 +808,24 @@ export class IndicationSetsProcessor {
             if (!indication) continue
             
             total++
+            // movement > 0 = price went up = long signal; movement < 0 = short.
+            // Direction is embedded in the key so long/short are independent sets.
             const direction = (indication.metadata?.movement || 0) >= 0 ? "long" : "short"
             indication.direction = direction
-            const setKey = `indication_set:${this.connectionId}:${symbol}:move:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
+            const setKey = `indication_set:${this.connectionId}:${symbol}:move:${direction}:r${range}:dd${drawdownRatio}:lp${lastPartRatio}:f${factorMultiplier}`
 
-            if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-              qualified++
-              pendingWrites.push({
-                setKey,
-                indication,
-                config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
-              })
-            }
+            candidates.push({
+              setKey,
+              indication,
+              config: { range, drawdownRatio, lastPartRatio, factorMultiplier },
+            })
           }
         }
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "move")
@@ -588,7 +845,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const threshold of thresholds) {
       for (const drawdownRatio of drawdownRatios) {
@@ -606,14 +863,11 @@ export class IndicationSetsProcessor {
                 if (indication) {
                   total++
                   const setKey = `indication_set:${this.connectionId}:${symbol}:active:t${threshold}:dd${drawdownRatio}:ar${activeTimeRatio}:lp${lastPartRatio}:f${factorMultiplier}`
-                  if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-                    qualified++
-                    pendingWrites.push({
-                      setKey,
-                      indication,
-                      config: { threshold, drawdownRatio, activeTimeRatio, lastPartRatio, factorMultiplier },
-                    })
-                  }
+                  candidates.push({
+                    setKey,
+                    indication,
+                    config: { threshold, drawdownRatio, activeTimeRatio, lastPartRatio, factorMultiplier },
+                  })
                 }
               } catch (error) {
                 console.error(`[v0] [IndicationSets] Active config error:`, error)
@@ -624,11 +878,56 @@ export class IndicationSetsProcessor {
       }
     }
 
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
+
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "active")
     }
 
     return { type: "active", total, qualified, configs: pendingWrites.length }
+  }
+
+  /**
+   * Process Active Advanced Indication Set.
+   *
+   * This is intentionally independent from the normal Active Set. It looks for
+   * a minimum number of same-direction recent moves and a configurable
+   * continuation ratio, then persists its own `active_advanced` set keys and
+   * contributes separately to active/windowed stats.
+   */
+  private async processActiveAdvancedSet(symbol: string, marketData: any): Promise<any> {
+    const activityRatios = this.activeAdvancedActivityRatios
+    const minPositions = this.activeAdvancedMinPositions
+    const continuationRatio = this.activeAdvancedContinuationRatio
+    const factorMultipliers = this.factorMultipliers
+    let qualified = 0
+    let total = 0
+    const candidates: IndicationCandidate[] = []
+
+    for (const activityRatio of activityRatios) {
+      for (const factorMultiplier of factorMultipliers) {
+        const config = { activityRatio, minPositions, continuationRatio, factorMultiplier }
+        const indication = this.calculateActiveAdvancedIndication(marketData, config)
+        if (!indication) continue
+
+        total++
+        const direction = indication.metadata?.direction === "short" ? "short" : "long"
+        indication.direction = direction
+        const setKey = `indication_set:${this.connectionId}:${symbol}:active_advanced:ar${activityRatio}:min${minPositions}:cr${continuationRatio}:f${factorMultiplier}`
+
+        candidates.push({ setKey, indication, config })
+      }
+    }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
+
+    if (pendingWrites.length > 0) {
+      await this.batchSaveIndications(pendingWrites, "active_advanced")
+    }
+
+    return { type: "active_advanced", total, qualified, configs: pendingWrites.length }
   }
 
   /**
@@ -640,7 +939,7 @@ export class IndicationSetsProcessor {
     const factorMultipliers = this.factorMultipliers
     let qualified = 0
     let total = 0
-    const pendingWrites: Array<{ setKey: string; indication: any; config: any }> = []
+    const candidates: IndicationCandidate[] = []
 
     for (const range of keyRanges) {
       for (const factorMultiplier of factorMultipliers) {
@@ -649,18 +948,18 @@ export class IndicationSetsProcessor {
         
         total++
         const setKey = `indication_set:${this.connectionId}:${symbol}:optimal:range${range}:factor${factorMultiplier}`
-        if ((await this.attachOutcomeBackedProfitFactor(symbol, marketData, setKey, indication)) >= 1.0) {
-          qualified++
-          pendingWrites.push({ setKey, indication, config: { range, factorMultiplier } })
-        }
+        candidates.push({ setKey, indication, config: { range, factorMultiplier } })
       }
     }
+
+    const pendingWrites = await this.attachQualifiedCandidates(symbol, marketData, candidates)
+    qualified = pendingWrites.length
 
     if (pendingWrites.length > 0) {
       await this.batchSaveIndications(pendingWrites, "optimal")
     }
 
-    return { type: "optimal", total, qualified }
+    return { type: "optimal", total, qualified, configs: pendingWrites.length }
   }
 
   /**
@@ -691,104 +990,53 @@ export class IndicationSetsProcessor {
     try {
       const client = await getCachedClient()
 
-      // DEV MODE: overwrite each indication_set key with only the LATEST single
-      // entry instead of appending to a growing 250-item JSON array.
-      // Full grid:  250 entries × ~300 B/entry × 144 keys = ~11 MB per cycle.
-      // Dev  mode:  1 entry     × ~300 B/entry × 144 keys =  43 KB per cycle.
-      // The strategy-coordinator reads these keys to build Real-stage sets; it
-      // only needs the most-recent entry (it re-evaluates from scratch each cycle)
-      // so overwriting loses no functional data.
-      if (process.env.NODE_ENV === "development") {
-        const now = Date.now()
-        const timestamp = new Date().toISOString()
-        await Promise.all(
-          writes.map(async ({ setKey, indication, config }, idx) => {
-            const direction: "long" | "short" =
-              indication.direction === "short" ? "short"
-              : indication.direction === "long" ? "long"
-              : indication?.metadata?.firstDir < 0 ? "short"
-              : "long"
-            const entry = {
-              id: `${type}_${now}_${idx}`,
-              timestamp,
-              type,
-              direction,
-              profitFactor: indication.profitFactor,
-              signalScore: indication.signalScore,
-              rawSignalStrength: indication.rawSignalStrength,
-              confidence: indication.confidence,
-              config,
-              metadata: indication.metadata,
-            }
-            await client.set(setKey, JSON.stringify([entry]))
-          })
-        )
-        return
-      }
       const now = Date.now()
       const timestamp = new Date().toISOString()
 
-      // Process writes in bounded parallel chunks for high-frequency throughput.
-      const concurrency = 20
       // Resolve compaction config once for the whole batch — type is
       // fixed for all writes in this call (the public batchSave API
       // takes a single `type`), so a single async resolution covers
       // every chunk and keeps the inner loop synchronous w.r.t. config
       // lookup.
       const compactionCfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
-      for (let i = 0; i < writes.length; i += concurrency) {
-        const chunk = writes.slice(i, i + concurrency)
-        await Promise.all(
-          chunk.map(async ({ setKey, indication, config }, idx) => {
-            // Resolve direction with progressive fallbacks. The strategy
-            // coordinator + live-stage both use this field, so it MUST
-            // be on the persisted entry to avoid silent "long" fallback.
-            const direction: "long" | "short" =
-              indication.direction === "short"
-                ? "short"
-                : indication.direction === "long"
-                ? "long"
-                : indication?.metadata?.firstDir < 0
-                ? "short"
-                : "long"
+      const grouped = new Map<string, string[]>()
+      writes.forEach(({ setKey, indication, config }, idx) => {
+        // Resolve direction with progressive fallbacks. The strategy
+        // coordinator + live-stage both use this field, so it MUST
+        // be on the persisted entry to avoid silent "long" fallback.
+        const direction: "long" | "short" =
+          indication.direction === "short"
+            ? "short"
+            : indication.direction === "long"
+            ? "long"
+            : indication?.metadata?.firstDir < 0
+            ? "short"
+            : "long"
 
-            const entry = {
-              id: `${type}_${now}_${i + idx}_${Math.random().toString(36).slice(2, 6)}`,
-              timestamp,
-              type,
-              direction,
-              profitFactor: indication.profitFactor,
-              signalScore: indication.signalScore,
-              rawSignalStrength: indication.rawSignalStrength,
-              confidence: indication.confidence,
-              config,
-              metadata: indication.metadata,
-            }
+        const entry = {
+          id: `${type}_${now}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp,
+          type,
+          direction,
+          profitFactor: indication.profitFactor,
+          signalScore: indication.signalScore,
+          rawSignalStrength: indication.rawSignalStrength,
+          confidence: indication.confidence,
+          config,
+          metadata: indication.metadata,
+        }
 
-            const existing = await client.get(setKey)
-            let entries = existing ? JSON.parse(existing) : []
-            // ── Newest-at-last (per spec) ──���─────────────────────────
-            // The compaction policy drops oldest by `slice(-floor)`,
-            // which requires chronological order. Use `push`, never
-            // `unshift`. Switching from the prior unshift+slice(0, n)
-            // pattern keeps reads in the same order downstream
-            // consumers expected, just from the *other end* of the
-            // array — and the dashboard's "newest first" surfaces all
-            // already reverse the array on read, so no UI change is
-            // needed.
-            entries.push(entry)
-            // ── Debounced threshold compaction ───────────────────────
-            // `compact` returns the original array if length < ceiling
-            // (cheap O(1) check). When it does fire, it returns a
-            // fresh `slice(-floor)` — same big-O as the old
-            // `slice(0, limit)` path but only every (ceiling-floor)
-            // cycles instead of every cycle. We use the per-batch
-            // resolved config (compactionCfg) so the inner loop avoids
-            // any async hop.
-            entries = compact(entries, compactionCfg, "recent")
-            await client.set(setKey, JSON.stringify(entries))
-          }),
-        )
+        const bucket = grouped.get(setKey)
+        if (bucket) bucket.push(JSON.stringify(entry))
+        else grouped.set(setKey, [JSON.stringify(entry)])
+      })
+
+      // Append each grouped set through the shared helper so legacy JSON-array
+      // keys are migrated to Redis LISTs consistently with the single-save path.
+      const groupedEntries = Array.from(grouped.entries())
+      for (const [setKey, serializedEntries] of groupedEntries) {
+        await this.appendIndicationEntries(client, setKey, serializedEntries, compactionCfg)
+        await this.indexSetKey(client, setKey, setKey.split(':')[2], type)
       }
     } catch (error) {
       // Silent fail for non-critical batch operations
@@ -816,9 +1064,6 @@ export class IndicationSetsProcessor {
   ): Promise<void> {
     try {
       const client = await getCachedClient()
-      
-      const existing = await client.get(setKey)
-      let entries = existing ? JSON.parse(existing) : []
 
       // Same direction-resolution logic as batchSaveIndications — see comment there.
       const direction: "long" | "short" =
@@ -831,10 +1076,10 @@ export class IndicationSetsProcessor {
           : "long"
 
       const id = `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-      // Newest-at-last per spec — see compaction module docs. The
-      // chronological invariant is required by the `mode: "recent"`
-      // compactor below (it does `slice(-floor)`).
-      entries.push({
+      // Newest-at-last per spec. Redis RPUSH appends at the tail, matching
+      // the previous chronological JSON-array invariant without a
+      // GET/parse/append/SET round-trip.
+      const entry = {
         id,
         timestamp: new Date().toISOString(),
         type,
@@ -845,22 +1090,22 @@ export class IndicationSetsProcessor {
         confidence: indication.confidence,
         config,
         metadata: indication.metadata,
-      })
+      }
 
       // Debounced threshold compaction. The cfg lookup is cached on
       // the processor instance with a 5s TTL so this single-save path
       // pays at most one Redis round-trip every 5s for config — every
       // subsequent call is a synchronous map lookup + a comparison.
       const cfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
-      entries = compact(entries, cfg, "recent")
+      await this.appendIndicationEntries(client, setKey, [JSON.stringify(entry)], cfg)
 
-      await client.set(setKey, JSON.stringify(entries))
-      
       // Broadcast indication update to connected clients. Direction is
       // derived from the actual indication signal — directional types
       // (direction/move) report UP/DOWN, all other types (active /
       // optimal / active_advanced) report NEUTRAL.
       const symbol = setKey.split(':')[2]
+      await this.indexSetKey(client, setKey, symbol, type)
+
       const broadcastDirection: "UP" | "DOWN" | "NEUTRAL" =
         type === "direction" || type === "move"
           ? direction === "long"
@@ -919,17 +1164,174 @@ export class IndicationSetsProcessor {
     return indication.signalScore || indication.rawSignalStrength || 0
   }
 
+  /**
+   * Record a realized outcome sample and return the current profit factor.
+   *
+   * Outcome samples stay in the capped Redis LIST for audit/debug consumers,
+   * while `${setKey}:outcome_stats` maintains the rolling aggregate used for
+   * profit-factor reads. This avoids an LRANGE + full-window recomputation on
+   * every sample. If the aggregate hash is missing or malformed, rebuild it
+   * once from the capped list and continue from the repaired values.
+   */
   private async recordOutcomeSample(setKey: string, sample: any): Promise<number> {
     const client = await getCachedClient()
     const key = `${setKey}:outcomes`
-    const raw = await client.get(key)
-    const samples = raw ? JSON.parse(raw) : []
-    samples.push(sample)
-    const trimmed = samples.slice(-1000)
-    await client.set(key, JSON.stringify(trimmed))
+    const statsKey = `${setKey}:outcome_stats`
+    const cap = 1000
+    const serializedSample = JSON.stringify(sample)
+    const sampleProfit = this.toOutcomeAmount(sample?.profit)
+    const sampleLoss = this.toOutcomeAmount(sample?.loss)
 
-    const grossProfit = trimmed.reduce((sum: number, s: any) => sum + Number(s.profit || 0), 0)
-    const grossLoss = trimmed.reduce((sum: number, s: any) => sum + Number(s.loss || 0), 0)
+    const evalLua = (client as any)?.eval as
+      | ((script: string, options: { keys: string[]; arguments: string[] }) => Promise<any>)
+      | undefined
+    if (typeof evalLua === "function") {
+      const result = await evalLua.call(client, RECORD_OUTCOME_SAMPLE_SCRIPT, {
+        keys: [key, statsKey],
+        arguments: [serializedSample, String(sampleProfit), String(sampleLoss), String(cap)],
+      })
+      const grossProfit = Number(result?.[0] ?? 0)
+      const grossLoss = Number(result?.[1] ?? 0)
+      return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+    }
+
+    return this.recordOutcomeSampleWithWatch(client, key, statsKey, serializedSample, sampleProfit, sampleLoss, cap)
+  }
+
+  private async recordOutcomeSampleWithWatch(
+    client: any,
+    key: string,
+    statsKey: string,
+    serializedSample: string,
+    sampleProfit: number,
+    sampleLoss: number,
+    cap: number,
+  ): Promise<number> {
+    const canWatch = typeof client?.watch === "function" && typeof client?.unwatch === "function"
+    const maxAttempts = canWatch ? 8 : 1
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (canWatch) await client.watch(key, statsKey)
+      try {
+        const rawStats = await client.hgetall(statsKey)
+        const existingStats = this.parseOutcomeStats(rawStats)
+
+        const currentLength = Number(await client.llen(key)) || 0
+        const evictCount = Math.max(0, currentLength + 1 - cap)
+
+        if (!existingStats) {
+          const tx = client.multi()
+          tx.rpush(key, serializedSample)
+          if (evictCount > 0) tx.ltrim(key, -cap, -1)
+          const execResult = await tx.exec()
+          if (!canWatch || execResult !== null) {
+            return this.repairOutcomeStatsFromSamples(client, key, statsKey)
+          }
+          continue
+        }
+        let evictedProfit = 0
+        let evictedLoss = 0
+        let evictedCount = 0
+        if (evictCount > 0) {
+          const evictedRaw: string[] = await client.lrange(key, 0, evictCount - 1)
+          for (const item of evictedRaw) {
+            const parsed = this.parseOutcomeSample(item)
+            if (!parsed) continue
+            evictedProfit += parsed.profit
+            evictedLoss += parsed.loss
+            evictedCount++
+          }
+        }
+
+        const grossProfit = Math.max(0, existingStats.grossProfit + sampleProfit - evictedProfit)
+        const grossLoss = Math.max(0, existingStats.grossLoss + sampleLoss - evictedLoss)
+        const count = Math.max(0, existingStats.count + 1 - evictedCount)
+
+        const tx = client.multi()
+        tx.rpush(key, serializedSample)
+        if (evictCount > 0) tx.ltrim(key, -cap, -1)
+        tx.hset(statsKey, {
+          grossProfit: String(grossProfit),
+          grossLoss: String(grossLoss),
+          count: String(count),
+        })
+        const execResult = await tx.exec()
+        if (!canWatch || execResult !== null) {
+          return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+        }
+      } finally {
+        if (canWatch) await client.unwatch().catch(() => {})
+      }
+    }
+
+    throw new Error(`[IndicationSets] Failed to atomically record outcome sample for ${key} after retries`)
+  }
+
+  private toOutcomeAmount(value: any): number {
+    const amount = Number(value || 0)
+    return Number.isFinite(amount) && amount > 0 ? amount : 0
+  }
+
+  private parseOutcomeSample(raw: string): { profit: number; loss: number } | null {
+    try {
+      const sample = JSON.parse(raw)
+      return {
+        profit: this.toOutcomeAmount(sample?.profit),
+        loss: this.toOutcomeAmount(sample?.loss),
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private parseOutcomeStats(
+    stats: Record<string, string> | null | undefined,
+  ): { grossProfit: number; grossLoss: number; count: number } | null {
+    if (
+      !stats ||
+      !Object.prototype.hasOwnProperty.call(stats, "grossProfit") ||
+      !Object.prototype.hasOwnProperty.call(stats, "grossLoss") ||
+      !Object.prototype.hasOwnProperty.call(stats, "count")
+    ) {
+      return null
+    }
+    const grossProfit = Number(stats.grossProfit)
+    const grossLoss = Number(stats.grossLoss)
+    const count = Number(stats.count)
+    if (
+      !Number.isFinite(grossProfit) ||
+      !Number.isFinite(grossLoss) ||
+      !Number.isFinite(count) ||
+      grossProfit < 0 ||
+      grossLoss < 0 ||
+      count < 0
+    ) {
+      return null
+    }
+    return { grossProfit, grossLoss, count }
+  }
+
+  private async repairOutcomeStatsFromSamples(client: any, key: string, statsKey: string): Promise<number> {
+    const raw: string[] = await client.lrange(key, 0, -1)
+    let grossProfit = 0
+    let grossLoss = 0
+    let count = 0
+    for (const item of raw) {
+      const parsed = this.parseOutcomeSample(item)
+      if (!parsed) continue
+      grossProfit += parsed.profit
+      grossLoss += parsed.loss
+      count++
+    }
+    await client.hset(statsKey, {
+      grossProfit: String(grossProfit),
+      grossLoss: String(grossLoss),
+      count: String(count),
+    })
+    return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+  }
+
+  private profitFactorFromOutcomeStats(grossProfit: number, grossLoss: number): number {
     if (grossLoss <= 0) return grossProfit > 0 ? grossProfit / 0.000001 : 0
     return grossProfit / grossLoss
   }
@@ -952,10 +1354,7 @@ export class IndicationSetsProcessor {
       // far more than the low-RAM dev VM needs; 100 is plenty to evaluate forward
       // outcomes. Production keeps the full 1000-entry window.
       // Scale with symbol count: 30 per symbol in dev (e.g. 300 for 10 symbols).
-      const _nDevSyms = this._isDev
-        ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
-        : 1
-      const pendingCap = this._isDev ? Math.max(100, _nDevSyms * 30) : 1000
+      const pendingCap = 1000
       await client.ltrim(key, -pendingCap, -1)
       await client.expire(key, 86400)
     } catch { /* non-critical */ }
@@ -967,33 +1366,87 @@ export class IndicationSetsProcessor {
       if (this.getForwardCandles(marketData).length < 2) return
       const client = await getCachedClient()
       const key = `indication_outcomes_pending:${this.connectionId}:${symbol}`
-      const raw = await client.lrange(key, 0, -1)
+      const raw: string[] = await client.lrange(key, 0, -1)
       if (!raw?.length) return
       await client.del(key)
+
+      // Separate still-pending from newly-closed in a single synchronous pass
+      // (evaluateForwardOutcome is pure-sync — no I/O).
+      const stillPending: string[] = []
+      const closedItems: Array<{ item: string; pending: any; closed: any }> = []
       for (const item of raw) {
-        const pending = JSON.parse(item)
+        let pending: any
+        try { pending = JSON.parse(item) } catch { continue }
         const closed = this.evaluateForwardOutcome(marketData, pending.direction)
         if (!closed.completed) {
-          await client.rpush(key, item)
-          continue
+          stillPending.push(item)
+        } else {
+          closedItems.push({ item, pending, closed })
         }
-        const pf = await this.recordOutcomeSample(pending.setKey, {
-          profit: Math.max(closed.pnlPct, 0),
-          loss: Math.max(-closed.pnlPct, 0),
-          pnlPct: closed.pnlPct,
-          closedAt: new Date().toISOString(),
-        })
-        const existing = await client.get(pending.setKey)
-        const entries = existing ? JSON.parse(existing) : []
-        for (let i = entries.length - 1; i >= 0; i--) {
-          if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
-            entries[i].profitFactor = pf
-            entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
-            break
-          }
-        }
-        await client.set(pending.setKey, JSON.stringify(entries))
       }
+
+      // Re-queue still-pending items in one rpush call (was one per item).
+      if (stillPending.length > 0) {
+        await client.rpush(key, ...stillPending)
+      }
+
+      // Process closed items — fan out get+record+set per unique setKey.
+      // Group by setKey first so we do at most one get/set per key even if
+      // multiple pending items share the same set.
+      const bySetKey = new Map<string, Array<{ pending: any; closed: any }>>()
+      for (const { pending, closed } of closedItems) {
+        const arr = bySetKey.get(pending.setKey) ?? []
+        arr.push({ pending, closed })
+        bySetKey.set(pending.setKey, arr)
+      }
+
+      await Promise.all(
+        [...bySetKey.entries()].map(async ([setKey, items]) => {
+          // Record all outcome samples for this setKey before reading entries,
+          // so the final PF reflects all closed outcomes from this cycle.
+          let pf = 0
+          for (const { closed } of items) {
+            pf = await this.recordOutcomeSample(setKey, {
+              profit:   Math.max(closed.pnlPct, 0),
+              loss:     Math.max(-closed.pnlPct, 0),
+              pnlPct:   closed.pnlPct,
+              closedAt: new Date().toISOString(),
+            })
+          }
+          // Single read-modify-write per setKey regardless of how many
+          // pending items referenced it. Read through the shared helper so
+          // LIST-backed sets stay in the modern representation and legacy
+          // JSON-array strings are still readable during migration.
+          const entries = await this.readIndicationSetEntries(client, setKey)
+          let patchCount = items.length
+          let patched = false
+          for (let i = entries.length - 1; i >= 0 && patchCount > 0; i--) {
+            if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
+              const closed = items[items.length - patchCount].closed
+              entries[i].profitFactor = pf
+              entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
+              patchCount--
+              patched = true
+            }
+          }
+          if (!patched) return
+
+          // Preserve LIST-backed indication_set:* keys when closing pending
+          // realtime outcomes. DEL + RPUSH recreates the key as a Redis LIST
+          // instead of SET-ing a legacy JSON string, then applies the same
+          // compaction and index policy used by appendIndicationEntries().
+          const type = (setKey.split(":")[3] || "direction") as keyof IndicationSetLimits
+          const cfg = await this.resolveCompaction(type)
+          const serializedEntries = entries.map((entry) => JSON.stringify(entry))
+          await client.del(setKey)
+          const length = serializedEntries.length > 0 ? await client.rpush(setKey, ...serializedEntries) : 0
+          if (length >= compactionCeiling(cfg)) {
+            await client.ltrim(setKey, -cfg.floor, -1)
+          }
+          await this.indexSetKey(client, setKey, setKey.split(":")[2], type)
+        }),
+      )
+
       await client.expire(key, 86400)
     } catch { /* non-critical */ }
   }
@@ -1138,6 +1591,63 @@ export class IndicationSetsProcessor {
     return null
   }
 
+  private calculateActiveAdvancedIndication(
+    marketData: any,
+    config: {
+      activityRatio: number
+      minPositions: number
+      continuationRatio: number
+      factorMultiplier: number
+    },
+  ): any {
+    const { activityRatio, minPositions, continuationRatio, factorMultiplier } = config
+    const window = Math.max(minPositions + 2, 8)
+    const prices = this.getPriceHistory(marketData, window)
+    if (!prices || prices.length < minPositions + 1) return null
+
+    const moves: number[] = []
+    for (let i = 1; i < prices.length; i++) {
+      const prev = prices[i - 1]
+      const curr = prices[i]
+      if (!Number.isFinite(prev) || !Number.isFinite(curr) || prev <= 0) continue
+      moves.push((curr - prev) / prev)
+    }
+    if (moves.length < minPositions) return null
+
+    const longMoves = moves.filter((m) => m > 0)
+    const shortMoves = moves.filter((m) => m < 0)
+    const direction = longMoves.length >= shortMoves.length ? "long" : "short"
+    const alignedMoves = direction === "long" ? longMoves : shortMoves
+    if (alignedMoves.length < minPositions) return null
+
+    const continuity = alignedMoves.length / moves.length
+    if (continuity < continuationRatio) return null
+
+    const avgMagnitudePct =
+      (alignedMoves.reduce((sum, m) => sum + Math.abs(m), 0) / Math.max(1, alignedMoves.length)) * 100
+    if (avgMagnitudePct < activityRatio) return null
+
+    const volatility = this.calculateVolatility(prices)
+    const signalScore = 1.0 + ((avgMagnitudePct / Math.max(activityRatio, 0.1)) * continuity + volatility) * factorMultiplier
+
+    return {
+      profitFactor: 0,
+      signalScore,
+      rawSignalStrength: signalScore,
+      confidence: Math.min(1.0, 0.45 + continuity * 0.35 + Math.min(0.2, avgMagnitudePct / 20)),
+      metadata: {
+        direction,
+        activityRatio,
+        minPositions,
+        continuationRatio,
+        factorMultiplier,
+        continuity,
+        avgMagnitudePct,
+        volatility,
+      },
+    }
+  }
+
   private calculateOptimalIndication(marketData: any, range: number, factorMultiplier: number): any {
     const prices = this.getPriceHistory(marketData, range * 3)
     if (!prices || prices.length < range * 3) return null
@@ -1221,13 +1731,13 @@ export class IndicationSetsProcessor {
     )
   }
 
-  private async warnIfPriceHistoryTooShort(symbol: string, marketData: any): Promise<void> {
-    const availablePrices = this.normalizePriceHistory(marketData).length
+  private async warnIfPriceHistoryTooShort(symbol: string, marketData: any, normalizedPriceCount?: number): Promise<boolean> {
+    const availablePrices = normalizedPriceCount ?? this.normalizePriceHistory(marketData).length
     const requiredPrices = this.getLargestConfiguredRange()
-    if (availablePrices >= requiredPrices) return
+    if (availablePrices >= requiredPrices) return true
 
     const warningKey = `${symbol}:${availablePrices}:${requiredPrices}`
-    if (this.shortPriceHistoryWarnings.has(warningKey)) return
+    if (this.shortPriceHistoryWarnings.has(warningKey)) return false
     this.shortPriceHistoryWarnings.add(warningKey)
 
     console.warn(
@@ -1239,6 +1749,7 @@ export class IndicationSetsProcessor {
       requiredPrices,
       reason: "insufficient_price_history",
     }).catch(() => {})
+    return false
   }
 
   private getDirection(prices: number[]): number {
@@ -1289,8 +1800,7 @@ export class IndicationSetsProcessor {
           error: "Redis client not available",
         }
       }
-      const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
-      const keys = await client.keys(`${prefix}*`)
+      const keys = await this.getIndexedSetKeys(client, symbol, type)
       if (!keys || keys.length === 0) {
         return {
           type,
@@ -1301,21 +1811,22 @@ export class IndicationSetsProcessor {
         }
       }
 
+      // Fan out all reads in parallel. New keys are Redis LISTs; legacy keys
+      // may still be JSON arrays, so the helper falls back to GET/JSON parse.
+      const values = await Promise.all(keys.map((k: string) => this.readIndicationSetEntries(client, k)))
+
       let totalEntries = 0
       let totalProfitFactor = 0
       let totalConfidence = 0
       let sampleCount = 0
 
-      for (const key of keys) {
-        const raw = await client.get(key)
-        if (!raw) continue
-        const entries = JSON.parse(raw)
+      for (const entries of values) {
         if (!Array.isArray(entries)) continue
 
         totalEntries += entries.length
         for (const entry of entries) {
           totalProfitFactor += Number(entry?.profitFactor || 0)
-          totalConfidence += Number(entry?.confidence || 0)
+          totalConfidence   += Number(entry?.confidence   || 0)
           sampleCount++
         }
       }
@@ -1339,31 +1850,17 @@ export class IndicationSetsProcessor {
   async getSetEntries(symbol: string, type: string, limit = 50): Promise<any[]> {
     try {
       const client = await getCachedClient()
-      const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
-      // NOTE: client.keys() is a full-keyspace scan. Acceptable here because
-      // this method is called only for the dashboard "Indications" detail
-      // panel (low frequency) and because the InlineLocalRedis Map scan is
-      // O(N) in the number of stored keys but bounded by per-symbol type
-      // ceiling (at most ~144 keys in dev / ~522 in prod per type×symbol).
-      // A SCAN-based alternative would be equivalent — InlineLocalRedis has
-      // no SCAN, so keys() is the only option for the in-process client.
-      const keys = await client.keys(`${prefix}*`)
+      const keys = await this.getIndexedSetKeys(client, symbol, type)
       if (!keys || keys.length === 0) return []
 
-      // Fan out all GETs in parallel — same pattern as getCurrentIndications
-      // in indication-stage.ts to avoid sequential await latency.
-      const rawValues = await Promise.all(
-        keys.map((k: string) => client.get(k).catch(() => null)),
-      )
+      // Fan out all reads in parallel. New keys are Redis LISTs; legacy keys
+      // may still be JSON arrays, so the helper falls back to GET/JSON parse.
+      const values = await Promise.all(keys.map((k: string) => this.readIndicationSetEntries(client, k)))
       const allEntries: any[] = []
-      for (let i = 0; i < rawValues.length; i++) {
-        const raw = rawValues[i]
-        if (!raw) continue
-        try {
-          const entries = JSON.parse(raw as string)
-          if (!Array.isArray(entries)) continue
-          allEntries.push(...entries.map((entry) => ({ ...entry, setKey: keys[i] })))
-        } catch { /* skip malformed entries */ }
+      for (let i = 0; i < values.length; i++) {
+        const entries = values[i]
+        if (!Array.isArray(entries)) continue
+        allEntries.push(...entries.map((entry) => ({ ...entry, setKey: keys[i] })))
       }
 
       return allEntries

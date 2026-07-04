@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 import React, { useState, useEffect } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -31,6 +32,8 @@ export function DashboardActiveConnectionsManager() {
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set())
   const [resetting, setResetting] = useState(false)
   const [globalEngineRunning, setGlobalEngineRunning] = useState(false)
+  const [globalEngineQueued, setGlobalEngineQueued] = useState(false)
+  const [globalEngineDiagnosticHint, setGlobalEngineDiagnosticHint] = useState<string | null>(null)
   const [globalEngineLoading, setGlobalEngineLoading] = useState(true)
   const globalEngineRef = React.useRef(false)
   const activeConnectionsRef = React.useRef<ActiveConnectionWithDetails[]>([])
@@ -161,9 +164,13 @@ export function DashboardActiveConnectionsManager() {
       if (res.ok) {
         const data = await res.json()
         const wasRunning = globalEngineRef.current
-        const nowRunning = data.running === true || data.running === "true" || data.status === "running"
+        const nowRunning = data.actualRuntimeStatus === "running" || data.running === true
+        const heartbeatFresh = data.workerAttached === true || data.connectionHeartbeatFresh === true || data.globalHeartbeatFresh === true
+        const intentRunning = data.operatorIntent === "running" || data.operatorStatus === "running"
         globalEngineRef.current = nowRunning
         setGlobalEngineRunning(nowRunning)
+        setGlobalEngineQueued(intentRunning && !heartbeatFresh)
+        setGlobalEngineDiagnosticHint(data.diagnostics?.hint || null)
         if (!wasRunning && nowRunning) {
           loadConnections()
         }
@@ -222,8 +229,10 @@ export function DashboardActiveConnectionsManager() {
     }
   }, [])
 
-  const handleToggle = async (connectionId: string, currentState: boolean) => {
-    const newState = !currentState
+  const handleToggle = async (connectionId: string, desiredState: boolean) => {
+    const currentState = activeConnectionsRef.current.find(ac => ac.connectionId === connectionId)?.isActive ?? false
+    const newState = desiredState
+    if (newState === currentState) return
 
     setTogglingIds(prev => new Set(prev).add(connectionId))
 
@@ -248,13 +257,28 @@ export function DashboardActiveConnectionsManager() {
       ))
 
       const toggleData = await toggleRes.json().catch(() => ({} as any))
+      dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(toggleData, {
+        connectionId,
+        connection: { id: connectionId, name: connInfo?.exchangeName },
+        engine: { action: newState ? "start" : "stop", status: toggleData.engine?.status },
+        source: "dashboard-active-connections-manager.toggleDashboard",
+      }))
       if (!newState) {
-        await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
+        const liveTradeRes = await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ is_live_trade: false }),
           cache: "no-store"
-        }).catch(() => {})
+        }).catch(() => null)
+        if (liveTradeRes?.ok) {
+          const liveTradeData = await liveTradeRes.json().catch(() => ({} as any))
+          dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(liveTradeData, {
+            connectionId,
+            connection: { id: connectionId, name: connInfo?.exchangeName },
+            engine: { action: "stop", status: liveTradeData.engineStatus },
+            source: "dashboard-active-connections-manager.liveTradeOff",
+          }))
+        }
         toast.success("Connection deactivated", { description: "Engine stopped" })
       } else if (toggleData.changed) {
         toast.success("Connection added to Main Connections", {
@@ -301,12 +325,21 @@ export function DashboardActiveConnectionsManager() {
       setRemovingIds(prev => new Set(prev).add(connectionId))
 
       // Stop engine first (non-critical)
-      await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
+      const liveTradeRes = await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ is_live_trade: false }),
         cache: "no-store"
-      }).catch(() => { /* non-critical */ })
+      }).catch(() => null)
+      if (liveTradeRes?.ok) {
+        const liveTradeData = await liveTradeRes.json().catch(() => ({} as any))
+        dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(liveTradeData, {
+          connectionId,
+          connection: { id: connectionId, name: connectionName },
+          engine: { action: "stop", status: liveTradeData.engineStatus },
+          source: "dashboard-active-connections-manager.remove.liveTradeOff",
+        }))
+      }
 
       // Remove from active panel
       const removeRes = await fetch(`/api/settings/connections/${connectionId}/active`, {
@@ -418,10 +451,10 @@ export function DashboardActiveConnectionsManager() {
           <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
-              Engine starting up
+              {globalEngineQueued ? "Queued / waiting for worker" : "Engine starting up"}
             </p>
             <p className="text-xs text-amber-600 dark:text-amber-400">
-              Engine is initializing for enabled connections. Status will update shortly.
+              {globalEngineDiagnosticHint || "Engine is initializing for enabled connections. Status will update shortly."}
             </p>
           </div>
         </div>

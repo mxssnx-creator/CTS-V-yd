@@ -20,14 +20,12 @@ export async function GET(request: NextRequest) {
       connections = connections.filter((c: any) => c.exchange === exchangeFilter)
     }
 
-    // Active connections = those with a running engine (active-inserted or dashboard-enabled)
-    const activeConnections = connections.filter(
-      (c: any) =>
-        c.is_active_inserted === true || c.is_active_inserted === "1" ||
-        c.is_assigned === true || c.is_assigned === "1" ||
-        c.is_active === true || c.is_active === "true" ||
-        c.is_enabled_dashboard === true || c.is_enabled_dashboard === "1",
-    )
+    // Active processing connections must be assigned and dashboard-enabled.
+    const isOn = (value: unknown) => value === true || value === 1 || value === "1" || value === "true"
+    const activeConnections = connections.filter((c: any) => {
+      const assigned = isOn(c.is_assigned) || isOn(c.is_active_inserted) || isOn(c.is_dashboard_inserted)
+      return assigned && isOn(c.is_enabled_dashboard)
+    })
 
     let totalPositions = 0
     let openPositions = 0

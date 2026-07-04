@@ -17,14 +17,12 @@ export async function GET() {
 
     const connections = await getAllConnections()
 
-    // Mirror the same eligibility logic as getAssignedAndEnabledConnections()
-    // so this surface never disagrees with the coordinator. Previously this
-    // filtered only on is_enabled + is_inserted, missing connections enabled
-    // via is_enabled_dashboard (quickstart / UI toggle path).
+    // Mirror the same eligibility logic as getAssignedAndEnabledConnections():
+    // assigned to Main Connections and explicitly dashboard-enabled.
     const _isOn = (v: unknown) => v === true || v === 1 || v === "1" || v === "true"
     const activeConnections = connections.filter((c: any) => {
       const assigned = _isOn(c.is_active_inserted) || _isOn(c.is_assigned) || _isOn(c.is_dashboard_inserted)
-      const enabled  = _isOn(c.is_enabled) || _isOn(c.enabled) || _isOn(c.is_enabled_dashboard)
+      const enabled = _isOn(c.is_enabled_dashboard)
       return assigned && enabled
     })
 
@@ -48,7 +46,7 @@ export async function GET() {
     // is still empty (e.g. snapshot restored without re-running quickstart).
     const connectionId =
       activeConnections[0]?.id ||
-      connections.find((c: any) => c.is_enabled_dashboard === "1" || c.is_assigned === "1")?.id ||
+      connections.find((c: any) => _isOn(c.is_enabled_dashboard) && (_isOn(c.is_assigned) || _isOn(c.is_active_inserted) || _isOn(c.is_dashboard_inserted)))?.id ||
       "unknown"
 
     // Read counters from the authoritative Redis keys:

@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 import { MIN_VOLUME_FACTOR } from "@/lib/constants"
 import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -620,6 +621,13 @@ export default function ExchangeConnectionManager() {
         throw new Error(errorMsg)
       }
 
+      dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(data, {
+        connectionId: id,
+        connection: { id, name: connection.name, exchange: connection.exchange },
+        engine: { action: enabled ? "enable" : "disable", status: data.tradeEngineStarted ? "running" : undefined },
+        source: "exchange-connection-manager.toggleConnection",
+      }))
+
       // Update local state immediately
       setConnections((prev) =>
         prev.map((c) => 
@@ -676,6 +684,13 @@ export default function ExchangeConnectionManager() {
         console.error("[v0] Dashboard toggle failed:", errorMsg)
         throw new Error(errorMsg)
       }
+
+      dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(data, {
+        connectionId: id,
+        connection: { id, name: connection.name, exchange: connection.exchange },
+        engine: { action: enabled ? "start" : "stop", status: data.engine?.status },
+        source: "exchange-connection-manager.toggleDashboard",
+      }))
 
       // Update local state immediately
       setConnections((prev) =>

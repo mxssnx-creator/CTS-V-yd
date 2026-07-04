@@ -61,11 +61,16 @@ export class HealthCheckService {
     const statuses = Object.values(checks).map(c => c.status)
     let status: HealthStatus = HealthStatus.HEALTHY
 
-    if (statuses.includes(HealthStatus.UNHEALTHY)) {
+    const criticalStatuses = [checks.redis.status, checks.database.status]
+    if (criticalStatuses.includes(HealthStatus.UNHEALTHY)) {
       status = HealthStatus.UNHEALTHY
-    } else if (statuses.includes(HealthStatus.DEGRADED)) {
+    } else if (criticalStatuses.includes(HealthStatus.DEGRADED)) {
       status = HealthStatus.DEGRADED
     }
+    // Memory pressure is reported at component level only. It should not fail
+    // production liveness/readiness by itself because V8 can report high
+    // heap-used/heap-total after build/cold-start while still serving and able
+    // to GC on demand.
 
     const report: HealthReport = {
       status,
@@ -170,10 +175,10 @@ export class HealthCheckService {
 
       let status = HealthStatus.HEALTHY
 
-      // Warn if heap usage is above 80%
-      if (heapUsedPercent > 90) {
-        status = HealthStatus.UNHEALTHY
-      } else if (heapUsedPercent > 80) {
+      // Warn if heap usage is above 80%. A high V8 heap-used/heap-total
+      // percentage alone is not a liveness failure: production processes often
+      // sit above 90% right after a build/cold start and recover on the next GC.
+      if (heapUsedPercent > 80) {
         status = HealthStatus.DEGRADED
       }
 

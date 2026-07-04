@@ -123,6 +123,11 @@ interface Settings {
   indicationTimeoutMs: number // 100ms to 3000ms, step 100ms
   maxConcurrentOperations: number
   cyclePauseMs?: number // 10-200ms, step 10, default 50ms — pause between engine cycles
+  strategyMaxEntriesPerSet: number
+  strategyMainAxisSetsCeiling: number
+  strategyRealSetsSafetyCeiling: number
+  maxRealSets: number
+  strategyLiveSetsCeiling: number
   autoRestartOnErrors: boolean
   logLevel: string
   maxDatabaseSizeMB: number
@@ -487,6 +492,11 @@ const initialSettings: Settings = {
   indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
   maxConcurrentOperations: 100, // 10-250, default 100
   cyclePauseMs: 50, // 10-200ms, step 10, default 50ms — pause between engine cycles
+  strategyMaxEntriesPerSet: 250,
+  strategyMainAxisSetsCeiling: 50,
+  strategyRealSetsSafetyCeiling: 100,
+  maxRealSets: 100,
+  strategyLiveSetsCeiling: 90,
   // prehistoric_range_hours is already set at line 366 above (first occurrence wins)
 
   // System Configuration
@@ -781,7 +791,7 @@ export default function SettingsPage() {
     tradeMode: initialSettings.tradeMode ?? "both",
     strategyTrailingEnabled: initialSettings.strategyTrailingEnabled ?? true,
     strategyBlockEnabled: initialSettings.strategyBlockEnabled ?? true,
-    strategyDcaEnabled: initialSettings.strategyDcaEnabled ?? true,
+    strategyDcaEnabled: initialSettings.strategyDcaEnabled ?? false,
     // FIX: Ensure useMainSymbols default is applied
     useMainSymbols: initialSettings.useMainSymbols ?? false,
     // FIX: Ensure numberOfSymbolsToSelect default is applied

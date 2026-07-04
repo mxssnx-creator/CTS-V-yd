@@ -143,7 +143,7 @@ export async function POST(request: NextRequest) {
 
     try {
       // Stop the engine via coordinator
-      await coordinator.stopEngine(connectionId)
+      await coordinator.stopEngine(connectionId, { operatorRequested: true })
 
       await SystemLogger.logTradeEngine(
         `Trade engine stopped successfully for connection: ${connection.name}`,

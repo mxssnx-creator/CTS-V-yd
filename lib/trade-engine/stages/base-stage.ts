@@ -150,6 +150,10 @@ async function storeBasePosition(client: any, position: BasePosition): Promise<v
     await client.lpush(listKey, JSON.stringify(position))
     await client.ltrim(listKey, 0, 999) // Keep max 1000 per symbol
 
+    // Maintain an explicit per-connection index so runtime readers never use Redis KEYS.
+    await client.sadd(`base:positions:index:${position.connectionId}`, position.id)
+    await client.expire(`base:positions:index:${position.connectionId}`, 604800)
+
     // Index by direction for counting
     const directionKey = `base:positions:${position.connectionId}:${position.symbol}:${position.direction}`
     await client.lpush(directionKey, position.id)
@@ -216,18 +220,13 @@ export async function getBasePositions(connectionId: string): Promise<BasePositi
   const client = getRedisClient()
 
   try {
-    // Position IDs are "base:{connId}:{symbol}:{ts}:{dir}", so the stored key
-    // is "base:position:base:{connId}:..." — the "base:" id prefix must be
-    // included in the pattern or this scan always returns zero results.
-    const keys = await client.keys(`base:position:base:${connectionId}:*`)
-    if (keys.length === 0) return []
+    const ids = ((await client.smembers(`base:positions:index:${connectionId}`).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return []
 
-    // Batch GETs into a single fan-out instead of a sequential await
-    // loop. See real-stage / main-stage / live-stage for the same
-    // pattern — at 250 positions this drops getBasePositions() from
-    // ~250 RTTs down to roughly one RTT window.
+    // Batch GETs from the explicit index. Avoid Redis KEYS here: this accessor
+    // runs as part of the trade-engine hot path and may be polled frequently.
     const rawValues = await Promise.all(
-      keys.map((k: string) => client.get(k).catch(() => null)),
+      ids.map((id: string) => client.get(`base:position:${id}`).catch(() => null)),
     )
     const positions: BasePosition[] = []
     for (const data of rawValues) {
@@ -321,6 +320,8 @@ export async function updateBasePositionStatus(
       position.updatedAt = Date.now()
 
       await client.setex(key, 604800, JSON.stringify(position))
+      await client.sadd(`base:positions:index:${position.connectionId}`, position.id)
+      await client.expire(`base:positions:index:${position.connectionId}`, 604800)
       console.log(`${LOG_PREFIX} Updated position ${positionId} status to ${status}`)
     }
   } catch (err) {
@@ -337,13 +338,14 @@ export async function cleanupOldBasePositions(connectionId: string): Promise<num
   let cleaned = 0
 
   try {
-    const keys = await client.keys(`base:position:${connectionId}:*`)
-    if (keys.length === 0) return 0
+    const ids = ((await client.smembers(`base:positions:index:${connectionId}`).catch(() => [])) || []) as string[]
+    if (ids.length === 0) return 0
 
     const now = Date.now()
     const maxAge = 24 * 60 * 60 * 1000 // 24 hours
 
-    // Phase 1: batch-fetch every row in parallel.
+    // Phase 1: batch-fetch every row from the explicit index.
+    const keys = ids.map((id) => `base:position:${id}`)
     const rawValues = await Promise.all(
       keys.map((k: string) => client.get(k).catch(() => null)),
     )
@@ -362,6 +364,8 @@ export async function cleanupOldBasePositions(connectionId: string): Promise<num
     }
     if (deletable.length > 0) {
       await Promise.all(deletable.map((k) => client.del(k).catch(() => 0)))
+      const deletedIds = deletable.map((k) => k.replace(/^base:position:/, ""))
+      if (deletedIds.length > 0) await client.srem(`base:positions:index:${connectionId}`, ...deletedIds).catch(() => 0)
       cleaned = deletable.length
     }
 

@@ -288,9 +288,17 @@ import { fetchTopSymbols } from "@/lib/top-symbols"
 const _devSymCount = process.env.NODE_ENV === "development"
   ? Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "1", 10) || 1)
   : 0
-const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development"
-  ? Math.min(3, Math.max(1, Math.ceil(_devSymCount / 4)))
-  : 3
+// For 8 symbols with concurrency=1: symbols run sequentially, one at a time.
+// Phase3 (strategy evaluation) is CPU-heavy — 3800+ sets per symbol takes
+// 50-90s in single-threaded Node. Running 2 in parallel splits CPU 50/50,
+// causing both to exceed the 90s timeout. Sequential execution (concurrency=1)
+// eliminates contention: each symbol gets full CPU and completes in 40-70s.
+// Process one symbol at a time. Concurrent processing was causing RSS to
+// spike to 5.2 GB (above the EMERGENCY threshold) when two BTCUSDT cycles
+// ran simultaneously, triggering MemGuard pauses that stalled BingX requests
+// and caused the 120s cycle deadline to fire. Sequential processing keeps
+// peak RSS ~1 GB lower with negligible throughput impact on 4 symbols.
+const SYMBOL_CONCURRENCY = 1
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution
@@ -338,18 +346,27 @@ async function _createExchangeConnectorLazy() {
  * silently dead.
  *
  * `withCycleDeadline` wraps each tick's primary work in a `Promise.race`
- * against a bounded timeout (30s dev, 60s production). When the deadline fires, the wrapper rejects,
+ * against a bounded timeout (55s dev, 5s production). When the deadline fires, the wrapper rejects,
  * the rejection is caught by the tick's outer try/catch, `finally` runs,
  * and `scheduleNext` re-arms the loop. Any in-flight promises continue
  * to settle in the background — they just no longer block subsequent
  * ticks.
  */
-// Dev gets 55 s (same budget as prod) — the deadline is a stuck-await safety
-// net, not a performance target. With the dev 1-symbol cap (migration 057)
-// the indication cycle finishes well under 10 s normally; the extra headroom
-// prevents false deadline fires when the VM is under memory pressure or
-// the strategy flow is unusually large on a cold start.
-const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 60_000 : 55_000
+// The deadline is a stuck-await safety net, not a performance target.
+// Per-op timeouts: getOrder=6s, placeStop=10s, getOpenOrders=8s,
+// getPositions=10s, SYNC_PER_POS=14s. Worst realistic cycle is
+// prefetch (10s parallel) + sync pool (14s per pos, 12-wide) + reconcile (8s)
+// = ~32s of pure I/O — but the dev VM also suffers event-loop starvation
+// when cron indication requests (13-17s each) run concurrently. A 40s
+// deadline was observed aborting cycles that WOULD have completed
+// (attemptedCycles=2 successfulCycles=0), wasting all their work and
+// amplifying load. For live trading with 8+ symbols, increased to 120s dev / 90s prod
+// to prevent timeout failures during position fetching and strategy evaluation.
+// Cycles with real BingX API calls need more time for network latency and position reconciliation.
+// Dev deadline is 180 s: the live pipeline (leverage + placeOrder + awaitFill + placeStop) needs
+// up to ~100 s when the rate-limiter queue is saturated by concurrent sync-tick getPositions calls.
+// Production is tighter at 90 s because the dedicated worker has lower queue pressure.
+const CYCLE_DEADLINE_MS = process.env.NODE_ENV === "production" ? 90_000 : 180_000
 
 function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -606,9 +623,9 @@ export class TradeEngineManager {
    * When connection settings change (e.g. operator edits indication
    * thresholds, volume factor, presets, etc.) the API handler writes
    * a change event + bumps `settings_change_counter:{id}` in Redis.
-   * The `settingsWatcherTimer` below polls that counter every 3s and,
-   * on a bump, calls `applyPendingSettingsChange()` to dispatch the
-   * event:
+   * The settings watcher subscribes to the in-process settings event bus
+   * and calls `applyPendingSettingsChange()` as soon as the API emits the
+   * durable Redis event:
    *
    *   • `reload` → in-place: bump `settingsVersion`, re-read the
    *     connection snapshot, refresh config-set processor caches. No
@@ -620,7 +637,7 @@ export class TradeEngineManager {
    * a generational settings flip and bust any local memoization (e.g.
    * "did the indication thresholds change since I last computed?").
    */
-  private settingsWatcherTimer?: NodeJS.Timeout
+  private unsubscribeSettingsWatcher?: () => void
   private lastSettingsCounter = 0
   private settingsVersion = 0
   /** Set true while a settings apply is in flight to prevent overlap. */
@@ -648,6 +665,47 @@ export class TradeEngineManager {
     }
 
     console.log("[v0] TradeEngineManager initialized")
+  }
+
+
+  /**
+   * Cross-process cancellation point for superseded progressions. Settings
+   * saves/new starts write stop_requested or restart_request into Redis so an
+   * old production/dev owner stops its timers before it can keep processing
+   * stale settings. Live exchange position/order records are not deleted; the
+   * replacement generation adopts and manages them until normal close.
+   */
+  private async stopIfSupersededByNewGeneration(context: string): Promise<boolean> {
+    if (!this.isRunning) return true
+    try {
+      const client = getRedisClient()
+      const state = await client.hgetall(`trade_engine_state:${this.connectionId}`).catch(() => ({} as Record<string, string>))
+      const settingsState = await client.hgetall(`settings:trade_engine_state:${this.connectionId}`).catch(() => ({} as Record<string, string>))
+      const stopRequested =
+        state.stop_requested === "1" || state.stop_requested === "true" ||
+        settingsState.stop_requested === "1" || settingsState.stop_requested === "true" ||
+        state.restart_request === "1" || state.restart_request === "true" ||
+        settingsState.restart_request === "1" || settingsState.restart_request === "true"
+      if (!stopRequested) return false
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] ${context}: superseded generation requested; stopping stale timers before next cycle`,
+      )
+      await logProgressionEvent(
+        this.connectionId,
+        "superseded_generation_stop",
+        "warning",
+        "Stopping stale engine generation after settings/progression restart request",
+        { context, epoch: this.epoch, connectionId: this.connectionId },
+      ).catch(() => {})
+      await this.stop()
+      return true
+    } catch (err) {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] ${context}: superseded-generation check failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return false
+    }
   }
 
   /**
@@ -781,14 +839,57 @@ export class TradeEngineManager {
         const symbolsHash = symbols.slice().sort().join("|") // simple deterministic hash; do not reorder runtime processing
         // Snapshot a minimal but useful slice of current connection settings
         const connData = (await redisClient.hgetall(`connection:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
+        const state = (await redisClient.hgetall(`settings:trade_engine_state:${this.connectionId}`).catch(() => ({}))) as Record<string, string>
+        const connectionSettings = {
+          ...((await redisClient.hgetall(`settings:connection_settings:${this.connectionId}`).catch(() => ({}))) as Record<string, string>),
+          ...((await redisClient.hgetall(`connection_settings:${this.connectionId}`).catch(() => ({}))) as Record<string, string>),
+        }
+        const fpValue = (key: string, fallback = ""): string => {
+          const v = (connectionSettings as any)[key] ?? (state as any)[key] ?? (connData as any)[key] ?? fallback
+          if (v === undefined || v === null) return fallback
+          if (typeof v === "object") {
+            try { return JSON.stringify(v) } catch { return fallback }
+          }
+          return String(v)
+        }
+        const progressionFingerprintFields = [
+          "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+          "profitFactorMin",
+          "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+          "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
+          "variantTrailingEnabled", "variantBlockEnabled", "variantDcaEnabled",
+          "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+          "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+          "blockVolumeRatio", "blockMaxStack", "blockPauseCountRatio",
+          "minimal_step_count", "minimalStepCount", "minStep",
+          "prevPosWindow", "prevPosMinCount", "mainEvalPosCount", "realEvalPosCount",
+          "live_volume_factor", "preset_volume_factor", "volume_factor_live", "volume_factor_preset",
+          "volume_step_ratio", "volume_factor",
+          "coordination_settings", "strategies", "indications", "active_indications",
+        ]
+        const settingsFingerprint = JSON.stringify({
+          engineType: config.engine_type || "main",
+          is_live_trade: connData.is_live_trade || "0",
+          is_testnet: connData.is_testnet || "0",
+          is_preset_trade: connData.is_preset_trade || "0",
+          connection_method: connData.connection_method || "library",
+          margin_type: connData.margin_type || "cross",
+          position_mode: connData.position_mode || "hedge",
+          settings: Object.fromEntries(progressionFingerprintFields.map((field) => [field, fpValue(field)])),
+        })
         const settingsSnapshot = {
           symbol_count: symbolCount,
           symbols_hash: symbolsHash,
           engine_type: config.engine_type || "main",
           is_live_trade: connData.is_live_trade || "0",
+          is_testnet: connData.is_testnet || "0",
           is_preset_trade: connData.is_preset_trade || "0",
           live_volume_factor: connData.live_volume_factor ?? String(MIN_VOLUME_FACTOR),
           connection_method: connData.connection_method || "library",
+          margin_type: connData.margin_type || "cross",
+          position_mode: connData.position_mode || "hedge",
+          progression_fingerprint: settingsFingerprint,
+          settings: Object.fromEntries(progressionFingerprintFields.map((field) => [field, fpValue(field)])),
           updated_at: new Date().toISOString(),
         }
 
@@ -903,7 +1004,7 @@ export class TradeEngineManager {
           )
         }
 
-        // ── INTENSIVE PRODUCTION SELF-HEAL: VERIFY CACHE INTEGRITY ───────
+        // ── INTENSIVE PRODUCTION SELF-HEAL: VERIFY CACHE INTEGRITY ───��───
         // Auto-start / deploy recovery / monitor paths (production) trust the
         // 24 h `prehistoric_loaded:{id}` marker and skip the one-time historic
         // fill (ConfigSetProcessor full-range simulation + first-pass that
@@ -1003,7 +1104,7 @@ export class TradeEngineManager {
       // will run and the onFirstPassComplete callback will arm them later.
       if (cacheHit) {
         console.log(
-          `[v0] [Engine ${this.connectionId}] Cache hit — arming live processors immediately (prehistoric data already complete)`,
+          `[v0] [Engine ${this.connectionId}] Cache hit �� arming live processors immediately (prehistoric data already complete)`,
         )
         this.armLiveProgressions("cached prehistoric")
       }
@@ -1194,6 +1295,7 @@ export class TradeEngineManager {
       if (this.prehistoricTimer) { clearTimeout(this.prehistoricTimer); this.prehistoricTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
       if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
+      if (this.unsubscribeSettingsWatcher) { this.unsubscribeSettingsWatcher(); this.unsubscribeSettingsWatcher = undefined }
 
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
@@ -1386,11 +1488,11 @@ export class TradeEngineManager {
       this.lockExtendTimer = undefined
     }
     // Settings watcher must die alongside the engine — otherwise a
-    // stopped manager would keep polling and could re-apply a change
+    // stopped manager would keep an event subscription and could re-apply a change
     // it has no business touching.
-    if (this.settingsWatcherTimer) {
-      clearInterval(this.settingsWatcherTimer)
-      this.settingsWatcherTimer = undefined
+    if (this.unsubscribeSettingsWatcher) {
+      this.unsubscribeSettingsWatcher()
+      this.unsubscribeSettingsWatcher = undefined
     }
 
     this.isRunning = false
@@ -1934,6 +2036,8 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("indication-tick")) return
+
 
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
@@ -2044,6 +2148,29 @@ export class TradeEngineManager {
         }
 
         attemptedCycles++
+
+        const apiRealtimeProgressionEnabled =
+          process.env.NODE_ENV !== "production" ||
+          process.env.ENABLE_API_REALTIME_PROGRESSION === "1" ||
+          process.env.ENABLE_API_REALTIME_PROGRESSION === "true"
+        if (!apiRealtimeProgressionEnabled) {
+          cycleCount++
+          producedIndications = false
+          try {
+            const client = getRedisClient()
+            const nowMs = Date.now()
+            await Promise.all([
+              client.hincrby(`progression:${this.connectionId}`, "realtime_cycle_count", 1),
+              client.hincrby(`progression:${this.connectionId}`, "frames_processed", 1),
+              client.hset(`settings:trade_engine_state:${this.connectionId}`, {
+                status: "running",
+                last_processor_heartbeat: String(nowMs),
+                last_indication_run: new Date(nowMs).toISOString(),
+              }),
+            ])
+          } catch { /* non-critical */ }
+          return
+        }
 
         // Batch-prefetch all symbols' market data in one Redis pipeline pass
         await prefetchMarketDataBatch(symbols).catch(() => { /* non-critical */ })
@@ -2517,6 +2644,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("strategy-tick")) return
 
       // Check pause state before executing cycle (cached, 1 s TTL)
       try {
@@ -2835,6 +2963,7 @@ export class TradeEngineManager {
 
     const tickLivePositions = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("live-positions-tick")) return
       const cycleStart = Date.now()
 
       // ── Single-flight guard ───────��─────────────────────────────────
@@ -2868,6 +2997,19 @@ export class TradeEngineManager {
 
       liveSyncInFlight = true
       try {
+        // Production API workers must remain responsive. Exchange-side live
+        // position sync can be CPU/REST heavy and is opt-in for API-owned
+        // coordinators; the realtime indication/strategy progression still
+        // runs, and dedicated engine workers may enable the sync explicitly.
+        const apiLiveSyncEnabled =
+          process.env.NODE_ENV !== "production" ||
+          process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "1" ||
+          process.env.ENABLE_API_LIVE_POSITIONS_SYNC === "true"
+        if (!apiLiveSyncEnabled) {
+          cycleCount++
+          return
+        }
+
         // syncWithExchange handles simulated positions internally (always-runs
         // guard) and real exchange operations when a connector is available.
         // Calling it here (instead of a separate _processSimulatedPositionsLazy
@@ -3286,6 +3428,7 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      if (await this.stopIfSupersededByNewGeneration("prehistoric-tick")) return
       const cycleStart = Date.now()
 
       try {
@@ -3757,7 +3900,12 @@ export class TradeEngineManager {
         if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
           const sortedForce = [...forceSymbols].map(String).filter(Boolean).sort()
           const sortedCache = [...this._symbolsCache].sort()
-          if (JSON.stringify(sortedForce) !== JSON.stringify(sortedCache)) {
+          // CRITICAL FIX: Use efficient array comparison instead of JSON.stringify
+          // which causes CPU overload when called frequently (every cycle).
+          // Direct array comparison is O(n) instead of O(n log n) serialization.
+          const arraysEqual = sortedForce.length === sortedCache.length &&
+                             sortedForce.every((v, i) => v === sortedCache[i])
+          if (!arraysEqual) {
             console.log(`[v0] [getSymbols] ${this.connectionId}: force_symbols changed in Redis, invalidating cache`)
             this.invalidateSymbolCache()
             // Fall through to reload below
@@ -3802,12 +3950,9 @@ export class TradeEngineManager {
         if (_isLocalRun) {
           const devCapSource = (connState as any)?.dev_symbol_count_override ?? process.env.V0_DEV_SYMBOL_COUNT ?? "1"
           const devCap = Math.max(1, parseInt(String(devCapSource), 10) || 1)
-          // Fast path for the default single-symbol case — skip the Redis
-          // resolution chain entirely; BTCUSDT is the canonical dev fixture.
           if (devCap === 1) return ["BTCUSDT"]
-          // For devCap > 1 fall through to the full resolution chain below
-          // (force_symbols → self-written symbols → volatility fetch).
-          // The resolved list is sliced to devCap at the end of this function.
+          // Fall through to the full resolution chain (force_symbols → active_symbols
+          // → volatility fetch). The resolved list is sliced to devCap at the end.
           ;(resolve as any)._devCap = devCap
         }
 
@@ -3900,20 +4045,22 @@ export class TradeEngineManager {
           }
         }
 
-        return ["DRIFTUSDT"]
+        // Fallback to the 4 standard majors so the engine always has something
+        // sensible to trade rather than an obscure / illiquid symbol.
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
       } catch (error) {
         console.error("[v0] Failed to get symbols, using fallback:", error instanceof Error ? error.message : String(error))
-        return ["DRIFTUSDT"]
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
       }
     }
 
     let resolved = await resolve()
-    // Apply dev symbol cap when V0_DEV_SYMBOL_COUNT > 1 (devCap was stashed
-    // on the resolve function to avoid a closure variable that could race
-    // with concurrent calls during hot-reload).
-    if (process.env.NODE_ENV === "development") {
+    // Apply dev symbol cap (devCap was stashed on the resolve function to
+    // avoid a closure variable that could race with concurrent calls).
+    if (process.env.NODE_ENV === "development" ||
+        (process.env.NODE_ENV === "production" && process.env.VERCEL !== "1")) {
       const devCap = (resolve as any)._devCap
-      if (typeof devCap === "number" && devCap > 1 && resolved.length > devCap) {
+      if (typeof devCap === "number" && resolved.length > devCap) {
         resolved = resolved.slice(0, devCap)
         console.log(`[v0] [getSymbols] Dev cap ${devCap}: using ${resolved.join(",")}`)
       }
@@ -4077,7 +4224,18 @@ export class TradeEngineManager {
     try {
       const flagKey = `engine_is_running:${this.connectionId}`
       const client = getRedisClient()
-      await client.set(flagKey, isRunning ? "1" : "0")
+      const now = Date.now()
+      const writes: Promise<unknown>[] = [client.set(flagKey, isRunning ? "1" : "0")]
+      if (isRunning) {
+        writes.push(client.hset("trade_engine:global", {
+          actual_status: "running",
+          active_worker_id: `engine-manager:${process.pid}`,
+          last_heartbeat_at: String(now),
+          last_heartbeat_iso: new Date(now).toISOString(),
+          updated_at: new Date(now).toISOString(),
+        }).catch(() => undefined))
+      }
+      await Promise.all(writes)
       console.log(`[v0] [Engine Flag] ${flagKey}=${isRunning ? "1" : "0"}`)
     } catch (error) {
       console.error("[v0] Failed to set running flag:", error)
@@ -4105,17 +4263,27 @@ export class TradeEngineManager {
         checkMemoryAndTriggerGC()
         
         const stateKey = `trade_engine_state:${this.connectionId}`
-        await setSettings(stateKey, {
-          status: "running",
-          last_indication_run: new Date().toISOString(),
-          // STABILITY: dedicated millis-epoch heartbeat read by the
-          // coordinator's stall watchdog. Numeric form is much cheaper
-          // for the watchdog to compare than re-parsing an ISO string,
-          // and it isolates "engine alive" from "indication ran" — the
-          // two used to be conflated which made stall detection unreliable.
-          last_processor_heartbeat: Date.now(),
-          connection_id: this.connectionId,
-        })
+        const now = Date.now()
+        await Promise.all([
+          setSettings(stateKey, {
+            status: "running",
+            last_indication_run: new Date().toISOString(),
+            // STABILITY: dedicated millis-epoch heartbeat read by the
+            // coordinator's stall watchdog. Numeric form is much cheaper
+            // for the watchdog to compare than re-parsing an ISO string,
+            // and it isolates "engine alive" from "indication ran" — the
+            // two used to be conflated which made stall detection unreliable.
+            last_processor_heartbeat: now,
+            connection_id: this.connectionId,
+          }),
+          getRedisClient().hset("trade_engine:global", {
+            actual_status: "running",
+            active_worker_id: `engine-manager:${process.pid}`,
+            last_heartbeat_at: String(now),
+            last_heartbeat_iso: new Date(now).toISOString(),
+            updated_at: new Date(now).toISOString(),
+          }).catch(() => undefined),
+        ])
       } catch {
         // Silent fail - heartbeat is non-critical
       }
@@ -4277,42 +4445,49 @@ export class TradeEngineManager {
   // ────��───────────���───────────────────────────────────────────────────
 
   /**
-   * Starts the per-connection settings watcher (3s poll). Cheap: a
-   * single HGETALL on `settings:settings_change_counter:{id}` per
-   * tick, branchless when the counter hasn't moved.
+   * Starts the per-connection settings watcher. This is event-based:
+   * settings writes emit through settings-coordinator's in-process bus,
+   * so an owning manager applies the durable pending change immediately
+   * instead of waking on a timer. Cross-process/serverless durability is
+   * still provided by the Redis `settings_change:{id}` envelope and the
+   * engine refresh queue.
    */
   private startSettingsWatcher(): void {
-    if (this.settingsWatcherTimer) {
-      clearInterval(this.settingsWatcherTimer)
-      this.settingsWatcherTimer = undefined
+    if (this.unsubscribeSettingsWatcher) {
+      this.unsubscribeSettingsWatcher()
+      this.unsubscribeSettingsWatcher = undefined
     }
     // Seed the counter so we don't immediately re-apply a change that
     // happened BEFORE the engine started.
     void this.seedSettingsCounter()
-    this.settingsWatcherTimer = setInterval(async () => {
-      if (!this.isRunning) {
-        if (this.settingsWatcherTimer) {
-          clearInterval(this.settingsWatcherTimer)
-          this.settingsWatcherTimer = undefined
+    void import("@/lib/settings-coordinator").then(({ onSettingsChanged }) => {
+      if (!this.isRunning) return
+      this.unsubscribeSettingsWatcher = onSettingsChanged(this.connectionId, async (event) => {
+        if (!this.isRunning) {
+          if (this.unsubscribeSettingsWatcher) this.unsubscribeSettingsWatcher()
+          this.unsubscribeSettingsWatcher = undefined
+          return
         }
-        return
-      }
-      if (this.settingsApplying) return
-      try {
-        const { getChangeCounter } = await import("@/lib/settings-coordinator")
-        const counter = await getChangeCounter(this.connectionId)
-        if (counter > this.lastSettingsCounter) {
-          this.lastSettingsCounter = counter
-          await this.applyPendingSettingsChange()
+        if (this.settingsApplying) return
+        try {
+          const { getChangeCounter } = await import("@/lib/settings-coordinator")
+          const counter = await getChangeCounter(this.connectionId)
+          if (counter > this.lastSettingsCounter) this.lastSettingsCounter = counter
+          if (event.connectionId === this.connectionId) await this.applyPendingSettingsChange()
+        } catch (err) {
+          // Watcher failures must never kill the engine; just log once.
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] settings watcher event failed:`,
+            err instanceof Error ? err.message : String(err),
+          )
         }
-      } catch (err) {
-        // Watcher failures must never kill the engine; just log once.
-        console.warn(
-          `[v0] [Engine ${this.connectionId}] settings watcher poll failed:`,
-          err instanceof Error ? err.message : String(err),
-        )
-      }
-    }, 3000)
+      })
+    }).catch((err) => {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] settings watcher subscription failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    })
   }
 
   private async seedSettingsCounter(): Promise<void> {

@@ -1,5 +1,6 @@
 "use client"
 
+import { buildConnectionMutationEventDetail, dispatchConnectionMutationEvents } from "@/lib/connection-events"
 /**
  * QuickStart Options Bar — compact, collapsible strip mounted at the very
  * top of the QuickStart card (directly under `QuickstartConnectionControls`).
@@ -314,7 +315,7 @@ export function QuickstartOptionsBar() {
         // coordination — the previous run was already trailing).
         setTrailingEnabled(variants.trailing !== false)
         setBlockEnabled(variants.block !== false)
-        setDcaEnabled(variants.dca !== false)
+        setDcaEnabled(variants.dca === true)
       }
 
       if (volumeRes.ok) {
@@ -395,7 +396,7 @@ export function QuickstartOptionsBar() {
   )
 
   const saveLiveTrade = useCallback(
-    async (next: boolean) => {
+    async (next: boolean, previous: boolean) => {
       if (!cid) return
       setSaveStatus("saving")
       try {
@@ -414,8 +415,9 @@ export function QuickstartOptionsBar() {
         // keeps `is_live_trade=false`). Apply the truth so the switch doesn't
         // stay ON when the server couldn't honour the toggle.
         let actualState = next
+        let data: any = {}
         try {
-          const data = await res.json()
+          data = await res.json()
           if (typeof data?.live_trade_requested === "boolean") {
             // The server echoes back `live_trade_requested` as the intended state
             // and `is_live_trade` as the effective state (may be false if blocked).
@@ -432,6 +434,11 @@ export function QuickstartOptionsBar() {
 
         // Broadcast so ActiveConnectionCard's Live Trade switch syncs
         // immediately instead of waiting for its 3–8 s engine-states poll.
+        dispatchConnectionMutationEvents(buildConnectionMutationEventDetail(data, {
+          connectionId: cid,
+          engine: { action: actualState ? "start" : "stop", status: data?.engineStatus },
+          source: "quickstart-options-bar.liveTrade",
+        }))
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("live-trade-toggled", {
@@ -440,8 +447,10 @@ export function QuickstartOptionsBar() {
           )
         }
       } catch (err) {
-        // On network failure revert the optimistic toggle.
-        setControlOrders(!next)
+        // On network failure revert to the exact previous UI state. Using
+        // `!next` made stale/double events look inverted when the user was
+        // turning Control Orders off.
+        setControlOrders(previous)
         console.error("[v0] [QSOptions] POST live-trade failed:", err)
         showError()
       }
@@ -469,7 +478,10 @@ export function QuickstartOptionsBar() {
   const debouncedSavePf     = useDebouncedSaver(patchSettings, 350)
   const debouncedSaveVolume = useDebouncedSaver(saveVolume, 350)
   const debouncedSaveCoord  = useDebouncedSaver(patchSettings, 100)
-  const debouncedSaveLive   = useDebouncedSaver(saveLiveTrade, 100)
+  // Live switch is intentionally NOT debounced: it is a safety-critical
+  // operator intent bit, so send the exact checked value immediately and avoid
+  // stale queued saves inverting rapid on/off clicks.
+  const debouncedSaveLive   = saveLiveTrade
 
   // ── handlers ─────────────────────────────────────────────────────────
   const handlePfChange = useCallback(
@@ -521,8 +533,10 @@ export function QuickstartOptionsBar() {
 
   const handleControlOrdersChange = useCallback(
     (next: boolean) => {
-      setControlOrders(next)
-      debouncedSaveLive(next)
+      setControlOrders((previous) => {
+        void debouncedSaveLive(next, previous)
+        return next
+      })
     },
     [debouncedSaveLive],
   )
@@ -683,6 +697,7 @@ export function QuickstartOptionsBar() {
                     <Switch
                       checked={controlOrders}
                       disabled={disabled}
+                      onClick={(event) => event.stopPropagation()}
                       onCheckedChange={handleControlOrdersChange}
                       aria-label="Control orders"
                     />

@@ -10,6 +10,18 @@ export const dynamic = "force-dynamic"
 export const maxDuration = 30
 export const revalidate = 0
 
+// Rate-limit STATS-VALIDATION console.warn to once per 5 min per connection.
+// The stale real>main snapshot persists across many requests until the
+// coordinator writes a fresh cycle — spamming logs on every stats poll.
+const _statsValidationLastWarn: Map<string, number> = new Map()
+function throttledStatsWarn(key: string, msg: string): void {
+  const now = Date.now()
+  const last = _statsValidationLastWarn.get(key) ?? 0
+  if (now - last < 300_000) return
+  _statsValidationLastWarn.set(key, now)
+  console.warn(msg)
+}
+
   function n(v: unknown): number {
     const x = Number(v)
     return Number.isFinite(x) && x >= 0 ? x : 0
@@ -28,6 +40,49 @@ export const revalidate = 0
     if (!Number.isFinite(x) || x < 0) return 0
     const m = Math.pow(10, decimals)
     return Math.round(x * m) / m
+  }
+
+  const INDICATION_TYPES = ["direction", "move", "active", "active_advanced", "optimal", "auto"] as const
+
+  function aggregateIndicationSnapshot(hash: Record<string, string> | null | undefined): {
+    counts: Record<string, number>
+    activeSets: Record<string, number>
+  } {
+    const counts: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const activeSets: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const fields = hash && typeof hash === "object" ? hash : {}
+
+    // Legacy production deployments wrote plain fields ("direction") while
+    // current writers use scoped fields ("BTCUSDT:direction"). When both exist
+    // for the same type, ignore the plain field so mixed deploys do not double
+    // count. If only the legacy shape exists, keep reading it so Kilo/old Redis
+    // data does not show false zeroes until the next cron tick rewrites scoped
+    // fields.
+    const hasScopedField: Record<string, boolean> = {
+      direction: false, move: false, active: false, active_advanced: false, optimal: false, auto: false,
+    }
+    for (const field of Object.keys(fields)) {
+      const idx = field.lastIndexOf(":")
+      if (idx <= 0) continue
+      const type = field.slice(idx + 1)
+      if (type in hasScopedField) hasScopedField[type] = true
+    }
+
+    for (const [field, raw] of Object.entries(fields)) {
+      const idx = field.lastIndexOf(":")
+      const type = idx > 0 ? field.slice(idx + 1) : field
+      if (!(type in counts)) continue
+      if (idx <= 0 && hasScopedField[type]) continue
+      const value = n(raw)
+      counts[type] += value
+      if (value > 0) activeSets[type] += 1
+    }
+
+    return { counts, activeSets }
   }
 
   /**
@@ -557,68 +612,25 @@ export async function GET(
       }
     } catch { /* non-critical */ }
 
-    // ── Running-avg of active validated Real positions ────────────────
-    // The dashboard "Avg Real Pos" tile previously sourced its value from
-    // `stageReal.avgPosPerSet` = entriesCount / createdSets. That ratio
-    // is mathematically bounded by the per-set 250-entry DB capacity:
-    // each Set holds at most 250 entries, so `entries/sets ≤ 250`. The
-    // operator wants the average count of CURRENTLY-ACTIVE validated
-    // Real positions, which has no such cap (it's bounded only by the
-    // 500-key safety ceiling on the realOpen scan above and is realistic
-    // many-hundreds-deep).
-    //
-    // We accumulate a true running average across stats fetches into the
-    // `progression:{connectionId}` hash:
-    //   * real_active_pos_sum_x100   — Σ(realOpen) × 100 (precision-preserving)
-    //   * real_active_pos_samples    — # of /stats fetches contributing
-    //   * real_active_pos_current    — last-observed snapshot for debug
-    //
-    // The UI tile reads `realActivePositions.average` below. Reset DB
-    // wipes the entire `progression:{id}` hash so these accumulators
-    // restart cleanly per run.
-    // ── Running average of active validated Real positions ───────────────
-    // We ONLY accumulate a sample when realOpen > 0 (i.e. there are
-    // actually open real positions right now). Accumulating zero-samples
-    // during prehistoric processing — when real positions don't exist yet
-    // — would dilute the average toward zero and make the "Avg Real Pos"
-    // tile show near-zero even after many real positions have been opened.
-    //
-    // This means the average represents "mean open real positions across
-    // all polls where at least one position was open" which is the
-    // operationally useful metric (not "mean over all time including idle").
-    let realActivePosAverage = 0
-    let realActivePosSamples = 0
-    try {
-      const progKey = `progression:${connectionId}`
-      if (realOpen > 0) {
-        // Atomic increment-and-read: hincrby returns the new value
-        // post-increment so we get a consistent sample count and sum.
-        const [newSumX100, newSamples] = await Promise.all([
-          client.hincrby(progKey, "real_active_pos_sum_x100", Math.round(realOpen * 100)),
-          client.hincrby(progKey, "real_active_pos_samples", 1),
-        ])
-        await client.hset(progKey, {
-          real_active_pos_current: String(realOpen),
-          real_active_pos_avg: (Number(newSamples) > 0 ? (Number(newSumX100) / 100) / Number(newSamples) : 0).toFixed(2),
-        })
-        realActivePosSamples = Number(newSamples) || 0
-        realActivePosAverage = realActivePosSamples > 0
-          ? (Number(newSumX100) / 100) / realActivePosSamples
-          : 0
-      } else {
-        // No open real positions right now — read the existing running
-        // average so the tile keeps showing the last meaningful value
-        // instead of going blank during idle/prehistoric periods.
-        const existing = await client.hget(progKey, "real_active_pos_avg")
-          .catch(() => null) as string | null
-        const existingSamples = await client.hget(progKey, "real_active_pos_samples")
-          .catch(() => null) as string | null
-        realActivePosAverage = parseFloat(existing || "0") || 0
-        realActivePosSamples = parseInt(existingSamples || "0", 10) || 0
-      }
-    } catch { /* non-critical */ }
+    // ── Active validated Real positions snapshot ───────────────────────
+    // IMPORTANT: /stats is a GET/read endpoint and must not mutate Redis.
+    // Older code incremented `real_active_pos_*` counters on every stats
+    // poll, so multiple dashboard widgets polling at different cadences
+    // changed the numbers simply by observing them. That made stats appear
+    // to collapse/stall with different results after progression start.
+    // The engine-owned `real_samples:{id}` ring remains the canonical rolling
+    // average source; this block only exposes the current snapshot plus any
+    // previously materialised average without adding poll-dependent samples.
+    const existingRealActiveAvg = n(progHash.real_active_pos_avg)
+    const existingRealActiveSamples = n(progHash.real_active_pos_samples)
+    const realActivePosAverage = realOpen > 0
+      ? (existingRealActiveSamples > 0 ? existingRealActiveAvg : realOpen)
+      : existingRealActiveAvg
+    const realActivePosSamples = realOpen > 0
+      ? Math.max(1, existingRealActiveSamples)
+      : existingRealActiveSamples
 
-    // ── Live-stage OPEN positions + Set-relation join ────────────────
+    // ── Live-stage OPEN positions + Set-relation join ─────���������───────────
     //
     // The operator asked for a coordination view that identifies which
     // Set each live exchange position came from. The live-stage
@@ -1041,6 +1053,8 @@ export async function GET(
     // occurred when a single-symbol standalone key was compared against
     // the cross-symbol active sum.
     const activeStratEvaluated: Record<string, number> = { base: 0, main: 0, real: 0 }
+    let activeRealInput = 0
+    let activeRealRelatedCreated = 0
     // Hoisted so the raw hash is accessible in the return block for `strategiesActive`.
     let stratActiveHash: Record<string, string> | null = null
     try {
@@ -1053,26 +1067,18 @@ export async function GET(
         ? (_stratActiveHash as Record<string, string>)
         : null
       if (indActiveHash && typeof indActiveHash === "object") {
-        for (const [field, val] of Object.entries(indActiveHash)) {
-          // field shape: "{symbol}:{type}" — split on the LAST colon so
-          // symbols containing colons (none today, but future-proof) survive.
-          const idx = field.lastIndexOf(":")
-          if (idx <= 0) continue
-          const type = field.slice(idx + 1)
-          const numVal = n(val)
-          if (type in activeIndByType) {
-            activeIndByType[type] += numVal
-            // Each non-zero (symbol×type) field == one Set actively
-            // producing qualified entries this cycle. Cardinality is
-            // the operator-asked "Active Progressing Sets" count.
-            if (numVal > 0) activeSetsIndByType[type] += 1
-          }
+        const snapshot = aggregateIndicationSnapshot(indActiveHash as Record<string, string>)
+        for (const type of INDICATION_TYPES) {
+          activeIndByType[type] = snapshot.counts[type] || 0
+          activeSetsIndByType[type] = snapshot.activeSets[type] || 0
         }
       }
       if (stratActiveHash && typeof stratActiveHash === "object") {
         for (const [field, val] of Object.entries(stratActiveHash)) {
-          // Field shape: "{SYMBOL}:{stage}" or "{SYMBOL}:{stage}:evaluated"
-          // e.g. "BTCUSDT:base", "BTCUSDT:base:evaluated", "ETHUSDT:real:evaluated"
+          // Field shape: "{SYMBOL}:{stage}" or Real accounting fields such as
+          // "{SYMBOL}:real:input", "{SYMBOL}:real:relatedCreated",
+          // and "{SYMBOL}:{stage}:evaluated".
+          // e.g. "BTCUSDT:base", "BTCUSDT:base:evaluated", "ETHUSDT:real:relatedCreated"
           // Strip the symbol prefix by slicing from the FIRST colon, not the last.
           // Using lastIndexOf would split "BTCUSDT:base:evaluated" into suffix="evaluated"
           // which never matches "base:evaluated" — the root cause of baseEvaluated=0.
@@ -1088,6 +1094,14 @@ export async function GET(
             activeStratEvaluated[stage] = (activeStratEvaluated[stage] ?? 0) + numVal
             continue
           }
+          if (suffix === "real:input") {
+            activeRealInput += numVal
+            continue
+          }
+          if (suffix === "real:relatedCreated") {
+            activeRealRelatedCreated += numVal
+            continue
+          }
           if (suffix in activeStratByStage) {
             activeStratByStage[suffix] += numVal
             if (numVal > 0) activeSetsStratByStage[suffix] += 1
@@ -1098,7 +1112,7 @@ export async function GET(
     const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
     // Pipeline-aware total: only count REAL stage (final filtered output), not sum of BASE+MAIN+REAL
     // Each strategy survives through the cascade filter, not added at each stage.
-    const activeStratTotal = activeStratByStage.real || strategiesTotal
+    let activeStratTotal = activeStratByStage.real || strategiesTotal
     const activeSetsIndTotal   = Object.values(activeSetsIndByType).reduce((s, v) => s + v, 0)
     // Only count distinct REAL-stage sets progressing, not sum across stages
     const activeSetsStratTotal = activeSetsStratByStage.real || 0
@@ -1149,6 +1163,56 @@ export async function GET(
         stratEvaluated[type] = fromActiveEval > 0 ? fromActiveEval : 0
       })
     )
+    // Enforce cascade invariants for all public progression counters:
+    // BASE expands into MAIN variants, REAL is a filtered subset of MAIN, and
+    // LIVE is a dispatch subset of REAL. During live runs, per-stage writers can
+    // briefly update different fields in separate Redis calls, so a stats read
+    // may observe `real > main` (or `live > real`) for one request. Normalize the
+    // snapshot here instead of exposing an impossible state to the dashboard,
+    // validation scripts, and operators watching long-running progressions.
+    // BASE expands into MAIN variants, REAL filters MAIN inputs and may also
+    // create additional Real Sets through related/axis fan-out, and LIVE is a
+    // dispatch subset of REAL. During live runs, per-stage writers can briefly
+    // update different fields in separate Redis calls, so a stats read may
+    // observe impossible overages. Normalize only when REAL exceeds the
+    // pipeline-aware ceiling: main inputs + Real Sets created at the Real stage.
+    // `strategies_real_related_created` is cumulative, so do not use it as
+    // the per-snapshot allowance; `strategies_real_last_created` is the
+    // coordinator's current-cycle related/axis-created Real fan-out.
+    const realRelatedCreatedForCurrentSnapshot = n(progHash.strategies_real_last_created)
+    const realCeiling = stratCounts.main + realRelatedCreatedForCurrentSnapshot
+    if (stratCounts.main > 0 && stratCounts.real > realCeiling) {
+      throttledStatsWarn(
+        `${connectionId}:real-ceiling`,
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > ` +
+        `main (${stratCounts.main}) + realRelatedCreated (${realRelatedCreatedForCurrentSnapshot}). ` +
+        `Clamping real to pipeline-aware ceiling (${realCeiling}).`,
+      )
+      stratCounts.real = realCeiling
+    }
+    // Enforce cascade invariants for public progression counters. REAL may fan
+    // out from upstream PF-eligible Main input, so real passed output can exceed
+    // main as long as it does not exceed input + real:relatedCreated. During live
+    // runs, per-stage writers can briefly update different fields in separate
+    // Redis calls, so normalize only truly impossible snapshots.
+    const realUpstreamInput = activeRealInput || stratCounts.main
+    const realMaxAfterFanOut = realUpstreamInput + activeRealRelatedCreated
+    if (realUpstreamInput > 0 && realMaxAfterFanOut > 0 && stratCounts.real > realMaxAfterFanOut) {
+      throttledStatsWarn(
+        `${connectionId}:real-fanout`,
+        `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > Real max after fan-out ` +
+        `(${realMaxAfterFanOut}; main=${stratCounts.main}, input=${activeRealInput}, ` +
+        `relatedCreated=${activeRealRelatedCreated}). Clamping real to fan-out max.`,
+      )
+      stratCounts.real = realMaxAfterFanOut
+      activeStratByStage.real = Math.min(activeStratByStage.real || 0, stratCounts.real)
+      activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
+    }
+    if (stratCounts.real > 0 && stratCounts.live > stratCounts.real) {
+      stratCounts.live = stratCounts.real
+      activeStratByStage.live = Math.min(activeStratByStage.live || 0, stratCounts.live)
+      activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
+    }
     // ── Pipeline-aware "total strategies" ────────────────────────────────
     // Base → Main → Real → Live is a CASCADE FILTER (eval → filter → adjust).
     // Each stage operates on the output of the previous stage, so the SAME
@@ -1575,16 +1639,17 @@ export async function GET(
     }
 
     // ── SINGLE closed-archive fetch shared by stratDetail.live and
-    //    closedPositionsForHistory (below) ───��───────���────────────────────
-    // Previously the archive was fetched TWICE:
-    //   1. lrange(0, 199) for stratDetail.live PF/hold/ROI numbers.
-    //   2. lrange(0, 499) for closedPositionsForHistory rows + perf tiers.
-    // Both fetches scanned the SAME key and parsed the SAME JSON.
-    // Now we do one 0–499 lrange here (outer scope), share the parsed
-    // array across both consumers, and slice as needed. This removes one
-    // full round-trip + 200–500 GET fan-outs from every /stats call.
+    //    closedPositionsForHistory (below) ─────────────────────────────────
+    // CRITICAL FIX: Fetch from BOTH Redis live positions AND database persisted
+    // positions to ensure complete trade history. Previously only Redis was checked,
+    // missing positions that were synced to the database by data-cleanup-manager.
+    // Now we fetch from Redis first (for freshest data), then supplement from
+    // database to capture any that may have been archived/cleaned.
     const sharedClosedParsed: Array<Record<string, any>> = []
+    const seenIds = new Set<string>()
+    
     try {
+      // Fetch from Redis live:positions:${connectionId}:closed list
       const closedIds = ((await client
         .lrange(`live:positions:${connectionId}:closed`, 0, 499)
         .catch(() => [])) || []) as string[]
@@ -1593,9 +1658,49 @@ export async function GET(
       )
       for (const raw of rawList) {
         if (!raw) continue
-        try { sharedClosedParsed.push(JSON.parse(raw as string)) } catch { /* skip malformed */ }
+        try {
+          const pos = JSON.parse(raw as string)
+          sharedClosedParsed.push(pos)
+          if (pos.id) seenIds.add(pos.id)
+        } catch { /* skip malformed */ }
       }
     } catch { /* archive empty */ }
+    
+    // Supplement with positions from database that may have been synced and not
+    // in the Redis live list (e.g., archived/cleaned or from previous sessions)
+    try {
+      const { query } = await import("@/lib/db")
+      const dbPositions = await query(
+        `SELECT 
+          id, symbol, direction, entry_price as "entryPrice", exit_price as "exitPrice",
+          quantity, realized_pnl as "realizedPnL", opened_at as "openedAt", 
+          closed_at as "closedAt", status
+        FROM positions 
+        WHERE connection_id = $1 AND status = 'closed'
+        ORDER BY closed_at DESC LIMIT 500`,
+        [connectionId]
+      )
+      for (const pos of dbPositions || []) {
+        // Skip if already in Redis (avoid duplicates)
+        if (pos.id && seenIds.has(pos.id)) continue
+        // Only add if it has minimum required fields for display
+        if (pos.symbol && pos.direction && pos.entryPrice && pos.realizedPnL !== null) {
+          sharedClosedParsed.push({
+            id: pos.id || "",
+            symbol: pos.symbol,
+            direction: pos.direction,
+            entryPrice: pos.entryPrice,
+            exitPrice: pos.exitPrice || 0,
+            quantity: pos.quantity,
+            realizedPnL: pos.realizedPnL,
+            openedAt: pos.openedAt ? new Date(pos.openedAt).getTime() : 0,
+            closedAt: pos.closedAt ? new Date(pos.closedAt).getTime() : 0,
+            status: pos.status,
+          })
+          if (pos.id) seenIds.add(pos.id)
+        }
+      }
+    } catch { /* database query failed */ }
 
     type DispatchSummaryRow = {
       bucket: string
@@ -2083,10 +2188,11 @@ export async function GET(
       den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
     // CUMULATIVE FUNNEL (operator spec): each stage's Eval% = sets that
     // survived/evaluated at the stage ÷ the full candidate pool considered at
-    // the stage, where the pool = (sets PASSED FORWARD from the previous stage)
-    // + (sets ADDITIONALLY CREATED via variant/axis fan-out at this stage).
+    // the stage. Main computes that pool as input + related fan-out. Real stores
+    // the unified pool directly in `strategies_real_evaluated`, matching
+    // `strategy_detail:*:real.evaluated`.
     //   strategies_{stage}_total           = stage OUTPUT (promoted / passed)
-    //   strategies_{stage}_evaluated        = stage INPUT  (passed forward in)
+    //   strategies_{stage}_evaluated        = stage evaluated pool
     //   strategies_{stage}_related_created  = additionally created at the stage
     const _baseOutput      = Number(progHash.strategies_base_total            || "0")
     const _baseEvaluated   = Number(progHash.strategies_base_evaluated        || "0")
@@ -2095,23 +2201,22 @@ export async function GET(
     const _mainCreated     = Number(progHash.strategies_main_related_created  || "0")
     const _realOutput      = Number(progHash.strategies_real_total            || "0")
     const _realInput       = Number(progHash.strategies_real_evaluated        || "0")
-    const _realCreated     = Number(progHash.strategies_real_related_created  || "0")
     // base = evaluated ÷ overall generated (pipeline entry — every Base Set is
     //        evaluated, so ~100% when any exist, expressed as the true ratio).
     // main = main output ÷ (passed-forward-from-base + additionally-created-at-main)
-    // real = real output ÷ (passed-forward-from-main + additionally-created-at-real)
+    // real = real output ÷ Real evaluated pool (already includes Real fan-out)
     // live evalPct = sets dispatched this cycle / real sets available for dispatch
     const _liveDispatched = stratCounts.live || 0
     const _liveBase       = stratCounts.real  || 0
     const stageEvalPercent = {
       base: _pct(_baseEvaluated, _baseOutput),
       main: _pct(_mainOutput, _mainInput + _mainCreated),
-      real: _pct(_realOutput, _realInput + _realCreated),
+      real: _pct(_realOutput, _realInput),
       // Live: what fraction of Real-stage survivors were dispatched to exchange
       live: _liveBase > 0 ? Math.min(100, Math.round((_liveDispatched / _liveBase) * 1000) / 10) : 0,
     }
 
-    // ── REAL AVERAGES ────────────────────────────────────────────────────────
+    // ── REAL AVERAGES ────────────��───────────────────────────────────────────
     // Average real_samples:{id} ring buffer over 5-min window. Falls back to
     // live snapshot when no in-window samples exist (cold boot / fresh session).
     const _REAL_AVG_WINDOW_MS = 5 * 60 * 1000
@@ -2417,13 +2522,8 @@ export async function GET(
             // Validate constraint: eval <= sets
             const base = stratCounts.base || 0
             const eval_val = stratEvaluated.base || 0
-            if (eval_val > base && base > 0) {
-              console.warn(
-                `[STATS-VALIDATION] ${connectionId}: baseEvaluated (${eval_val}) > base (${base}). ` +
-                `Clamping to base.`,
-              )
-              return base
-            }
+            // Transient read-race: clamp silently (expected, not a bug).
+            if (eval_val > base && base > 0) return base
             return eval_val
           })(),
           mainEvaluated: (() => {
@@ -2439,22 +2539,28 @@ export async function GET(
             // interpretation), treat the main count itself as the evaluated count:
             // all main sets undergo full PF/DDT evaluation.
             if (main > 0 && eval_val < main) return main
-            if (eval_val > main && main > 0) {
-              console.warn(
-                `[STATS-VALIDATION] ${connectionId}: mainEvaluated (${eval_val}) > main (${main}). ` +
-                `Clamping to main.`,
-              )
-              return main
-            }
+            // Transient read-race: clamp silently (expected, not a bug).
+            if (eval_val > main && main > 0) return main
             return eval_val || main
           })(),
           realEvaluated: (() => {
             // NOTE: realEvaluated = Main sets that ENTERED Real-stage PF evaluation
             // (the INPUT count, written as mainPFEligible by the coordinator).
             // stratCounts.real = Real sets that PASSED and survived to dispatch
-            // (the OUTPUT count). Input is always >= output after filtering, so
-            // realEvaluated > real is CORRECT and expected — do NOT clamp here.
+            // (the OUTPUT count), plus any related/axis-created fan-out that
+            // the Real stage materialized for this snapshot. With fan-out
+            // enabled, output can legitimately exceed the upstream input by
+            // that related-created amount, so do NOT clamp realEvaluated here.
             return stratEvaluated.real || 0
+            // NOTE: Real accounting has three meanings:
+            // - real:input = upstream Main PF-eligible input before Real fan-out.
+            // - real:relatedCreated = current-cycle Real fan-out added to input.
+            // - stratCounts.real = Real passed output after PF/DDT filtering.
+            // Public realEvaluated is every Real Set considered after fan-out, so
+            // prefer input + relatedCreated and fall back to the writer's evaluated
+            // field for mixed deploys. It may exceed passed output; do not clamp.
+            const afterFanOut = activeRealInput + activeRealRelatedCreated
+            return afterFanOut || stratEvaluated.real || 0
           })(),
         },
       },
@@ -2778,6 +2884,17 @@ export async function GET(
                 : Math.round(liveAggTotalMarginUsd * 100) / 100
             })()
 
+        // Real-stage active validated positions can be represented either by
+        // persisted RealPosition rows (`realOpen`) or, for coordinator-only
+        // strategy validation cycles, by Real detail's setsRunningNow. Use the
+        // validated Real-stage snapshot as fallback so the UI does not show 0
+        // active Real positions while Real Sets are actively coordinating.
+        const realDetailRunning = n(stratDetail.real?.setsRunningNow)
+        const realValidatedActivePositions = realOpen || realDetailRunning || 0
+        const realActiveAvgDisplay = realValidatedActivePositions > 0 && realActivePosSamples === 0
+          ? realValidatedActivePositions
+          : realActivePosAverage
+
         // Full Exchange Position Details per live position. Contains
         // everything the operator needs to evaluate trade health
         // (leverage, margin at risk, liquidation distance, SL/TP,
@@ -2835,14 +2952,14 @@ export async function GET(
             topSets:      pseudoTopSets,             // { setKey, count }
           },
           real: {
-            open:         realOpen,                  // count only
+            open:         realValidatedActivePositions, // active validated Real-stage position count
             // Running average of currently-active validated Real
             // positions, accumulated across all /stats fetches for this
             // connection. UNBOUNDED — does not share the per-set 250
             // entry cap. See "Running-avg of active validated Real
             // positions" block above for the storage layout. Resets
             // when ResetDB clears `progression:{id}`.
-            activeAvg:    Math.round(realActivePosAverage * 100) / 100,
+            activeAvg:    Math.round(realActiveAvgDisplay * 100) / 100,
             activeSamples: realActivePosSamples,
           },
           live: {

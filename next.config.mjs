@@ -1,4 +1,35 @@
-// Migration 025 deadlock fix applied — forces full server restart
+// Migration 028 — high-perf: axis 800×, real 5000×, rssHard 82%, BingX 5 concurrent, stopSem 6
+
+const localServerActionAllowedOrigins = ["localhost:3002", "127.0.0.1:3002"]
+
+function normalizeAllowedOrigin(value) {
+  const trimmed = value?.trim()
+  if (!trimmed) return []
+
+  try {
+    return [new URL(trimmed).host]
+  } catch {
+    return [trimmed.replace(/^https?:\/\//, "").replace(/\/.*$/, "")]
+  }
+}
+
+function getServerActionAllowedOrigins() {
+  const configuredOrigins = [
+    process.env.NEXT_PUBLIC_APP_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    process.env.SERVER_ACTION_ALLOWED_ORIGINS,
+  ]
+    .flatMap((value) => value?.split(",") ?? [])
+    .flatMap(normalizeAllowedOrigin)
+    .filter(Boolean)
+
+  const origins =
+    process.env.NODE_ENV === "production"
+      ? configuredOrigins
+      : [...configuredOrigins, ...localServerActionAllowedOrigins]
+
+  return [...new Set(origins)]
+}
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
@@ -20,6 +51,17 @@ const nextConfig = {
   // class-transformer). Webpack bundling fails on those optional requires;
   // loading via Node require at runtime handles them gracefully.
   serverExternalPackages: ["redis", "@redis/client", "bingx-api"],
+  serverExternalPackages: [
+    "redis",
+    "@redis/client",
+    // bingx-api ships a NestJS module tree (@nestjs/common) whose optional
+    // deps (class-validator/class-transformer) break webpack bundling.
+    // Keep it external so Node resolves it at runtime instead.
+    "bingx-api",
+    "@nestjs/common",
+    "class-validator",
+    "class-transformer",
+  ],
   // ── Tier-3 perf: prod-only console removal ───────────────────────
   // Strips `console.log` / `console.debug` / `console.info` from
   // production client + server bundles, keeping `console.error` and
@@ -36,7 +78,7 @@ const nextConfig = {
   },
   experimental: {
     serverActions: {
-      allowedOrigins: ["*"],
+      allowedOrigins: getServerActionAllowedOrigins(),
     },
     // instrumentation.ts is auto-discovered by Next.js and remains the
     // deterministic server-side boot sequence entry point.
@@ -72,26 +114,6 @@ const nextConfig = {
   },
   webpack: (config, { isServer, nextRuntime, webpack }) => {
     config.resolve = config.resolve || {}
-    config.resolve.alias = {
-      ...(config.resolve.alias || {}),
-      diagnostics_channel: false,
-      "node:diagnostics_channel": false,
-      net: false,
-      "node:net": false,
-      tls: false,
-      "node:tls": false,
-      dns: false,
-      "dns/promises": false,
-      "node:dns": false,
-      "node:dns/promises": false,
-      assert: false,
-      "node:assert": false,
-      perf_hooks: false,
-      "node:perf_hooks": false,
-      events: false,
-      "node:events": false,
-      "@node-rs/xxhash": false,
-    }
     config.plugins = config.plugins || []
 
     // Strip the `node:` URI scheme so Webpack 5 can resolve Node built-ins
@@ -104,6 +126,26 @@ const nextConfig = {
 
     // Browser bundle: alias Node built-ins to empty stubs.
     if (!isServer) {
+      config.resolve.alias = {
+        ...(config.resolve.alias || {}),
+        diagnostics_channel: false,
+        "node:diagnostics_channel": false,
+        net: false,
+        "node:net": false,
+        tls: false,
+        "node:tls": false,
+        dns: false,
+        "dns/promises": false,
+        "node:dns": false,
+        "node:dns/promises": false,
+        assert: false,
+        "node:assert": false,
+        perf_hooks: false,
+        "node:perf_hooks": false,
+        events: false,
+        "node:events": false,
+        "@node-rs/xxhash": false,
+      }
       config.resolve.fallback = {
         ...(config.resolve.fallback || {}),
         crypto: false,
@@ -115,9 +157,21 @@ const nextConfig = {
     }
 
     // Edge runtime: stub every Node built-in that server-side libs import.
-    // The instrumentation.ts runtime guard ensures stubs are never executed.
+    // IMPORTANT: do not apply these aliases to the normal Node server bundle.
+    // Production webpack compilation is the only mode that bundles route code;
+    // aliasing `net`/`tls`/`dns`/`events` to `false` there makes Redis,
+    // exchange SDKs, and Node HTTP clients resolve to empty modules. Dev mode
+    // does not hit that bundled path, which is why production alone saw
+    // stalls/crashes. Keep the stubs scoped to browser/edge only.
     if (nextRuntime === "edge") {
       const nodeBuiltinsToStub = [
+        "diagnostics_channel",
+        "net",
+        "tls",
+        "dns",
+        "dns/promises",
+        "assert",
+        "perf_hooks",
         "crypto",
         "fs",
         "fs/promises",

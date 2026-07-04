@@ -24,6 +24,7 @@ type HealingSweepOptions = {
 type HealingSweepResult = {
   startedCount: number
   eligibleCount: number
+  queuedRefreshProcessedCount?: number
   skipped?: string
   error?: string
 }
@@ -51,11 +52,67 @@ function getGlobalOperatorIntent(state: Record<string, string> | null | undefine
 }
 
 function shouldArmInProcessMonitor(): boolean {
-  // Timers are useful for long-lived dedicated workers. Hosted/serverless web
-  // processes should rely on the cron route because intervals are not durable
-  // after the request completes and can add avoidable UI latency.
+  // Long-lived Node production/dev processes can own in-process engine starts by
+  // default. Serverless/edge deployments still rely on the awaited healing sweep
+  // and deployment cron because timers are not durable after responses return.
+  if (process.env.DISABLE_TRADE_ENGINE_AUTOSTART === "1") return false
   if (process.env.VERCEL === "1" || process.env.NEXT_RUNTIME === "edge") return false
-  return process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || process.env.ENABLE_IN_PROCESS_CONTINUITY === "1"
+  return true
+}
+
+async function getQueuedRefreshRequestList() {
+  const { getQueuedEngineRefreshRequests } = await import("./engine-refresh-queue")
+  return getQueuedEngineRefreshRequests().catch(() => [] as Awaited<ReturnType<typeof getQueuedEngineRefreshRequests>>)
+}
+
+async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnType<typeof loadTradeEngineCoordinator>>): Promise<number> {
+  const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest } = await import("./engine-refresh-queue")
+  const { getConnection } = await loadRedisDb()
+
+  const refreshRequests = await getQueuedEngineRefreshRequests()
+  let processed = 0
+
+  for (const { request } of refreshRequests) {
+    const requestTime = new Date(request.timestamp).getTime()
+    if (!Number.isFinite(requestTime) || Date.now() - requestTime >= 120_000) {
+      console.log(`[v0] [AutoStart] Dropping expired refresh request for ${request.connectionId}`)
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
+      continue
+    }
+
+    const connection = await getConnection(request.connectionId)
+    const currentVersion = String(connection?.state_switch_version ?? 0)
+    const requestedVersion = String(request.state_switch_version ?? "")
+    if (!connection || currentVersion !== requestedVersion) {
+      console.log(
+        `[v0] [AutoStart] Ignoring stale refresh request for ${request.connectionId}: ` +
+          `requested state_switch_version=${requestedVersion}, current=${currentVersion}`,
+      )
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
+      continue
+    }
+
+    console.log(
+      `[v0] [AutoStart] Processing queued refresh request for ${request.connectionId}: ${request.action} ` +
+        `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
+    )
+    await clearEngineRefreshRequest(request.connectionId)
+    processed++
+
+    if (request.action === "stop") {
+      await coordinator.stopEngine(request.connectionId, { operatorRequested: true })
+    } else if (request.action === "start") {
+      if (!coordinator.isEngineRunning?.(request.connectionId)) {
+        await coordinator.startMissingEngines([connection])
+      }
+    } else {
+      await coordinator.applyPendingChangesNow?.(request.connectionId)
+    }
+  }
+
+  return processed
 }
 
 /**
@@ -67,9 +124,9 @@ function shouldArmInProcessMonitor(): boolean {
  */
 export async function initializeTradeEngineAutoStart(): Promise<void> {
   if (autoStartInitialized) {
-    console.log("[v0] [Auto-Start] Already initialized, skipping")
+    console.warn("[v0] [Auto-Start] Already initialized, skipping")
     if (!autoStartTimer && shouldArmInProcessMonitor()) {
-      console.log("[v0] [Auto-Start] Monitor missing after init; restarting monitor")
+      console.warn("[v0] [Auto-Start] Monitor missing after init; restarting monitor")
       startConnectionMonitoring()
     }
     return
@@ -89,9 +146,23 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
   try {
     console.log("[v0] [Auto-Start] Initializing trade-engine synchronization...")
 
-    const { initRedis, ensureUniqueSiteInstance } = await loadRedisDb()
+    const { initRedis, ensureUniqueSiteInstance, getRedisClient } = await loadRedisDb()
     await initRedis()
     await ensureUniqueSiteInstance().catch(() => {})
+
+    // LIVE TRADING FIX: Clear stale operator_intent from previous runs
+    // If intent is explicitly "stopped", delete it so it defaults to "running"
+    // This ensures engines start automatically on each new deployment/restart
+    try {
+      const client = getRedisClient()
+      const state = await client.hgetall("trade_engine:global")
+      if (state?.operator_intent === "stopped") {
+        console.log("[v0] [Auto-Start] Clearing stale operator_intent='stopped' to enable autostart")
+        await client.hdel("trade_engine:global", "operator_intent")
+      }
+    } catch (redisErr) {
+      console.warn("[v0] [Auto-Start] Failed to clear stale intent:", redisErr)
+    }
 
     autoStartInitialized = true
     await runTradeEngineHealingSweep({ isStartup: true, armTimer: true })
@@ -131,9 +202,9 @@ export async function runTradeEngineHealingSweep(
 
 async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOptions): Promise<HealingSweepResult> {
   try {
-    const { initRedis, getRedisClient, getAllConnections } = await loadRedisDb()
+    const { initRedis, getRedisClient, getAssignedAndEnabledConnections, getConnection } = await loadRedisDb()
     const { loadSettingsAsync } = await import("./settings-storage")
-    const { isConnectionEligibleForEngine } = await import("./connection-state-utils")
+    const { writeTradeEngineWorkerHeartbeat } = await import("./trade-engine-worker-heartbeat")
 
     await initRedis()
     const client = getRedisClient()
@@ -142,34 +213,60 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
 
     if (operatorIntent === "paused") {
       if (isStartup) {
-        console.log("[v0] [AutoStart] Startup sweep skipped: global coordinator is paused")
+        console.warn("[v0] [AutoStart] Startup sweep skipped: global coordinator is paused")
       }
       return { startedCount: 0, eligibleCount: 0, skipped: "paused" }
     }
 
-    if (operatorIntent !== "running") {
+    // PROD FIX: Uninitialized operator_intent now defaults to "running" (changed from "stopped")
+    // Only explicitly stopped/paused intents block autostart
+    const shouldRun = operatorIntent !== "stopped"
+    if (!shouldRun) {
       if (isStartup) {
-        console.log(
-          `[v0] [AutoStart] Startup sweep skipped: global engine not running (intent="${operatorIntent || "empty"}"). ` +
-            "Engine will start only when operator clicks Start.",
+        console.warn(
+          `[v0] [AutoStart] Startup sweep skipped: operator_intent="${operatorIntent}". ` +
+            "Engine will start only when operator explicitly resumes.",
         )
       }
-      return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent || "not_running" }
+      return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent }
     }
 
-    const connections = await getAllConnections()
-    if (!Array.isArray(connections)) {
-      console.warn("[v0] [AutoStart] Connections not array, skipping sweep")
+    const coordinator = await loadTradeEngineCoordinator()
+    const queuedRefreshRequests = await getQueuedRefreshRequestList()
+    const stopRequests = queuedRefreshRequests.filter(({ request }) => request.action === "stop")
+    for (const { request } of stopRequests) {
+      await coordinator.stopEngine(request.connectionId, { operatorRequested: true }).catch((stopErr: unknown) => {
+        console.warn(
+          `[v0] [AutoStart] Immediate stop failed for ${request.connectionId}:`,
+          stopErr instanceof Error ? stopErr.message : String(stopErr),
+        )
+      })
+    }
+
+    const eligibleConnections = await getAssignedAndEnabledConnections()
+    for (const { request } of queuedRefreshRequests) {
+      if (request.action !== "start") continue
+      if (eligibleConnections.some((connection: any) => connection.id === request.connectionId)) continue
+      const connection = await getConnection(request.connectionId).catch(() => null)
+      if (connection) eligibleConnections.push(connection)
+    }
+
+    if (!Array.isArray(eligibleConnections)) {
+      console.warn("[v0] [AutoStart] Eligible connections not array, skipping sweep")
       return { startedCount: 0, eligibleCount: 0, skipped: "connections_not_array" }
     }
-
-    const eligibleConnections = connections.filter((connection) => isConnectionEligibleForEngine(connection))
 
     // Best-effort warm load. Engines still read Redis settings while ticking.
     await loadSettingsAsync().catch(() => {})
 
-    const coordinator = await loadTradeEngineCoordinator()
+    const queuedRefreshProcessedCount = await processQueuedEngineRefreshRequests(coordinator)
     const startedCount = await coordinator.startMissingEngines(eligibleConnections)
+
+    const activeEngineCount = typeof coordinator.getActiveEngineCount === "function" ? coordinator.getActiveEngineCount() : 0
+    if (coordinator.isRunning() || activeEngineCount > 0) {
+      await writeTradeEngineWorkerHeartbeat(client, `auto-start:${process.pid}`)
+    }
+
     if (startedCount > 0 || isStartup) {
       console.log(
         `[v0] [AutoStart] Healing sweep: ${startedCount} engines started ` +
@@ -177,7 +274,7 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       )
     }
 
-    return { startedCount, eligibleCount: eligibleConnections.length }
+    return { startedCount, eligibleCount: eligibleConnections.length, queuedRefreshProcessedCount }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (message.includes("Redis credentials")) {

@@ -1,3 +1,4 @@
+import { EventEmitter } from "events"
 import { initRedis, getSettings, setSettings, getConnection, getRedisClient } from "@/lib/redis-db"
 
 /**
@@ -7,18 +8,38 @@ import { initRedis, getSettings, setSettings, getConnection, getRedisClient } fr
  * When a connection's settings are updated, this module:
  * 1. Writes a change event to Redis so engines know to reload
  * 2. Determines if the change requires an engine restart vs hot reload
- * 3. Provides a polling mechanism for engines to detect changes
+ * 3. Emits an in-process event so local engines apply changes without timers
  */
 
 // Fields that require a full engine restart when changed
 const RESTART_REQUIRED_FIELDS = [
   "api_key", "api_secret", "exchange", "is_testnet",
-  "api_type", "api_subtype", "is_enabled", "progression_epoch",
-  "api_type", "api_subtype", "is_enabled",
+  "api_type", "api_subtype", "progression_epoch",
+  "api_type", "api_subtype",
   // Browser/dialog saves must not stop or restart a live engine. Symbol and
   // mode changes are handled by the hot-reload path, which invalidates symbol
   // caches, refreshes per-cycle settings, and lets progression recoordination
   // update Redis state without tearing down live trade.
+]
+
+// Settings that alter the strategy/progression graph must trigger a durable
+// progression reload/recoordination signal. They should not tear down a live
+// engine process unless a credential/runtime identity field also changed.
+const PROGRESSION_RESTART_FIELDS = [
+  "connection_settings", "strategies", "indications", "active_indications",
+  "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
+  "is_live_trade", "is_preset_trade", "connection_method",
+  "live_volume_factor", "preset_volume_factor", "volume_factor_live",
+  "volume_factor_preset", "volume_step_ratio", "volume_factor",
+  "profitFactorMin", "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+  "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+  "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
+  "coordination_settings", "variantTrailingEnabled", "variantBlockEnabled", "variantDcaEnabled",
+  "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+  "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+  "blockVolumeRatio", "blockMaxStack", "blockPauseCountRatio",
+  "minimal_step_count", "minimalStepCount", "minStep",
+  "prevPosWindow", "prevPosMinCount", "mainEvalPosCount", "realEvalPosCount",
 ]
 
 // Fields that can be hot-reloaded without restart
@@ -27,7 +48,7 @@ const HOT_RELOAD_FIELDS = [
   "connection_settings", "strategies", "indications",
   "active_indications", "preset_type",
   "symbols", "active_symbols", "force_symbols", "symbol_count", "symbol_order",
-  "is_live_trade", "is_preset_trade", "connection_method",
+  "is_enabled", "is_enabled_dashboard", "is_live_trade", "is_preset_trade", "connection_method",
   "live_volume_factor", "preset_volume_factor", "volume_factor_live",
   "volume_factor_preset", "volume_step_ratio",
   "profitFactorMin", "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
@@ -49,6 +70,34 @@ export interface SettingsChangeEvent {
   timestamp: string
   previousValues?: Record<string, unknown>
   newValues?: Record<string, unknown>
+}
+
+const SETTINGS_CHANGED_EVENT = "settings-changed"
+const settingsChangeBus = new EventEmitter()
+settingsChangeBus.setMaxListeners(500)
+
+export function onSettingsChanged(
+  connectionId: string,
+  handler: (event: SettingsChangeEvent) => void | Promise<void>,
+): () => void {
+  const listener = (event: SettingsChangeEvent) => {
+    if (event.connectionId !== connectionId) return
+    try {
+      void Promise.resolve(handler(event)).catch((error) => {
+        console.warn(
+          `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
+          error instanceof Error ? error.message : String(error),
+        )
+      })
+    } catch (error) {
+      console.warn(
+        `[v0] [SettingsCoordinator] In-process settings event handler failed for ${connectionId}:`,
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
+  settingsChangeBus.on(SETTINGS_CHANGED_EVENT, listener)
+  return () => settingsChangeBus.off(SETTINGS_CHANGED_EVENT, listener)
 }
 
 async function clearEngineRestartFlags(connectionId: string): Promise<void> {
@@ -78,10 +127,14 @@ async function clearEngineRestartFlags(connectionId: string): Promise<void> {
  * Determine the type of change based on which fields were modified
  */
 export function classifyChange(changedFields: string[]): ChangeType {
-  if (changedFields.some(f => RESTART_REQUIRED_FIELDS.includes(f))) {
+  const normalized = changedFields.flatMap((field) => {
+    const f = String(field || "")
+    return f.startsWith("connection_settings.") ? [f, f.slice("connection_settings.".length)] : [f]
+  })
+  if (normalized.some(f => RESTART_REQUIRED_FIELDS.includes(f))) {
     return "restart"
   }
-  if (changedFields.some(f => HOT_RELOAD_FIELDS.includes(f))) {
+  if (normalized.some(f => HOT_RELOAD_FIELDS.includes(f) || PROGRESSION_RESTART_FIELDS.includes(f))) {
     return "reload"
   }
   return "cosmetic"
@@ -172,6 +225,34 @@ export async function notifySettingsChanged(
       console.log(`[v0] [SettingsCoordinator] Engine hot-reload flagged for ${connectionId}`)
     }
   }
+
+  // Event-state fast path: wake the owning in-process coordinator immediately
+  // for reload/progression/coordination changes instead of waiting for the
+  // durable queue drain or a continuity sweep. This only targets the affected connection;
+  // the durable settings_change envelope above remains the cross-worker source
+  // of truth.
+  try {
+    const connection = await getConnection(connectionId).catch(() => null)
+    const { queueEngineRefreshRequest } = await import("@/lib/engine-refresh-queue")
+    await queueEngineRefreshRequest({
+      connectionId,
+      action: changeType === "restart" ? "restart" : "refresh",
+      state_switch_version: String((connection as any)?.state_switch_version ?? 0),
+      reason: `settings_${changeType}:${changedFields.slice(0, 6).join(",")}`,
+      timestamp: new Date().toISOString(),
+    })
+  } catch (eventErr) {
+    console.warn(
+      `[v0] [SettingsCoordinator] Immediate event-state refresh failed for ${connectionId}:`,
+      eventErr instanceof Error ? eventErr.message : String(eventErr),
+    )
+  }
+
+  // Emit only after all durable state writes above have completed. The
+  // in-process engine subscriber may immediately consume and clear the pending
+  // settings_change envelope; emitting earlier can race with reload_required /
+  // restart_required state writes and leave stale flags behind.
+  settingsChangeBus.emit(SETTINGS_CHANGED_EVENT, event)
 
   return event
 }

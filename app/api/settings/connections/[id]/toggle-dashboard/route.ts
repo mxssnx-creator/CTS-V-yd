@@ -6,11 +6,27 @@ import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { isTruthyFlag, parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
+import { currentStateSwitchVersion, nextStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
+import { buildMissingTradeEngineWorkerDiagnostic } from "@/lib/trade-engine-worker-heartbeat"
 
 // POST toggle connection active status (inserted/enabled) - INDEPENDENT from Settings
 // When enabling, also triggers engine start for this connection
 export const dynamic = "force-dynamic"
 export const maxDuration = 15
+
+async function queueCoordinatorRefresh(connectionId: string, action: "start" | "stop", reason: string, stateSwitchVersion?: string) {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    connectionId,
+    action,
+    reason,
+    state_switch_version: stateSwitchVersion || null,
+  }
+  await Promise.all([
+    setSettings("engine_coordinator:refresh_requested", payload),
+    setSettings(`engine_coordinator:refresh_requested:${connectionId}`, payload),
+  ])
+}
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -82,20 +98,24 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     let updatedConnection: any
     let engineAction: "start" | "stop" | null = null
     
+    let stateSwitchVersion = currentStateSwitchVersion(connection)
     if (needsUpdate) {
       if (isRemoval) {
         // Remove from Main Connections completely - unassign
-        updatedConnection = buildMainConnectionRemoveUpdate(connection)
+        stateSwitchVersion = nextStateSwitchVersion(connection)
+        updatedConnection = { ...buildMainConnectionRemoveUpdate(connection), state_switch_version: stateSwitchVersion }
         engineAction = "stop"
         console.log(`[v0] [Toggle] REMOVING: main_assigned=false, main_enabled=false (complete unassignment)`)
       } else if (enableMain) {
         // Enable in Main Connections - use clean helper
-        updatedConnection = buildMainConnectionEnableUpdate(connection)
+        stateSwitchVersion = nextStateSwitchVersion(connection)
+        updatedConnection = { ...buildMainConnectionEnableUpdate(connection), state_switch_version: stateSwitchVersion }
         engineAction = "start"
         console.log(`[v0] [Toggle] ENABLING: main_assigned=true, main_enabled=true (engine will process)`)
       } else {
         // Disable in Main Connections - use clean helper  
-        updatedConnection = buildMainConnectionDisableUpdate(connection)
+        stateSwitchVersion = nextStateSwitchVersion(connection)
+        updatedConnection = { ...buildMainConnectionDisableUpdate(connection), state_switch_version: stateSwitchVersion }
         engineAction = "stop"
         console.log(`[v0] [Toggle] DISABLING: main_enabled=false (engine will stop)`)
       }
@@ -143,14 +163,29 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       }
     }
 
-    // Save connection state only if state changed
+    // Save connection state only if state changed. Stamp a per-connection
+    // switch generation so status/progression readers and coordinator workers
+    // can distinguish this operator intent from stale queued start/stop work.
     if (needsUpdate && updatedConnection) {
+      stateSwitchVersion = `${Date.now()}`
+      updatedConnection = {
+        ...updatedConnection,
+        state_switch_version: stateSwitchVersion,
+        state_switch_action: enableMain ? "enable" : "disable",
+        state_switch_at: new Date().toISOString(),
+      }
       await updateConnection(resolvedId, updatedConnection)
+      await setSettings(`connection_state_switch:${resolvedId}`, {
+        version: stateSwitchVersion,
+        action: enableMain ? "enable" : "disable",
+        updated_at: updatedConnection.state_switch_at,
+      }).catch(() => undefined)
       console.log(`[v0] [Toggle] Updated ${connection.name} (resolved id: ${resolvedId})`)
     }
 
     // Trigger engine action based on toggle state
     let engineStatus = "unchanged"
+    let engineWarning: string | null = null
     if (engineAction === "start") {
       try {
         // Log progression event for UI feedback
@@ -185,11 +220,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
         }
         
-        // Update global engine state. A real explicit enable action is allowed
-        // to start the coordinator because `startEngine()` refuses to start
-        // when `trade_engine:global.status` is not "running". No-op dashboard
-        // reads/repeats still never reach this branch because engineAction is
-        // only set for an explicit enable state transition/re-enable request.
+        // Update global engine intent first. A real explicit enable action
+        // clears any stale operator stop latch and starts/reconciles the
+        // process-level coordinator below.
+        // clears any stale operator stop latch and then either queues the
+        // dedicated coordinator worker or (only in dev/opt-in environments)
+        // starts the local in-process runtime below.
         const toggleClient = getRedisClient()
         const globalState: Record<string, string> = await toggleClient.hgetall("trade_engine:global").catch(() => ({})) || {}
         const allConnections = await getAllConnections()
@@ -203,21 +239,26 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           desired_status: "running",
           operator_intent: "running",
           coordinator_ready: "true",
+          operator_stopped: "0",
+          operator_stopped_at: "",
+          stopped_at: "",
           started_at: globalState.started_at || new Date().toISOString(),
           updated_at: new Date().toISOString(),
           active_connections: String(activeDashboardCount),
         })
         
-        // Start in-process only when this worker is explicitly allowed to own
-        // engine loops or it already has a local coordinator running. In
-        // production/OpenNext the UI/API worker must stay responsive: enabling a
-        // connection should persist operator intent and request the dedicated
-        // coordinator to reconcile, not spin a heavy trade loop inside the
-        // request handler and starve subsequent status/UI requests.
+        // Queue/reconcile by default in production so API workers stay responsive.
+        // Local foreground start is reserved for non-production or explicit
+        // production opt-in via ALLOW_API_TRADE_ENGINE_FOREGROUND +
+        // ENABLE_TRADE_ENGINE_IN_PROCESS.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           const localStartAllowed =
-            process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
+            process.env.DISABLE_TRADE_ENGINE_IN_PROCESS !== "1" &&
+            process.env.NEXT_RUNTIME !== "edge" &&
+            (process.env.NODE_ENV !== "production" ||
+              (process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
+                process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"))
 
           if (localStartAllowed) {
             const settings = await loadSettingsAsync()
@@ -231,12 +272,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(resolvedId, engineConfig)
-            if (!started && !coordinator.isEngineRunning(resolvedId)) {
+            const engineStarted = await coordinator.startEngine(resolvedId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
+            if (!engineStarted && !coordinator.isEngineRunning(resolvedId)) {
               throw new Error("Coordinator did not start the engine after enable; startup lock may be held by another worker")
             }
             
-            console.log(`[v0] [Toggle] ✓ Engine ${started ? "started" : "already running"} directly for ${connection.name}`)
+            console.log(`[v0] [Toggle] ✓ Engine ${engineStarted ? "started" : "already running"} directly for ${connection.name}`)
             await logProgressionEvent(resolvedId, "engine_started_direct", "info", "Main Trade Engine started directly from enable", {
               connectionId: resolvedId,
               connectionName: connection.name,
@@ -244,31 +285,43 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             })
             engineStatus = "started"
           } else {
-            await setSettings("engine_coordinator:refresh_requested", {
-              timestamp: new Date().toISOString(),
+            await queueCoordinatorRefresh(resolvedId, "start", "dashboard_toggle_enable", stateSwitchVersion)
+            await queueEngineRefreshRequest({
               connectionId: resolvedId,
               action: "start",
+              state_switch_version: stateSwitchVersion,
               reason: "dashboard_toggle_enable",
+              timestamp: new Date().toISOString(),
             })
             await logProgressionEvent(resolvedId, "engine_start_queued", "info", "Connection enabled; start queued for coordinator worker", {
               connectionId: resolvedId,
               connectionName: connection.name,
               exchange: connection.exchange,
-              hint: "Set ENABLE_TRADE_ENGINE_AUTOSTART=1 on a dedicated worker to run engines in-process.",
+              hint: "No local engine runtime accepted the foreground start; queued for continuity reconciliation.",
             })
+            const queuedGlobalState = await toggleClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) as Record<string, string>
+            const workerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(queuedGlobalState)
+            engineWarning = workerDiagnostic.error
             engineStatus = "queued"
-            console.log(
-              `[v0] [Toggle] Engine start queued for ${connection.name}; this UI worker is not opted in for local engine loops`,
+            console.warn(
+              `[v0] [Toggle] Engine start queued for ${connection.name}; foreground start was unavailable`,
             )
           }
         } catch (engineStartError) {
           console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
           // Still set the flag as fallback - coordinator may pick it up
-          await setSettings("engine_coordinator:refresh_requested", {
-            timestamp: new Date().toISOString(),
+          await queueCoordinatorRefresh(resolvedId, "start", "dashboard_toggle_enable_fallback", stateSwitchVersion)
+          await queueEngineRefreshRequest({
             connectionId: resolvedId,
             action: "start",
+            state_switch_version: stateSwitchVersion,
+            reason: "dashboard_toggle_enable_fallback",
+            timestamp: new Date().toISOString(),
           })
+          const fallbackClient = getRedisClient()
+          const fallbackGlobalState = await fallbackClient.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>)) as Record<string, string>
+          const workerDiagnostic = buildMissingTradeEngineWorkerDiagnostic(fallbackGlobalState)
+          engineWarning = workerDiagnostic.error
           engineStatus = "queued"
         }
           
@@ -323,12 +376,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent,
           operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent,
           coordinator_ready: disableGlobalState?.coordinator_ready || "true",
+          operator_stopped:
+            (disableGlobalState?.operator_intent || disableGlobalState?.desired_status || disableGlobalState?.status) === "running"
+              ? "0"
+              : disableGlobalState?.operator_stopped || "0",
         })
         
         // DIRECTLY STOP THE ENGINE - don't rely on coordinator polling
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
-          await coordinator.stopEngine(resolvedId)
+          await coordinator.stopEngine(resolvedId, { operatorRequested: true })
           console.log(`[v0] [Toggle] ✓ Engine stopped directly for ${connection.name}`)
           await logProgressionEvent(resolvedId, "engine_stopped_direct", "info", "Main Trade Engine stopped directly from disable", {
             connectionId: resolvedId,
@@ -337,10 +394,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         } catch (engineStopError) {
           console.warn(`[v0] [Toggle] Failed to stop engine directly:`, engineStopError)
           // Fallback refresh request so coordinator picks up desired stop state
-          await setSettings("engine_coordinator:refresh_requested", {
-            timestamp: new Date().toISOString(),
+          await queueCoordinatorRefresh(resolvedId, "stop", "dashboard_toggle_disable_fallback", stateSwitchVersion)
+          await queueEngineRefreshRequest({
             connectionId: resolvedId,
             action: "stop",
+            state_switch_version: stateSwitchVersion,
+            reason: "dashboard_toggle_stop_fallback",
+            timestamp: new Date().toISOString(),
           })
           await logProgressionEvent(resolvedId, "engine_stop_fallback_requested", "warning", "Direct stop failed; coordinator refresh requested", {
             connectionId: resolvedId,
@@ -374,6 +434,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       engine: {
         action: engineAction,
         status: engineStatus,
+        warning: engineWarning,
       },
       progressionUrl: `/api/connections/progression/${resolvedId}`,
     })

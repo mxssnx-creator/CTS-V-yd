@@ -148,11 +148,18 @@ export async function PUT(
     const body = await request.json()
 
     await initRedis()
+    const client = getRedisClient()
     const connection = await getConnection(id)
 
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
+
+    // Merge settings with existing (like PATCH does)
+    const currentSettings = typeof connection.connection_settings === "string"
+      ? JSON.parse(connection.connection_settings)
+      : connection.connection_settings || {}
+    const mergedSettings = { ...currentSettings, ...(body.settings || {}) }
 
     const updated = {
       ...connection,
@@ -166,11 +173,28 @@ export async function PUT(
       is_enabled: body.is_enabled !== undefined ? body.is_enabled : connection.is_enabled,
       is_active: body.is_active !== undefined ? body.is_active : connection.is_active,
       volume_factor: body.volume_factor || connection.volume_factor,
-      connection_settings: body.settings || connection.connection_settings,
+      connection_settings: mergedSettings,
+      // Mirror symbol fields to connection hash (CRITICAL - same as PATCH)
+      ...(Array.isArray(body.symbols) && body.symbols.length > 0
+        ? { force_symbols: JSON.stringify(body.symbols), symbol_count: String(body.symbols.length) }
+        : {}),
       updated_at: new Date().toISOString(),
     }
 
     let effectiveConnection = (await updateConnection(id, updated)) || updated
+
+    // Also write symbols to the flat hash (same as PATCH) so getSymbols() reads them
+    if (Array.isArray(body.symbols) && body.symbols.length > 0) {
+      try {
+        await client.hset(`connection_settings:${id}`, {
+          symbols: JSON.stringify(body.symbols),
+          force_symbols: JSON.stringify(body.symbols),
+          symbol_count: String(body.symbols.length),
+        })
+      } catch (err) {
+        console.warn(`[v0] Failed to update symbol hash for ${id}:`, err)
+      }
+    }
 
     // Full propagation: notify + fast-path apply + recoordinate
     // (start/stop/hot-reload as the new state dictates). See

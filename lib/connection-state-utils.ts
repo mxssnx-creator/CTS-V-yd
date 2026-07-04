@@ -27,12 +27,21 @@ export function isConnectionBaseEnabled(connection: any): boolean {
 // ========== MAIN CONNECTION STATE (Dashboard Panel) ==========
 // NEW: Renamed from is_active_inserted → is_assigned for clarity
 export function isConnectionAssignedToMain(connection: any): boolean {
-  // Support both old and new naming during migration
-  return isTruthyFlag(connection?.is_assigned) || isTruthyFlag(connection?.is_active_inserted)
+  // Support old and new naming during migration. Assignment/visibility is
+  // separate from processing enablement.
+  return (
+    isTruthyFlag(connection?.is_assigned) ||
+    isTruthyFlag(connection?.is_active_inserted) ||
+    isTruthyFlag(connection?.is_dashboard_inserted)
+  )
+}
+
+export function isConnectionProcessingEnabled(connection: any): boolean {
+  return isTruthyFlag(connection?.is_enabled_dashboard)
 }
 
 export function isConnectionDashboardEnabled(connection: any): boolean {
-  return isTruthyFlag(connection?.is_enabled_dashboard)
+  return isConnectionProcessingEnabled(connection)
 }
 
 // ========== COMBINED STATE CHECKS ==========
@@ -41,11 +50,11 @@ export function isConnectionInActivePanel(connection: any): boolean {
   return isConnectionAssignedToMain(connection)
 }
 
-// PHASE 2 FIX: Add independent state check for main processing
 export function isConnectionMainProcessing(connection: any): boolean {
-  // Connection is processing if BOTH assigned AND dashboard-enabled
-  // These states are independent - removing from base doesn't affect main
-  return isConnectionAssignedToMain(connection) && isConnectionDashboardEnabled(connection)
+  // Connection is processing if BOTH assigned AND dashboard-enabled.
+  // is_active_inserted / is_assigned are panel-assignment flags only;
+  // is_enabled_dashboard is the explicit processing switch.
+  return isConnectionAssignedToMain(connection) && isConnectionProcessingEnabled(connection)
 }
 
 export function isConnectionSystemEnabled(connection: any): boolean {
@@ -67,12 +76,10 @@ export function isConnectionWorking(connection: any): boolean {
 
 // ========== ENGINE ELIGIBILITY ==========
 export function isConnectionEligibleForEngine(connection: any): boolean {
-  // Connection must be assigned to the main panel (is_active_inserted / is_assigned).
-  // The is_enabled_dashboard toggle is NOT required — active-inserted connections always
-  // have an engine running so they appear in the dashboard. The toggle only gates whether
-  // live-trade and preset operations fire, not whether the engine itself processes cycles.
-  
-  const isAssigned = isConnectionAssignedToMain(connection)
+  // Engine processing requires assignment plus the dashboard processing toggle.
+  // Base `is_enabled` / legacy `enabled` are intentionally ignored here; they
+  // only describe base connection availability/settings visibility.
+  const isProcessingEnabled = isConnectionMainProcessing(connection)
 
   // Any credentials count — placeholder and testnet are accepted; credentials are
   // validated per-operation by the exchange connector, not at eligibility check time.
@@ -81,7 +88,7 @@ export function isConnectionEligibleForEngine(connection: any): boolean {
   const isDemoMode = isTruthyFlag(connection?.demo_mode)
   const isPredefined = isTruthyFlag(connection?.is_predefined)
 
-  return isAssigned && (hasCredentials || isTestnet || isDemoMode || isPredefined)
+  return isProcessingEnabled && (hasCredentials || isTestnet || isDemoMode || isPredefined)
 }
 
 export function isOpenPosition(position: any): boolean {

@@ -137,7 +137,9 @@ export abstract class BaseExchangeConnector {
     const timestamp = new Date().toISOString()
     const logMessage = `[${timestamp}] ${message}`
     this.logs.push(logMessage)
-    console.log(`[v0] ${logMessage}`)
+    if (process.env.NODE_ENV !== "test" && !process.env.JEST_WORKER_ID) {
+      console.log(`[v0] ${logMessage}`)
+    }
   }
 
   /**
@@ -232,23 +234,53 @@ export abstract class BaseExchangeConnector {
     return "UNIFIED"
   }
 
-  protected async rateLimitedFetch(url: string, options?: RequestInit): Promise<Response> {
-    return this.rateLimiter.execute(async () => {
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+  /**
+   * Rate-limited fetch. Accepts either a pre-built URL string or a
+   * LAZY URL BUILDER function.
+   *
+   * WHY THE BUILDER MATTERS: signed exchange requests embed a `timestamp`
+   * in the query string. When the rate-limiter queue is backed up, a URL
+   * built at call time can sit in the queue for seconds before actually
+   * being sent — by then the embedded timestamp is stale and exchanges
+   * reject it (BingX code=100421 "timestamp mismatch"). Passing a builder
+   * defers timestamp + signature computation to the moment the rate-limit
+   * slot is actually acquired, so the timestamp is always fresh.
+   */
+  protected async rateLimitedFetch(
+    url: string | (() => string),
+    options?: RequestInit,
+  ): Promise<Response> {
+    // this.timeout is enforced via the rate-limiter's executeTimeoutMs parameter.
+    // The timeout starts at dispatch time (when the request leaves the queue and
+    // begins executing), NOT at enqueue time. This prevents abort signals from
+    // firing during legitimate queue-wait periods and killing requests before
+    // they reach BingX.
+    return this.rateLimiter.execute(
+      async () => {
+        // Resolve the URL INSIDE the rate-limit slot so lazily-built signed
+        // URLs carry a timestamp from send time, not queue-entry time.
+        const resolvedUrl = typeof url === "function" ? url() : url
 
-      try {
-        const response = await fetch(url, {
-          ...options,
-          signal: controller.signal,
-        })
-        clearTimeout(timeoutId)
-        return response
-      } catch (error) {
-        clearTimeout(timeoutId)
-        throw error
-      }
-    })
+        const controller = new AbortController()
+        // The rate-limiter's executeTimeoutMs fires Promise.race at this.timeout
+        // already; this AbortController is a belt-and-suspenders abort so the
+        // underlying TCP connection is also cleaned up on timeout.
+        const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+        try {
+          const response = await fetch(resolvedUrl, {
+            ...options,
+            signal: controller.signal,
+          })
+          clearTimeout(timeoutId)
+          return response
+        } catch (error) {
+          clearTimeout(timeoutId)
+          throw error
+        }
+      },
+      undefined, // no caller AbortSignal — timeouts are managed by executeTimeoutMs
+      this.timeout, // executeTimeoutMs: starts at dispatch, not enqueue
+    )
   }
 
   abstract testConnection(): Promise<ExchangeConnectorResult>

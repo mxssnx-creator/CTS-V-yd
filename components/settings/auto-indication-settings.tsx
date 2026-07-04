@@ -58,7 +58,7 @@ export function AutoIndicationSettings() {
     levelProfitTargetAdjustment: true,
 
     // DCA strategy
-    dcaEnabled: true,
+    dcaEnabled: false,
     dcaMaxSteps: 4,
     dcaStep1Volume: 1.5,
     dcaStep2Volume: 2.0,

@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
-import { initRedis, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
-import { SystemLogger } from "@/lib/system-logger"
+import { initRedis, getAssignedAndEnabledConnections, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
 
 async function handleStartAll() {
   try {
@@ -38,19 +37,16 @@ async function handleStartAll() {
       }, { status: 500 })
     }
 
-    // Filter for ONLY connections that are BOTH inserted AND enabled
-    // These are the ones displayed in "Active Connections"
-    const activeConnections = connections.filter((c: any) => {
-      const isInserted = c.is_inserted === "1" || c.is_inserted === true
-      const isEnabled = c.is_enabled === "1" || c.is_enabled === true
-      const hasLiveTrade = c.is_live_trade === "1" || c.is_live_trade === true
-      return isInserted && isEnabled && hasLiveTrade
-    })
+    // Reuse the canonical Main Connections eligibility rule.
+    // Use the same assignment + dashboard-enabled eligibility as the global
+    // coordinator. `is_live_trade` controls live order execution, not whether
+    // an assigned connection should receive general engine processing.
+    const activeConnections = await getAssignedAndEnabledConnections()
 
     if (activeConnections.length === 0) {
       return NextResponse.json({
         success: true,
-        message: "No active connections with live trade enabled",
+        message: "No assigned and dashboard-enabled connections found",
         totalConnections: connections.length,
         activeConnections: 0,
         results: [],
@@ -84,27 +80,24 @@ async function handleStartAll() {
 
         const engineConfig = {
           connectionId: connection.id,
+          allowInProcessStart: true,
           indicationInterval,
           strategyInterval,
           realtimeInterval,
         }
-        setImmediate(() => {
-          coordinator.startEngine(connection.id, engineConfig).catch(async (error: unknown) => {
-            console.error(`[START-ALL] Background start failed for ${connection.id}:`, error)
-            await client.set(`engine_is_running:${connection.id}`, "0").catch(() => {})
-            await SystemLogger.logError(error, "api", `Background start-all engine ${connection.id}`).catch(() => {})
-          })
-        })
+        const engineStarted = await coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true })
 
         results.push({
           connectionId: connection.id,
           connectionName: connection.name,
           exchange: connection.exchange,
-          success: true,
-          message: "Engine start queued",
+          success: engineStarted,
+          message: engineStarted ? "Engine started" : "Engine start skipped by coordinator",
         })
 
-        successCount++
+        if (engineStarted) {
+          successCount++
+        }
       } catch (error) {
         results.push({
           connectionId: connection.id,

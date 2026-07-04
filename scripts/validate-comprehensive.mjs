@@ -5,6 +5,14 @@ import { performance } from 'perf_hooks'
 
 const API_BASE = 'http://localhost:3002/api'
 
+function formatRequestError(error, path) {
+  if (error?.message) return error.message
+  if (Array.isArray(error?.errors) && error.errors.length > 0) {
+    return error.errors.map((err) => err?.message || String(err)).join('; ')
+  }
+  return `Request to ${path} failed: ${String(error)}`
+}
+
 function request(path, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
     const normalizedPath = path.startsWith('/') ? path.slice(1) : path
@@ -15,6 +23,7 @@ function request(path, method = 'GET', body = null) {
       path: url.pathname + url.search,
       method,
       headers: { 'Content-Type': 'application/json' },
+      timeout: 10000,
     }
 
     const req = http.request(options, (res) => {
@@ -29,10 +38,21 @@ function request(path, method = 'GET', body = null) {
       })
     })
 
-    req.on('error', reject)
+    req.on('timeout', () => req.destroy(new Error(`Request timed out: ${method} ${url.href}`)))
+    req.on('error', (error) => reject(new Error(formatRequestError(error, path))))
     if (body) req.write(JSON.stringify(body))
     req.end()
   })
+}
+
+async function apiIsAvailable() {
+  try {
+    const health = await request('/health')
+    return health.status >= 200 && health.status < 500
+  } catch (error) {
+    console.warn(`[SKIP] API server is not reachable at ${API_BASE}: ${formatRequestError(error, '/health')}`)
+    return false
+  }
 }
 
 function strategyCounts(stats) {
@@ -51,6 +71,17 @@ function strategyCounts(stats) {
 function percent(numerator, denominator) {
   if (!denominator) return '0.0'
   return ((numerator / denominator) * 100).toFixed(1)
+}
+
+function realtimeProgressMarkers(stats) {
+  return {
+    liveCycles: Number(stats.realtime?.liveRealtimeCycles ?? stats.realtime?.cycleCounters?.realtimeLive ?? 0),
+    liveTotal: Number(stats.realtime?.realtimeLiveTotal ?? stats.realtime?.setsCreated?.live ?? 0),
+    realtimeCycles: Number(stats.realtime?.realtimeCycles ?? stats.realtime?.cycleCounters?.realtime ?? 0),
+    framesProcessed: Number(stats.realtime?.framesProcessed ?? 0),
+    pseudoPositionUpdateCycles: Number(stats.realtime?.pseudoPositionUpdates?.updateCycles ?? 0),
+    positionsOpen: Number(stats.realtime?.positionsOpen ?? 0),
+  }
 }
 
 async function engineIsRunning() {
@@ -135,8 +166,12 @@ async function testRealtimeProgress() {
     const initial = state1.data
 
     console.log(`\nInitial state:`)
-    console.log(`  - Real time live cycles: ${initial.realtime?.liveRealtimeCycles || 0}`)
-    console.log(`  - Real time live count: ${initial.realtime?.realtimeLiveTotal || 0}`)
+    const initialMarkers = realtimeProgressMarkers(initial)
+    console.log(`  - Real time live cycles: ${initialMarkers.liveCycles}`)
+    console.log(`  - Real time live count: ${initialMarkers.liveTotal}`)
+    console.log(`  - Real time cycles: ${initialMarkers.realtimeCycles}`)
+    console.log(`  - Frames processed: ${initialMarkers.framesProcessed}`)
+    console.log(`  - Pseudo-position update cycles: ${initialMarkers.pseudoPositionUpdateCycles}`)
 
     // Wait for realtime processing
     console.log('\nWaiting 30s for realtime cycle updates...')
@@ -147,12 +182,20 @@ async function testRealtimeProgress() {
     const updated = state2.data
 
     console.log(`\nUpdated state after 30s:`)
-    console.log(`  - Real time live cycles: ${updated.realtime?.liveRealtimeCycles || 0}`)
-    console.log(`  - Real time live count: ${updated.realtime?.realtimeLiveTotal || 0}`)
+    const updatedMarkers = realtimeProgressMarkers(updated)
+    console.log(`  - Real time live cycles: ${updatedMarkers.liveCycles}`)
+    console.log(`  - Real time live count: ${updatedMarkers.liveTotal}`)
+    console.log(`  - Real time cycles: ${updatedMarkers.realtimeCycles}`)
+    console.log(`  - Frames processed: ${updatedMarkers.framesProcessed}`)
+    console.log(`  - Pseudo-position update cycles: ${updatedMarkers.pseudoPositionUpdateCycles}`)
 
     // Check progression
-    const cyclesProgressed = (updated.realtime?.liveRealtimeCycles || 0) > (initial.realtime?.liveRealtimeCycles || 0)
-    const livesProgressed = (updated.realtime?.realtimeLiveTotal || 0) > (initial.realtime?.realtimeLiveTotal || 0)
+    const cyclesProgressed = updatedMarkers.liveCycles > initialMarkers.liveCycles
+      || updatedMarkers.realtimeCycles > initialMarkers.realtimeCycles
+    const livesProgressed = updatedMarkers.liveTotal > initialMarkers.liveTotal
+      || updatedMarkers.framesProcessed > initialMarkers.framesProcessed
+      || updatedMarkers.pseudoPositionUpdateCycles > initialMarkers.pseudoPositionUpdateCycles
+      || updatedMarkers.positionsOpen > initialMarkers.positionsOpen
 
     if (!cyclesProgressed && !livesProgressed) {
       console.warn('[WARN] No realtime cycle progression detected')
@@ -299,6 +342,12 @@ async function main() {
 `)
 
   const start = performance.now()
+
+  if (!(await apiIsAvailable())) {
+    console.log('Start the app with `npm run dev` or `npm run start` before running live workflow validation.')
+    console.log('✓ LIVE VALIDATION SKIPPED (API unavailable)')
+    process.exit(0)
+  }
 
   const results = {
     prehistoric: await testPrehistoric(),

@@ -200,7 +200,7 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     // non-BTC quickstart symbols and flooded stdout enough to slow the dev
     // engine. Check the requested symbol set, only load missing symbols, and
     // throttle the "already cached" log.
-    if (process.env.NODE_ENV === "development") {
+    {
       const cacheKeys = targetSymbols.map((symbol) => `market_data:${symbol}:1s`)
       const cachedValues = cacheKeys.length > 0
         ? (await (client as any).mget(...cacheKeys)) as (string | null)[]
@@ -210,12 +210,12 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
         const now = Date.now()
         if (now - __lastDevCacheHitLogAt > 30_000) {
           __lastDevCacheHitLogAt = now
-          console.log(`[v0] [MarketData] Dev-mode: ${targetSymbols.length} requested symbols already cached; skipping reload`)
+          console.log(`[v0] [MarketData] ${targetSymbols.length} requested symbols already cached; skipping reload`)
         }
         return 0
       }
       targetSymbols = missingSymbols
-      console.log(`[v0] [MarketData] Dev-mode: ${cachedValues.length - missingSymbols.length}/${cachedValues.length} requested symbols cached; loading ${missingSymbols.length} missing`)
+      console.log(`[v0] [MarketData] ${cachedValues.length - missingSymbols.length}/${cachedValues.length} requested symbols cached; loading ${missingSymbols.length} missing`)
     }
 
     // Base prices for fallback synthetic data. Used when the live exchange

@@ -11,8 +11,11 @@
 const _INDICATION_BUILD_VERSION = "5.0.1"
 const _BUILD_TIMESTAMP = 1712361660000 // Updated to force rebuild at 13:21
 
-// Log immediately on module load to confirm new code is running
-console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
+// Log exactly once per process (guarded by a globalThis flag so HMR reloads are silent)
+if (!(globalThis as any).__IND_PROC_LOGGED__) {
+  ;(globalThis as any).__IND_PROC_LOGGED__ = true
+  console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
+}
 
 // CRITICAL: Create a shared Map that will be used by ALL instances
 // This fixes the issue where class field initialization fails in cached bundles
@@ -52,9 +55,11 @@ const FALLBACK_CACHE = new Map<string, any>()
 ;(globalThis as any).__FALLBACK_MARKET_DATA_CACHE__ = FALLBACK_CACHE
 
 // Override Map methods to be more defensive - if called on undefined, use fallback
+// Guard with globalThis flag so this logs exactly once per process even if the
+// module is re-evaluated due to Next.js hot-module-replacement.
 if (!(globalThis as any).__MAP_PATCHED__) {
-  (globalThis as any).__MAP_PATCHED__ = true
-  console.log("[v0] Applying Map prototype patch for undefined cache fix")
+  ;(globalThis as any).__MAP_PATCHED__ = true
+  // Intentionally silent after first load — repeated logging drowns out real errors.
 }
 
 // Patch to make the shared cache available globally for old cached code
@@ -351,10 +356,13 @@ export class IndicationProcessor {
         recordsProcessed++
       }
 
-      const directionStats = await setsProcessor.getSetStats(symbol, "direction")
-      const moveStats = await setsProcessor.getSetStats(symbol, "move")
-      const activeStats = await setsProcessor.getSetStats(symbol, "active")
-      const optimalStats = await setsProcessor.getSetStats(symbol, "optimal")
+      // Fan out all 4 stat reads in parallel — was 4 serial awaits.
+      const [directionStats, moveStats, activeStats, optimalStats] = await Promise.all([
+        setsProcessor.getSetStats(symbol, "direction"),
+        setsProcessor.getSetStats(symbol, "move"),
+        setsProcessor.getSetStats(symbol, "active"),
+        setsProcessor.getSetStats(symbol, "optimal"),
+      ])
 
       const ProgressionManager = await getProgressionManager()
       await ProgressionManager.incrementPrehistoricCycle(this.connectionId, symbol)
@@ -790,6 +798,7 @@ export class IndicationProcessor {
           direction: 0,
           move: 0,
           active: 0,
+          active_advanced: 0,
           optimal: 0,
           auto: 0,
         }
@@ -801,12 +810,24 @@ export class IndicationProcessor {
           await _ir()
           const _client = _gc()
           const activeKey = `indications_active:${this.connectionId}`
+          const w5Key = `indications_window:${this.connectionId}:last5`
+          const w60Key = `indications_window:${this.connectionId}:last60min`
           const fields: Record<string, string> = {}
           for (const [type, cnt] of Object.entries(typeCounts)) {
             fields[`${symbol}:${type}`] = String(cnt)
           }
-          await _client.hset(activeKey, fields)
-          await _client.expire(activeKey, 600)
+          const pipe = _client.multi()
+          pipe.hset(activeKey, fields)
+          pipe.expire(activeKey, 600)
+          // Keep windowed stats idempotent and per-symbol for all raw
+          // indication types, including Auto. Without these writes, the
+          // detailed tracking endpoint falls back to cumulative counters and
+          // shows inflated/identical "last 5" numbers in production.
+          pipe.hset(w5Key, fields)
+          pipe.expire(w5Key, 300)
+          pipe.hset(w60Key, fields)
+          pipe.expire(w60Key, 4200)
+          await pipe.exec()
         } catch { /* non-critical — falls back to cumulative indCounts */ }
       }
 

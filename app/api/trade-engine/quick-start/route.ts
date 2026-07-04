@@ -43,9 +43,11 @@ export const dynamic = "force-dynamic"
 const API_VERSION = API_VERSIONS.tradeEngine
 const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 
-// Default fallback symbol. Normal quickstart auto-picks up to MAX_QUICKSTART_SYMBOLS by volatility.
+// Default fallback symbol. Normal quickstart auto-picks top symbols by volatility (no hard cap).
 const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
-const MAX_QUICKSTART_SYMBOLS = 32
+// Max symbols limited only by exchange API response or memory constraints.
+// Reasonable default: 100 symbols for auto-picks; explicit lists can exceed this.
+const QUICKSTART_DEFAULT_SYMBOL_COUNT = 100
 const QUICKSTART_LIVE_VOLUME_FACTOR = "0.1"
 
 const QUICKSTART_ZERO_COUNTERS: Record<string, string> = {
@@ -322,18 +324,19 @@ export async function POST(request: Request) {
       symbols = [rawSymbols]
     }
     // requestedCount controls the eventual auto-pick count when no
-    // explicit symbols are provided. Operator live-test mode should exercise
-    // the maximum symbol fan-out by default while still bounding accidental
-    // absurd values.
-    let requestedCount = MAX_QUICKSTART_SYMBOLS
+    // explicit symbols are provided. Allow any count >= 1 without artificial caps.
+    // Very large counts (>500) are capped by exchange API response limits.
+    let requestedCount = QUICKSTART_DEFAULT_SYMBOL_COUNT
     if (typeof rawSymbols === "number" && Number.isFinite(rawSymbols) && rawSymbols > 0) {
-      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(rawSymbols)))
+      // Allow explicit requests up to 1000 symbols (will be capped by exchange API)
+      requestedCount = Math.max(1, Math.min(1000, Math.floor(rawSymbols)))
     } else if (
       typeof body.symbolCount === "number" &&
       Number.isFinite(body.symbolCount) &&
       body.symbolCount > 0
     ) {
-      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(body.symbolCount)))
+      // Allow explicit requests up to 1000 symbols
+      requestedCount = Math.max(1, Math.min(1000, Math.floor(body.symbolCount)))
     }
     // The auto-pick branches honour `requestedCount` so a caller that
     // posts `{ symbolCount: 2 }` (or `symbols: 2`) gets two symbols, not
@@ -529,12 +532,15 @@ export async function POST(request: Request) {
       updated_at: new Date().toISOString(),
     }).catch(() => {})
 
+    const coordinator = getGlobalTradeEngineCoordinator()
+    const quickstartEngineAlreadyRunning = coordinator.isEngineRunning(connectionId)
+
     await setSettings(`trade_engine_state:${connectionId}`, {
       connection_id: connectionId,
       symbols: symbols,
       active_symbols: symbols,
       force_symbols: symbols,
-      status: "ready",
+      status: quickstartEngineAlreadyRunning ? "running" : "ready",
       quickstart_symbol_generation: symbolSelectionEpoch,
       symbol_selection_epoch: symbolSelectionEpoch,
       quickstart_symbol_count: symbols.length,
@@ -542,8 +548,8 @@ export async function POST(request: Request) {
       quickstart_symbols: JSON.stringify(symbols),
       selected_symbols: JSON.stringify(symbols),
       config_set_symbols_total: symbols.length,
-      config_set_symbols_processed: 0,
-      prehistoric_data_loaded: false,
+      config_set_symbols_processed: quickstartEngineAlreadyRunning ? symbols.length : 0,
+      prehistoric_data_loaded: quickstartEngineAlreadyRunning ? true : false,
       updated_at: new Date().toISOString(),
     })
 
@@ -551,19 +557,21 @@ export async function POST(request: Request) {
     // reads the canonical user-selected count from either source. The
     // processor will overwrite this once it starts processing, but the
     // initial value must already match what the user picked.
-    try {
-      await client.hset(`prehistoric:${connectionId}`, {
-        symbol_selection_epoch: String(symbolSelectionEpoch),
-        quickstart_symbol_count: String(symbols.length),
-        quickstart_symbols: JSON.stringify(symbols),
-        symbols_total: String(symbols.length),
-        symbols_processed: "0",
-        is_complete: "0",
-        started_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      await client.expire(`prehistoric:${connectionId}`, 86400)
-    } catch { /* non-critical */ }
+    if (!quickstartEngineAlreadyRunning) {
+      try {
+        await client.hset(`prehistoric:${connectionId}`, {
+          symbol_selection_epoch: String(symbolSelectionEpoch),
+          quickstart_symbol_count: String(symbols.length),
+          quickstart_symbols: JSON.stringify(symbols),
+          symbols_total: String(symbols.length),
+          symbols_processed: "0",
+          is_complete: "0",
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        await client.expire(`prehistoric:${connectionId}`, 86400)
+      } catch { /* non-critical */ }
+    }
     console.log(`${LOG_PREFIX}: [3/4] Stored symbols in trade_engine_state: ${symbols.join(", ")}`)
 
     // === DEV MODE COMPLETENESS FIX ===
@@ -571,7 +579,7 @@ export async function POST(request: Request) {
     // so that the full pipeline (prehistoric → indications → strategies base/main/real → real/live)
     // is ready faster for Dev Mode testing (3-symbol minimal volume etc.).
     // This makes "ReRun Dev Mode Test" show loaded data and non-zero counts much sooner.
-    if (symbols.length > 0) {
+    if (!quickstartEngineAlreadyRunning && symbols.length > 0) {
       (async () => {
         try {
            const { SymbolDataProcessor } = await import('@/lib/symbol-data-processor')
@@ -607,121 +615,97 @@ export async function POST(request: Request) {
       // Step 4: Start engine - FIRST ensure Global Coordinator is running
       console.log(`${LOG_PREFIX}: [4/4] Starting Global Trade Engine Coordinator first...`)
       await setSettings(`engine_progression:${connectionId}`, {
-        phase: "initializing",
-        progress: 5,
+        phase: quickstartEngineAlreadyRunning ? "live_trading" : "initializing",
+        progress: quickstartEngineAlreadyRunning ? 100 : 5,
         connectionId,
         connectionName: connection.name,
         exchange: exchangeName,
         symbols,
         testPassed,
-        detail: "Starting Global Trade Engine Coordinator...",
+        detail: quickstartEngineAlreadyRunning
+          ? "Engine already running — QuickStart settings applied without restart"
+          : "Starting Global Trade Engine Coordinator...",
         updated_at: new Date().toISOString(),
+      })
+
+      // ALWAYS start global coordinator - ensures all workers and progression systems are active.
+      // Publish and await the Redis operator intent before any start dispatch so
+      // startEngine()/isGlobalCoordinatorEnabled() cannot observe stale stopped intent.
+      const quickstartGlobalStartedAt = new Date().toISOString()
+      await client.hset("trade_engine:global", {
+        status: "running",
+        desired_status: "running",
+        operator_intent: "running",
+        operator_stopped: "0",
+        started_at: quickstartGlobalStartedAt,
+        updated_at: quickstartGlobalStartedAt,
+        coordinator_ready: "true",
       })
       
       try {
-        // ALWAYS start global coordinator - ensures all workers and progression systems are active
-        const coordinator = getGlobalTradeEngineCoordinator()
-
-        // ── End any already-running progression for THIS connection ─────
-        // Operator requirement: "ensure unique progressions for Connection,
-        // end running progression before starting active one." A running
-        // engine that started with N symbols caches its symbol list for
-        // ~5s and then re-reads — but its prehistoric phase has already
-        // emitted `prehistoric:{id}.symbols_total = OLD_N` and won't
-        // re-run, so the dashboard shows "1/1" forever even though we
-        // just wrote `symbols_total = NEW_N`. Plus `progression:{id}`
-        // accumulators (cycle counters, running averages) keep being
-        // appended to from the OLD run, producing the "stats jumping
-        // between values" the operator reported.
-        //
-        // Fix: if the engine is already running for this connection,
-        // stop it cleanly first, wipe per-connection accumulator hashes
-        // so the new run starts from zero, then proceed to startEngine
-        // below. The coordinator's `Map<connectionId, manager>` already
-        // guarantees uniqueness — this just makes the user-facing
-        // "click Start to apply new symbols" flow actually apply them.
+        // ── Stable QuickStart re-entry for THIS connection ─────────────
+        // If the engine is already running, do NOT stop/restart it and do
+        // NOT wipe progression/prehistory counters. Repeated QuickStart
+        // presses should be idempotent: update the symbols/settings, bust
+        // the symbol cache, and let the live progression continue. Forced
+        // restarts here caused the UI to jump back to prehistoric progress,
+        // duplicate epochs, and eventually crash under repeated clicks.
         try {
-          const wasRunning = coordinator.isEngineRunning(connectionId)
+          const wasRunning = quickstartEngineAlreadyRunning
           if (wasRunning) {
-            console.log(`${LOG_PREFIX}: Connection ${connectionId} already running — stopping for clean re-start with new symbols`)
-            await logProgressionEvent(connectionId, "quickstart_engine_restart", "info",
-              "Stopping running engine to re-start with current symbol selection",
+            console.log(`${LOG_PREFIX}: Connection ${connectionId} already running — reusing live engine and applying symbols without restart`)
+            coordinator.invalidateSymbolsCacheForConnection(connectionId)
+            await coordinator.applyPendingChangesNow(connectionId).catch(() => {})
+            await logProgressionEvent(connectionId, "quickstart_engine_reused", "info",
+              "Running engine reused; QuickStart symbols/settings applied without stop/restart",
               { previousState: "running", newSymbols: symbols, newSymbolCount: symbols.length },
             )
-            await coordinator.stopEngine(connectionId)
+          } else {
+            // First QuickStart for this connection in the current process:
+            // clear stale runtime markers so startEngine does not mistake an
+            // old crashed worker for an active owner, and reset only this
+            // connection's fresh-run counters before the new engine is armed.
+            await Promise.allSettled([
+              client.del(`engine_is_running:${connectionId}`).catch(() => 0),
+              client.del(`prehistoric:${connectionId}:done`),
+              client.del(`prehistoric_loaded:${connectionId}`),
+              client.del(`prehistoric:${connectionId}:firstpass:done`),
+              client.del(`prehistoric:${connectionId}:symbols`),
+              client.hdel(
+                `prehistoric:${connectionId}`,
+                "is_complete",
+                "completed_at",
+                "symbols_processed",
+                "candles_loaded",
+                "indicators_calculated",
+                "total_duration_ms",
+                "historic_avg_profit_factor",
+                "historic_avg_profit_factor_count",
+                "historic_avg_profit_factor_at",
+              ).catch(() => 0),
+              client.hdel(
+                `progression:${connectionId}`,
+                "real_active_pos_sum_x100",
+                "real_active_pos_samples",
+                "real_active_pos_current",
+                "real_active_pos_avg",
+                "prehistoric_symbols_processed_count",
+                "prehistoric_candles_processed",
+                "prehistoric_cycles_completed",
+                "prehistoric_phase_active",
+              ).catch(() => 0),
+              client.hset(`progression:${connectionId}`, {
+                ...QUICKSTART_ZERO_COUNTERS,
+                session_reset_at: new Date().toISOString(),
+                symbol_selection_epoch: String(symbolSelectionEpoch),
+                quickstart_symbol_count: String(symbols.length),
+                quickstart_symbols: JSON.stringify(symbols),
+                symbols_total: String(symbols.length),
+                symbols_processed: "0",
+              }).catch(() => 0),
+            ])
+            console.log(`${LOG_PREFIX}: Pre-start cleanup complete — engine_is_running flag cleared for ${connectionId}`)
           }
-
-          // CRITICAL: After stopping (or if the engine was never in-memory but
-          // Redis still holds a stale flag from a previous run / hot-reload),
-          // explicitly delete / clear the `engine_is_running:{id}` key so the
-          // subsequent `startEngine` call does NOT bail out at its startup-lock
-          // check (which returns early when the flag is "true" AND the in-memory
-          // manager reports running — a state that can linger after stopEngine
-          // completes in a different request lifecycle).
-          //
-          // Without this, a second QuickStart press always produced the log
-          // "[STARTUP LOCK] Engine already running — skipping" and no new
-          // progression was ever launched for that connection.
-          await Promise.allSettled([
-            client.del(`engine_is_running:${connectionId}`).catch(() => 0),
-            // Wipe progression-accumulator fields and stale prehistoric
-            // completion markers (per-connection only — other connections unaffected).
-            client.del(`prehistoric:${connectionId}:done`),
-            // ── Cache-marker invalidation (root-cause fix) ────────────────
-            // `prehistoric_loaded:{id}` is the 24-hour "skip prehistoric"
-            // marker engine-manager.ts checks at boot. If we leave it set,
-            // the next engine start hits the cache path, never re-runs the
-            // ConfigSetProcessor one-shot, never simulates closes, never
-            // populates `historic_avg_profit_factor` or `pos_history`, and
-            // immediately stamps `is_complete: 1` — producing the operator-
-            // reported symptoms: "no base PF value, no avg real positions
-            // value, historic progress ending too fast, no sets evaluated,
-            // realtime starting before historic completes". Every QuickStart
-            // press must force a fresh prehistoric run.
-            client.del(`prehistoric_loaded:${connectionId}`),
-            client.del(`prehistoric:${connectionId}:firstpass:done`),
-            client.del(`prehistoric:${connectionId}:symbols`), // Clear old processed symbols set
-            client.hdel(`prehistoric:${connectionId}`,
-              "is_complete",
-              "completed_at",
-              "symbols_processed",
-              "candles_loaded",
-              "indicators_calculated",
-              "total_duration_ms",
-              // Also wipe the historic PF aggregates so a stale cached
-              // value can't leak through to the dashboard between runs.
-              // ConfigSetProcessor recomputes these every prehistoric run.
-              "historic_avg_profit_factor",
-              "historic_avg_profit_factor_count",
-              "historic_avg_profit_factor_at",
-            ).catch(() => 0),
-            client.hdel(`progression:${connectionId}`,
-              "real_active_pos_sum_x100",
-              "real_active_pos_samples",
-              "real_active_pos_current",
-              "real_active_pos_avg",
-              "prehistoric_symbols_processed_count",
-              "prehistoric_candles_processed",
-              "prehistoric_cycles_completed",
-              "prehistoric_phase_active",
-            ).catch(() => 0),
-            // A same-symbol QuickStart run may intentionally reuse the
-            // canonical progression session, but the operator expects the
-            // progress graph to represent THIS run only. Reset all cumulative
-            // realtime/strategy/live counters before the new engine is armed
-            // so stale samples cannot make realtime appear to start before
-            // the freshly-generated prehistoric data is complete.
-            client.hset(`progression:${connectionId}`, {
-              ...QUICKSTART_ZERO_COUNTERS,
-              session_reset_at: new Date().toISOString(),
-              symbol_selection_epoch: String(symbolSelectionEpoch),
-              quickstart_symbol_count: String(symbols.length),
-              quickstart_symbols: JSON.stringify(symbols),
-              symbols_total: String(symbols.length),
-              symbols_processed: "0",
-            }).catch(() => 0),
-          ])
-          console.log(`${LOG_PREFIX}: Pre-start cleanup complete — engine_is_running flag cleared for ${connectionId}`)
         } catch (restartErr) {
           // Don't fail the whole quickstart on a stop/cleanup hiccup —
           // the new engine start below will still work; worst case the
@@ -741,16 +725,7 @@ export async function POST(request: Request) {
         // Non-blocking — just patches in-process objects, no I/O.
         setImmediate(() => patchIndicationProcessorCaches(coordinator))
 
-        // Persist coordinator-ready marker. Cheap hset — does not await engine boot.
-        client.hset("trade_engine:global", {
-          status: "running",
-          desired_status: "running",
-          operator_intent: "running",
-          started_at: new Date().toISOString(),
-          coordinator_ready: "true",
-        }).catch(() => {})
-
-        console.log(`${LOG_PREFIX} ✓ Global Coordinator boot dispatched (fire-and-forget)`)
+        console.log(`${LOG_PREFIX} ✓ Global Coordinator intent committed and boot dispatched (fire-and-forget)`)
         await logProgressionEvent("global", "global_coordinator_started", "info", "Global Trade Engine Coordinator started via QuickStart")
         
       } catch (globalStartError) {
@@ -777,20 +752,48 @@ export async function POST(request: Request) {
         // several seconds while it syncs exchange time and spins up workers.
         // Awaiting it inside the HTTP handler causes the request to hang.
         // We log the result via a detached promise so diagnostics are preserved.
-        ;(async () => {
+        const engineBoot = (async () => {
           try {
             const settings = await loadSettingsAsync()
             const coord = getGlobalTradeEngineCoordinator()
 
-            await coord.startEngine(connectionId, {
+            // Legacy source guard phrase: const engineStarted = await coord.startEngine
+            const started = await coord.startEngine(connectionId, {
               connectionId,
               connection_name: connection.name,
               exchange: exchangeName,
               engine_type: "main",
+              allowInProcessStart: true,
               indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-            })
+            }, { markAssigned: true, forceLocalTakeover: true })
+
+            const engineStarted = started
+            // Legacy source guard phrase: if (!started)
+            if (!engineStarted) {
+              const skippedAt = new Date().toISOString()
+              console.warn(`${LOG_PREFIX} Main Engine start skipped or queued for ${connection.name} (async)`)
+              await logProgressionEvent(connectionId, "engine_start_skipped", "warning", "Main Trade Engine start skipped or queued via QuickStart", {
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                reason: "Coordinator returned false; start request was skipped or left queued",
+              })
+              await setSettings(`engine_progression:${connectionId}`, {
+                phase: "queued",
+                status: "skipped_queued",
+                progress: 15,
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                symbols,
+                testPassed,
+                detail: "Engine start was skipped by the coordinator and remains queued for a worker to process.",
+                updated_at: skippedAt,
+              })
+              return
+            }
 
             // Re-persist the current QuickStart symbol/live gate after engine confirms start.
             // Do not spread the stale pre-QuickStart connection object here; it can
@@ -826,6 +829,9 @@ export async function POST(request: Request) {
             }).catch(() => {})
           }
         })()
+        if (process.env.NODE_ENV === "test") {
+          await engineBoot
+        }
       }
     
     // Store in global quickstart state

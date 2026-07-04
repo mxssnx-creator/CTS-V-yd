@@ -35,6 +35,7 @@ import { getMarketDataCached, prefetchMarketDataBatch } from "./market-data-cach
 // constants below are kept as fallback defaults when the cache is empty on
 // cold start.
 import { getEngineTimings } from "@/lib/engine-timings"
+import { performanceProfiler } from "@/lib/performance-profiler"
 
 // ── Module-level import memoization for live-sync hot paths ──────────
 // `fireSyncLiveFromPseudo` and `maybeRunLiveSync` were previously doing
@@ -351,7 +352,12 @@ export class RealtimeProcessor {
    * gate follow-up work (telemetry, backoff) without re-querying Redis.
    */
   async processRealtimeUpdates(): Promise<{ updates: number }> {
+    // PERFORMANCE: Start cycle profiling
+    const cycleId = performanceProfiler.startCycle(this.connectionId, "realtime")
+    
     try {
+      performanceProfiler.recordOperation(cycleId, "init")
+      
       // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
       // When user updates connection settings via UI, a dirty flag is set.
       // On the next realtime tick, we detect it and clear the flag so
@@ -476,6 +482,7 @@ export class RealtimeProcessor {
       // progression contract.
 
       if (count === 0) {
+        performanceProfiler.endCycle(cycleId)
         return { updates: 0 }
       }
 
@@ -543,12 +550,14 @@ export class RealtimeProcessor {
         // Non-critical visibility metric — never break the realtime loop.
       }
 
+      performanceProfiler.endCycle(cycleId)
       return { updates: count }
     } catch (error) {
       console.error("[v0] Failed to process realtime updates:", error)
       await logProgressionEvent(this.connectionId, "realtime_error", "error", "Realtime processor failed", {
         error: error instanceof Error ? error.message : String(error),
       })
+      performanceProfiler.endCycle(cycleId)
       return { updates: 0 }
     }
   }
@@ -815,7 +824,16 @@ export class RealtimeProcessor {
 
       const startRatio = parseFloat(position.trailing_start_ratio || "0")
       const stopRatio = parseFloat(position.trailing_stop_ratio || "0")
-      const stepRatio = parseFloat(position.trailing_step_ratio || "0")
+      let stepRatio = parseFloat(position.trailing_step_ratio || "0")
+      
+      // CRITICAL: Validate stepRatio is not zero or too small. If stepRatio is
+      // 0 or NaN, re-anchoring would happen on every price change, breaking the
+      // entire trailing mechanism. Default to stopRatio/2 if invalid.
+      if (!Number.isFinite(stepRatio) || stepRatio <= 0) {
+        stepRatio = stopRatio > 0 ? stopRatio / 2 : 0
+        if (!Number.isFinite(stepRatio)) stepRatio = 0
+      }
+      
       const useMultiStep = startRatio > 0 && stopRatio > 0
 
       const client = getRedisClient()
@@ -888,7 +906,11 @@ export class RealtimeProcessor {
         // in the favourable direction. Step is computed against the
         // STORED anchor (not currentPrice) so a single big tick doesn't
         // skip over and immediately re-anchor on the next.
-        const stepDistance = anchorStored * stepRatio
+        // CRITICAL: Enforce minimum stepRatio to prevent ratcheting too frequently.
+        // If stepRatio is too small, every small price tick would trigger re-anchoring.
+        const minStepRatio = 0.001  // 0.1% minimum step size (can be overridden via settings)
+        const safeStepRatio = Math.max(stepRatio, minStepRatio)
+        const stepDistance = anchorStored * safeStepRatio
         if (side === "long") {
           if (currentPrice <= anchorStored + stepDistance) return
           const newAnchor = currentPrice

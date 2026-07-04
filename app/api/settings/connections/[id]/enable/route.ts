@@ -3,6 +3,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import { initRedis, getConnection, updateConnection, getRedisClient } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
+import { nextStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 
 /**
  * POST /api/settings/connections/[id]/enable
@@ -79,9 +80,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     }
 
     // Update connection enabled state
+    const stateSwitchVersion = nextStateSwitchVersion(connection)
     const updatedConnection = {
       ...connection,
       is_enabled: shouldEnable ? "1" : "0",
+      state_switch_version: stateSwitchVersion,
       updated_at: new Date().toISOString(),
     }
 
@@ -97,7 +100,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
     // Notify engine of enable/disable change and apply immediately
     try {
-      await notifySettingsChanged(id, ["is_enabled"], { is_enabled: connection.is_enabled }, { is_enabled: updatedConnection.is_enabled })
+      await notifySettingsChanged(id, ["is_enabled", "state_switch_version"], { is_enabled: connection.is_enabled, state_switch_version: (connection as any).state_switch_version }, { is_enabled: updatedConnection.is_enabled, state_switch_version: stateSwitchVersion })
       const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
       const coordinator = getGlobalTradeEngineCoordinator()
       
@@ -124,15 +127,44 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             desired_status: "running",
             operator_intent: "running",
             coordinator_ready: "true",
+            operator_stopped: "0",
+            operator_stopped_at: "",
+            stopped_at: "",
             started_at: globalState.started_at || new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
 
-          await coordinator.startMissingEngines([updatedConnection])
+          await queueEngineRefreshRequest({
+            timestamp: new Date().toISOString(),
+            connectionId: id,
+            action: "start",
+            state_switch_version: stateSwitchVersion,
+            reason: "connection_enable",
+          })
+          const localStartAllowed =
+            process.env.DISABLE_TRADE_ENGINE_IN_PROCESS !== "1" &&
+            process.env.NEXT_RUNTIME !== "edge" &&
+            (process.env.NODE_ENV !== "production" ||
+              (process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
+                process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"))
+          if (localStartAllowed && !coordinator.isEngineRunning(id)) {
+            await coordinator.startMissingEngines([updatedConnection])
+          }
         }
       } else {
-        // Engine should stop if it was running
+        // Engine should stop if it was running. Queue + trigger the event-state
+        // refresh so production workers do not wait for the periodic sweep.
+        await queueEngineRefreshRequest({
+          timestamp: new Date().toISOString(),
+          connectionId: id,
+          action: "stop",
+          state_switch_version: stateSwitchVersion,
+          reason: "connection_disable",
+        })
         await coordinator.applyPendingChangesNow(id)
+        if (coordinator.isEngineRunning(id)) {
+          await coordinator.stopEngine(id, { operatorRequested: true })
+        }
       }
     } catch (applyErr) {
       console.warn(

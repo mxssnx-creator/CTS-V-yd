@@ -91,7 +91,7 @@ export function ConnectionCard({
     maxDrawdownTime: 12,
     trailingEnabled: true,
     blockEnabled: true,
-    dcaEnabled: true,
+    dcaEnabled: false,
   })
   const [connectionInfo, setConnectionInfo] = useState({
     marginMode: "cross",
@@ -107,7 +107,7 @@ export function ConnectionCard({
     strategyStates: {
       trailing: true,
       block: true,
-      dca: true,
+      dca: false,
     },
   })
   const [presetTradeEnabled, setPresetTradeEnabled] = useState(false)
@@ -130,7 +130,7 @@ export function ConnectionCard({
   const [strategyConfig, setStrategyConfig] = useState<StrategyConfig>({
     trailing: true,
     block: true,
-    dca: true,
+    dca: false,
   })
 
   const [logs, setLogs] = useState<Array<{ timestamp: string; level: string; message: string }>>([])
@@ -271,7 +271,7 @@ export function ConnectionCard({
             maxDrawdownTime: data.max_drawdown_time || 12,
             trailingEnabled: data.trailing_enabled !== false,
             blockEnabled: data.block_enabled !== false,
-            dcaEnabled: data.dca_enabled !== false,
+            dcaEnabled: data.dca_enabled === true,
           })
         }
       } catch { /* non-critical */ }

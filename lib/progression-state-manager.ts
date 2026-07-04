@@ -947,6 +947,10 @@ return {
       const state = (await client
         .hgetall(`settings:trade_engine_state:${connectionId}`)
         .catch(() => ({}))) as Record<string, string>
+      const connectionSettings = {
+        ...((await client.hgetall(`settings:connection_settings:${connectionId}`).catch(() => ({}))) as Record<string, string>),
+        ...((await client.hgetall(`connection_settings:${connectionId}`).catch(() => ({}))) as Record<string, string>),
+      }
       const cd = connData as Record<string, string>
       let currentSymbols: string[] = parseSymbols(state.force_symbols)
       if (currentSymbols.length === 0) currentSymbols = parseSymbols(cd.force_symbols)
@@ -966,15 +970,40 @@ return {
       // configuration that drives the exchange connector. We compare the
       // *stored* snapshot (captured at engine-start) to the *live* values
       // so the first settings-save that differs triggers a clean restart.
-      const liveFingerprint = [
-        engineType || "main",
-        connData.is_live_trade   || "0",
-        connData.is_testnet      || "0",
-        connData.is_preset_trade || "0",
-        connData.connection_method || "library",
-        connData.margin_type     || "cross",
-        connData.position_mode   || "hedge",
-      ].join(":")
+      const fpValue = (key: string, fallback = ""): string => {
+        const v = (connectionSettings as any)[key] ?? (state as any)[key] ?? (connData as any)[key] ?? fallback
+        if (v === undefined || v === null) return fallback
+        if (typeof v === "object") {
+          try { return JSON.stringify(v) } catch { return fallback }
+        }
+        return String(v)
+      }
+      const progressionFingerprintFields = [
+        "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+        "profitFactorMin",
+        "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+        "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
+        "variantTrailingEnabled", "variantBlockEnabled", "variantDcaEnabled",
+        "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+        "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+        "blockVolumeRatio", "blockMaxStack", "blockPauseCountRatio",
+        "minimal_step_count", "minimalStepCount", "minStep",
+        "prevPosWindow", "prevPosMinCount", "mainEvalPosCount", "realEvalPosCount",
+        "live_volume_factor", "preset_volume_factor", "volume_factor_live", "volume_factor_preset",
+        "volume_step_ratio", "volume_factor",
+        "coordination_settings", "strategies", "indications", "active_indications",
+      ]
+
+      const liveFingerprint = JSON.stringify({
+        engineType: engineType || "main",
+        is_live_trade: connData.is_live_trade || "0",
+        is_testnet: connData.is_testnet || "0",
+        is_preset_trade: connData.is_preset_trade || "0",
+        connection_method: connData.connection_method || "library",
+        margin_type: connData.margin_type || "cross",
+        position_mode: connData.position_mode || "hedge",
+        settings: Object.fromEntries(progressionFingerprintFields.map((field) => [field, fpValue(field)])),
+      })
 
       // The stored snapshot is a JSON blob; parse it gracefully.
       let storedFingerprint = ""
@@ -982,15 +1011,20 @@ return {
         const snap = existing.progress_settings_snapshot
           ? JSON.parse(existing.progress_settings_snapshot)
           : {}
-        storedFingerprint = [
-          snap.engine_type || existing.engine_type || "main",
-          snap.is_live_trade   || "0",
-          snap.is_testnet      || "0",
-          snap.is_preset_trade || "0",
-          snap.connection_method || "library",
-          snap.margin_type     || "cross",
-          snap.position_mode   || "hedge",
-        ].join(":")
+        if (snap.progression_fingerprint) {
+          storedFingerprint = String(snap.progression_fingerprint)
+        } else {
+          storedFingerprint = JSON.stringify({
+            engineType: snap.engine_type || existing.engine_type || "main",
+            is_live_trade: snap.is_live_trade || "0",
+            is_testnet: snap.is_testnet || "0",
+            is_preset_trade: snap.is_preset_trade || "0",
+            connection_method: snap.connection_method || "library",
+            margin_type: snap.margin_type || "cross",
+            position_mode: snap.position_mode || "hedge",
+            settings: snap.settings || {},
+          })
+        }
       } catch { /* treat missing snapshot as a mismatch */ }
 
       const liveSnapshot = {
@@ -1003,17 +1037,155 @@ return {
         connection_method: connData.connection_method || "library",
         margin_type: connData.margin_type || "cross",
         position_mode: connData.position_mode || "hedge",
+        progression_fingerprint: liveFingerprint,
+        settings: Object.fromEntries(progressionFingerprintFields.map((field) => [field, fpValue(field)])),
         updated_at: new Date().toISOString(),
       }
 
       const storedSymbolCount = parseInt(existing.symbol_count || "0", 10)
       const storedHash = existing.active_symbols_hash || ""
+      const storedSymbols = storedHash
+        ? storedHash.split("|").map((symbol: string) => symbol.trim()).filter(Boolean)
+        : []
+      const storedSymbolSet = new Set(storedSymbols)
+      const missingSymbols = currentSymbols.filter((symbol) => !storedSymbolSet.has(symbol))
+      const additiveSymbolOnlyChange =
+        storedSymbols.length > 0 &&
+        missingSymbols.length > 0 &&
+        storedSymbols.every((symbol) => currentSymbols.includes(symbol)) &&
+        storedFingerprint !== "" &&
+        storedFingerprint === liveFingerprint
+
+      if (additiveSymbolOnlyChange) {
+        // Additive symbol changes should not wipe an otherwise healthy
+        // progression. Preserve completed historic work for existing symbols
+        // and clear only the gates for symbols that are genuinely missing so
+        // the next prehistoric pass calculates the delta instead of replaying
+        // the whole connection.
+        await Promise.all([
+          client.del(`prehistoric:${connectionId}:done`).catch(() => {}),
+          client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}:verified`).catch(() => {}),
+          client.del(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => {}),
+          ...missingSymbols.map((symbol) =>
+            client.del(`prehistoric:${connectionId}:${symbol}:processed_intervals`).catch(() => {}),
+          ),
+        ])
+
+        await client.hset(key, {
+          symbol_count: String(liveSymbolCount),
+          active_symbols_hash: liveSymbolsHash,
+          started_for_settings_version: existing.started_for_settings_version || new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          engine_type: engineType || "main",
+          prehistoric_phase_active: "true",
+          missing_prehistoric_symbols: JSON.stringify(missingSymbols),
+          last_update: new Date().toISOString(),
+        }).catch(() => {})
+
+        const actualProcessedCount = await client
+          .scard(`prehistoric:${connectionId}:symbols`)
+          .catch(async () => client.scard(`progression:${connectionId}:prehistoric_symbols_set`).catch(() => 0))
+        await client
+          .hset(`settings:trade_engine_state:${connectionId}`, {
+            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
+            config_set_symbols_processed: String(Math.min(Math.max(0, actualProcessedCount || 0), liveSymbolCount)),
+          })
+          .catch(() => {})
+
+        return {
+          changed: true,
+          reason: `symbols added (${missingSymbols.join(",")}) — preserving existing prehistoric progress`,
+          newEpoch: Number(existing.epoch || existing.started_at || 0) || undefined,
+        }
+      }
 
       const symbolMismatch = storedSymbolCount !== liveSymbolCount || storedHash !== liveSymbolsHash
       // Only compare fingerprints when a stored snapshot exists (empty stored
       // fingerprint = first ever start, not yet solidified — not a mismatch).
       const settingsMismatch = storedFingerprint !== "" && storedFingerprint !== liveFingerprint
+      const missingPrehistoricSymbols = currentSymbols.filter((symbol) => !storedSymbolSet.has(symbol))
+      const additiveSymbolChange =
+        symbolMismatch &&
+        !settingsMismatch &&
+        storedSymbols.length > 0 &&
+        liveSymbolCount > storedSymbols.length &&
+        storedSymbols.every((symbol) => currentSymbols.includes(symbol)) &&
+        missingPrehistoricSymbols.length === liveSymbolCount - storedSymbols.length
       const mismatch = symbolMismatch || settingsMismatch
+
+      if (additiveSymbolChange) {
+        const reason = `symbols added (stored=${storedSymbolCount} vs live=${liveSymbolCount})`
+        console.log(
+          `[v0] [Progression] Additive symbol re-coordination for ${connectionId}: ${reason}. ` +
+          `Keeping existing progress and re-opening prehistoric gates for new symbols only.`,
+        )
+
+        const progressionProcessedSet = `progression:${connectionId}:prehistoric_symbols_set`
+        const canonicalProcessedSet = `prehistoric:${connectionId}:symbols`
+        const [progressionProcessedCountRaw, canonicalProcessedCountRaw] = await Promise.all([
+          client.scard(progressionProcessedSet).catch(() => 0),
+          client.scard(canonicalProcessedSet).catch(() => 0),
+        ])
+        const progressionProcessedCount = Number(progressionProcessedCountRaw) || 0
+        const canonicalProcessedCount = Number(canonicalProcessedCountRaw) || 0
+        const actualProcessedCount = progressionProcessedCount > 0
+          ? progressionProcessedCount
+          : canonicalProcessedCount
+        const configSetSymbolsProcessed = Math.min(actualProcessedCount, liveSymbolCount)
+
+        await Promise.all([
+          client.del(`prehistoric:${connectionId}:done`).catch(() => {}),
+          client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}`).catch(() => {}),
+          client.del(`prehistoric_loaded:${connectionId}:verified`).catch(() => {}),
+          client.del(`prehistoric:progress:${connectionId}`).catch(() => {}),
+        ])
+
+        try {
+          const intervalKeys = missingPrehistoricSymbols.map((symbol) => `prehistoric:${connectionId}:${symbol}:processed_intervals`)
+          if (intervalKeys.length > 0) {
+            await client.del(...intervalKeys).catch(() => {})
+          }
+        } catch { /* non-critical */ }
+
+        await client.hset(key, {
+          symbol_count: String(liveSymbolCount),
+          active_symbols_hash: liveSymbolsHash,
+          started_for_settings_version: new Date().toISOString(),
+          progress_settings_snapshot: JSON.stringify(liveSnapshot),
+          engine_type: engineType || "main",
+          prehistoric_phase_active: configSetSymbolsProcessed < liveSymbolCount ? "true" : "false",
+          last_update: new Date().toISOString(),
+        }).catch(() => {})
+
+        await client.hset(`prehistoric:${connectionId}`, {
+          symbols_total: String(liveSymbolCount),
+          symbols_processed: String(configSetSymbolsProcessed),
+          is_complete: configSetSymbolsProcessed >= liveSymbolCount ? "1" : "0",
+          updated_at: new Date().toISOString(),
+        }).catch(() => {})
+
+        await client
+          .hset(`settings:trade_engine_state:${connectionId}`, {
+            config_set_symbols_total: String(liveSymbolCount > 0 ? liveSymbolCount : 1),
+            config_set_symbols_processed: String(configSetSymbolsProcessed),
+            missing_prehistoric_symbols: JSON.stringify(missingPrehistoricSymbols),
+            prehistoric_data_loaded: configSetSymbolsProcessed >= liveSymbolCount ? "true" : "false",
+            updated_at: new Date().toISOString(),
+          })
+          .catch(() => {})
+
+        if (configSetSymbolsProcessed >= liveSymbolCount) {
+          await Promise.all([
+            client.set(`prehistoric:${connectionId}:done`, "1", { EX: 86400 } as any).catch(() => {}),
+            client.set(`prehistoric:${connectionId}:firstpass:done`, "1", { EX: 86400 } as any).catch(() => {}),
+          ])
+        }
+
+        return { changed: true, reason, newEpoch: Number(existing.epoch || "0") || undefined }
+      }
 
       if (mismatch) {
         const reason = symbolMismatch

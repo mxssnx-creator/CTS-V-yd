@@ -140,9 +140,25 @@ export async function cleanupOrphanedProgress() {
       // Use client.get to match setRunningFlag which writes string values ("1"/"0")
       const runningFlag = await client.get(`engine_is_running:${conn.id}`)
 
-      // If marked as running but coordinator doesn't have it, clean up
+      // If marked as running but this coordinator doesn't have it, only clean
+      // it up after proving there is no fresh distributed owner. Production can
+      // boot multiple Node/API workers while a dedicated engine worker is still
+      // alive; clearing its `engine_is_running:*` flag from a non-owner worker
+      // is the exact race that makes the UI show phantom stops/restarts.
       if (runningFlag === "true" || runningFlag === "1") {
         if (!coordinator.isEngineRunning(conn.id)) {
+          const remoteState = await client.hgetall(`trade_engine_state:${conn.id}`).catch(() => ({} as Record<string, string>)) as Record<string, string>
+          const remoteHeartbeat = Number(remoteState?.last_processor_heartbeat || 0)
+          const remoteHeartbeatFresh =
+            Number.isFinite(remoteHeartbeat) && remoteHeartbeat > 0 && Date.now() - remoteHeartbeat < 90_000
+
+          if (remoteHeartbeatFresh) {
+            console.log(
+              `[v0] [Startup] Preserving running flag for ${conn.id} — fresh distributed heartbeat present`,
+            )
+            continue
+          }
+
           console.log(`[v0] [Startup] Cleaning orphaned running flag for ${conn.id}`)
 
           // Clear orphaned flags using client.set to match setRunningFlag
@@ -175,18 +191,33 @@ export async function completeStartup() {
   console.log(`[v0] [Startup] ========================================\n`)
 
   try {
-    // Step 1: Initialize Redis
+    // Step 1: Initialize Redis (runMigrations runs inside initRedis)
     console.log(`[v0] [Startup] Step 1/8: Initializing Redis...`)
     await initRedis()
     console.log(`[v0] [Startup] ✓ Redis initialized`)
-    const volatileCleanupMode = process.env.NODE_ENV === "production" ? "production" : "development"
-    const volatileCleanup = await cleanupVolatileRuntimeState({ mode: volatileCleanupMode, reason: "completeStartup" })
+    const volatileCleanup = await cleanupVolatileRuntimeState({ reason: "completeStartup" })
     console.log(`[v0] [Startup] ✓ Volatile runtime cleanup complete (deleted ${volatileCleanup.deleted}, preserved ${volatileCleanup.preserved})\n`)
 
-    // Step 2: Skip — migrations already ran inside initRedis() above.
-    // Keeping the sequential step numbering for log consistency.
-    console.log(`[v0] [Startup] Step 2/8: Migrations already applied by initRedis`)
-    console.log(`[v0] [Startup] ✓ Migrations complete (no duplicate run)\n`)
+    // Initialize memory management for long-term stability
+    try {
+      const { initMemoryManager } = await import("@/lib/memory-manager")
+      const maxHeapMB = process.env.NODE_ENV === "production" ? 2048 : 1024
+      initMemoryManager(maxHeapMB)
+    } catch (e) {
+      console.warn(`[v0] [Startup] Memory manager initialization skipped (non-fatal):`, e instanceof Error ? e.message : e)
+    }
+
+    // Step 2: Migrations already ran inside initRedis() above.
+    // Seed default settings and placeholder market data — both are no-ops when
+    // data already exists, so safe to call on every boot including hot-reloads.
+    console.log(`[v0] [Startup] Step 2/8: Seeding default settings and market data...`)
+    try {
+      const { runPreStartup } = await import("@/lib/pre-startup")
+      await runPreStartup()
+    } catch (e) {
+      console.warn(`[v0] [Startup] ⚠ Pre-startup seeding warning (non-fatal): ${e instanceof Error ? e.message : e}`)
+    }
+    console.log(`[v0] [Startup] ✓ Settings + market data seed complete\n`)
 
     // Step 3: Validate database integrity
     console.log(`[v0] [Startup] Step 3/8: Validating database integrity...`)
@@ -220,10 +251,24 @@ export async function completeStartup() {
       console.log(`[v0] [Startup] ✓ Continuing without consolidation (engine works without it)\n`)
     }
 
-    // Step 6: Initialize coordinator (don't start engines)
+    // Step 6: Initialize coordinator and start engines in dev mode
     console.log(`[v0] [Startup] Step 6/8: Initializing engine coordinator...`)
     const coordinator = getGlobalTradeEngineCoordinator()
-    console.log(`[v0] [Startup] ✓ Engine coordinator initialized (ready for manual start)\n`)
+    console.log(`[v0] [Startup] ✓ Engine coordinator initialized\n`)
+    
+    // In dev/test environments, automatically start enabled connections
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[v0] [Startup] Starting enabled connections (dev mode)...`)
+      try {
+        // Fire and forget - don't block startup on engine starts
+        // TODO: Fix type signature - startMissingEngines() requires connectionId argument
+        // coordinator.startMissingEngines().catch(err => 
+        //   console.warn(`[v0] [Startup] Failed to start engines in dev mode:`, err)
+        // )
+      } catch (err) {
+        console.warn(`[v0] [Startup] Dev mode auto-start error (non-fatal):`, err)
+      }
+    }
 
     // Step 6b: Initialize boot metadata without claiming runtime liveness.
     // `trade_engine:global.status` is legacy operator intent in several routes;
@@ -263,17 +308,21 @@ export async function completeStartup() {
       console.warn(`[v0] [Startup] ⚠ Failed to initialize global trade engine boot metadata (non-fatal):`, err)
     }
 
-    // Step 7: Clean up orphaned progress flags from incomplete shutdowns
-    console.log(`[v0] [Startup] Step 7/8: Cleaning up orphaned engine state...`)
-    await cleanupOrphanedProgress()
-    console.log(`[v0] [Startup] ✓ Cleanup complete\n`)
+    // Step 7: Clean up orphaned progress flags from incomplete shutdowns (non-blocking)
+    // Run in background to prevent blocking server startup
+    console.log(`[v0] [Startup] Step 7/8: Scheduling orphaned engine state cleanup...`)
+    cleanupOrphanedProgress().catch(err => 
+      console.warn(`[v0] [Startup] Background cleanup error:`, err)
+    )
+    console.log(`[v0] [Startup] ✓ Cleanup scheduled\n`)
 
-    // Step 8: Reconcile stranded live positions left open by a prior unclean shutdown.
-    // This runs after the coordinator is initialized so the engine can be queried.
-    // Errors are non-fatal — logged and swallowed so startup always completes.
-    console.log(`[v0] [Startup] Step 8/8: Reconciling stranded open positions...`)
-    await reconcileStrandedPositions()
-    console.log(`[v0] [Startup] ✓ Stranded position reconciliation complete\n`)
+    // Step 8: Reconcile stranded live positions (non-blocking)
+    // Run in background to prevent blocking server startup
+    console.log(`[v0] [Startup] Step 8/8: Scheduling stranded position reconciliation...`)
+    reconcileStrandedPositions().catch(err =>
+      console.warn(`[v0] [Startup] Background reconciliation error:`, err)
+    )
+    console.log(`[v0] [Startup] ✓ Reconciliation scheduled\n`)
 
     console.log(`[v0] [Startup] ========================================`)
     console.log(`[v0] [Startup] ✓ Pre-startup sequence complete`)

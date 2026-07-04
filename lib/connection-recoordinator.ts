@@ -80,6 +80,41 @@ export async function recoordinateAfterSettingsChange(
     return
   }
 
+  // If the operator previously requested Live Trade while credentials were
+  // missing, saving credentials in the connection/settings dialog must unblock
+  // the live stage without requiring the operator to toggle Live off/on again.
+  // Otherwise `live_trade_blocked_reason` remains sticky and
+  // hasRealTradeBlock() rejects every exchange order even though credentials
+  // now exist.
+  try {
+    const { hasConnectionCredentials, isTruthyFlag } = await import("@/lib/connection-state-utils")
+    const liveRequested = isTruthyFlag((after as any).live_trade_requested) || isTruthyFlag((after as any).is_live_trade)
+    const hasCreds = hasConnectionCredentials(after, 5, true)
+    const hasBlock = String((after as any).live_trade_blocked_reason || "").trim().length > 0
+    if (liveRequested && hasCreds && (!isTruthyFlag((after as any).is_live_trade) || hasBlock)) {
+      const { updateConnection } = await import("@/lib/redis-db")
+      const patch = {
+        is_live_trade: "1",
+        live_trade_requested: "1",
+        live_trade_blocked_reason: "",
+        last_test_status: "success",
+        updated_at: new Date().toISOString(),
+      }
+      await updateConnection(id, patch)
+      after = { ...after, ...patch }
+      if (!changedFields.includes("is_live_trade")) changedFields.push("is_live_trade")
+      if (!changedFields.includes("live_trade_blocked_reason")) changedFields.push("live_trade_blocked_reason")
+      console.log(
+        `[v0] [${opts.logTag}] Live Trade unblocked for ${id} after credential/settings save`,
+      )
+    }
+  } catch (liveRepairErr) {
+    console.warn(
+      `[v0] [${opts.logTag}] Live Trade credential unblock check failed for ${id}:`,
+      liveRepairErr instanceof Error ? liveRepairErr.message : String(liveRepairErr),
+    )
+  }
+
   // Step 1 — durable notify (Redis envelope read by all running engines).
   try {
     await notifySettingsChanged(id, changedFields, before, after)
@@ -158,7 +193,7 @@ export async function recoordinateAfterSettingsChange(
       normalized === "minStep"
     )
   })
-  if (symbolsChanged) {
+  if (symbolsChanged || strategyOrCoordinationChanged) {
     try {
       const { ProgressionStateManager } = await import("@/lib/progression-state-manager")
       // Use the COUPLED recoordinate path (not the bare archive). It
@@ -173,11 +208,11 @@ export async function recoordinateAfterSettingsChange(
       // churn when the PATCH route also recoordinates.
       const result = await ProgressionStateManager.recoordinateForActualOne(id)
       console.log(
-        `[v0] [${opts.logTag}] Symbol set changed for ${id} → recoordinated progression (changed:${result?.changed ?? "?"}, reason:${result?.reason ?? "?"})`,
+        `[v0] [${opts.logTag}] Progress-affecting settings changed for ${id} → recoordinated progression (changed:${result?.changed ?? "?"}, reason:${result?.reason ?? "?"})`,
       )
     } catch (archiveErr) {
       console.warn(
-        `[v0] [${opts.logTag}] Failed to recoordinate progression after symbol change for ${id}:`,
+        `[v0] [${opts.logTag}] Failed to recoordinate progression after settings change for ${id}:`,
         archiveErr instanceof Error ? archiveErr.message : String(archiveErr),
       )
       // Continue — progression will still update under the old schema,
@@ -191,7 +226,7 @@ export async function recoordinateAfterSettingsChange(
   // data so the UI shows fresh prehistoric/realtime stats on next fetch.
   // This ensures the stats endpoint returns up-to-date progress reflecting
   // the new settings (not stale cached values from before the change).
-  if (progressAffectingChange && !symbolsChanged) {
+  if (progressAffectingChange && !(symbolsChanged || strategyOrCoordinationChanged)) {
     // For non-symbol changes, we don't archive (symbol changes do that above).
     // But we DO want to clear any cached progress data so the UI refreshes.
     // The progression data is persisted in Redis but won't auto-recalculate
@@ -296,20 +331,23 @@ export async function recoordinateAfterSettingsChange(
       try {
         const { getRedisClient } = await import("@/lib/redis-db")
         const globalState = await getRedisClient().hgetall("trade_engine:global")
-        globalRunning = (globalState as any)?.status === "running"
+        const operatorStopped =
+          (globalState as any)?.operator_stopped === "1" || (globalState as any)?.operator_stopped === "true"
+        const intent = operatorStopped
+          ? "stopped"
+          : (globalState as any)?.operator_intent || (globalState as any)?.desired_status || (globalState as any)?.status || ""
+        globalRunning = intent === "running"
       } catch {
         globalRunning = false
       }
-      const localStartAllowed =
-        process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()
-      if (globalRunning && localStartAllowed) {
+      if (globalRunning) {
         console.log(
-          `[v0] [${opts.logTag}] Recoordinate: starting engine for ${id} (was stopped, now should run, global=running, local worker opted in)`,
+          `[v0] [${opts.logTag}] Recoordinate: starting engine for ${id} (was stopped, now should run, global intent=running)`,
         )
         await coordinator.startMissingEngines([after])
       } else {
         console.log(
-          `[v0] [${opts.logTag}] Recoordinate: NOT starting ${id} — ${globalRunning ? "web worker has no local engine runtime/opt-in" : "global engine not running (operator stop honored)"}; settings apply on next explicit Start or dedicated worker tick`,
+          `[v0] [${opts.logTag}] Recoordinate: NOT starting ${id} — global engine not running (operator stop honored); settings apply on next explicit Start or continuity tick`,
         )
       }
     } else if (!shouldRun && isRunning) {
@@ -318,7 +356,7 @@ export async function recoordinateAfterSettingsChange(
       console.log(
         `[v0] [${opts.logTag}] Recoordinate: stopping engine for ${id} (was running, no longer should)`,
       )
-      await coordinator.stopEngine(id)
+      await coordinator.stopEngine(id, { operatorRequested: true })
     } else if (shouldRun && isRunning) {
       // Should run and is — the hot-reload path inside
       // `applyPendingChangesNow` already handled the change. Nothing

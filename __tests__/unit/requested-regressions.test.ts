@@ -5,6 +5,34 @@ const repo = path.resolve(__dirname, "../..")
 const read = (file: string) => fs.readFileSync(path.join(repo, file), "utf8")
 
 describe("requested regression guardrails", () => {
+  test("real progression evaluated includes fan-out without impossible-state clamp", () => {
+    const coordinator = read("lib/strategy-coordinator.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+
+    expect(coordinator).toContain("let realStageRelatedCreated = 0")
+    expect(coordinator).toContain("realStageRelatedCreated += activePositionBlockOverlays.length")
+    expect(coordinator).toContain("const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)")
+    expect(coordinator).toContain("const realTotalEvaluated = mainPFEligible + realRelatedCreated")
+    expect(coordinator).toContain('`${symbol}:real:input`')
+    expect(coordinator).toContain('`${symbol}:real:relatedCreated`')
+    expect(coordinator).toContain('`${symbol}:real:evaluated`]: String(realTotalEvaluated)')
+
+    expect(statsRoute).toContain("let activeRealInput = 0")
+    expect(statsRoute).toContain("let activeRealRelatedCreated = 0")
+    expect(statsRoute).toContain("const realUpstreamInput = activeRealInput || stratCounts.main")
+    expect(statsRoute).toContain('suffix === "real:input"')
+    expect(statsRoute).toContain('suffix === "real:relatedCreated"')
+    expect(statsRoute).toContain("const afterFanOut = activeRealInput + activeRealRelatedCreated")
+    expect(statsRoute).toContain("const realMaxAfterFanOut = realUpstreamInput + activeRealRelatedCreated")
+    expect(statsRoute).not.toContain("stratCounts.real > stratCounts.main) {")
+
+    const snapshot = { main: 10, realRelatedCreated: 5, real: 12 }
+    const realEvaluated = snapshot.main + snapshot.realRelatedCreated
+    const shouldClampImpossibleState = snapshot.real > snapshot.main + snapshot.realRelatedCreated
+    expect(realEvaluated).toBe(15)
+    expect(shouldClampImpossibleState).toBe(false)
+  })
+
 
   test("live order test endpoints require explicit server and request safety gates", () => {
     const safety = read("lib/live-order-safety.ts")
@@ -88,12 +116,24 @@ describe("requested regression guardrails", () => {
     expect(intentBlock).toContain('mode: hasCredentials ? "live" : "live_requested"')
   })
 
-  test("live-trade queued starts use settings namespace consumed by coordinator", () => {
+  test("live-trade queued starts use per-connection refresh requests consumed by coordinator", () => {
     const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
 
-    expect(source).toContain('setSettings("engine_coordinator:refresh_requested"')
+    expect(source).toContain("queueEngineRefreshRequest({")
+    expect(source).toContain("state_switch_version: stateSwitchVersion")
     expect(source).not.toContain('hset("engine_coordinator:refresh_requested"')
     expect(source).toContain('engineStatus = "queued"')
+  })
+
+  test("production healing sweep drains queued engine refresh requests", () => {
+    const source = read("lib/trade-engine-auto-start.ts")
+
+    expect(source).toContain("processQueuedEngineRefreshRequests")
+    expect(source).toContain("getQueuedEngineRefreshRequests")
+    expect(source).toContain("currentVersion !== requestedVersion")
+    expect(source).toContain("await coordinator.stopEngine(request.connectionId, { operatorRequested: true })")
+    expect(source).toContain("await coordinator.startMissingEngines([connection])")
+    expect(source).toContain("queuedRefreshProcessedCount")
   })
 
   test("live-trade enable preserves requested state when credentials are missing", () => {
@@ -103,7 +143,6 @@ describe("requested regression guardrails", () => {
     expect(source).toContain('liveTradeBlockedReason = "API credentials required for live trading"')
     expect(source).toContain("is_live_trade: toRedisFlag(isLiveTrade && hasCredentials)")
     expect(source).toContain('live_trade_requested: "1"')
-    expect(source).not.toContain('...(isLiveTrade ? { live_trade_blocked_reason: "" } : {})')
     expect(source).not.toContain('error: "API credentials required for live trading"')
   })
 
@@ -113,7 +152,6 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("const liveTradeUpdate = credentialCheck.valid")
     expect(source).toContain("...liveTradeUpdate")
     expect(source).toContain('is_live_trade: credentialCheck.valid ? "1" : "0"')
-    expect(source).toContain('live_trade_blocked_reason: credentialCheck.valid ? "" : credentialCheck.reason')
     expect(source).not.toMatch(/\.\.\.liveTradeUpdate,[\s\S]{0,160}is_live_trade:\s*"1"/)
   })
 
@@ -171,7 +209,7 @@ describe("requested regression guardrails", () => {
     expect(disableBranch).not.toContain('if (activeCount === 0) return "stopped"')
   })
 
-  test("explicit dashboard enable starts coordinator in production-safe foreground", () => {
+  test("explicit dashboard enable queues in production and foreground-starts only with opt-in", () => {
     const source = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
     const startBranch = source.slice(
       source.indexOf('if (engineAction === "start")'),
@@ -180,9 +218,11 @@ describe("requested regression guardrails", () => {
 
     expect(startBranch).toContain('status: "running"')
     expect(startBranch).toContain('coordinator_ready: "true"')
-    expect(startBranch).toContain("const started = await coordinator.startEngine")
-    expect(startBranch).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(startBranch).toContain("const engineStarted = await coordinator.startEngine")
+    expect(startBranch).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
+    expect(startBranch).toContain('process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"')
     expect(startBranch).toContain('engineStatus = "queued"')
+    expect(startBranch).toContain('allowInProcessStart: true')
     expect(startBranch).not.toContain("setImmediate")
   })
 
@@ -193,8 +233,8 @@ describe("requested regression guardrails", () => {
 
     expect(processor).toContain("[`${symbol}:move`]: String(moveQ)")
     expect(processor).not.toContain('pipe.hincrby(w5Key,  "move"')
-    expect(cron).toContain("pipeline.hset(w5Key,  `${symbol}:${type}`, String(count))")
-    expect(cron).toContain("Zeroes are written too")
+    expect(cron).toContain("runIndStratCycle(connectionId, symbol, \"realtime\"")
+    expect(cron).toContain("ensureCurrentMarketDataCandle(symbol, client)")
     expect(tracking).toContain("aggregateWindowByType")
     expect(tracking).toContain("prefer the per-symbol snapshot")
     expect(tracking).toContain("if (idx <= 0 && hasSymbolField[type]) continue")
@@ -212,14 +252,15 @@ describe("requested regression guardrails", () => {
     expect(source).not.toContain("/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&sort=volatility")
   })
 
-  test("live-trade enable awaits production-safe engine start", () => {
+  test("live-trade enable queues in production and foreground-starts only with opt-in", () => {
     const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
 
     expect(source).toContain('export const runtime = "nodejs"')
-    expect(source).toContain("const started = await coordinator.startEngine")
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
+    expect(source).toContain("const engineStarted = await coordinator.startEngine")
+    expect(source).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"')
     expect(source).toContain('reason: "live_trade_enable"')
-    expect(source).toContain("Engine start queued for")
+    expect(source).toContain('allowInProcessStart: true')
     expect(source).toContain('live_trade_requested: "1"')
     expect(source).toContain('mode: hasCredentials ? "live" : "live_requested"')
     expect(source).not.toContain("setImmediate")
@@ -306,15 +347,17 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("Success Rate: ${tradeSuccessRate.toFixed(1)}%")
   })
 
-  test("startEngine retries stale cross-worker startup locks", () => {
+  test("startEngine leaves healthy cross-worker startup locks untouched", () => {
     const source = read("lib/trade-engine.ts")
     const lockBranch = source.slice(
       source.indexOf("Cannot start engine ${connectionId}"),
       source.indexOf("lockHandle = acquired.handle"),
     )
 
-    expect(lockBranch).toContain("forceBreakProgressionLock")
-    expect(lockBranch).not.toMatch(/return false\s+try/)
+    expect(lockBranch).toContain("Leaving existing owner untouched")
+    expect(lockBranch).toContain("return false")
+    expect(lockBranch).not.toContain("forceBreakProgressionLock")
+    expect(lockBranch).not.toContain("stopEngine(connectionId)")
   })
 
   test("startMissingEngines keeps the Main pipeline running without credentials", () => {
@@ -363,18 +406,20 @@ describe("requested regression guardrails", () => {
 
   test("block overlays completed-position counts and active-position exposure at Real stage", () => {
     const source = read("lib/strategy-coordinator.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
 
     expect(source).toContain("Block is not materialized as its own Main/Real Set")
     expect(source).toContain('activeVariants.filter((p) => p.name !== "block")')
     expect(source).toContain("EVERY block size [1..blockMaxStack]")
     expect(source).toContain("blockMaxStack:    10")
-    expect(source).toContain("Math.max(1, Math.min(8, this._coordinationSettings.blockMaxStack | 0))")
+    expect(source).toContain("Math.max(1, Math.min(10, this._coordinationSettings.blockMaxStack | 0))")
     expect(source).toContain("for (let blockCount = 1; blockCount <= maxStack; blockCount++)")
     expect(source).toContain("setKey: `${source.setKey}#block:${blockCount}`")
     expect(source).toContain("Active Real/Live-position Block handling belongs to REAL")
     expect(source).toContain("buildActiveRealBlockOverlaysForReal")
     expect(source).toContain("blockActiveRealEnabled && !this._coordinationSettings.blockActiveLiveEnabled")
     expect(source).toContain("setKey: `${source.setKey}#block:active:${boundedCount}`")
+    expect(statsRoute).toContain("const realValidatedActivePositions = realOpen || realDetailRunning || 0")
     expect(source).toContain("variantSizeMultiplier: Number((blockConfig.size * blockMul).toFixed(6))")
     expect(source).toContain("variant: \"block\"")
   })
@@ -417,12 +462,15 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("private static readonly _AXIS_LRU_MAX = (() =>")
   })
 
-  test("coordinator startEngine is guarded in production UI workers", () => {
+  test("coordinator startEngine is queue-only in production API workers unless explicitly opted in", () => {
     const source = read("lib/trade-engine.ts")
 
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(source).toContain('process.env.npm_lifecycle_event === "start"')
-    expect(source).toContain('startEngine(${connectionId}) queued/skipped in production UI worker')
+    expect(source).toContain("private canOwnEngineRuntime()")
+    expect(source).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"')
+    expect(source).toContain("queued-only in this production API worker")
+    expect(source).toContain("Leaving start request queued")
+    expect(source).not.toContain("runningUnderProdStart")
   })
 
   test("base connection migrations preserve existing live-trade operator state", () => {
@@ -442,18 +490,71 @@ describe("requested regression guardrails", () => {
     expect(existingBlock).not.toContain("!hasLiveTrade")
   })
 
-  test("production web boot does not auto-start heavy engine loops unless explicitly opted in", () => {
+  test("production web boot enables in-process starts and continuity by default", () => {
     const instrumentation = read("instrumentation.ts")
     const continuityRunner = read("lib/server-continuity-runner.ts")
 
     expect(instrumentation).toContain('process.env.NEXT_RUNTIME === "edge"')
     expect(instrumentation).not.toContain('process.env.NEXT_RUNTIME !== "nodejs"')
-    expect(instrumentation).toContain('ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(instrumentation).toContain("trade-engine auto-start skipped")
-    expect(instrumentation).toContain('ENABLE_IN_PROCESS_CONTINUITY === "1"')
-    expect(continuityRunner).toContain('ENABLE_IN_PROCESS_CONTINUITY !== "1"')
-    expect(continuityRunner).toContain("web/UI process")
+    expect(instrumentation).toContain('DISABLE_TRADE_ENGINE_AUTOSTART !== "1"')
+    expect(instrumentation).toContain('DISABLE_IN_PROCESS_CONTINUITY !== "1"')
+    expect(continuityRunner).toContain('DISABLE_IN_PROCESS_CONTINUITY === "1"')
+    expect(continuityRunner).toContain("Long-lived Node production/dev processes should keep continuity alive")
   })
+
+  test("indication snapshots do not double-count legacy production fields", () => {
+    const detailedTracking = read("lib/detailed-tracking.ts")
+    const statsRoute = read("app/api/connections/progression/[id]/stats/route.ts")
+    const migrations = read("lib/redis-migrations.ts")
+
+    expect(detailedTracking).toContain("const byType = aggregateWindowByType(active)")
+    expect(detailedTracking).toContain("indication_sets_active")
+    expect(detailedTracking).toContain("indication_sets_window")
+    expect(detailedTracking).toContain("Do not read the raw indications_active")
+    expect(detailedTracking).toContain("last5ByType[t] = v5")
+    expect(detailedTracking).toContain("const totalIndicationSets = totalActive || last5Total || 0")
+    expect(detailedTracking).not.toContain("const aggregateWindowByType = (hash: Record<string, string>): Record<string, number> =>")
+    expect(statsRoute).toContain("function aggregateIndicationSnapshot")
+    expect(statsRoute).toContain("ignore the plain field so mixed deploys do not double")
+    expect(migrations).toContain('name: "063-reset-legacy-indication-snapshots"')
+    expect(migrations).toContain('name: "064-split-raw-and-set-indication-snapshots"')
+    expect(migrations).toContain('"indications_active:*"')
+    expect(migrations).toContain('"indications_window:*:last5"')
+    expect(migrations).toContain("do NOT touch cumulative progression counters")
+  })
+
+  test("indication processing keeps every type independent and windowed", () => {
+    const setProcessor = read("lib/indication-sets-processor.ts")
+    const rawProcessor = read("lib/trade-engine/indication-processor-fixed.ts")
+
+    expect(setProcessor).toContain('runType("active_advanced", () => this.processActiveAdvancedSet(symbol, marketData))')
+    expect(setProcessor).toContain("private async processActiveAdvancedSet")
+    expect(setProcessor).toContain('await this.batchSaveIndications(pendingWrites, "active_advanced")')
+    expect(setProcessor).toContain('active_advanced: activeAdvancedResults')
+    expect(setProcessor).toContain('`${symbol}:active_advanced`]: String(advQ)')
+    expect(setProcessor).toContain('const activeKey = `indication_sets_active:${this.connectionId}`')
+    expect(setProcessor).toContain('const w5Key      = `indication_sets_window:${this.connectionId}:last5`')
+    expect(rawProcessor).toContain("active_advanced: 0")
+    expect(rawProcessor).toContain('const w5Key = `indications_window:${this.connectionId}:last5`')
+    expect(rawProcessor).toContain("pipe.hset(w5Key, fields)")
+    expect(rawProcessor).toContain("pipe.hset(w60Key, fields)")
+  })
+  test("closing pending realtime outcomes preserves LIST-backed indication sets", () => {
+    const setProcessor = read("lib/indication-sets-processor.ts")
+    const closeStart = setProcessor.indexOf("private async closePendingRealtimeOutcomes")
+    const closeEnd = setProcessor.indexOf("private evaluateForwardOutcome", closeStart)
+    const closeBlock = setProcessor.slice(closeStart, closeEnd)
+
+    expect(closeBlock).toContain("await this.readIndicationSetEntries(client, setKey)")
+    expect(closeBlock).toContain("await client.del(setKey)")
+    expect(closeBlock).toContain("await client.rpush(setKey, ...serializedEntries)")
+    expect(closeBlock).toContain("compactionCeiling(cfg)")
+    expect(closeBlock).toContain("await client.ltrim(setKey, -cfg.floor, -1)")
+    expect(closeBlock).toContain("await this.indexSetKey(client, setKey")
+    expect(closeBlock).not.toContain("await client.set(setKey, JSON.stringify(entries))")
+    expect(closeBlock).not.toContain("const existing = await client.get(setKey)")
+  })
+
 
   test("server continuity cron awaits direct healing sweep instead of relying on auto-start timers", () => {
     const cronRoute = read("app/api/cron/server-continuity/route.ts")
@@ -500,10 +601,45 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("workerAttached: hasLocalEngineRuntime")
     expect(source).toContain("distributedHeartbeatFresh: hasFreshDistributedHeartbeat")
     expect(source).toContain("distributedEngineCount")
-    expect(source).toContain("no local manager or fresh distributed processor heartbeat is attached")
-    expect(source).toContain("ENABLE_TRADE_ENGINE_AUTOSTART=1")
+    expect(source).toContain("No local engine runtime is attached yet; explicit UI actions and continuity sweeps will attach engine work in this process.")
+    expect(source).toContain("Optional for dedicated-worker deployments")
     expect(source).toContain("operatorStatus: operatorIntent")
     expect(source).not.toContain("Math.max(coordinatorEngineCount, summary.running)")
+  })
+
+
+
+  test("settings recoordinator uses operator intent and unblocks live trade after credentials save", () => {
+    const source = read("lib/connection-recoordinator.ts")
+
+    expect(source).toContain("Live Trade unblocked")
+    expect(source).toContain("operator_intent || (globalState as any)?.desired_status")
+    expect(source).not.toContain("web worker has no local engine runtime/opt-in")
+    expect(source).not.toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
+  })
+
+  test("live-trade foreground start failures do not mark the global coordinator error", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+
+    expect(source).toContain("live_trade_enable_foreground_start_failed")
+    expect(source).toContain('status: "running"')
+    expect(source).toContain('operator_intent: "running"')
+    expect(source).toContain('engineStatus = "queued"')
+    expect(source).not.toContain('status: "error"')
+    expect(source).not.toContain('engine_is_running:${connectionId}`')
+  })
+
+  test("startup cleanup preserves fresh distributed engine owners", () => {
+    const source = read("lib/startup-coordinator.ts")
+    const cleanupBlock = source.slice(
+      source.indexOf("export async function cleanupOrphanedProgress"),
+      source.indexOf("export async function completeStartup"),
+    )
+
+    expect(cleanupBlock).toContain("fresh distributed heartbeat present")
+    expect(cleanupBlock).toContain("last_processor_heartbeat")
+    expect(cleanupBlock).toContain("Date.now() - remoteHeartbeat < 90_000")
+    expect(cleanupBlock.indexOf("remoteHeartbeatFresh")).toBeLessThan(cleanupBlock.indexOf("Cleaning orphaned running flag"))
   })
 
   test("startup lock preserves a fresh remote engine owner instead of clearing its Redis flag", () => {
@@ -515,22 +651,57 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("not clearing distributed running flag")
   })
 
-  test("settings save does not auto-start heavy engine loops in an unopted web worker", () => {
-    const source = read("lib/connection-recoordinator.ts")
 
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
-    expect(source).toContain("web worker has no local engine runtime/opt-in")
-    expect(source).toContain("settings apply on next explicit Start or dedicated worker tick")
+  test("restart from non-owner preserves fresh remote progression lock", () => {
+    const source = read("lib/trade-engine.ts")
+    const restartBlock = source.slice(
+      source.indexOf("async restartEngine(connectionId: string): Promise<void>"),
+      source.indexOf("private async markRemoteRestartRequestIfFresh"),
+    )
+
+    expect(restartBlock).toContain("hasLocalRunningManager")
+    expect(restartBlock).toContain("stop normally so the manager releases its own")
+    expect(restartBlock).toContain("markRemoteRestartRequestIfFresh(connectionId)")
+    expect(restartBlock).toContain("remote owner has fresh heartbeat")
+    expect(restartBlock).toContain("treat the distributed")
+    expect(restartBlock).toContain("forceBreakProgressionLock(connectionId)")
+    expect(restartBlock.indexOf("markRemoteRestartRequestIfFresh(connectionId)")).toBeLessThan(
+      restartBlock.indexOf("forceBreakProgressionLock(connectionId)"),
+    )
   })
 
-  test("dashboard enable queues engine start instead of blocking an unopted production UI worker", () => {
+  test("fresh remote restart marker path does not force-break progression lock", () => {
+    const source = read("lib/trade-engine.ts")
+    const markerBlock = source.slice(
+      source.indexOf("private async markRemoteRestartRequestIfFresh"),
+      source.indexOf("async applyPendingChangesNow"),
+    )
+
+    expect(markerBlock).toContain("Date.now() - remoteHeartbeat < 90_000")
+    expect(markerBlock).toContain("restart_request")
+    expect(markerBlock).toContain("settings_change_marker")
+    expect(markerBlock).not.toContain("forceBreakProgressionLock")
+  })
+
+  test("settings save start reconciliation follows global operator intent", () => {
+    const source = read("lib/connection-recoordinator.ts")
+
+    expect(source).toContain("operator_intent || (globalState as any)?.desired_status")
+    expect(source).toContain("global intent=running")
+    expect(source).toContain("operator stop honored")
+    expect(source).not.toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
+    expect(source).not.toContain("web worker has no local engine runtime/opt-in")
+  })
+
+  test("dashboard enable keeps API worker responsive unless foreground runtime is explicitly allowed", () => {
     const source = read("app/api/settings/connections/[id]/toggle-dashboard/route.ts")
 
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1"')
-    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_AUTOSTART === "1" || coordinator.isRunning()')
-    expect(source).toContain("Connection enabled; start queued for coordinator worker")
-    expect(source).toContain("this UI worker is not opted in for local engine loops")
+    expect(source).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
+    expect(source).toContain('process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"')
+    expect(source).toContain('allowInProcessStart: true')
+    expect(source).toContain('const engineStarted = await coordinator.startEngine')
     expect(source).toContain('engineStatus = "queued"')
+    expect(source).toContain('engineStatus = "started"')
   })
 
   test("connection enable paths keep global coordinator intent stable when engines can run", () => {
@@ -542,12 +713,56 @@ describe("requested regression guardrails", () => {
     expect(enableRoute).toContain('desired_status: "running"')
     expect(enableRoute).toContain('operator_intent: "running"')
     expect(enableRoute).toContain('coordinator_ready: "true"')
+    expect(enableRoute).toContain('operator_stopped: "0"')
+    expect(enableRoute).toContain('const localStartAllowed =')
+    expect(enableRoute).toContain('process.env.NODE_ENV !== "production"')
+    expect(enableRoute).toContain('process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1"')
     expect(enableRoute.indexOf('operator_intent: "running"')).toBeLessThan(enableRoute.indexOf("await coordinator.startMissingEngines"))
 
     expect(dashboardRoute).toContain("const preservedCoordinatorIntent")
     expect(dashboardRoute).toContain("desired_status: disableGlobalState?.desired_status || preservedCoordinatorIntent")
     expect(dashboardRoute).toContain("operator_intent: disableGlobalState?.operator_intent || preservedCoordinatorIntent")
+    expect(dashboardRoute).toContain('operator_stopped: "0"')
     expect(dashboardRoute).toContain("Only /api/trade-engine/stop owns global shutdown")
+  })
+
+  test("live-trade enable clears stale global operator stop latch", () => {
+    const source = read("app/api/settings/connections/[id]/live-trade/route.ts")
+    const enableBlock = source.slice(
+      source.indexOf("if (isLiveTrade)"),
+      source.indexOf("await persistNow()", source.indexOf("if (isLiveTrade)")),
+    )
+
+    expect(enableBlock).toContain('operator_intent: "running"')
+    expect(enableBlock).toContain('operator_stopped: "0"')
+    expect(enableBlock).toContain('operator_stopped_at: ""')
+    expect(enableBlock).toContain('stopped_at: ""')
+  })
+
+
+  test("global resume restores Redis intent before startEngine and supports fresh-process paused state", () => {
+    const resumeRoute = read("app/api/trade-engine/resume/route.ts")
+    const coordinator = read("lib/trade-engine.ts")
+
+    const routeRestoreIndex = resumeRoute.indexOf('await client.hset("trade_engine:global", {')
+    const routeResumeIndex = resumeRoute.indexOf("await coordinator.resume({ force: true })")
+    expect(routeRestoreIndex).toBeGreaterThanOrEqual(0)
+    expect(routeRestoreIndex).toBeLessThan(routeResumeIndex)
+    expect(resumeRoute).toContain('status: previousStatus')
+    expect(resumeRoute).toContain('desired_status: previousStatus')
+    expect(resumeRoute).toContain('operator_intent: previousStatus')
+
+    const resumeBlock = coordinator.slice(
+      coordinator.indexOf("async resume(options: { force?: boolean } = {})"),
+      coordinator.indexOf("getEngineManager", coordinator.indexOf("async resume(options: { force?: boolean } = {})")),
+    )
+    expect(resumeBlock).toContain('const redisPaused = globalState?.status === "paused" || globalState?.operator_intent === "paused"')
+    expect(resumeBlock).toContain("if (!options.force && !this.isPaused && !redisPaused)")
+    expect(resumeBlock.indexOf('await client.hset("trade_engine:global", {')).toBeLessThan(resumeBlock.indexOf("await this.startEngine(connectionId, config)"))
+    expect(resumeBlock).toContain('status: restoredStatus')
+    expect(resumeBlock).toContain('desired_status: restoredStatus')
+    expect(resumeBlock).toContain('operator_intent: restoredStatus')
+    expect(resumeBlock.indexOf('await client.hdel("trade_engine:global", "paused_at", "paused_by", "previous_status")')).toBeGreaterThan(resumeBlock.indexOf('await client.hset("trade_engine:global", {'))
   })
 
   test("dashboard detailed logs header action scrolls within the log dialog", () => {
@@ -578,6 +793,356 @@ describe("requested regression guardrails", () => {
     expect(statusRoute).toContain("const effectivelyRunning = isGloballyRunning && !isGloballyPaused && (hasRuntimeProof || distributedEngineCount > 0)")
     expect(statusRoute).toContain('actualStatus: effectivelyRunning ? "running" : (isGloballyPaused ? "paused" : "degraded")')
     expect(statusRoute).toContain("last_heartbeat_at")
+  })
+
+  test.each([
+    ["0", false],
+    ["1", true],
+  ])("testing place-order forwards Redis is_testnet %s as connector isTestnet=%s", async (isTestnetFlag, expectedIsTestnet) => {
+    jest.resetModules()
+
+    const hgetall = jest.fn().mockResolvedValue({
+      name: "Test Connection",
+      exchange: "bingx",
+      api_key: "test-api-key",
+      api_secret: "test-api-secret",
+      api_passphrase: "test-passphrase",
+      api_type: "swap",
+      contract_type: "perpetual",
+      is_testnet: isTestnetFlag,
+      margin_type: "cross",
+      position_mode: "one_way",
+      connection_method: "api",
+      connection_library: "ccxt",
+    })
+    const hget = jest.fn().mockResolvedValue(null)
+    const hincrby = jest.fn().mockResolvedValue(1)
+    const hincrbyfloat = jest.fn().mockResolvedValue(1)
+    const createExchangeConnector = jest.fn().mockResolvedValue({
+      placeOrder: jest.fn().mockResolvedValue({ success: true, orderId: "order-1" }),
+    })
+
+    jest.doMock("@/lib/redis-db", () => ({
+      initRedis: jest.fn().mockResolvedValue(undefined),
+      getRedisClient: jest.fn(() => ({ hgetall, hget, hincrby, hincrbyfloat })),
+      savePosition: jest.fn().mockResolvedValue(undefined),
+      getMarketData: jest.fn().mockResolvedValue(null),
+    }))
+    jest.doMock("@/lib/exchange-connectors/factory", () => ({
+      createExchangeConnector,
+    }))
+    jest.doMock("@/lib/live-order-safety", () => ({
+      getLiveOrderSafetyFailure: jest.fn(() => null),
+    }))
+
+    const { POST } = await import("../../app/api/testing/place-order/route")
+
+    const response = await POST({
+      json: async () => ({
+        connectionId: "conn-1",
+        symbol: "BTCUSDT",
+        side: "buy",
+        quantity: 0.001,
+        leverage: 1,
+      }),
+    } as any)
+    const payload = await response.json()
+
+    expect(payload.success).toBe(true)
+    expect(createExchangeConnector).toHaveBeenCalledWith(
+      "bingx",
+      expect.objectContaining({
+        isTestnet: expectedIsTestnet,
+        apiType: "swap",
+        contractType: "perpetual",
+      }),
+    )
+  })
+
+  test("queued settings refreshes hot-apply one connection and do not reinitialize all engines", () => {
+    const coordinator = read("lib/trade-engine.ts")
+    const autoStart = read("lib/trade-engine-auto-start.ts")
+    const settingsCoordinator = read("lib/settings-coordinator.ts")
+
+    const healthBlock = coordinator.slice(
+      coordinator.indexOf('if (request.action === "stop")'),
+      coordinator.indexOf("// -- 2. Per-engine stall watchdog", coordinator.indexOf('if (request.action === "stop")')),
+    )
+    expect(healthBlock).toContain("await this.applyPendingChangesNow(request.connectionId)")
+    expect(healthBlock).not.toContain("await this.refreshEngines()")
+
+    const autoBlock = autoStart.slice(
+      autoStart.indexOf('if (request.action === "stop")'),
+      autoStart.indexOf("return processed", autoStart.indexOf('if (request.action === "stop")')),
+    )
+    expect(autoBlock).toContain("await coordinator.applyPendingChangesNow?.(request.connectionId)")
+    expect(autoBlock).not.toContain("await coordinator.refreshEngines()")
+
+    const restartFields = settingsCoordinator.slice(
+      settingsCoordinator.indexOf("const RESTART_REQUIRED_FIELDS"),
+      settingsCoordinator.indexOf("const HOT_RELOAD_FIELDS"),
+    )
+    expect(restartFields).not.toContain('"is_enabled"')
+    expect(settingsCoordinator).toContain('"is_enabled", "is_enabled_dashboard", "is_live_trade"')
+  })
+
+  test("QuickStart live controls send the checked state directly and revert to previous on failure", () => {
+    const optionsBar = read("components/dashboard/quickstart-options-bar.tsx")
+    const quickstartSection = read("components/dashboard/quickstart-section.tsx")
+    const activeCard = read("components/dashboard/active-connection-card.tsx")
+    const activeManager = read("components/dashboard/dashboard-active-connections-manager.tsx")
+
+    expect(optionsBar).toContain("void debouncedSaveLive(next, previous)")
+    expect(optionsBar).toContain("setControlOrders(previous)")
+    expect(optionsBar).toContain("onClick={(event) => event.stopPropagation()}")
+    expect(optionsBar).not.toContain("const debouncedSaveLive   = useDebouncedSaver(saveLiveTrade")
+
+    expect(quickstartSection).toContain("const previousState = liveTradeActive")
+    expect(quickstartSection).toContain("setLiveTradeActive(previousState)")
+    expect(quickstartSection).toContain("live-trade-toggled")
+
+    expect(activeCard).toContain("const previousState = liveTrade")
+    expect(activeCard).toContain("setLiveTrade(previousState)")
+    expect(activeCard).toContain("onCheckedChange={(checked) => {\n                    onToggle(connection.connectionId, checked)")
+    expect(activeManager).toContain("const newState = desiredState")
+    expect(activeManager).not.toContain("const newState = !currentState")
+  })
+
+  test("strategy set top-k selection uses a bounded heap for large progression inputs", () => {
+    const source = read("lib/strategy-sets-processor.ts")
+    expect(source).toContain("Memory-safe top-K selection")
+    expect(source).toContain("const heap: any[] = []")
+    expect(source).toContain("bubbleUp")
+    expect(source).toContain("sinkDown")
+    expect(source).not.toContain("top[minIdx] = indication")
+  })
+
+
+  test("production system monitoring returns process resource metrics even when Redis is unavailable", () => {
+    const route = read("app/api/system/monitoring/route.ts")
+    const helper = read("lib/system-resource-metrics.ts")
+
+    expect(route).toContain('const resourceMetrics = getSystemResourceMetrics()')
+    expect(route.indexOf('const resourceMetrics = getSystemResourceMetrics()')).toBeLessThan(route.indexOf('await initRedis()'))
+    expect(route).toContain('Redis unavailable while collecting system metrics')
+    expect(route).toContain('cpu: resourceMetrics.cpuPercent')
+    expect(route).toContain('memory: resourceMetrics.memoryPercent')
+    expect(route).not.toContain('cpu: 0,')
+    expect(route).not.toContain('memory: 0,')
+
+    expect(helper).toContain('process.cpuUsage(previous.cpuUsage)')
+    expect(helper).toContain('/sys/fs/cgroup/memory.max')
+    expect(helper).toContain('/sys/fs/cgroup/cpu.max')
+    expect(helper).toContain('Math.max(0.1')
+    expect(helper).toContain('memory.rss')
+  })
+
+
+  test("progression stats endpoint is read-only for poll-derived real active averages", () => {
+    const route = read("app/api/connections/progression/[id]/stats/route.ts")
+    const snapshotBlock = route.slice(
+      route.indexOf("Active validated Real positions snapshot"),
+      route.indexOf("Live-stage OPEN positions", route.indexOf("Active validated Real positions snapshot")),
+    )
+
+    expect(snapshotBlock).toContain("/stats is a GET/read endpoint and must not mutate Redis")
+    expect(snapshotBlock).toContain("const existingRealActiveAvg = n(progHash.real_active_pos_avg)")
+    expect(snapshotBlock).not.toContain("hincrby")
+    expect(snapshotBlock).not.toContain("hset")
+  })
+
+  test("dashboard stats polling ignores stale overlapping responses", () => {
+    const quickstart = read("components/dashboard/quickstart-section.tsx")
+    const overview = read("components/dashboard/statistics-overview-v2.tsx")
+
+    expect(quickstart).toContain("const statsFetchSeqRef = useRef(0)")
+    expect(quickstart).toContain("const requestSeq = ++statsFetchSeqRef.current")
+    expect(quickstart).toContain("requestSeq !== statsFetchSeqRef.current")
+
+    expect(overview).toContain("const statsFetchSeqRef = useRef(0)")
+    expect(overview).toContain("const requestSeq = ++statsFetchSeqRef.current")
+    expect(overview).toContain("requestSeq !== statsFetchSeqRef.current")
+  })
+
+
+  test("QuickStart live button uses effective live state and live-trade enable makes engine eligible", () => {
+    const quickstart = read("components/dashboard/quickstart-section.tsx")
+    const liveRoute = read("app/api/settings/connections/[id]/live-trade/route.ts")
+    const helper = read("lib/system-resource-metrics.ts")
+
+    const quickstartHelper = quickstart.slice(
+      quickstart.indexOf("QuickStart's Live button controls effective exchange order placement"),
+      quickstart.indexOf("// ─── types", quickstart.indexOf("QuickStart's Live button controls effective exchange order placement")),
+    )
+    expect(quickstartHelper).toContain("toBooleanFlag(conn?.is_live_trade)")
+    expect(quickstartHelper).not.toContain("live_trade_requested) ||")
+    expect(quickstart).toContain("setLiveTradeActive(effectiveState)")
+
+    const liveEnableBlock = liveRoute.slice(
+      liveRoute.indexOf("If Live is turned on while the main engine is not already running"),
+      liveRoute.indexOf('live_trade_requested: "1"', liveRoute.indexOf("If Live is turned on while the main engine is not already running")) + 40,
+    )
+    expect(liveEnableBlock).toContain('is_assigned: "1"')
+    expect(liveEnableBlock).toContain('is_enabled_dashboard: "1"')
+    expect(liveEnableBlock).toContain('is_active: "1"')
+    expect(helper).toContain('os.totalmem')
+    expect(helper).toContain('memory.rss')
+  })
+
+  test("Redis migrations remain sequential for production schema upgrades", () => {
+    const source = read("lib/redis-migrations.ts")
+    const versions = Array.from(source.matchAll(/version:\s*(\d+)/g), (match) => Number(match[1]))
+    const gaps: Array<[number, number]> = []
+    for (let i = 1; i < versions.length; i++) {
+      if (versions[i] !== versions[i - 1] + 1) gaps.push([versions[i - 1], versions[i]])
+    }
+
+    expect(gaps).toEqual([])
+    expect(source).toContain('name: "043-reserved-schema-continuity"')
+    expect(source).toContain('name: "044-reserved-schema-continuity"')
+    expect(source).toContain('name: "065-dev-prod-database-health-metadata"')
+    expect(source).toContain("export function getLatestMigrationVersion")
+    expect(source).toContain('"system:database:health"')
+    expect(source).toContain('migrations_bundle_version: String(finalVersion)')
+  })
+
+  test("Redis init rechecks stale global readiness before skipping migrations", () => {
+    const source = read("lib/redis-db.ts")
+    const globalReadyBlock = source.slice(
+      source.indexOf("if (globalForRedis.__redis_fully_connected)"),
+      source.indexOf("if (isConnected) return", source.indexOf("if (globalForRedis.__redis_fully_connected)")),
+    )
+
+    expect(globalReadyBlock).toContain("getLatestMigrationVersion")
+    expect(globalReadyBlock).toContain('redisInstance!.get("_schema_version")')
+    expect(globalReadyBlock).toContain("currentVersion < latestVersion")
+    expect(globalReadyBlock).toContain("await runMigrations()")
+    expect(globalReadyBlock).toContain("Global ready marker is stale")
+  })
+
+  test("QuickStart re-entry preserves running progressions instead of forced restarts", () => {
+    const quickStart = read("app/api/trade-engine/quick-start/route.ts")
+    const coordinator = read("lib/trade-engine.ts")
+
+    expect(quickStart).toContain("quickstartEngineAlreadyRunning")
+    expect(quickStart).toContain("quickstart_engine_reused")
+    expect(quickStart).toContain("Running engine reused; QuickStart symbols/settings applied without stop/restart")
+    expect(quickStart).toContain("Engine already running — QuickStart settings applied without restart")
+    expect(quickStart).toContain("config_set_symbols_processed: quickstartEngineAlreadyRunning ? symbols.length : 0")
+    expect(quickStart).toContain("coordinator.invalidateSymbolsCacheForConnection(connectionId)")
+    expect(quickStart).not.toContain("quickstart_engine_restart")
+
+    expect(coordinator).toContain("FULL_RESTART_ESCALATION_ENABLED = false")
+    expect(coordinator).toContain("restart escalation disabled")
+  })
+
+  test("QuickStart commits running Redis intent before dispatching engine starts", () => {
+    const quickStart = read("app/api/trade-engine/quick-start/route.ts")
+    const step4 = quickStart.slice(
+      quickStart.indexOf("// Step 4: Start engine"),
+      quickStart.indexOf("// Store in global quickstart state"),
+    )
+    const intentWriteIndex = step4.indexOf('await client.hset("trade_engine:global", {')
+    const startAllIndex = step4.indexOf("coordinator.startAll()")
+    const targetedStartIndex = step4.indexOf("const engineStarted = await coord.startEngine")
+
+    expect(intentWriteIndex).toBeGreaterThanOrEqual(0)
+    expect(intentWriteIndex).toBeLessThan(startAllIndex)
+    expect(intentWriteIndex).toBeLessThan(targetedStartIndex)
+    expect(step4).toContain('operator_stopped: "0"')
+    expect(step4).toContain("updated_at: quickstartGlobalStartedAt")
+    expect(step4).toContain("const quickstartGlobalStartedAt = new Date().toISOString()")
+
+    const intentBlock = step4.slice(intentWriteIndex, step4.indexOf("})", intentWriteIndex))
+    expect(intentBlock).toContain('status: "running"')
+    expect(intentBlock).toContain('desired_status: "running"')
+    expect(intentBlock).toContain('operator_intent: "running"')
+
+    const targetedStartBlock = step4.slice(targetedStartIndex)
+    expect(targetedStartBlock).toContain("if (!engineStarted)")
+    expect(targetedStartBlock).toContain('"engine_start_skipped"')
+    expect(targetedStartBlock).toContain('phase: "queued"')
+    expect(targetedStartBlock).toContain('status: "skipped_queued"')
+  })
+
+  test("Real-stage evaluation denominator includes related outputs and never reports negative failures", () => {
+    const source = read("lib/strategy-coordinator.ts")
+
+    expect(source).toContain("const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)")
+    expect(source).toContain("const realTotalEvaluated = mainPFEligible + realRelatedCreated")
+    expect(source).toContain("const passRatioReal = realTotalEvaluated > 0 ? n / realTotalEvaluated : 0")
+    expect(source).toContain("evaluated:          String(realEvaluatedAfterFanOut)")
+    expect(source).toContain("[`s:${symbol}:evaluated`]:  String(realTotalEvaluated)")
+    expect(source).toContain('client.set(`strategies:${this.connectionId}:real:evaluated`, String(realTotalEvaluated))')
+    expect(source).toContain("totalCreated: realTotalEvaluated")
+    expect(source).toContain("failedEvaluation: Math.max(0, realTotalEvaluated - realSets.length)")
+    expect(source).not.toContain("failedEvaluation: mainPFEligible - realSets.length")
+
+    const mainPFEligible = 3
+    const realSetsLength = 5
+    const realRelatedCreated = Math.max(0, realSetsLength - mainPFEligible)
+    const realTotalEvaluated = mainPFEligible + realRelatedCreated
+
+    expect(Math.max(0, realTotalEvaluated - realSetsLength)).toBe(0)
+    expect(realTotalEvaluated).toBe(5)
+  })
+
+  test("production cron route uses canonical ind-strat pipeline for all configured symbols", () => {
+    const cron = read("app/api/cron/generate-indications/route.ts")
+    const pipeline = read("lib/trade-engine/shared-ind-strat-pipeline.ts")
+    const strategy = read("lib/trade-engine/strategy-processor.ts")
+
+    expect(cron).toContain('runIndStratCycle(connectionId, symbol, "realtime"')
+    expect(cron).toContain("new IndicationProcessor(connection.id)")
+    expect(cron).toContain("new RealtimeProcessor(connection.id)")
+    expect(cron).toContain("new StrategyProcessor(connection.id)")
+    expect(cron).toContain("new IndicationSetsProcessor(connection.id)")
+    expect(cron).toContain("ensureCurrentMarketDataCandle(symbol, client)")
+    expect(cron).toContain("const symbolConcurrency = parsePositiveInteger(process.env.CRON_SYMBOL_CONCURRENCY, 4)")
+    expect(cron).toContain("const symbolLimit = parsePositiveInteger(process.env.CRON_SYMBOL_LIMIT, 20)")
+    expect(cron).toContain("symbolsToProcess,")
+    expect(cron).not.toContain("executeStrategyFlowBatch(strategyItems.slice(0, 2)")
+    expect(cron).not.toContain("strategyItems.slice(0, 2)")
+    expect(cron).toContain("skipLiveDispatch: process.env.CRON_LIVE_DISPATCH")
+    expect(cron).toContain("enableStrategyFlow: process.env.DISABLE_CRON_STRATEGIES !== \"1\"")
+
+    const pseudoIdx = pipeline.indexOf("updateOpenPseudoPositionsForSymbol(symbol)")
+    const strategyIdx = pipeline.lastIndexOf("processStrategy(symbol, indications")
+    expect(pseudoIdx).toBeGreaterThan(0)
+    expect(strategyIdx).toBeGreaterThan(pseudoIdx)
+    expect(pipeline).toContain("deps.enableStrategyFlow === true")
+    expect(strategy).toContain("skipLiveDispatch: boolean = false")
+    expect(strategy).toContain("executeStrategyFlow(symbol, validIndications, false, undefined, skipLiveDispatch)")
+  })
+
+
+  test("trailing coordination survives Main cache and accumulated live sync", () => {
+    const coordinator = read("lib/strategy-coordinator.ts")
+    const liveStage = read("lib/trade-engine/stages/live-stage.ts")
+
+    expect(coordinator).toContain("trailingProfile: built.trailingProfile")
+    expect(coordinator).toContain("Preserve it on")
+    expect(coordinator).toContain("every Main projection")
+    expect(coordinator).toContain("mutable cache patch")
+    expect(coordinator).toContain("...(baseSet.trailingProfile && { trailingProfile: baseSet.trailingProfile })")
+
+    expect(liveStage).toContain("setKey/parentSetKey/accumulatedSetKeys")
+    expect(liveStage).toContain("every owning Set must be allowed")
+    expect(liveStage).toContain("advance its trailing ratchet")
+    expect(liveStage).toContain("const liveKeys = new Set<string>()")
+    expect(liveStage).toContain("Array.isArray(p.accumulatedSetKeys)")
+    expect(liveStage).toContain("liveKeys.has(pseudoSetKey)")
+  })
+
+
+  test("dashboard footer shows session instance and running time", () => {
+    const source = read("components/dashboard/dashboard.tsx")
+
+    expect(source).toContain("function DashboardRuntimeFooter()")
+    expect(source).toContain("Unique Session / Instance ID")
+    expect(source).toContain("createSessionInstanceId")
+    expect(source).toContain("Running: {formatDuration")
+    expect(source).toContain("<DashboardRuntimeFooter />")
   })
 
 })

@@ -1,37 +1,25 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { getSystemResourceMetrics } from "@/lib/system-resource-metrics"
 
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
 export async function GET() {
   try {
-    await initRedis()
-    const client = getRedisClient()
-
-    const memUsage = process.memoryUsage()
-    const os = await import('os')
-    const cpus = os.cpus()
-    let totalIdle = 0
-    let totalTick = 0
-    cpus.forEach(cpu => {
-      for (const type in cpu.times) {
-        totalTick += cpu.times[type as keyof typeof cpu.times]
-      }
-      totalIdle += cpu.times.idle
-    })
-    const cpuPercent = Math.round(100 - (totalIdle / totalTick * 100))
-    const memPercent = memUsage.heapTotal > 0
-      ? Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100)
-      : 0
+    const resourceMetrics = getSystemResourceMetrics()
+    let client: ReturnType<typeof getRedisClient> | null = null
 
     let allKeys: string[] = []
     let redisAvailable = false
     try {
+      await initRedis()
+      client = getRedisClient()
       const keysResult = await client.keys("*")
       allKeys = Array.isArray(keysResult) ? keysResult : []
       redisAvailable = true
-    } catch {
+    } catch (redisError) {
+      console.warn("[Monitoring] Redis unavailable while collecting system metrics:", redisError instanceof Error ? redisError.message : String(redisError))
       allKeys = []
       redisAvailable = false
     }
@@ -52,12 +40,12 @@ export async function GET() {
       let sampledBytes = 0
       for (const key of sampleKeys) {
         sampledBytes += key.length
-        const strValue = await client.get(key).catch(() => null)
+        const strValue = client ? await client.get(key).catch(() => null) : null
         if (typeof strValue === "string" && strValue.length > 0) {
           sampledBytes += strValue.length
           continue
         }
-        const hashValue = await client.hgetall(key).catch(() => null)
+        const hashValue = client ? await client.hgetall(key).catch(() => null) : null
         if (hashValue && typeof hashValue === "object") {
           for (const [field, value] of Object.entries(hashValue)) {
             sampledBytes += String(field).length + String(value).length
@@ -91,6 +79,7 @@ export async function GET() {
       const progressionKeys = allKeys.filter((k: string) => k.startsWith("progression:") && !k.includes(":"))
       for (const progKey of progressionKeys) {
         try {
+          if (!client) continue
           const progHash = await client.hgetall(progKey)
           if (progHash && typeof progHash === "object") {
             const indCycles  = Number(progHash.indication_cycle_count)  || 0
@@ -114,6 +103,7 @@ export async function GET() {
         const connectionStateKeys = allKeys.filter((k: string) => k.startsWith("settings:trade_engine_state:"))
         for (const stateKey of connectionStateKeys) {
           try {
+            if (!client) continue
             const stateStr = await client.get(stateKey)
             if (stateStr) {
               const state = JSON.parse(stateStr)
@@ -132,7 +122,7 @@ export async function GET() {
     
     let redisEngineRunning = false
     try {
-      const globalEngine = await client.hgetall("trade_engine:global")
+      const globalEngine = client ? await client.hgetall("trade_engine:global") : null
       if (globalEngine && Object.keys(globalEngine).length > 0) {
         redisEngineRunning = globalEngine.status === "running"
       }
@@ -152,10 +142,13 @@ export async function GET() {
     }
 
     return NextResponse.json({
-      cpu: cpuPercent,
-      memory: memPercent,
-      memoryUsed: Math.round(memUsage.heapUsed / 1024),
-      memoryTotal: Math.round(memUsage.heapTotal / 1024),
+      cpu: resourceMetrics.cpuPercent,
+      memory: resourceMetrics.memoryPercent,
+      memoryUsed: Math.round(resourceMetrics.memoryUsedBytes / 1024),
+      memoryTotal: Math.round(resourceMetrics.memoryTotalBytes / 1024),
+      heapUsed: Math.round(resourceMetrics.heapUsedBytes / 1024),
+      heapTotal: Math.round(resourceMetrics.heapTotalBytes / 1024),
+      rss: Math.round(resourceMetrics.rssBytes / 1024),
       database: {
         size: estimatedDbBytes,
         keys,
@@ -192,12 +185,16 @@ export async function GET() {
     })
   } catch (error) {
     console.error("[Monitoring] Error:", error)
+    const resourceMetrics = getSystemResourceMetrics()
     return NextResponse.json(
       { 
-        cpu: 0, 
-        memory: 0, 
-        memoryUsed: 0, 
-        memoryTotal: 1,
+        cpu: resourceMetrics.cpuPercent, 
+        memory: resourceMetrics.memoryPercent, 
+        memoryUsed: Math.round(resourceMetrics.memoryUsedBytes / 1024), 
+        memoryTotal: Math.round(resourceMetrics.memoryTotalBytes / 1024),
+        heapUsed: Math.round(resourceMetrics.heapUsedBytes / 1024),
+        heapTotal: Math.round(resourceMetrics.heapTotalBytes / 1024),
+        rss: Math.round(resourceMetrics.rssBytes / 1024),
         database: { size: 0, keys: 0, sets: 0, positions1h: 0, entries1h: 0, requestsPerSecond: 0 },
         services: { tradeEngine: false, indicationsEngine: false, strategiesEngine: false, websocket: false },
         modules: { redis: false, persistence: false, coordinator: false, logger: true },

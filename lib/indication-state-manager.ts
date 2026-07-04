@@ -31,6 +31,10 @@ export class IndicationStateManager {
   private priceCache: Map<string, { price: number; timestamp: number }> = new Map()
   private readonly PRICE_CACHE_TTL = 1000 // 1 second
   private pendingOperations: Map<string, Promise<any>> = new Map()
+  // Short-lived in-memory positions cache: avoids re-reading the same Redis key
+  // on every range in the batch loop (up to 29 sequential reads per cycle).
+  private positionsCache: Map<string, { positions: any[]; ts: number }> = new Map()
+  private readonly POSITIONS_CACHE_TTL = 500 // 500 ms — refreshed each processing cycle
 
   private basePseudoManager: BasePseudoPositionManager
 
@@ -250,11 +254,18 @@ export class IndicationStateManager {
     lastPartRatio: number | null,
   ): Promise<boolean> {
     try {
-      // Get active positions from Redis
       const positionsKey = `positions:${this.connectionId}:${symbol}:${type}`
-      const positions = (await getSettings(positionsKey)) as any[] || []
+      // Use the in-memory cache to avoid re-reading the same Redis key on every
+      // range in the inner batch loop (up to 29 reads per direction/move cycle).
+      const now = Date.now()
+      let cached = this.positionsCache.get(positionsKey)
+      if (!cached || now - cached.ts > this.POSITIONS_CACHE_TTL) {
+        const raw = (await getSettings(positionsKey)) as any[]
+        cached = { positions: Array.isArray(raw) ? raw : [], ts: now }
+        this.positionsCache.set(positionsKey, cached)
+      }
+      const positions = cached.positions
 
-      // Filter active positions by criteria
       let activeCount = 0
       for (const pos of positions) {
         if (pos.status !== 'active') continue
@@ -686,12 +697,16 @@ export class IndicationStateManager {
         { enabled: true, start: 1.0, stop: 0.3 },
       ]
 
-      let createdCount = 0
+      // Read once, collect all new entries, write once.
+      // Previous impl: read+write inside the inner loop — O(N) round-trips.
+      const advancedKey = `positions_advanced:${this.connectionId}:${symbol}`
+      const existingAdvanced = ((await getSettings(advancedKey)) as any[]) || []
+      const newAdvanced: any[] = []
+      const now = new Date().toISOString()
 
       for (const tpFactor of tpFactors) {
         for (const slRatio of slRatios) {
           for (const trailingConfig of trailingOptions) {
-            // Get or create base position for THIS SPECIFIC config
             const basePositionId = await this.basePseudoManager.getOrCreateBasePosition(
               symbol,
               "active_advanced",
@@ -702,20 +717,15 @@ export class IndicationStateManager {
               trailingConfig.enabled,
               trailingConfig.start,
               trailingConfig.stop,
-              metrics.drawdown / 100, // Convert to ratio
+              metrics.drawdown / 100,
               timeWindow,
               metrics.continuationRatio,
             )
 
             if (!basePositionId) continue
+            if (!(await this.basePseudoManager.canCreatePosition(basePositionId))) continue
 
-            // Check if this base position can create more entries (up to 250 per set)
-            if (!(await this.basePseudoManager.canCreatePosition(basePositionId))) {
-              continue
-            }
-
-            // Record active advanced position in Redis
-            const advancedPositionData = {
+            newAdvanced.push({
               connection_id: this.connectionId,
               symbol,
               indication_type: "active_advanced",
@@ -738,20 +748,17 @@ export class IndicationStateManager {
               momentum: metrics.momentum,
               drawdown_ratio: metrics.drawdown / 100,
               continuation_ratio: metrics.continuationRatio,
-              created_at: new Date().toISOString(),
-            }
-
-            // Store in Redis
-            const advancedKey = `positions_advanced:${this.connectionId}:${symbol}`
-            const advancedPositions = (await getSettings(advancedKey)) as any[] || []
-            advancedPositions.push(advancedPositionData)
-            await setSettings(advancedKey, advancedPositions)
-
-            createdCount++
+              created_at: now,
+            })
           }
         }
       }
 
+      if (newAdvanced.length > 0) {
+        await setSettings(advancedKey, [...existingAdvanced, ...newAdvanced])
+      }
+
+      const createdCount = newAdvanced.length
       console.log(
         `[v0] Created ${createdCount} Active Advanced BASE pseudo position entries for ${symbol} ${direction} (${activityRatio}% / ${timeWindow}min)`,
       )
@@ -789,7 +796,13 @@ export class IndicationStateManager {
         { enabled: true, start: 1.0, stop: 0.3 },
       ]
 
-      let createdCount = 0
+      // Collect all new position records in memory first, then write once.
+      // Previous impl: read+write the positions list inside the inner loop —
+      // O(N) round-trips where N = tpFactors × slRatios × trailing = up to 528.
+      const positionsKey = `positions:${this.connectionId}:${symbol}:${indicationType}`
+      const existingPositions = ((await getSettings(positionsKey)) as any[]) || []
+      const newPositions: any[] = []
+      const now = new Date().toISOString()
 
       for (const tpFactor of tpFactors) {
         for (const slRatio of slRatios) {
@@ -810,18 +823,10 @@ export class IndicationStateManager {
               1.5, // Default last part ratio
             )
 
-            if (!basePositionId) {
-              // This config set already at 250 limit or failed
-              continue
-            }
+            if (!basePositionId) continue
+            if (!(await this.basePseudoManager.canCreatePosition(basePositionId))) continue
 
-            // Check if this base position can create more entries (up to 250 per set)
-            if (!(await this.basePseudoManager.canCreatePosition(basePositionId))) {
-              continue
-            }
-
-            // Record position creation in Redis
-            const positionData = {
+            newPositions.push({
               connection_id: this.connectionId,
               symbol,
               indication_type: indicationType,
@@ -837,25 +842,22 @@ export class IndicationStateManager {
               status: "active",
               base_position_id: basePositionId,
               position_level: 1,
-              created_at: new Date().toISOString(),
-            }
-
-            // Store in Redis
-            const positionsKey = `positions:${this.connectionId}:${symbol}:${indicationType}`
-            const positions = (await getSettings(positionsKey)) as any[] || []
-            positions.push(positionData)
-            await setSettings(positionsKey, positions)
-
-            createdCount++
+              created_at: now,
+            })
           }
         }
       }
 
+      // Single write for all positions from this cycle.
+      if (newPositions.length > 0) {
+        await setSettings(positionsKey, [...existingPositions, ...newPositions])
+      }
+
+      const createdCount = newPositions.length
       console.log(
         `[v0] Created ${createdCount} BASE pseudo position entries across multiple config sets for ${symbol} ${indicationType} ${direction}`,
       )
-      
-      // Log base pseudo position creation
+
       if (createdCount > 0) {
         await logProgressionEvent(this.connectionId, "base_pseudo_created", "info", `Created ${createdCount} base pseudo positions for ${symbol}`, {
           symbol,

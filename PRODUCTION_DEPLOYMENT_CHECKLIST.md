@@ -70,6 +70,21 @@ Orphaned cleanup: Automatic on permanent failure
 Timeout fallback: Graceful degradation to drift-only
 ```
 
+### Server Actions Origin Allowlist
+
+Server Actions no longer accept wildcard origins. Production deployments should set one or more trusted origins through environment variables:
+
+```bash
+# Preferred explicit allowlist; comma-separated hostnames or URLs are supported.
+SERVER_ACTION_ALLOWED_ORIGINS=app.example.com,https://admin.example.com
+
+# Also auto-detected when present.
+NEXT_PUBLIC_APP_URL=https://app.example.com
+VERCEL_PROJECT_PRODUCTION_URL=app.example.com
+```
+
+Local development is limited to the repo's dev-server port (`localhost:3002` and `127.0.0.1:3002`).
+
 ---
 
 ## Deployment Steps
