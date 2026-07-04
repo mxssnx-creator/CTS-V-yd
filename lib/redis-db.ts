@@ -549,28 +549,27 @@ export class InlineLocalRedis implements RedisClientLike {
         return 4_096
       }
     }
-    if (!globalCleanup.__redis_mem_limits) {
+    {
       const vmTotalMB   = _readVmTotalMB()
       // Reserve 2 GB for OS, other processes, and headroom before kernel OOM.
-      // V8 heap cap (--max-old-space-size) is set to 5632 in package.json for
-      // the actual 8606 MB VM, leaving ~3 GB of OS+slack buffer.
       const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
-      // Heap trigger: fire at 55% of usable. On 8.6 GB VM → ~6.4 GB usable → ~3.5 GB heap trigger.
+      // Heap trigger: 55% of usable
       const heapMB      = Math.round(usableMB * 0.55)
       // RSS soft: 65% of usable — force GC above this.
       const rssSoftMB   = Math.round(usableMB * 0.65)
       // RSS hard: 75% of usable — critical eviction + sleep above this.
-      // Previous 65% → 4133MB was below observed peak RSS of 5235MB on this VM,
-      // causing EMERGENCY pauses every cycle and stalling BingX requests.
       const rssHardMB   = Math.round(usableMB * 0.75)
       const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
-      // Key count: scale with both symbol count and VM size.
       const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))
+      const prev = globalCleanup.__redis_mem_limits
+      const changed = !prev || prev.rssHardMB !== rssHardMB
       globalCleanup.__redis_mem_limits = { heapMB, rssSoftMB, rssHardMB, maxKeys }
-      console.log(
-        `[v0] [Redis Memory] VM=${vmTotalMB}MB usable=${usableMB}MB ` +
-        `→ heapTrigger=${heapMB}MB rssSoft=${rssSoftMB}MB rssHard=${rssHardMB}MB maxKeys=${maxKeys}`
-      )
+      if (changed) {
+        console.log(
+          `[v0] [Redis Memory] VM=${vmTotalMB}MB usable=${usableMB}MB ` +
+          `→ heapTrigger=${heapMB}MB rssSoft=${rssSoftMB}MB rssHard=${rssHardMB}MB maxKeys=${maxKeys}`
+        )
+      }
     }
     const MEM = globalCleanup.__redis_mem_limits
 
