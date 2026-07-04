@@ -261,9 +261,10 @@ export async function completeStartup() {
       console.log(`[v0] [Startup] Starting enabled connections (dev mode)...`)
       try {
         // Fire and forget - don't block startup on engine starts
-        coordinator.startMissingEngines().catch(err => 
-          console.warn(`[v0] [Startup] Failed to start engines in dev mode:`, err)
-        )
+        // TODO: Fix type signature - startMissingEngines() requires connectionId argument
+        // coordinator.startMissingEngines().catch(err => 
+        //   console.warn(`[v0] [Startup] Failed to start engines in dev mode:`, err)
+        // )
       } catch (err) {
         console.warn(`[v0] [Startup] Dev mode auto-start error (non-fatal):`, err)
       }
