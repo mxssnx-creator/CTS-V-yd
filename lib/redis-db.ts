@@ -531,25 +531,24 @@ export class InlineLocalRedis implements RedisClientLike {
       __redis_cleanup_started?: boolean
       __redis_mem_limits?: { heapMB: number; rssSoftMB: number; rssHardMB: number; maxKeys: number }
     }
-    if (globalCleanup.__redis_cleanup_started) return
-    globalCleanup.__redis_cleanup_started = true
 
     // ── Dynamic memory limits ────────────────────────────────────────────────
-    // Read actual VM total RAM from /proc/meminfo once at startup so every
-    // threshold is proportional to the real machine instead of a hardcoded
-    // constant that may be wrong for the current deployment size.
-    // Fallback: 4096 MB (conservative for unknown environments).
-    const _readVmTotalMB = (): number => {
-      try {
-        const fs = require("fs") as typeof import("fs")
-        const raw = fs.readFileSync("/proc/meminfo", "utf8")
-        const match = raw.match(/MemTotal:\s+(\d+)\s+kB/)
-        return match ? Math.round(parseInt(match[1], 10) / 1024) : 4_096
-      } catch {
-        return 4_096
-      }
-    }
+    // Computed BEFORE the startup guard so the thresholds update on every
+    // HMR reload (the guard below only prevents the timer from being
+    // registered twice, not the threshold computation from re-running).
+    // Reads /proc/meminfo each time so values are always proportional to
+    // the actual VM; fallback 4096 MB for unknown environments.
     {
+      const _readVmTotalMB = (): number => {
+        try {
+          const fs = require("fs") as typeof import("fs")
+          const raw = fs.readFileSync("/proc/meminfo", "utf8")
+          const match = raw.match(/MemTotal:\s+(\d+)\s+kB/)
+          return match ? Math.round(parseInt(match[1], 10) / 1024) : 4_096
+        } catch {
+          return 4_096
+        }
+      }
       const vmTotalMB   = _readVmTotalMB()
       // Reserve 2 GB for OS, other processes, and headroom before kernel OOM.
       const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
@@ -571,6 +570,10 @@ export class InlineLocalRedis implements RedisClientLike {
         )
       }
     }
+
+    if (globalCleanup.__redis_cleanup_started) return
+    globalCleanup.__redis_cleanup_started = true
+
     const MEM = globalCleanup.__redis_mem_limits
 
     // Run an immediate targeted flush at startup to clear volatile key families

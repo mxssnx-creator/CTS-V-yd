@@ -776,7 +776,9 @@ export class StrategyCoordinator {
     pruneStrategy: "hybrid",
   }
 
-  private strategyMainAxisSetsCeiling = 50
+  // null = use the dynamic VM-memory-scaled default (300 × memScale).
+  // Set to a number via connection settings or STRATEGY_MAIN_AXIS_SETS_CEILING env var.
+  private strategyMainAxisSetsCeiling: number | null = null
   private strategyRealSetsSafetyCeiling = 100
   private strategyLiveSetsCeiling = 90
 
@@ -1286,7 +1288,13 @@ export class StrategyCoordinator {
         return Math.max(min, Math.min(max, Math.floor(n)))
       }
       this.config.maxEntriesPerSet = intSetting((s as any).strategyMaxEntriesPerSet, 250, 50, 750)
-      this.strategyMainAxisSetsCeiling = intSetting((s as any).strategyMainAxisSetsCeiling, 50, 10, 50_000)
+      // Only set when the connection explicitly provides a value; otherwise
+      // leave null so the VM-memory-scaled dynamic default applies per cycle.
+      const _rawAxisCeil = (s as any).strategyMainAxisSetsCeiling
+      this.strategyMainAxisSetsCeiling =
+        _rawAxisCeil != null && Number.isFinite(Number(_rawAxisCeil)) && Number(_rawAxisCeil) > 0
+          ? intSetting(_rawAxisCeil, 50, 10, 50_000)
+          : null
       this.strategyRealSetsSafetyCeiling = intSetting((s as any).strategyRealSetsSafetyCeiling, 100, 25, 50_000)
       this.config.maxRealSets = intSetting((s as any).maxRealSets, this.strategyRealSetsSafetyCeiling, 1, this.strategyRealSetsSafetyCeiling)
       this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 90, 1, 1_000)
@@ -4938,7 +4946,7 @@ export class StrategyCoordinator {
                     // already incorporated the CoordRecord sizeDelta from the
                     // Real-stage tuner — no extra entry scan needed.
                     sizeMultiplier: effectiveSizeMult,
-                    // ── Set-config propagation to Live ───���──────────────────
+                    // ── Set-config propagation to Live ───������─────────────────
                     // Forward the Set's trailing profile and historical
                     // performance snapshot into the RealPosition so that
                     // `executeLivePosition` can (a) anchor the initial SL at
