@@ -1540,11 +1540,15 @@ async function placeProtectionOrder(
 async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
   if (!connector || typeof connector.getOpenOrders !== "function") return null
   try {
-    // 15 s upper bound — BingX can take 6–8 s under load with many symbols.
+    // 25 s upper bound — BingX getOpenOrders queues behind live-order calls
+    // in the rate limiter. With maxConcurrent=3 and a placeOrder (market) in
+    // flight, getOpenOrders may wait up to ~15 s in queue before the HTTP
+    // request even starts. 25 s covers queue-wait + HTTP round-trip reliably
+    // without blocking the rate limiter indefinitely.
     // On timeout we degrade gracefully to drift-only reconciliation.
     const orders = (await withTimeout(
       connector.getOpenOrders() as Promise<any>,
-      15_000,
+      25_000,
       "getOpenOrders(reconcile-tick)",
     )) as any[] | undefined
     if (!Array.isArray(orders)) return null
@@ -2533,7 +2537,7 @@ export async function executeLivePosition(
     // This is the only writer of `live:lock:{conn}:{sym}:{dir}` on the
     // critical path, so the race window is closed at its source.
     if (isLiveTradeEnabled) {
-      // ── Variant-specific lock key ────────────────────────────────────��───
+      // ── Variant-specific lock key ─��──────────────────────────────────��───
       // Block add-on orders MUST be able to proceed even when the default/
       // trailing position's lock is held (that lock means "default slot is
       // occupied — don't open a second default", not "all orders blocked").
@@ -4002,7 +4006,7 @@ export async function updateLivePositionFill(
  *      next pass — better than leaking the lock).
  *   3. Compute realized PnL + margin-based ROI (matches exchange ROE).
  *   4. Persist via savePosition() �� that helper already handles the
- *      open-index ��� closed-archive move idempotently. We do NOT touch
+ *      open-index ���� closed-archive move idempotently. We do NOT touch
  *      Redis directly any more (which previously left the position in
  *      the open index forever on manual close).
  *   5. Release the dedup lock so a subsequent signal can re-enter.
@@ -4917,7 +4921,7 @@ export async function reconcileLivePositions(
       return summary
     }
 
-    // ── Step 4+ from reconcileLivePositions ────────────────────────────────
+    // ── Step 4+ from reconcileLivePositions ───────────���────────────────────
     // Nothing to do if connector absent (sim-only is already done above)
     if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
       if (!reconcileMode) return summary  // cron always runs full path
