@@ -293,9 +293,12 @@ const _devSymCount = process.env.NODE_ENV === "development"
 // 50-90s in single-threaded Node. Running 2 in parallel splits CPU 50/50,
 // causing both to exceed the 90s timeout. Sequential execution (concurrency=1)
 // eliminates contention: each symbol gets full CPU and completes in 40-70s.
-// Total pipeline per cycle: 8 × ~55s ≈ 440s — within the 120s outer cycle
-// deadline because symbols are skipped if the deadline is hit (not blocked).
-const SYMBOL_CONCURRENCY = process.env.NODE_ENV === "development" ? 1 : 2
+// Process one symbol at a time. Concurrent processing was causing RSS to
+// spike to 5.2 GB (above the EMERGENCY threshold) when two BTCUSDT cycles
+// ran simultaneously, triggering MemGuard pauses that stalled BingX requests
+// and caused the 120s cycle deadline to fire. Sequential processing keeps
+// peak RSS ~1 GB lower with negligible throughput impact on 4 symbols.
+const SYMBOL_CONCURRENCY = 1
 
 // ── Lazy-import helpers for LivePositions hot path ───────────────────
 // `await import()` at 200 ms cadence costs ~1 ms each (module resolution

@@ -166,7 +166,7 @@ export class InlineLocalRedis implements RedisClientLike {
 
   // ──────────────────────────────────────────────────────────────────────
   // Disk persistence (snapshot-based, single instance)
-  // ──────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────���────────────────────────────────────
   //
   // The "local Redis" is in-memory only, so without a snapshot every
   // deploy / container restart / serverless cold-start wipes EVERYTHING:
@@ -555,12 +555,14 @@ export class InlineLocalRedis implements RedisClientLike {
       // V8 heap cap (--max-old-space-size) is set to 5632 in package.json for
       // the actual 8606 MB VM, leaving ~3 GB of OS+slack buffer.
       const usableMB    = Math.max(1_500, vmTotalMB - 2_048)
-      // Heap trigger: fire at 45% of usable. On 8.6 GB VM → ~4.3 GB usable → ~1.9 GB heap trigger.
-      const heapMB      = Math.round(usableMB * 0.45)
-      // RSS soft: 50% of usable — force GC above this. Keeps us well clear of OOM.
-      const rssSoftMB   = Math.round(usableMB * 0.50)
-      // RSS hard: 65% of usable — critical eviction + sleep above this.
-      const rssHardMB   = Math.round(usableMB * 0.65)
+      // Heap trigger: fire at 55% of usable. On 8.6 GB VM → ~6.4 GB usable → ~3.5 GB heap trigger.
+      const heapMB      = Math.round(usableMB * 0.55)
+      // RSS soft: 65% of usable — force GC above this.
+      const rssSoftMB   = Math.round(usableMB * 0.65)
+      // RSS hard: 75% of usable — critical eviction + sleep above this.
+      // Previous 65% → 4133MB was below observed peak RSS of 5235MB on this VM,
+      // causing EMERGENCY pauses every cycle and stalling BingX requests.
+      const rssHardMB   = Math.round(usableMB * 0.75)
       const _nSyms      = Math.max(1, parseInt(process.env.V0_DEV_SYMBOL_COUNT ?? "4", 10) || 4)
       // Key count: scale with both symbol count and VM size.
       const maxKeys     = Math.round(1_000 + _nSyms * 800 * Math.max(1, usableMB / 2_048))

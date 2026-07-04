@@ -2553,26 +2553,25 @@ export class StrategyCoordinator {
       // then stayed too CPU-bound for UI health/API requests at 800 and 200. Startup
       // must prioritize worker liveness and top-ranked axis candidates over
       // full Cartesian materialization.
-      // Scale with symbol count so multi-symbol dev runs don't OOM.
-      // Base: 300 sets per symbol in dev, 50 in prod by default.
-      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING for controlled load tests (production default: 50).
-      // V0_DEV_SYMBOL_COUNT controls the dev symbol count (default 1).
-      // At 10 symbols: 10 × 300 = 3000 ceiling (well within 4GB heap with
-      // the new per-symbol eviction caps in redis-db).
+      // Scale with VM memory so large machines can afford more axis fan-out
+      // while small machines stay safe. memScale ≈ 1 on 4 GB, ≈ 2 on 8 GB.
+      // Override with STRATEGY_MAIN_AXIS_SETS_CEILING env var for load tests.
+      // Previous prod hardcap of 50 was designed for 4 GB VMs and caused
+      // BTCUSDT to always hit the ceiling on the actual 8.4 GB VM, generating
+      // a noisy log every cycle without actually preventing OOM.
       const rawAxisCeiling = Number(process.env.STRATEGY_MAIN_AXIS_SETS_CEILING ?? "")
       const configuredAxisCeiling =
         Number.isFinite(rawAxisCeiling) && rawAxisCeiling > 0
           ? Math.floor(rawAxisCeiling)
           : null
-      // Scale the default ceiling with VM memory so large machines can afford
-      // more axis fan-out while small machines stay safe. memScale ≈ 1 on 4 GB,
-      // ≈ 2 on 8 GB. 5000 × 2 = 10000 on the actual 8.6 GB VM.
       const _axGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
+      // memScale ≈ 1.7 on the 8.4 GB VM (heapMB ≈ 3500 after the 75% rssHard update).
+      // Default ceiling: 300 × memScale per symbol → ~510 on this VM.
       const _axMemScale = _axGl ? Math.max(1, _axGl.heapMB / 2_048) : 1
       const MAIN_AXIS_SETS_CEILING =
         configuredAxisCeiling ??
         this.strategyMainAxisSetsCeiling ??
-        (process.env.NODE_ENV === "production" ? 50 : Math.round(5_000 * _axMemScale))
+        Math.round(300 * _axMemScale)
       let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
@@ -3752,7 +3751,7 @@ export class StrategyCoordinator {
           let sizeDelta: number
           let leverageDelta: number | undefined
           if (s.variant === "block") {
-            // Block: attenuate via combined; floor at −0.5 keeps result ≥ 50% base.
+            // Block: attenuate via combined; floor at −0.5 keeps result �� 50% base.
             sizeDelta = Math.max(-0.5, combined - 1)
           } else if (s.variant === "dca") {
             // DCA: only attenuate when historic PF poor — never amplify.
