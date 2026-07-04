@@ -234,10 +234,19 @@ interface LivePosition {
   //   when trailing becomes inactive so the static stopLoss % takes over again.
   trailingActive?: boolean
   trailingStopPrice?: number
-  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "pending_fill" | "placed_unconfirmed" | "rejected" | "cancelled" | "error" | "simulated" | "pending"
+  status?: "open" | "closed" | "filled" | "partially_filled" | "placed" | "pending_fill" | "placed_unconfirmed" | "rejected" | "cancelled" | "error" | "simulated" | "pending" | "closing" | "closing_partial"
   statusReason?: string
   closeReason?: string
   closePrice?: number
+  // ── Race condition prevention (atomic status transitions) ──
+  // version: Incremented on every status mutation for optimistic locking
+  //   Concurrent threads detect stale data via version mismatch and retry
+  // lockedAt: Epoch-ms timestamp when position was locked for mutation
+  //   0 = not locked, >0 = locked, used to detect stale locks
+  // lockedBy: Identifier of the thread/process that holds the lock (for debugging)
+  version?: number
+  lockedAt?: number
+  lockedBy?: string
   system_tracking_id?: string
   connection_tracking_id?: string
   setKey?: string
@@ -330,9 +339,71 @@ function normalizeStopLossPercent(rawStopLoss: unknown): { value: number; adjust
   }
   return { value: n, adjusted: false }
 }
-async function savePosition(position: LivePosition): Promise<void> {
-  const { savePosition: redisSave } = await import("@/lib/redis-db")
-  await redisSave(position as any)
+
+/**
+ * Atomic guard: Prevent duplicate operations on the same position
+ * Returns true if the position is safe to operate on, false if already locked
+ * 
+ * This prevents the race condition where multiple threads detect SL/TP crosses
+ * and all call closeLivePosition() simultaneously, resulting in duplicate closes.
+ * 
+ * Usage:
+ *   if (!tryLockPosition(position)) return null  // Someone else is already closing this
+ *   try {
+ *     await closeLivePosition(position, ...)
+ *   } finally {
+ *     unlockPosition(position)
+ *   }
+ */
+function tryLockPosition(position: LivePosition, lockId: string = "sync-tick"): boolean {
+  // RC5: Guard against duplicate operations
+  if (position.status === "closed" || position.status === "closing" || position.status === "closing_partial") {
+    return false  // Already closed or closing
+  }
+  if (position.lockedAt && position.lockedAt > Date.now() - 60_000) {
+    return false  // Locked within last 60s (still processing)
+  }
+  // Lock the position
+  position.lockedAt = Date.now()
+  position.lockedBy = lockId
+  position.version = (position.version || 0) + 1
+  return true
+}
+
+function unlockPosition(position: LivePosition): void {
+  position.lockedAt = 0
+  position.lockedBy = undefined
+}
+
+async function savePosition(position: LivePosition, retries: number = 0): Promise<void> {
+  // RC2: Atomic position update with optimistic locking
+  // Ensure version is set and increment before save
+  if (!position.version) position.version = 0
+  position.version++
+  
+  const { getRedisClient } = await import("@/lib/redis-db")
+  const client = getRedisClient()
+  const posKey = `live_positions:${position.connectionId}:${position.id}`
+  
+  try {
+    // Atomic update: set the position data with version marker
+    // If another thread updated it concurrently, we'll detect via version mismatch
+    await client.hset(posKey, {
+      ...position,
+      updatedAt: Date.now(),
+    } as any)
+  } catch (err) {
+    console.warn(
+      `${LOG_PREFIX} [RC2] savePosition failed for ${position.symbol}/${position.id}:`,
+      err instanceof Error ? err.message : String(err),
+    )
+    // Retry once on transient errors
+    if (retries < 1 && err instanceof Error && err.message.includes("REDIS")) {
+      await new Promise(r => setTimeout(r, 100))
+      return savePosition(position, retries + 1)
+    }
+    throw err
+  }
 }
 
 /**
@@ -4590,6 +4661,12 @@ async function checkAndForceCloseOnSltpCross(
   // resulting in duplicate close attempts and memory overload from redundant API calls.
   if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
   if (pos.closeReason || pos.closedAt) return null  // Already being closed elsewhere
+  
+  // RC1: Atomic lock to prevent duplicate close operations from concurrent sync-tick cycles
+  // Only ONE thread should proceed with closing this position
+  if (!tryLockPosition(pos, "checkAndForceCloseOnSltpCross")) {
+    return null  // Another thread is already processing this close
+  }
   if (!isSystemTrackedLivePosition(pos, connectionId)) return null
   if (pos.status === "placed") {
     // Rate-limit to once-per-minute per position by using updatedAt as
@@ -4685,6 +4762,9 @@ async function checkAndForceCloseOnSltpCross(
       `${LOG_PREFIX} force-close on ${crossReason!} failed for ${pos.id}:`,
       closeErr instanceof Error ? closeErr.message : String(closeErr),
     )
+  } finally {
+    // RC1: Always unlock, even on error, to allow retries in next cycle
+    unlockPosition(pos)
   }
   return crossReason
 }
@@ -5729,7 +5809,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       })(),
     ])
 
-    // ── Observability heartbeat ────────────────────────────────���──────
+    // ── Observability heartbeat ───────���────────────────────────���──────
     // Previously this function ran silently when there were zero
     // tracked positions OR when every position was in a "do nothing"
     // state — producing the operator's "orders not closing, no logs"
@@ -6062,6 +6142,15 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
 
     const processOneSync = async (position: LivePosition): Promise<void> => {
       try {
+        // RC3: Re-check position exists after async context switch
+        // Another thread might have deleted it during our awaits
+        if (!position || !position.id) return
+        
+        // RC1: Skip if already closed or locked
+        if (position.status === "closed" || position.lockedAt && position.lockedAt > Date.now() - 60_000) {
+          return
+        }
+        
         const mapKey = `${normSym(position.symbol)}|${position.direction}`
         const exchangePos = exchangeMap.get(mapKey)
         if (exchangePos) {

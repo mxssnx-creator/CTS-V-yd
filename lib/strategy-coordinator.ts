@@ -1306,7 +1306,7 @@ export class StrategyCoordinator {
       _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
         ? intSetting(_rawRealCeil, 100, 25, 50_000)
         : null
-    // maxRealSets is uncapped (no Infinity default); let _realSetsCap enforce the limit.
+    // maxRealSets is uncapped (no Infinity default); let realSetsCap enforce the limit.
     this.config.maxRealSets = 
       _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
         ? intSetting((s as any).maxRealSets, Number(_rawRealCeil), 1, 50_000)
@@ -3394,13 +3394,17 @@ export class StrategyCoordinator {
       (this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
         ? this.strategyRealSetsSafetyCeiling
         : _defaultRealCap)
-    const __realSetsCap = Math.min(this.config.maxRealSets ?? _realOutputCap, _realOutputCap)
+    const realSetsCap = Math.min(this.config.maxRealSets ?? _realOutputCap, _realOutputCap)
     
-    if (realQualifying.length > __realSetsCap) {
+    console.log(`[v0] [DEBUG] EARLY CAP: realQualifying=${realQualifying.length} cap=${realSetsCap} env=${process.env.NODE_ENV}`)
+    if (realQualifying.length > realSetsCap) {
       console.warn(
-        `[v0] [RealStage] ${this.connectionId}: Capping ${realQualifying.length} → ${__realSetsCap} before hedge netting`
+        `[v0] [RealStage] ${this.connectionId}: Capping ${realQualifying.length} → ${realSetsCap} before hedge netting`
       )
-      realQualifying.length = __realSetsCap  // Truncate in-place
+      realQualifying.length = realSetsCap  // Truncate in-place
+      console.log(`[v0] [DEBUG] EARLY CAP: After truncate realQualifying=${realQualifying.length}`)
+    } else {
+      console.log(`[v0] [DEBUG] EARLY CAP: No truncation needed (${realQualifying.length} <= ${realSetsCap})`)
     }
     
     const realSorted = realQualifying   // alias — hedge-net reads realSorted
@@ -3646,18 +3650,18 @@ export class StrategyCoordinator {
     // NO axis fan-out, so their counts are small and reserving for them is
     // cheap while keeping the total within the real output cap (OOM ceiling intact).
     let realSets: StrategySet[]
-    if (realPostHedge.length <= _realSetsCap) {
+    if (realPostHedge.length <= realSetsCap) {
       realSets = realPostHedge
     } else {
       // Up to ~30% of the cap is split across the 4 non-default variant types;
       // the remaining ~70% goes to the global PF ranking. Floor of 1 ensures
       // every present variant survives even at a tiny cap.
-      const floorPerVariant = Math.max(1, Math.floor((_realSetsCap * 0.3) / 4))
+      const floorPerVariant = Math.max(1, Math.floor((realSetsCap * 0.3) / 4))
       const reserved: StrategySet[] = []
       const reservedKeys = new Set<string>()
       const keptPerVariant: Record<string, number> = {}
       for (const s of realPostHedge) {
-        if (reserved.length >= _realSetsCap) break
+        if (reserved.length >= realSetsCap) break
         const v = (s.variant as string) ?? "default"
         if (v === "default") continue
         const kept = keptPerVariant[v] ?? 0
@@ -3666,7 +3670,7 @@ export class StrategyCoordinator {
         reservedKeys.add(s.setKey)
         keptPerVariant[v] = kept + 1
       }
-      const remaining = Math.max(0, _realSetsCap - reserved.length)
+      const remaining = Math.max(0, realSetsCap - reserved.length)
       const fill: StrategySet[] = []
       for (const s of realPostHedge) {
         if (fill.length >= remaining) break
@@ -3677,7 +3681,7 @@ export class StrategyCoordinator {
       realSets = reserved.concat(fill).sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       console.warn(
         `[v0] [RealStage] ${this.connectionId}: ${realPostHedge.length} Real Sets exceeds ` +
-        `safety ceiling ${_realSetsCap}; kept top ${_realSetsCap} by rank with per-variant ` +
+        `safety ceiling ${realSetsCap}; kept top ${realSetsCap} by rank with per-variant ` +
         `reserve (floor ${floorPerVariant}/variant: ${JSON.stringify(keptPerVariant)}). ` +
         `Set maxRealSets in Settings to override.`,
       )

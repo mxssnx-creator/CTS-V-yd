@@ -29,7 +29,11 @@ export function buildMissingTradeEngineWorkerDiagnostic(
   globalState: Record<string, string> | null | undefined,
   now = Date.now(),
 ) {
-  const operatorIntent = globalState?.operator_intent || globalState?.desired_status || globalState?.status || "stopped"
+  // PROD FIX: Default operator_intent to "running" instead of "stopped"
+  // Previously, uninitialized operator_intent defaulted to "stopped", which prevented
+  // engine autostart in production mode. Now uninitialized intent enables autostart.
+  // Explicit UI/API calls will set intent to "stopped" or "paused" when needed.
+  const operatorIntent = globalState?.operator_intent || globalState?.desired_status || globalState?.status || "running"
   const heartbeat = readTradeEngineWorkerHeartbeat(globalState, now)
   const missingFreshWorkerHeartbeat = operatorIntent === "running" && !heartbeat.fresh
 

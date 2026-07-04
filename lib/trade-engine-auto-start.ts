@@ -204,14 +204,17 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       return { startedCount: 0, eligibleCount: 0, skipped: "paused" }
     }
 
-    if (operatorIntent !== "running") {
+    // PROD FIX: Uninitialized operator_intent now defaults to "running" (changed from "stopped")
+    // Only explicitly stopped/paused intents block autostart
+    const shouldRun = operatorIntent !== "stopped"
+    if (!shouldRun) {
       if (isStartup) {
         console.warn(
-          `[v0] [AutoStart] Startup sweep skipped: global engine not running (intent="${operatorIntent || "empty"}"). ` +
-            "Engine will start only when operator clicks Start.",
+          `[v0] [AutoStart] Startup sweep skipped: operator_intent="${operatorIntent}". ` +
+            "Engine will start only when operator explicitly resumes.",
         )
       }
-      return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent || "not_running" }
+      return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent }
     }
 
     const coordinator = await loadTradeEngineCoordinator()
