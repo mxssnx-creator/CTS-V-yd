@@ -600,12 +600,18 @@ export class InlineLocalRedis implements RedisClientLike {
         const totalKeys  = this.data.strings.size + this.data.hashes.size +
                            this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
 
+        // Always read the current thresholds from globalThis so HMR reloads
+        // that update percentages are reflected immediately in the timer callback
+        // without needing a process restart. Fallback to the module-level MEM
+        // snapshot if the global was somehow cleared.
+        const CMEM = (globalThis as any).__redis_mem_limits as typeof MEM | undefined ?? MEM
+
         // Three-tier pressure response:
         //   NORMAL  → TTL cleanup only on the slower full-scan cadence
         //   WARM    → immediately evict + GC when heap/RSS/key pressure is high
         //   CRITICAL → immediately volatile cleanup + 3× evict passes + GC
-        const isCritical = rssMB > MEM.rssHardMB
-        const isWarm     = isCritical || heapUsedMB > MEM.heapMB || rssMB > MEM.rssSoftMB || totalKeys > MEM.maxKeys
+        const isCritical = rssMB > CMEM.rssHardMB
+        const isWarm     = isCritical || heapUsedMB > CMEM.heapMB || rssMB > CMEM.rssSoftMB || totalKeys > CMEM.maxKeys
         const shouldRunFullCleanup = isWarm || now - _lastFullCleanupMs >= FULL_CLEANUP_INTERVAL_MS
 
         if (!shouldRunFullCleanup) return
