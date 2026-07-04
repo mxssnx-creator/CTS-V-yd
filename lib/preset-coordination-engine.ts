@@ -33,7 +33,8 @@ export class PresetCoordinationEngine {
   private pseudoPositionManager: PresetPseudoPositionManager
 
   private readonly BATCH_SIZE = 10
-  private readonly MAX_CONCURRENT_SYMBOLS = 5
+  // No MAX_CONCURRENT_SYMBOLS — process all symbols in connection dynamically
+  // Symbol-level concurrency is controlled by engine-manager.ts SYMBOL_CONCURRENCY=1
   private readonly MAX_CONCURRENT_INDICATIONS = 20 // Process 20 indication combinations in parallel
   private readonly RATE_LIMIT_DELAY = 100
 
@@ -144,7 +145,9 @@ export class PresetCoordinationEngine {
     }
 
     const symbolEntries = Array.from(symbolDayRequirements.entries())
-    const batches = this.createBatches(symbolEntries, this.MAX_CONCURRENT_SYMBOLS)
+    // Process all symbols in the connection without artificial batching limits.
+    // SYMBOL_CONCURRENCY=1 in engine-manager ensures sequential CPU scheduling.
+    const batches = this.createBatches(symbolEntries, symbolEntries.length || 1)
     let completed = 0
 
     for (const batch of batches) {
@@ -239,7 +242,8 @@ export class PresetCoordinationEngine {
       this.configurationSets.map(async (configSet) => {
         try {
           const symbols = await this.getSymbolsForConfigSet(configSet)
-          const batches = this.createBatches(symbols, this.MAX_CONCURRENT_SYMBOLS)
+          // Dynamic batching: no artificial symbol limits, respects SYMBOL_CONCURRENCY=1
+          const batches = this.createBatches(symbols, symbols.length || 1)
           for (const batch of batches) {
             await Promise.all(
               batch.map((symbol) =>
