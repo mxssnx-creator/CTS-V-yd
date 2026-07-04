@@ -1299,15 +1299,18 @@ export class StrategyCoordinator {
         _rawAxisCeil != null && Number.isFinite(Number(_rawAxisCeil)) && Number(_rawAxisCeil) > 0
           ? intSetting(_rawAxisCeil, 50, 10, 50_000)
           : null
-      // Only set when the connection explicitly provides a value; otherwise
-      // leave null so the VM-memory-scaled dynamic default applies per cycle.
-      const _rawRealCeil = (s as any).strategyRealSetsSafetyCeiling
-      this.strategyRealSetsSafetyCeiling =
-        _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
-          ? intSetting(_rawRealCeil, 100, 25, 50_000)
-          : null
-      const _effectiveRealCeil = this.strategyRealSetsSafetyCeiling ?? Infinity
-      this.config.maxRealSets = intSetting((s as any).maxRealSets, _effectiveRealCeil, 1, _effectiveRealCeil)
+    // Only set when the connection explicitly provides a value; otherwise
+    // leave null so the standard dev/prod defaults (60/100 per symbol) apply.
+    const _rawRealCeil = (s as any).strategyRealSetsSafetyCeiling
+    this.strategyRealSetsSafetyCeiling =
+      _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
+        ? intSetting(_rawRealCeil, 100, 25, 50_000)
+        : null
+    // maxRealSets is uncapped (no Infinity default); let realSetsCap enforce the limit.
+    this.config.maxRealSets = 
+      _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
+        ? intSetting((s as any).maxRealSets, Number(_rawRealCeil), 1, 50_000)
+        : undefined
       this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 90, 1, 1_000)
       this.config.maxLiveSets = this.strategyLiveSetsCeiling
     } catch (err) {
@@ -3385,80 +3388,6 @@ export class StrategyCoordinator {
     realQualifying.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
     const realSorted = realQualifying   // alias — hedge-net reads realSorted
 
-    // ── LAZY VARIANT GENERATION (optimization: moved from MAIN stage) ──────
-    // Previously: variant expansion happened at MAIN, creating 3 sets per
-    // base (default + trailing + dca) before axis fan-out, then axis ceiling
-    // discarded most of them. Now: only default sets at MAIN, then at REAL
-    // stage create variants ONLY from qualifying Main sets. This reduces
-    // MAIN peak from 4,869 sets/symbol to ~500-600, a 8-9x improvement.
-    // Trailing is a Base profile (flows unchanged). Block and DCA are created
-    // here from realSorted's qualifying sets if the variants are active.
-    const variantProfiles = this.variantProfiles()
-    const trailingProfile = variantProfiles.find((p) => p.name === "trailing")
-    const dcaProfile = variantProfiles.find((p) => p.name === "dca")
-    const ctx = (this as any)._lastPositionCtx  // from getPositionContext call in executeStrategyFlow
-    
-    if (trailingProfile && ctx && realSorted.length > 0) {
-      // Build trailing variants from qualifying Main defaults (only)
-      const defaultSets = realSorted.filter((s) => !s.variant || s.variant === "default")
-      for (const baseSet of defaultSets) {
-        const trailing = await this.buildVariantSet(baseSet, trailingProfile, metrics, 250, ctx)
-        if (trailing) {
-          trailing.status = "valid_real"
-          realSorted.push(trailing)
-          if (coordIndex && !coordIndex.byCoordKey.has(trailing.setKey)) {
-            registerCoordRecord(coordIndex, {
-              coordKey: trailing.setKey,
-              parentKey: trailing.parentSetKey || baseSet.setKey,
-              variant: "trailing",
-              axisWindows: trailing.axisWindows ?? null,
-              status: "valid_real",
-              avgProfitFactor: trailing.avgProfitFactor,
-              avgDrawdownTime: trailing.avgDrawdownTime,
-              avgConfidence: trailing.avgConfidence,
-              entryCount: trailing.entryCount,
-              indicationType: trailing.indicationType,
-              direction: trailing.direction,
-              prevPos: trailing.prevPos,
-              trailingProfile: trailing.trailingProfile,
-            })
-          }
-        }
-      }
-    }
-
-    if (dcaProfile && ctx && realSorted.length > 0) {
-      // Build DCA variants from qualifying Main defaults
-      const defaultSets = realSorted.filter((s) => !s.variant || s.variant === "default")
-      for (const baseSet of defaultSets) {
-        const dca = await this.buildVariantSet(baseSet, dcaProfile, metrics, 250, ctx)
-        if (dca) {
-          dca.status = "valid_real"
-          realSorted.push(dca)
-          if (coordIndex && !coordIndex.byCoordKey.has(dca.setKey)) {
-            registerCoordRecord(coordIndex, {
-              coordKey: dca.setKey,
-              parentKey: dca.parentSetKey || baseSet.setKey,
-              variant: "dca",
-              axisWindows: dca.axisWindows ?? null,
-              status: "valid_real",
-              avgProfitFactor: dca.avgProfitFactor,
-              avgDrawdownTime: dca.avgDrawdownTime,
-              avgConfidence: dca.avgConfidence,
-              entryCount: dca.entryCount,
-              indicationType: dca.indicationType,
-              direction: dca.direction,
-              prevPos: dca.prevPos,
-              trailingProfile: dca.trailingProfile,
-            })
-          }
-        }
-      }
-    }
-
-    // Re-sort after variant injection so hedge netting sees PF-desc order
-    realSorted.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
-
     // ── HEDGE NETTING (operator spec: Real stage only) ─────────────────────
     //
     // The Main-stage Position-Count Cartesian emits a long/short pair for
@@ -3521,7 +3450,7 @@ export class StrategyCoordinator {
       const outcome = aw?.outcome ?? "pos"
       const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
       // ── Variant-INDEPENDENT bucketing (operator spec: each activated
-      // variant is handled independently) ──────────────────────────────────
+      // variant is handled independently) ─────────���────────────────────────
       // The bucket key MUST include the variant. Without it, every variant
       // derived from the same Base Set + axis context (default/trailing/block/
       // dca/pause) collapsed into ONE hedge bucket and competed against each
@@ -3684,39 +3613,26 @@ export class StrategyCoordinator {
     // keeping the full Real-stage pipeline exercised.
     // Dev lowered 600→200 per symbol for OOM-protection on the 4.39 GB VM.
     // 200 × SYMBOL_CONCURRENCY(3) = 600 Real sets peak — still enough Real-stage
-    // candidates for the live dispatch to find qualifying PF-positive sets.
-    // Scale with dev symbol count: 60 real sets per symbol in dev, production default: 100.
-    const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_SAFETY_CEILING ?? "")
+    // ── REAL OUTPUT CAP ─────────────────────────────────────────────────────
+    // This caps the number of StrategySet objects that REAL stage outputs to
+    // Live dispatch. This is NOT a heap safety ceiling (that's axis ceiling).
+    // This is a quality filter: we want the top N sets by PF, not all sets.
+    // Dev: 60 per symbol (240 for 4 symbols). Prod: 100 per symbol.
+    // User can override via maxRealSets or STRATEGY_REAL_SETS_CEILING env var.
+    const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_CEILING ?? "")
     const configuredRealCeiling =
       Number.isFinite(rawRealCeiling) && rawRealCeiling > 0
         ? Math.floor(rawRealCeiling)
         : null
-    // Default scales with VM RAM just like the axis ceiling.
-    const _rsGl = (globalThis as any).__redis_mem_limits as { heapMB: number } | undefined
-    const _rsMemScale = _rsGl ? Math.max(1, _rsGl.heapMB / 2_048) : 1
-    // Instance field is null when unconfigured (new code) or ≤100 when the
-    // singleton was built under old code where 100 was the class default.
-    // Treat null OR the old sentinel ≤100 as "not explicitly set" so the
-    // dynamic VM-scaled default applies (5000 × memScale ≈ 8540 on 8.4 GB VM).
-    const _instanceRealCeiling =
-      this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
-        ? this.strategyRealSetsSafetyCeiling
-        : null
-    const _dynRealCeiling = process.env.NODE_ENV === "production" ? 100 : Math.round(5_000 * _rsMemScale)
-    // Write to globalThis so HMR-lagged singleton instances pick up the new value.
-    ;(globalThis as any).__real_sets_ceiling = _dynRealCeiling
-    const REAL_SETS_SAFETY_CEILING =
+    // Reasonable default output cap (NOT heap ceiling): per-symbol basis.
+    // Dev is lower to keep heap under control during development; Prod can be higher.
+    const _defaultRealOutputCap = process.env.NODE_ENV === "production" ? 100 : 60
+    const REAL_SETS_OUTPUT_CAP =
       configuredRealCeiling ??
-      _instanceRealCeiling ??
-      ((globalThis as any).__real_sets_ceiling as number | undefined) ??
-      _dynRealCeiling
-    // HARD ENFORCE with Math.min: the config default is Infinity, and
-    // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
-    // the safety ceiling NEVER engaged and the process was OOM-killed at
-    // ~4GB heap (verified: FATAL "Ineffective mark-compacts near heap limit"
-    // during a 5-symbol live run). The operator can LOWER the cap via
-    // maxRealSets but can never exceed the ceiling.
-    const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING, REAL_SETS_SAFETY_CEILING)
+      (this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
+        ? this.strategyRealSetsSafetyCeiling
+        : _defaultRealOutputCap)
+    const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_OUTPUT_CAP, REAL_SETS_OUTPUT_CAP)
     // ── Variant-fair cap (operator spec: each activated variant independent) ──
     // `realPostHedge` is PF-desc sorted. A pure top-N slice lets the large
     // `default` axis fan-out (up to MAIN_AXIS_SETS_CEILING Sets, ALL tagged
@@ -3780,6 +3696,82 @@ export class StrategyCoordinator {
         }
       }
     }
+
+    // ── LAZY VARIANT GENERATION (after cap: efficiency & memory) ───────────
+    // Only create trailing/DCA variants from the surviving (capped) Real sets.
+    // Previously this happened at MAIN stage before cap, wasting memory on
+    // variants that would be discarded. Now: cap first (60 sets per symbol),
+    // then create variants only from survivors. This keeps REAL output tight.
+    // Variants are generated on-demand so they're only created if needed.
+    const variantProfiles = this.variantProfiles()
+    const trailingProfile = variantProfiles.find((p) => p.name === "trailing")
+    const dcaProfile = variantProfiles.find((p) => p.name === "dca")
+    const ctx = (this as any)._lastPositionCtx
+
+    if (trailingProfile && ctx && realSets.length > 0) {
+      // Build trailing variants from surviving defaults (only non-default variants from cap)
+      const defaultSets = realSets.filter((s) => !s.variant || s.variant === "default")
+      const variantsCreated = []
+      for (const baseSet of defaultSets) {
+        const trailing = await this.buildVariantSet(baseSet, trailingProfile, metrics, 250, ctx)
+        if (trailing) {
+          trailing.status = "valid_real"
+          variantsCreated.push(trailing)
+          if (coordIndex && !coordIndex.byCoordKey.has(trailing.setKey)) {
+            registerCoordRecord(coordIndex, {
+              coordKey: trailing.setKey,
+              parentKey: trailing.parentSetKey || baseSet.setKey,
+              variant: "trailing",
+              axisWindows: trailing.axisWindows ?? null,
+              status: "valid_real",
+              avgProfitFactor: trailing.avgProfitFactor,
+              avgDrawdownTime: trailing.avgDrawdownTime,
+              avgConfidence: trailing.avgConfidence,
+              entryCount: trailing.entryCount,
+              indicationType: trailing.indicationType,
+              direction: trailing.direction,
+              prevPos: trailing.prevPos,
+              trailingProfile: trailing.trailingProfile,
+            })
+          }
+        }
+      }
+      realSets = realSets.concat(variantsCreated)
+    }
+
+    if (dcaProfile && ctx && realSets.length > 0) {
+      // Build DCA variants from surviving defaults
+      const defaultSets = realSets.filter((s) => !s.variant || s.variant === "default")
+      const variantsCreated = []
+      for (const baseSet of defaultSets) {
+        const dca = await this.buildVariantSet(baseSet, dcaProfile, metrics, 250, ctx)
+        if (dca) {
+          dca.status = "valid_real"
+          variantsCreated.push(dca)
+          if (coordIndex && !coordIndex.byCoordKey.has(dca.setKey)) {
+            registerCoordRecord(coordIndex, {
+              coordKey: dca.setKey,
+              parentKey: dca.parentSetKey || baseSet.setKey,
+              variant: "dca",
+              axisWindows: dca.axisWindows ?? null,
+              status: "valid_real",
+              avgProfitFactor: dca.avgProfitFactor,
+              avgDrawdownTime: dca.avgDrawdownTime,
+              avgConfidence: dca.avgConfidence,
+              entryCount: dca.entryCount,
+              indicationType: dca.indicationType,
+              direction: dca.direction,
+              prevPos: dca.prevPos,
+              trailingProfile: dca.trailingProfile,
+            })
+          }
+        }
+      }
+      realSets = realSets.concat(variantsCreated)
+    }
+
+    // Re-sort after variant injection to maintain PF-desc order for downstream processing
+    realSets.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
 
     // ── Real-stage tuner — per-variant adjustments from Base prev-pos ──
     //
