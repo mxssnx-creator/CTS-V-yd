@@ -293,8 +293,9 @@ export class AnalyticsEngine {
     // quantity proxy.
     const totalPositionCosts = positions.reduce((sum, p) => sum + resolvePositionCostNotional(p) * 0.001, 0)
     
+    // Cap PF at 99 when den == 0 so "all wins" doesn't poison min-blend math.
     const adjustedDenominator = grossLoss + totalPositionCosts
-    return adjustedDenominator > 0 ? grossProfit / adjustedDenominator : grossProfit > 0 ? 2 : 0
+    return adjustedDenominator > 0 ? grossProfit / adjustedDenominator : grossProfit > 0 ? 99 : 0
   }
 
   private calculateDrawdownTime(positions: TradingPosition[]): number {
@@ -352,6 +353,8 @@ export class AnalyticsEngine {
   }
 
   private extractTakeProfitFactor(positions: TradingPosition[]): number {
+    if (positions.length === 0) return 1.05 // Default 5% TP
+    
     // Extract from takeprofit field or estimate from strategy
     const avgTP = positions.reduce((sum, p) => {
       if (p.takeprofit && p.entry_price) {
@@ -363,6 +366,8 @@ export class AnalyticsEngine {
   }
 
   private calculateTPSLRatio(positions: TradingPosition[]): number {
+    if (positions.length === 0) return 2 // Default 2:1 ratio
+    
     const avgRatio = positions.reduce((sum, p) => {
       if (p.takeprofit && p.stoploss && p.entry_price) {
         const tpDistance = Math.abs(p.takeprofit - p.entry_price)
