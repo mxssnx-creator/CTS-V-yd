@@ -776,6 +776,12 @@ export class StrategyCoordinator {
     pruneStrategy: "hybrid",
   }
 
+  // Legacy/prod-tuned constants for strategy ceiling configuration.
+  // STRATEGY_MAIN_AXIS_SETS_CEILING: env-overridable main axis set limit
+  // STRATEGY_REAL_SETS_SAFETY_CEILING: env-overridable real set safety ceiling
+  private static readonly STRATEGY_MAIN_AXIS_SETS_CEILING: 50
+  private static readonly STRATEGY_REAL_SETS_SAFETY_CEILING: 100
+
   // null = use the dynamic VM-memory-scaled default (300 × memScale).
   // Set to a number via connection settings or STRATEGY_MAIN_AXIS_SETS_CEILING env var.
   private strategyMainAxisSetsCeiling: number | null = null
@@ -2387,7 +2393,8 @@ export class StrategyCoordinator {
       // surviving Main Sets. This keeps MAIN set count 1/3 the previous peak.
       // Spec-note: Trailing is a Base-level profile (trailingProfile metadata),
       // not a Main variant; it flows unchanged through any downstream variant.
-      const variantsForThisBase = activeVariants.filter((p) => p.name === "default")
+      // Block is materialized only at REAL; skip it here.
+      const variantsForThisBase = activeVariants.filter((p) => p.name !== "block")
 
       for (const profile of variantsForThisBase) {
         // Spawn async build task for this variant
@@ -2439,6 +2446,9 @@ export class StrategyCoordinator {
               (Array.isArray(cached?.entries) && cached.entries.length > 0) ||
               ((cached?.entryCount ?? 0) > 0)
             if (cached && cachedHasEntries) {
+              // do not special-case trailingProfile here; it is inherited from
+              // baseSet and propagates naturally through all variant flows.
+              // legacy placeholder only; real trailing Sets are created at BASE
               if (baseSet.trailingProfile && !cached.trailingProfile) {
                 cached.trailingProfile = baseSet.trailingProfile
               }
@@ -3563,6 +3573,7 @@ export class StrategyCoordinator {
     // running real positions before the Real-stage cap. These are counted
     // automatically in realRelatedCreated = realSets.length - mainPFEligible
     // since they flow through realPostHedge → realSets.
+    let realStageRelatedCreated = 0
     try {
       const activePositionBlockOverlays = await this.buildActiveRealBlockOverlaysForReal(
         symbol,
@@ -3571,6 +3582,7 @@ export class StrategyCoordinator {
         coordIndex,
       )
       if (activePositionBlockOverlays.length > 0) {
+        realStageRelatedCreated += activePositionBlockOverlays.length
         realPostHedge = realPostHedge
           .concat(activePositionBlockOverlays)
           .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
@@ -5253,7 +5265,7 @@ export class StrategyCoordinator {
   private readonly POSITION_CONTEXT_TTL_MS = 2000
 
   /**
-   * Produce a neutral position context — no open positions, no prior wins
+   * Produce a neutral position context �� no open positions, no prior wins
    * or losses. Used for prehistoric/backtest runs and as a fallback when the
    * pseudo-position read fails (keeps Main operational even if the position
    * index is temporarily unavailable).
