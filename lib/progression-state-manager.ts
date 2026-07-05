@@ -129,8 +129,43 @@ export interface ProgressionState {
   prehistoricCandlesProcessed?: number
   prehistoricSymbolsProcessedCount?: number
   
+  // Indication-set counters
+  indicationsDirectionCount?: number
+  indicationsMoveCount?: number
+  indicationsActiveCount?: number
+  indicationsActiveAdvancedCount?: number
+  indicationsOptimalCount?: number
+  indicationsAutoCount?: number
+  indicationsCount?: number
+  
+  // Strategy-set counters
+  strategiesBaseTotal?: number
+  strategiesMainTotal?: number
+  strategiesRealTotal?: number
+  strategyEvaluatedBase?: number
+  strategyEvaluatedMain?: number
+  strategyEvaluatedReal?: number
+  strategiesCount?: number
+  
+  // Processing metrics
+  cycleTimeMs?: number
+  intervalsProcessed?: number
+  
   progressSettingsSnapshot?: Record<string, any>
   startedForSettingsVersion?: string
+  
+  // Per-processor cycle counters (cumulative, atomic)
+  indicationCycleCount?: number
+  indicationLiveCycleCount?: number
+  strategyCycleCount?: number
+  strategyLiveCycleCount?: number
+  realtimeCycleCount?: number
+  realtimeLiveCycleCount?: number
+  framesProcessed?: number
+  
+  // Uniqueness / solidity snapshot fields
+  symbolCount?: number
+  activeSymbolsHash?: string
 }
 
 /**
@@ -138,6 +173,141 @@ export interface ProgressionState {
  * Uses Redis for persistent storage and in-memory LRU for hot connection state.
  */
 export class ProgressionStateManager {
+  static async getProgressionState(connectionId: string): Promise<ProgressionState> {
+    try {
+      // PRODUCTION FIX: Always initialize Redis connection before using it
+      await initRedis()
+      const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not initialized for ${connectionId}, returning default state`)
+        return this.getDefaultState(connectionId)
+      }
+
+      const key = `progression:${connectionId}`
+      let data: Record<string, string> = {}
+      
+      try {
+        const raw = await client.hgetall(key)
+        if (raw !== null && raw !== undefined) data = raw as Record<string, string>
+      } catch (redisError) {
+        console.warn(`[v0] Redis connection error reading progression:${connectionId}, using default state:`, redisError)
+        return this.getDefaultState(connectionId)
+      }
+
+      if (!data || Object.keys(data).length === 0) {
+        return this.getDefaultState(connectionId)
+      }
+
+      return {
+        connectionId,
+        // Session identity
+        sessionNumber: data.session_number ? parseInt(data.session_number, 10) : undefined,
+        epoch: data.epoch ? Number(data.epoch) : undefined,
+        startedAt: data.started_at ? Number(data.started_at) : undefined,
+        endedAt: data.ended_at ? Number(data.ended_at) : undefined,
+        cyclesCompleted: parseInt(data.cycles_completed || "0", 10),
+        successfulCycles: parseInt(data.successful_cycles || "0", 10),
+        failedCycles: parseInt(data.failed_cycles || "0", 10),
+        totalTrades: parseInt(data.total_trades || "0", 10),
+        successfulTrades: parseInt(data.successful_trades || "0", 10),
+        totalProfit: parseFloat(data.total_profit || "0"),
+        cycleSuccessRate: parseFloat(data.cycle_success_rate || "0"),
+        tradeSuccessRate: parseFloat(data.trade_success_rate || "0"),
+        lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
+        lastUpdate: new Date(data.last_update || new Date()),
+        prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
+        prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? (() => { try { return JSON.parse(data.prehistoric_symbols_processed) } catch { return [] } })() : [],
+        prehistoricPhaseActive: data.prehistoric_phase_active === "true",
+        prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
+        prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
+        indicationsDirectionCount: parseInt(data.indications_direction_count || "0", 10),
+        indicationsMoveCount: parseInt(data.indications_move_count || "0", 10),
+        indicationsActiveCount: parseInt(data.indications_active_count || "0", 10),
+        indicationsActiveAdvancedCount: parseInt(data.indications_active_advanced_count || "0", 10),
+        indicationsOptimalCount: parseInt(data.indications_optimal_count || "0", 10),
+        indicationsAutoCount: parseInt(data.indications_auto_count || "0", 10),
+        strategiesBaseTotal: parseInt(data.strategies_base_total || "0", 10),
+        strategiesMainTotal: parseInt(data.strategies_main_total || "0", 10),
+        strategiesRealTotal: parseInt(data.strategies_real_total || "0", 10),
+        strategyEvaluatedBase: parseInt(data.strategies_base_evaluated || "0", 10),
+        strategyEvaluatedMain: parseInt(data.strategies_main_evaluated || "0", 10),
+        strategyEvaluatedReal: parseInt(data.strategies_real_evaluated || "0", 10),
+        cycleTimeMs: parseInt(data.cycle_time_ms || "0", 10),
+        intervalsProcessed: parseInt(data.intervals_processed || "0", 10),
+        indicationsCount: parseInt(data.indications_count || "0", 10),
+        strategiesCount: parseInt(data.strategies_count || "0", 10),
+        // Uniqueness / solidity snapshot fields
+        progressSettingsSnapshot: data.progress_settings_snapshot ? (() => { try { return JSON.parse(data.progress_settings_snapshot) } catch { return {} } })() : {},
+        symbolCount: data.symbol_count ? parseInt(data.symbol_count, 10) : 0,
+        activeSymbolsHash: data.active_symbols_hash || "",
+        startedForSettingsVersion: data.started_for_settings_version || "",
+        // Per-processor cycle counters (cumulative, atomic)
+        indicationCycleCount: parseInt(data.indication_cycle_count || "0", 10),
+        indicationLiveCycleCount: parseInt(data.indication_live_cycle_count || "0", 10),
+        strategyCycleCount: parseInt(data.strategy_cycle_count || "0", 10),
+        strategyLiveCycleCount: parseInt(data.strategy_live_cycle_count || "0", 10),
+        realtimeCycleCount: parseInt(data.realtime_cycle_count || "0", 10),
+        realtimeLiveCycleCount: parseInt(data.realtime_live_cycle_count || "0", 10),
+        framesProcessed: parseInt(data.frames_processed || "0", 10),
+      }
+    } catch (error) {
+      console.error(`[v0] Failed to get progression state for ${connectionId}:`, error)
+      return this.getDefaultState(connectionId)
+    }
+  }
+
+  /**
+   * Get default progression state (reusable helper)
+   */
+  static getDefaultState(connectionId: string): ProgressionState {
+    return {
+      connectionId,
+      cyclesCompleted: 0,
+      successfulCycles: 0,
+      failedCycles: 0,
+      totalTrades: 0,
+      successfulTrades: 0,
+      totalProfit: 0,
+      cycleSuccessRate: 0,
+      tradeSuccessRate: 0,
+      lastCycleTime: undefined,
+      lastUpdate: new Date(),
+      prehistoricCyclesCompleted: 0,
+      prehistoricSymbolsProcessed: [],
+      prehistoricPhaseActive: false,
+      prehistoricCandlesProcessed: 0,
+      prehistoricSymbolsProcessedCount: 0,
+      indicationsDirectionCount: 0,
+      indicationsMoveCount: 0,
+      indicationsActiveCount: 0,
+      indicationsActiveAdvancedCount: 0,
+      indicationsOptimalCount: 0,
+      indicationsAutoCount: 0,
+      strategiesBaseTotal: 0,
+      strategiesMainTotal: 0,
+      strategiesRealTotal: 0,
+      strategyEvaluatedBase: 0,
+      strategyEvaluatedMain: 0,
+      strategyEvaluatedReal: 0,
+      cycleTimeMs: 0,
+      intervalsProcessed: 0,
+      indicationsCount: 0,
+      strategiesCount: 0,
+      // Uniqueness / solidity snapshot fields
+      progressSettingsSnapshot: {},
+      symbolCount: 0,
+      activeSymbolsHash: "",
+      startedForSettingsVersion: "",
+      indicationCycleCount: 0,
+      indicationLiveCycleCount: 0,
+      strategyCycleCount: 0,
+      strategyLiveCycleCount: 0,
+      realtimeCycleCount: 0,
+      realtimeLiveCycleCount: 0,
+      framesProcessed: 0,
+    }
+  }
+
   /**
    * Cycle counting and progression tracking.
    * Three processors call this concurrently, so we use atomic hincrby to
