@@ -179,7 +179,7 @@ export class PresetTester {
     const losingTrades = trades.filter((t) => t.pnl < 0)
     const totalProfit = winningTrades.reduce((sum, t) => sum + t.pnl, 0)
     const totalLoss = Math.abs(losingTrades.reduce((sum, t) => sum + t.pnl, 0))
-    const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 2 : 0
+    const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 99 : 0
     const winRate = trades.length > 0 ? winningTrades.length / trades.length : 0
     const avgProfit = winningTrades.length > 0 ? totalProfit / winningTrades.length : 0
     const avgLoss = losingTrades.length > 0 ? totalLoss / losingTrades.length : 0

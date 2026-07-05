@@ -50,6 +50,7 @@ const MIN_EXCHANGE_STOP_LOSS_PERCENT = 0.2
 // (~500ms) so subsequent cycles re-fetch fresh state. Reduces API calls by 30-40%.
 const positionCacheByConn = new Map<string, { positions: any[]; expiresAt: number }>()
 const POSITION_CACHE_TTL_MS = 500
+const POSITION_CACHE_MAX_SIZE = 50  // Prevent unbounded growth with many connections
 
 function getCachedPositions(connId: string): any[] | null {
   const entry = positionCacheByConn.get(connId)
@@ -61,6 +62,11 @@ function getCachedPositions(connId: string): any[] | null {
 }
 
 function setCachedPositions(connId: string, positions: any[]): void {
+  // Enforce size limit to prevent unbounded memory growth
+  if (positionCacheByConn.size >= POSITION_CACHE_MAX_SIZE && !positionCacheByConn.has(connId)) {
+    const firstKey = positionCacheByConn.keys().next().value
+    if (firstKey) positionCacheByConn.delete(firstKey)
+  }
   positionCacheByConn.set(connId, {
     positions,
     expiresAt: Date.now() + POSITION_CACHE_TTL_MS,
@@ -1967,7 +1973,7 @@ async function updateProtectionOrders(
     console.warn(`${LOG_PREFIX} [system-close] toggle read failed for ${pos.symbol} — falling back to control orders:`, modeErr instanceof Error ? modeErr.message : String(modeErr))
   }
 
-  // ── Liveness verification against the venue ──────────────────────────
+  // ── Liveness verification against the venue ────────────────���─────────
   // Without this step the engine has no way to notice a SILENTLY GONE
   // protection order. The legacy drift-only check passes (price hasn't
   // moved, qty hasn't moved, id is still set) and we leave the position
@@ -4906,7 +4912,7 @@ async function orphanCloseExpiredPositions(
 }
 
 /**
- * ── CANONICAL LIVE SYNC & RECONCILE ─────────────────────────────────────────
+ * ── CANONICAL LIVE SYNC & RECONCILE ────────────────���────────────────────────
  * Single entry-point for ALL live-position + exchange sync work.
  *
  * Called by:

@@ -80,14 +80,13 @@ export async function processIndications(
         price: lastPrice,
       }
       signals.push(indication)
-      if (process.env.NODE_ENV !== "development") {
-        const indicationKey = `indication:${connId}:${symbol}:${timeframe}`
-        writes.push(
-          client
-            .setex(indicationKey, 86400, JSON.stringify(indication))
-            .then(() => client.sadd(getIndicationIndexKey(connId), indicationKey)),
-        )
-      }
+      // Always persist indications to Redis for tracking and UI display
+      const indicationKey = `indication:${connId}:${symbol}:${timeframe}`
+      writes.push(
+        client
+          .setex(indicationKey, 86400, JSON.stringify(indication))
+          .then(() => client.sadd(getIndicationIndexKey(connId), indicationKey)),
+      )
     }
     if (writes.length > 0) await Promise.all(writes)
 

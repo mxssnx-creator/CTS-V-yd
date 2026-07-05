@@ -129,63 +129,50 @@ export interface ProgressionState {
   prehistoricCandlesProcessed?: number
   prehistoricSymbolsProcessedCount?: number
   
-  // Indications by type. EVERY type used by IndicationSetsProcessor has its
-  // own independent cumulative counter on `progression:{connId}` written
-  // atomically via hincrby in EngineManager.startIndicationProcessor.
-  // Adding a new type to DEFAULT_LIMITS in indication-sets-processor.ts
-  // requires adding the matching counter here AND in `getProgressionState`
-  // / `getDefaultState` so the dashboard surfaces it.
+  // Indication-set counters
   indicationsDirectionCount?: number
   indicationsMoveCount?: number
   indicationsActiveCount?: number
   indicationsActiveAdvancedCount?: number
   indicationsOptimalCount?: number
   indicationsAutoCount?: number
+  indicationsCount?: number
   
-  // Strategy count sets and evaluated counts
+  // Strategy-set counters
   strategiesBaseTotal?: number
   strategiesMainTotal?: number
   strategiesRealTotal?: number
   strategyEvaluatedBase?: number
   strategyEvaluatedMain?: number
   strategyEvaluatedReal?: number
+  strategiesCount?: number
   
-  // Engine performance metrics
+  // Processing metrics
   cycleTimeMs?: number
   intervalsProcessed?: number
-  indicationsCount?: number
-  strategiesCount?: number
-
-  // ── UNIQUENESS / SOLIDITY SNAPSHOT (prevents "stalling to different one") ──
-  // Captured at the exact moment this progression session was born.
-  // Makes every progress for a connection unique to its (settings + symbol list) at start time.
+  
   progressSettingsSnapshot?: Record<string, any>
-  symbolCount?: number
-  activeSymbolsHash?: string
   startedForSettingsVersion?: string
-
-  // ── Per-processor cycle counters (cumulative, hincrby) ─────────────
-  // Each processor (indication / strategy / realtime) writes these
-  // atomically on every tick. They survive engine restarts and are the
-  // canonical source of truth used by `/api/connections/progression/[id]/stats`.
-  // The "_live_" variants only increment on productive ticks (work was done).
+  
+  // Per-processor cycle counters (cumulative, atomic)
   indicationCycleCount?: number
   indicationLiveCycleCount?: number
   strategyCycleCount?: number
   strategyLiveCycleCount?: number
   realtimeCycleCount?: number
   realtimeLiveCycleCount?: number
-  // Cross-processor cumulative tick counter — sum of all per-processor
-  // cycle increments since the engine started. Independent of per-Set
-  // DB-entry caps. This is the "Frames / Total Ticks" number on the
-  // dashboard.
   framesProcessed?: number
+  
+  // Uniqueness / solidity snapshot fields
+  symbolCount?: number
+  activeSymbolsHash?: string
 }
 
+/**
+ * Progression state manager - tracks engine cycles and progression for each connection.
+ * Uses Redis for persistent storage and in-memory LRU for hot connection state.
+ */
 export class ProgressionStateManager {
-  /**
-   * Get current progression state for a connection
-   */
   static async getProgressionState(connectionId: string): Promise<ProgressionState> {
     try {
       // PRODUCTION FIX: Always initialize Redis connection before using it
@@ -207,62 +194,62 @@ export class ProgressionStateManager {
         return this.getDefaultState(connectionId)
       }
 
-       if (!data || Object.keys(data).length === 0) {
-         return this.getDefaultState(connectionId)
-       }
+      if (!data || Object.keys(data).length === 0) {
+        return this.getDefaultState(connectionId)
+      }
 
-return {
-          connectionId,
-          // Session identity
-          sessionNumber: data.session_number ? parseInt(data.session_number, 10) : undefined,
-          epoch: data.epoch ? Number(data.epoch) : undefined,
-          startedAt: data.started_at ? Number(data.started_at) : undefined,
-          endedAt: data.ended_at ? Number(data.ended_at) : undefined,
-          cyclesCompleted: parseInt(data.cycles_completed || "0", 10),
-          successfulCycles: parseInt(data.successful_cycles || "0", 10),
-          failedCycles: parseInt(data.failed_cycles || "0", 10),
-          totalTrades: parseInt(data.total_trades || "0", 10),
-          successfulTrades: parseInt(data.successful_trades || "0", 10),
-          totalProfit: parseFloat(data.total_profit || "0"),
-          cycleSuccessRate: parseFloat(data.cycle_success_rate || "0"),
-          tradeSuccessRate: parseFloat(data.trade_success_rate || "0"),
-          lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
-          lastUpdate: new Date(data.last_update || new Date()),
-          prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
-          prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? (() => { try { return JSON.parse(data.prehistoric_symbols_processed) } catch { return [] } })() : [],
-          prehistoricPhaseActive: data.prehistoric_phase_active === "true",
-          prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
-          prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
-          indicationsDirectionCount: parseInt(data.indications_direction_count || "0", 10),
-          indicationsMoveCount: parseInt(data.indications_move_count || "0", 10),
-          indicationsActiveCount: parseInt(data.indications_active_count || "0", 10),
-          indicationsActiveAdvancedCount: parseInt(data.indications_active_advanced_count || "0", 10),
-          indicationsOptimalCount: parseInt(data.indications_optimal_count || "0", 10),
-          indicationsAutoCount: parseInt(data.indications_auto_count || "0", 10),
-          strategiesBaseTotal: parseInt(data.strategies_base_total || "0", 10),
-          strategiesMainTotal: parseInt(data.strategies_main_total || "0", 10),
-          strategiesRealTotal: parseInt(data.strategies_real_total || "0", 10),
-          strategyEvaluatedBase: parseInt(data.strategies_base_evaluated || "0", 10),
-          strategyEvaluatedMain: parseInt(data.strategies_main_evaluated || "0", 10),
-          strategyEvaluatedReal: parseInt(data.strategies_real_evaluated || "0", 10),
-          cycleTimeMs: parseInt(data.cycle_time_ms || "0", 10),
-          intervalsProcessed: parseInt(data.intervals_processed || "0", 10),
-          indicationsCount: parseInt(data.indications_count || "0", 10),
-          strategiesCount: parseInt(data.strategies_count || "0", 10),
-          // Uniqueness / solidity snapshot fields (captured at progression start)
-          progressSettingsSnapshot: data.progress_settings_snapshot ? (() => { try { return JSON.parse(data.progress_settings_snapshot) } catch { return {} } })() : {},
-          symbolCount: data.symbol_count ? parseInt(data.symbol_count, 10) : 0,
-          activeSymbolsHash: data.active_symbols_hash || "",
-          startedForSettingsVersion: data.started_for_settings_version || "",
-          // Per-processor cycle counters (cumulative, atomic)
-          indicationCycleCount: parseInt(data.indication_cycle_count || "0", 10),
-          indicationLiveCycleCount: parseInt(data.indication_live_cycle_count || "0", 10),
-          strategyCycleCount: parseInt(data.strategy_cycle_count || "0", 10),
-          strategyLiveCycleCount: parseInt(data.strategy_live_cycle_count || "0", 10),
-          realtimeCycleCount: parseInt(data.realtime_cycle_count || "0", 10),
-          realtimeLiveCycleCount: parseInt(data.realtime_live_cycle_count || "0", 10),
-          framesProcessed: parseInt(data.frames_processed || "0", 10),
-        }
+      return {
+        connectionId,
+        // Session identity
+        sessionNumber: data.session_number ? parseInt(data.session_number, 10) : undefined,
+        epoch: data.epoch ? Number(data.epoch) : undefined,
+        startedAt: data.started_at ? Number(data.started_at) : undefined,
+        endedAt: data.ended_at ? Number(data.ended_at) : undefined,
+        cyclesCompleted: parseInt(data.cycles_completed || "0", 10),
+        successfulCycles: parseInt(data.successful_cycles || "0", 10),
+        failedCycles: parseInt(data.failed_cycles || "0", 10),
+        totalTrades: parseInt(data.total_trades || "0", 10),
+        successfulTrades: parseInt(data.successful_trades || "0", 10),
+        totalProfit: parseFloat(data.total_profit || "0"),
+        cycleSuccessRate: parseFloat(data.cycle_success_rate || "0"),
+        tradeSuccessRate: parseFloat(data.trade_success_rate || "0"),
+        lastCycleTime: data.last_cycle_time ? new Date(data.last_cycle_time) : undefined,
+        lastUpdate: new Date(data.last_update || new Date()),
+        prehistoricCyclesCompleted: parseInt(data.prehistoric_cycles_completed || "0", 10),
+        prehistoricSymbolsProcessed: data.prehistoric_symbols_processed ? (() => { try { return JSON.parse(data.prehistoric_symbols_processed) } catch { return [] } })() : [],
+        prehistoricPhaseActive: data.prehistoric_phase_active === "true",
+        prehistoricCandlesProcessed: parseInt(data.prehistoric_candles_processed || "0", 10),
+        prehistoricSymbolsProcessedCount: parseInt(data.prehistoric_symbols_processed_count || "0", 10),
+        indicationsDirectionCount: parseInt(data.indications_direction_count || "0", 10),
+        indicationsMoveCount: parseInt(data.indications_move_count || "0", 10),
+        indicationsActiveCount: parseInt(data.indications_active_count || "0", 10),
+        indicationsActiveAdvancedCount: parseInt(data.indications_active_advanced_count || "0", 10),
+        indicationsOptimalCount: parseInt(data.indications_optimal_count || "0", 10),
+        indicationsAutoCount: parseInt(data.indications_auto_count || "0", 10),
+        strategiesBaseTotal: parseInt(data.strategies_base_total || "0", 10),
+        strategiesMainTotal: parseInt(data.strategies_main_total || "0", 10),
+        strategiesRealTotal: parseInt(data.strategies_real_total || "0", 10),
+        strategyEvaluatedBase: parseInt(data.strategies_base_evaluated || "0", 10),
+        strategyEvaluatedMain: parseInt(data.strategies_main_evaluated || "0", 10),
+        strategyEvaluatedReal: parseInt(data.strategies_real_evaluated || "0", 10),
+        cycleTimeMs: parseInt(data.cycle_time_ms || "0", 10),
+        intervalsProcessed: parseInt(data.intervals_processed || "0", 10),
+        indicationsCount: parseInt(data.indications_count || "0", 10),
+        strategiesCount: parseInt(data.strategies_count || "0", 10),
+        // Uniqueness / solidity snapshot fields
+        progressSettingsSnapshot: data.progress_settings_snapshot ? (() => { try { return JSON.parse(data.progress_settings_snapshot) } catch { return {} } })() : {},
+        symbolCount: data.symbol_count ? parseInt(data.symbol_count, 10) : 0,
+        activeSymbolsHash: data.active_symbols_hash || "",
+        startedForSettingsVersion: data.started_for_settings_version || "",
+        // Per-processor cycle counters (cumulative, atomic)
+        indicationCycleCount: parseInt(data.indication_cycle_count || "0", 10),
+        indicationLiveCycleCount: parseInt(data.indication_live_cycle_count || "0", 10),
+        strategyCycleCount: parseInt(data.strategy_cycle_count || "0", 10),
+        strategyLiveCycleCount: parseInt(data.strategy_live_cycle_count || "0", 10),
+        realtimeCycleCount: parseInt(data.realtime_cycle_count || "0", 10),
+        realtimeLiveCycleCount: parseInt(data.realtime_live_cycle_count || "0", 10),
+        framesProcessed: parseInt(data.frames_processed || "0", 10),
+      }
     } catch (error) {
       console.error(`[v0] Failed to get progression state for ${connectionId}:`, error)
       return this.getDefaultState(connectionId)
@@ -271,7 +258,6 @@ return {
 
   /**
    * Get default progression state (reusable helper)
-   * Public static method to allow callers to get default state on errors
    */
   static getDefaultState(connectionId: string): ProgressionState {
     return {
@@ -307,7 +293,7 @@ return {
       intervalsProcessed: 0,
       indicationsCount: 0,
       strategiesCount: 0,
-      // Uniqueness / solidity snapshot fields (default empty for new progression)
+      // Uniqueness / solidity snapshot fields
       progressSettingsSnapshot: {},
       symbolCount: 0,
       activeSymbolsHash: "",
@@ -323,9 +309,15 @@ return {
   }
 
   /**
-   * Increment completed cycle (successful or failed)
-   * Writes every cycle so dashboard/log dialogs show live progression immediately.
+   * Cycle counting and progression tracking.
+   * Three processors call this concurrently, so we use atomic hincrby to
+   * avoid read-modify-write race windows.
+   *
+   * Memory optimization: Limit to 100 active connections in memory.
+   * When limit exceeded, oldest (least recently used) connection is evicted.
+   * This prevents unbounded memory growth when many connections are created.
    */
+  private static readonly CYCLE_COUNTERS_MAX = 100
   private static cycleCounters: Map<string, { completed: number; successful: number; failed: number }> = new Map()
 
   static async incrementCycle(connectionId: string, successful: boolean, profit: number = 0): Promise<void> {
@@ -380,6 +372,11 @@ return {
       }
 
       // Update local counter for tracking (best-effort mirror; not authoritative)
+      // Enforce size limit to prevent unbounded memory growth
+      if (this.cycleCounters.size >= this.CYCLE_COUNTERS_MAX && !this.cycleCounters.has(connectionId)) {
+        const firstKey = this.cycleCounters.keys().next().value
+        if (firstKey) this.cycleCounters.delete(firstKey)
+      }
       this.cycleCounters.set(connectionId, {
         completed: newCompleted,
         successful: newSuccessful,

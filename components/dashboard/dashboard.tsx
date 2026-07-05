@@ -87,9 +87,7 @@ function DashboardRuntimeFooter() {
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono">
           <span>Started: {startedAt ? startedAt.toLocaleString() : "—"}</span>
           <span>Now: {now ? now.toLocaleString() : "—"}</span>
-          <span>
-            Running: {startedAt && now ? formatDuration(now.getTime() - startedAt.getTime()) : "—"}
-          </span>
+          <span>Running: {formatDuration(startedAt && now ? now.getTime() - startedAt.getTime() : 0)}</span>
         </div>
       </div>
     </Card>

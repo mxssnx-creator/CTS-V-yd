@@ -253,7 +253,8 @@ export class IndicationProcessor {
       // Priority 1: raw candles array (250 candles from market-data-loader)
       const candlesRaw = await client.get(`market_data:${symbol}:candles`)
       if (candlesRaw) {
-        const candles = JSON.parse(typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw))
+        // Redis returns strings; parse directly without re-stringify
+        const candles = typeof candlesRaw === "string" ? JSON.parse(candlesRaw) : candlesRaw
         if (Array.isArray(candles) && candles.length > 0) {
           this._parsedCandlesCache.set(symbol, { candles, ts: Date.now() })
           this.logCandleCountIfChanged(symbol, "candles-array", candles.length)
@@ -269,7 +270,8 @@ export class IndicationProcessor {
         (await client.get(`market_data:${symbol}:1s`)) ??
         (await client.get(`market_data:${symbol}:1m`))
       if (marketDataRaw) {
-        const marketDataObj = JSON.parse(typeof marketDataRaw === "string" ? marketDataRaw : JSON.stringify(marketDataRaw))
+        // Redis returns strings; parse directly without re-stringify
+        const marketDataObj = typeof marketDataRaw === "string" ? JSON.parse(marketDataRaw) : marketDataRaw
         if (marketDataObj?.candles && Array.isArray(marketDataObj.candles) && marketDataObj.candles.length > 0) {
           this.logCandleCountIfChanged(symbol, "market-data-envelope", marketDataObj.candles.length)
           return marketDataObj.candles
