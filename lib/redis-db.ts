@@ -443,16 +443,15 @@ export class InlineLocalRedis implements RedisClientLike {
     if (InlineLocalRedis.persistenceTickStarted) return true
     InlineLocalRedis.persistenceTickStarted = true
 
-    // ── Dev-mode optimization: disable periodic snapshots ──
-    // In Next.js dev mode, module reloads + multiple workers independently
-    // load/save snapshots, causing stale lock values to overwrite live engine
-    // lock tokens → "ownership loss" crashes every ~75s. 5-minute cycle is safe.
-    // 5-minute snapshot tick. unref() so this timer never holds the
-    // process open during a graceful exit.
-    const FIVE_MIN_MS = 5 * 60 * 1000
+    // ── Continuous session persistence ──
+    // 3-minute snapshot interval ensures continuous operation across rebuilds,
+    // page refreshes, and restarts. Data is restored on startup, maintaining
+    // engine progress, UI state, and trading history without interruption.
+    // unref() so this timer never holds the process open during a graceful exit.
+    const THREE_MIN_MS = 3 * 60 * 1000 // 3 minutes for continuous session state
     const t = setInterval(() => {
       this.saveToDisk().catch(() => { /* warned inside saveToDisk */ })
-    }, FIVE_MIN_MS)
+    }, THREE_MIN_MS)
     if (typeof t.unref === "function") t.unref()
 
     // Flush-on-exit handlers (idempotent).
@@ -2888,7 +2887,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
 // `getAppSettings()` returns a merged record with `app_settings` winning
 // on conflict (it's the canonical UI-facing key). Missing keys silently
 // fall back to an empty object so callers can use `?? default` patterns.
-// ─��─��─────────────────────────────────────────────────────────────────
+// ─��─��──────────────────────────────────────────��──────────────────────
 
 const APP_SETTINGS_KEY_CANONICAL = "app_settings" as const
 const APP_SETTINGS_KEY_LEGACY    = "all_settings" as const
