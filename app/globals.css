@@ -3,41 +3,61 @@
 @tailwind utilities;
 
 :root {
-  --background: 0 0% 100%;
-  --foreground: 240 10% 3.9%;
-  --card: 0 0% 100%;
-  --card-foreground: 240 10% 3.9%;
-  --popover: 0 0% 100%;
-  --popover-foreground: 240 10% 3.9%;
-  --primary: 240 5.9% 10%;
-  --primary-foreground: 0 0% 98%;
-  --secondary: 240 4.8% 95.9%;
-  --secondary-foreground: 240 5.9% 10%;
-  --muted: 240 4.8% 95.9%;
-  --muted-foreground: 240 3.9% 46.1%;
-  --accent: 240 4.8% 95.9%;
-  --accent-foreground: 240 5.9% 10%;
-  --destructive: 0 84.2% 60.2%;
-  --destructive-foreground: 0 0% 98%;
-  --border: 240 5.9% 90%;
-  --input: 240 5.9% 90%;
-  --ring: 240 5.9% 10%;
-  --radius: 0.75rem;
-  --chart-1: 240 5.9% 10%;
-  --chart-2: 240 4.8% 95.9%;
-  --chart-3: 240 3.9% 46.1%;
-  --chart-4: 0 84.2% 60.2%;
-  --chart-5: 120 100% 25%;
+  /* Modern Professional Color Scheme - CTS Trading Dashboard */
+  /* Primary: Dark Navy Blue (#1a1a2e) - Trustworthy, Professional */
+  /* Secondary: Bright Green (#10b981) - Success, Growth, Profit */
+  /* Accent: Slate Blue (#64748b) - Neutral Balance */
   
-  /* Sidebar CSS Variables */
-  --sidebar-background: 0 0% 98%;
-  --sidebar-foreground: 240 5.3% 26.1%;
-  --sidebar-primary: 240 5.9% 10%;
-  --sidebar-primary-foreground: 0 0% 98%;
-  --sidebar-accent: 240 4.8% 95.9%;
-  --sidebar-accent-foreground: 240 5.9% 10%;
-  --sidebar-border: 220 13% 91%;
-  --sidebar-ring: 240 5.9% 10%;
+  /* Backgrounds */
+  --background: 0 0% 100%;
+  --foreground: 220 13% 14%;
+  --card: 0 0% 100%;
+  --card-foreground: 220 13% 14%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 220 13% 14%;
+  
+  /* Primary - Dark Navy Blue */
+  --primary: 220 20% 16%;
+  --primary-foreground: 0 0% 100%;
+  
+  /* Secondary - Bright Green */
+  --secondary: 160 84% 39%;
+  --secondary-foreground: 0 0% 100%;
+  
+  /* Muted - Slate Gray */
+  --muted: 220 13% 91%;
+  --muted-foreground: 220 10% 40%;
+  
+  /* Accent - Professional Slate */
+  --accent: 220 13% 25%;
+  --accent-foreground: 0 0% 100%;
+  
+  /* Status Colors */
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 100%;
+  
+  /* Borders & Inputs */
+  --border: 220 13% 88%;
+  --input: 220 13% 92%;
+  --ring: 160 84% 39%;
+  --radius: 0.5rem;
+  
+  /* Chart Colors - Professional Palette */
+  --chart-1: 160 84% 39%;
+  --chart-2: 220 20% 16%;
+  --chart-3: 0 84% 60%;
+  --chart-4: 50 97% 50%;
+  --chart-5: 220 13% 50%;
+  
+  /* Sidebar */
+  --sidebar-background: 220 20% 16%;
+  --sidebar-foreground: 0 0% 90%;
+  --sidebar-primary: 160 84% 39%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 220 13% 25%;
+  --sidebar-accent-foreground: 0 0% 100%;
+  --sidebar-border: 220 20% 20%;
+  --sidebar-ring: 160 84% 39%;
   --sidebar-width: 16rem;
   --sidebar-width-icon: 3rem;
 }
@@ -114,8 +134,28 @@ main {
 
 /* Status Styles */
 .status-active {
-  background-color: hsl(142 76% 36%);
-  color: hsl(355 100% 97%);
+  background-color: hsl(160 84% 39%);
+  color: hsl(0 0% 100%);
+}
+
+.status-success {
+  background-color: hsl(160 84% 39%);
+  color: hsl(0 0% 100%);
+}
+
+.status-warning {
+  background-color: hsl(50 97% 50%);
+  color: hsl(220 20% 16%);
+}
+
+.status-error {
+  background-color: hsl(0 84% 60%);
+  color: hsl(0 0% 100%);
+}
+
+.status-inactive {
+  background-color: hsl(220 13% 88%);
+  color: hsl(220 13% 25%);
 }
 
 .status-inactive {
