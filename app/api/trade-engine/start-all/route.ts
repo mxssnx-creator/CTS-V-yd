@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { initRedis, getAssignedAndEnabledConnections, getAllConnections, getSettings, getRedisClient } from "@/lib/redis-db"
-import { SystemLogger } from "@/lib/system-logger"
+import { currentStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 
 async function handleStartAll() {
   try {
@@ -59,25 +59,24 @@ async function handleStartAll() {
     const strategyInterval = settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1
     const realtimeInterval = settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3
 
-    const results = []
-    let successCount = 0
-
-    for (const connection of activeConnections) {
+    const results = await Promise.all(activeConnections.map(async (connection) => {
       try {
-        // Reset evaluated counters for fresh start
+        // Reset evaluated counters for fresh start. Run every connection's
+        // reset/start independently so one slow exchange does not block the
+        // rest of Start-All from reaching the coordinator.
         await initRedis()
         const evalKeys = [
           `strategies:${connection.id}:base:evaluated`,
           `strategies:${connection.id}:main:evaluated`,
           `strategies:${connection.id}:real:evaluated`,
         ]
-        for (const key of evalKeys) {
+        await Promise.all(evalKeys.map(async (key) => {
           try {
             await getRedisClient().del(key)
           } catch (delErr) {
             console.warn(`[START-ALL] Failed to delete ${key}:`, delErr)
           }
-        }
+        }))
 
         const engineConfig = {
           connectionId: connection.id,
@@ -86,37 +85,39 @@ async function handleStartAll() {
           strategyInterval,
           realtimeInterval,
         }
-        setImmediate(() => {
-          coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true }).catch(async (error: unknown) => {
-            console.error(`[START-ALL] Background start failed for ${connection.id}:`, error)
-            await client.set(`engine_is_running:${connection.id}`, "0").catch(() => {})
-            await SystemLogger.logError(error, "api", `Background start-all engine ${connection.id}`).catch(() => {})
+        const started = await coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true })
+        if (!started) {
+          await queueEngineRefreshRequest({
+            timestamp: new Date().toISOString(),
+            connectionId: connection.id,
+            action: "start",
+            state_switch_version: currentStateSwitchVersion(connection),
+            reason: "start_all_start_skipped",
           })
-        })
+        }
 
-        results.push({
+        return {
           connectionId: connection.id,
           connectionName: connection.name,
           exchange: connection.exchange,
-          success: true,
-          message: "Engine start dispatched",
-        })
-
-        successCount++
+          success: started,
+          message: started ? "Engine started" : "Engine start queued for coordinator worker",
+        }
       } catch (error) {
-        results.push({
+        return {
           connectionId: connection.id,
           connectionName: connection.name,
           exchange: connection.exchange,
           success: false,
           error: error instanceof Error ? error.message : String(error),
-        })
+        }
       }
-    }
+    }))
+    const successCount = results.filter((result) => result.success).length
 
     return NextResponse.json({
       success: true,
-      message: `Queued ${successCount} of ${activeConnections.length} trade engines`,
+      message: `Started ${successCount} of ${activeConnections.length} trade engines`,
       totalConnections: connections.length,
       activeConnections: activeConnections.length,
       successCount,

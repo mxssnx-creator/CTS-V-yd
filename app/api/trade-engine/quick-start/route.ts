@@ -8,6 +8,7 @@ import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
 import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
+import { currentStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 
 function toNumber(value: unknown): number {
   const n = Number(value)
@@ -750,7 +751,7 @@ export async function POST(request: Request) {
             const settings = await loadSettingsAsync()
             const coord = getGlobalTradeEngineCoordinator()
 
-            await coord.startEngine(connectionId, {
+            const started = await coord.startEngine(connectionId, {
               connectionId,
               connection_name: connection.name,
               exchange: exchangeName,
@@ -760,6 +761,25 @@ export async function POST(request: Request) {
               strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }, { markAssigned: true, forceLocalTakeover: true })
+
+            if (!started) {
+              await queueEngineRefreshRequest({
+                timestamp: new Date().toISOString(),
+                connectionId,
+                action: "start",
+                state_switch_version: currentStateSwitchVersion(connection),
+                reason: "quickstart_start_skipped",
+              })
+              console.warn(`${LOG_PREFIX} Main Engine start skipped for ${connection.name} (async); queued for coordinator worker`)
+              await logProgressionEvent(connectionId, "engine_start_queued", "warning", "Main Trade Engine start queued via QuickStart", {
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                testPassed,
+                hint: "No local engine runtime accepted the foreground start; queued for the coordinator worker.",
+              })
+              return
+            }
 
             // Re-persist the current QuickStart symbol/live gate after engine confirms start.
             // Do not spread the stale pre-QuickStart connection object here; it can

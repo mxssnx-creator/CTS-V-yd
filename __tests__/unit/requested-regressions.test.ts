@@ -11,11 +11,11 @@ describe("requested regression guardrails", () => {
 
     expect(coordinator).toContain("let realStageRelatedCreated = 0")
     expect(coordinator).toContain("realStageRelatedCreated += activePositionBlockOverlays.length")
-    expect(coordinator).toContain("const realRelatedCreated = realStageRelatedCreated")
-    expect(coordinator).toContain("const realEvaluatedAfterFanOut = mainPFEligible + realRelatedCreated")
+    expect(coordinator).toContain("const realRelatedCreated = Math.max(0, realSets.length - mainPFEligible)")
+    expect(coordinator).toContain("const realTotalEvaluated = mainPFEligible + realRelatedCreated")
     expect(coordinator).toContain('`${symbol}:real:input`')
     expect(coordinator).toContain('`${symbol}:real:relatedCreated`')
-    expect(coordinator).toContain('`${symbol}:real:evaluated`]: String(realEvaluatedAfterFanOut)')
+    expect(coordinator).toContain('`${symbol}:real:evaluated`]: String(realTotalEvaluated)')
 
     expect(statsRoute).toContain("let activeRealInput = 0")
     expect(statsRoute).toContain("let activeRealRelatedCreated = 0")
