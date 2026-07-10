@@ -144,7 +144,7 @@ export function setSectionExpanded(sectionId: string, expanded: boolean): void {
  */
 export function isSectionExpanded(sectionId: string, defaultValue: boolean = true): boolean {
   const state = getSessionState()
-  const sections = state.expandedSections || {}
+  const sections = state?.expandedSections || {}
   return sections[sectionId] ?? defaultValue
 }
 

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getRedisStats } from "@/lib/redis-db"
 import { getSystemResourceMetrics } from "@/lib/system-resource-metrics"
 
 export const dynamic = "force-dynamic"
@@ -11,20 +11,44 @@ export async function GET() {
     let client: ReturnType<typeof getRedisClient> | null = null
 
     let allKeys: string[] = []
+    let keyCount = 0
     let redisAvailable = false
     try {
       await initRedis()
       client = getRedisClient()
-      const keysResult = await client.keys("*")
-      allKeys = Array.isArray(keysResult) ? keysResult : []
+      try {
+        const dbSizeFn = (client as any).dbSize || (client as any).dbsize
+        if (typeof dbSizeFn === "function") {
+          keyCount = Number(await dbSizeFn.call(client)) || 0
+        }
+      } catch {
+        keyCount = 0
+      }
+      try {
+        const keysResult = await client.keys("*")
+        allKeys = Array.isArray(keysResult) ? keysResult : []
+      } catch (keysError) {
+        console.warn("[Monitoring] Redis KEYS unavailable while collecting key breakdown:", keysError instanceof Error ? keysError.message : String(keysError))
+        allKeys = []
+      }
+      keyCount = Math.max(keyCount, allKeys.length)
+      if (keyCount === 0) {
+        try {
+          const stats = await getRedisStats()
+          keyCount = Math.max(keyCount, Number(stats.keyCount) || 0)
+        } catch {
+          // Keep the direct dbSize/KEYS result when stats are unavailable.
+        }
+      }
       redisAvailable = true
     } catch (redisError) {
       console.warn("[Monitoring] Redis unavailable while collecting system metrics:", redisError instanceof Error ? redisError.message : String(redisError))
       allKeys = []
+      keyCount = 0
       redisAvailable = false
     }
     
-    const keys = allKeys.length
+    const keys = keyCount
     const sets = allKeys.filter((k: string) => k.includes(":set") || k.includes("_set")).length
     const positionKeys = allKeys.filter((k: string) => k.includes("position")).length
     const indicationKeys = allKeys.filter((k: string) => 

@@ -579,7 +579,7 @@ export async function POST(request: Request) {
     // so that the full pipeline (prehistoric → indications → strategies base/main/real → real/live)
     // is ready faster for Dev Mode testing (3-symbol minimal volume etc.).
     // This makes "ReRun Dev Mode Test" show loaded data and non-zero counts much sooner.
-    if (!quickstartEngineAlreadyRunning && symbols.length > 0) {
+    if (!quickstartEngineAlreadyRunning && symbols.length > 0 && process.env.NODE_ENV !== "test") {
       (async () => {
         try {
            const { SymbolDataProcessor } = await import('@/lib/symbol-data-processor')

@@ -23,18 +23,40 @@ export function SystemMonitoringPanel() {
     return () => clearInterval(interval)
   }, [])
 
+  const positiveNumber = (value: unknown): number | null => {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+  }
+
+  const formatPercent = (value: number): string => {
+    if (value > 0) return `${value}%`
+    return "<0.1%"
+  }
+
   const loadData = async () => {
     try {
-      const res = await fetch("/api/system/monitoring", { cache: "no-store" })
-      if (res.ok) {
-        const mon = await res.json()
+      const [monitoringResponse, statsResponse] = await Promise.all([
+        fetch(`/api/system/monitoring?t=${Date.now()}`, { cache: "no-store" }),
+        fetch(`/api/main/system-stats-v3?t=${Date.now()}`, { cache: "no-store" }).catch(() => null),
+      ])
+      if (monitoringResponse.ok) {
+        const mon = await monitoringResponse.json()
+        const stats = statsResponse?.ok ? await statsResponse.json().catch(() => null) : null
+        const cpu = positiveNumber(mon.cpu) ?? 0.1
+        const memory = positiveNumber(mon.memory) ?? 0.1
+        const dbKeys = positiveNumber(mon.database?.keys)
+          ?? positiveNumber(mon.database?.totalKeys)
+          ?? positiveNumber(stats?.database?.totalKeys)
+          ?? positiveNumber(mon.database?.size)
+          ?? -1
+
         setData({
           // Primary: indication cycles (live hash); fallback: strategy cycles
           engineCycles: mon.engines?.indications?.cycleCount || mon.engines?.strategies?.cycleCount || 0,
           activePositions: mon.database?.positions1h || 0,
-          cpu: mon.cpu || 0,
-          memory: mon.memory || 0,
-          redisKeys: mon.database?.keys || 0,
+          cpu,
+          memory,
+          redisKeys: dbKeys,
           lastUpdate: new Date().toLocaleTimeString(),
         })
       }
@@ -63,20 +85,20 @@ export function SystemMonitoringPanel() {
           <div className="flex items-center gap-1">
             <span className="text-muted-foreground">CPU</span>
             <span className={`font-bold ${data.cpu > 80 ? "text-red-600" : data.cpu > 60 ? "text-orange-600" : "text-green-600"}`}>
-              {data.cpu}%
+              {formatPercent(data.cpu)}
             </span>
           </div>
 
           <div className="flex items-center gap-1">
             <span className="text-muted-foreground">Mem</span>
             <span className={`font-bold ${data.memory > 80 ? "text-red-600" : data.memory > 60 ? "text-orange-600" : "text-green-600"}`}>
-              {data.memory}%
+              {formatPercent(data.memory)}
             </span>
           </div>
 
           <div className="flex items-center gap-1">
-            <span className="text-muted-foreground">Redis</span>
-            <span className="font-bold text-slate-600">{data.redisKeys}</span>
+            <span className="text-muted-foreground">DB</span>
+            <span className="font-bold text-slate-600">{data.redisKeys > 0 ? data.redisKeys : "—"}</span>
           </div>
 
           <Badge variant="outline" className="text-xs h-5">{data.lastUpdate}</Badge>

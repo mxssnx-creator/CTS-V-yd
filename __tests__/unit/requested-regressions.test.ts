@@ -927,6 +927,9 @@ describe("requested regression guardrails", () => {
     expect(route).toContain('Redis unavailable while collecting system metrics')
     expect(route).toContain('cpu: resourceMetrics.cpuPercent')
     expect(route).toContain('memory: resourceMetrics.memoryPercent')
+    expect(route).toContain('const dbSizeFn = (client as any).dbSize || (client as any).dbsize')
+    expect(route).toContain('keyCount = Math.max(keyCount, allKeys.length)')
+    expect(route).toContain('const stats = await getRedisStats()')
     expect(route).not.toContain('cpu: 0,')
     expect(route).not.toContain('memory: 0,')
 
@@ -934,7 +937,16 @@ describe("requested regression guardrails", () => {
     expect(helper).toContain('/sys/fs/cgroup/memory.max')
     expect(helper).toContain('/sys/fs/cgroup/cpu.max')
     expect(helper).toContain('Math.max(0.1')
+    expect(helper).toContain('return 0.1')
     expect(helper).toContain('memory.rss')
+
+    const panel = read("components/dashboard/system-monitoring-panel.tsx")
+    expect(panel).toContain('fetch(`/api/system/monitoring?t=${Date.now()}`')
+    expect(panel).toContain('fetch(`/api/main/system-stats-v3?t=${Date.now()}`')
+    expect(panel).toContain('const cpu = positiveNumber(mon.cpu) ?? 0.1')
+    expect(panel).toContain('const memory = positiveNumber(mon.memory) ?? 0.1')
+    expect(panel).toContain('positiveNumber(stats?.database?.totalKeys)')
+    expect(panel).toContain('{data.redisKeys > 0 ? data.redisKeys : "—"}')
   })
 
 
