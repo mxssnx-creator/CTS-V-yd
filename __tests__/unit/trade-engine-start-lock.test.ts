@@ -129,6 +129,37 @@ describe("GlobalTradeEngineCoordinator.startEngine lock contention", () => {
     expect(startAll).toContain("if (engineStarted)")
   })
 
+  test("Global Start queues and reports skipped startEngine calls instead of counting them as started", () => {
+    const source = read("app/api/trade-engine/start/route.ts")
+
+    expect(source).toContain('import { currentStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"')
+    expect(source).toContain("const started = await coordinator.startEngine(connId")
+    expect(source).toContain("const started = await coordinator.startEngine(conn.id")
+    expect(source).toContain('reason: "global_resume_start_skipped"')
+    expect(source).toContain('reason: "global_start_skipped"')
+    expect(source).toContain("state_switch_version: currentStateSwitchVersion(updatedConn)")
+    expect(source).toContain("if (started === true)")
+    expect(source).toContain("queuedResumedConnections")
+    expect(source).toContain("queuedStartedConnections")
+    expect(source).toContain("queuedResumedCount: queuedResumedConnections.length")
+    expect(source).toContain("queuedStartedCount: queuedStartedConnections.length")
+
+    const resumeStart = source.slice(
+      source.indexOf("const started = await coordinator.startEngine(connId"),
+      source.indexOf("// Clear the paused main list"),
+    )
+    expect(resumeStart.indexOf("if (started === true)")).toBeLessThan(resumeStart.indexOf("resumedConnections.push(connId)"))
+    expect(resumeStart.indexOf("if (started === true)")).toBeLessThan(resumeStart.indexOf("queuedResumedConnections.push(connId)"))
+
+    const assignedStart = source.slice(
+      source.indexOf("const started = await coordinator.startEngine(conn.id"),
+      source.indexOf("// Also resume preset engines"),
+    )
+    expect(assignedStart.indexOf("if (started === true)")).toBeLessThan(assignedStart.indexOf("startedConnections.push(conn.id)"))
+    expect(assignedStart.indexOf("if (started === true)")).toBeLessThan(assignedStart.indexOf("queuedStartedConnections.push(conn.id)"))
+  })
+
+
 
   test("queued start requests use action-aware expiry and are not dropped by refresh TTL", () => {
     const queue = read("lib/engine-refresh-queue.ts")
