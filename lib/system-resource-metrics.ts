@@ -100,7 +100,10 @@ function getCpuPercent(): number {
   }
 
   const oneMinuteLoad = os.loadavg?.()[0] ?? 0
-  return roundPercent((oneMinuteLoad / effectiveCores) * 100)
+  const loadPercent = roundPercent((oneMinuteLoad / effectiveCores) * 100)
+  // The bottom info bar should show that monitoring is alive even during very
+  // quiet first samples where process.cpuUsage() and loadavg both round to 0.
+  return loadPercent > 0 ? loadPercent : 0.1
 }
 
 export function getSystemResourceMetrics(): SystemResourceMetrics {
