@@ -315,7 +315,7 @@ export class AdjustStrategyStatisticsCalculator {
 
       const avgStepPosition = positions.reduce((sum: number, p: any) => sum + (p.dca_step || 1), 0) / positions.length
 
-      const avgAveragingEffectiveness = stepWinRates.reduce((a, b) => a + b, 0) / stepWinRates.length
+      const avgAveragingEffectiveness = stepWinRates.length > 0 ? stepWinRates.reduce((a, b) => a + b, 0) / stepWinRates.length : 0
 
       return {
         total_steps: Math.max(...positions.map((p: any) => p.dca_total_steps || 4)),

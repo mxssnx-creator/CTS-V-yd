@@ -50,7 +50,12 @@ import {
   forceBreakProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
-import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests, recordEngineRefreshRequestFailure } from "./engine-refresh-queue"
+import {
+  clearEngineRefreshRequest,
+  getQueuedEngineRefreshRequests,
+  isEngineRefreshRequestExpired,
+  recordEngineRefreshRequestFailure,
+} from "./engine-refresh-queue"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -127,6 +132,14 @@ export class GlobalTradeEngineCoordinator {
    * the coordinator worker. Development keeps foreground ownership for local UX.
    */
   private canOwnEngineRuntime(): boolean {
+    // In dev/test environments, always allow owning engine runtime
+    // In production, require explicit opt-in via environment variables
+    const isDev = process.env.NODE_ENV !== "production"
+    const allowExplicit = 
+      process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" ||
+      process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+    
+    return isDev || allowExplicit
     if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1") return false
     if (process.env.NEXT_RUNTIME === "edge") return false
     return process.env.NODE_ENV !== "production" ||
@@ -223,6 +236,14 @@ export class GlobalTradeEngineCoordinator {
     const explicitForegroundAllowed =
       process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
       process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+
+    if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1" || process.env.NEXT_RUNTIME === "edge") {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) skipped — in-process trade engine runtime is disabled or running on edge.`,
+      )
+      return false
+    }
+
 
     if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1" || process.env.NEXT_RUNTIME === "edge") {
       console.warn(
@@ -532,6 +553,9 @@ export class GlobalTradeEngineCoordinator {
         "stop_requested",
         "stop_reason",
         "stop_requested_at",
+        "restart_request",
+        "settings_change_marker",
+        "restart_requested_at",
         "running",
         "is_running",
         "engine_started",
@@ -542,6 +566,9 @@ export class GlobalTradeEngineCoordinator {
         "stop_requested",
         "stop_reason",
         "stop_requested_at",
+        "restart_request",
+        "settings_change_marker",
+        "restart_requested_at",
         "is_running",
         "running",
         "engine_started",
@@ -713,6 +740,8 @@ export class GlobalTradeEngineCoordinator {
       const requestTime = new Date(request.timestamp).getTime()
       if (!Number.isFinite(requestTime) || now - requestTime >= 120_000) {
         console.log(`[v0] [Coordinator] Dropping expired refresh request for ${request.connectionId}`)
+      if (isEngineRefreshRequestExpired(request, now)) {
+        console.log(`[v0] [Coordinator] Dropping expired ${request.action} request for ${request.connectionId}`)
         await clearEngineRefreshRequest(request.connectionId)
         continue
       }
@@ -747,6 +776,18 @@ export class GlobalTradeEngineCoordinator {
               continue
             }
           }
+        } else if (request.action === "restart") {
+          if (!this.isEngineRunning(request.connectionId)) {
+            // A different production worker may own this engine. Leave the
+            // durable restart request queued so the owning coordinator's
+            // health-monitor drain can consume it instead of letting an API
+            // worker clear the request without restarting anything.
+            console.log(
+              `[v0] [Coordinator] Restart request for ${request.connectionId} is not local; leaving queued for owner`,
+            )
+            continue
+          }
+          await this.restartEngine(request.connectionId)
         } else {
           // Settings/progression refresh requests must be hot-applied to the
           // target connection only. Calling refreshEngines() here performed
@@ -924,6 +965,7 @@ export class GlobalTradeEngineCoordinator {
       }
       
       const settings = await loadSettingsAsync()
+      const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
       let successCount = 0
       
       for (const connection of validConnections) {
@@ -936,16 +978,29 @@ export class GlobalTradeEngineCoordinator {
             realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
           }
           
-          await this.startEngine(connection.id, config)
-          successCount++
-          console.log(`[v0] [Coordinator] ✓ Started: ${connection.name}`)
+          const didStart = await this.startEngine(connection.id, config)
+          if (didStart === true) {
+            successCount++
+            console.log(`[v0] [Coordinator] ✓ Started: ${connection.name}`)
+          } else {
+            const reason = "queued-only or already owned"
+            console.warn(`[v0] [Coordinator] ⚠ Skipped start for ${connection.name}: ${reason}`)
+            await logProgressionEvent(
+              connection.id,
+              "engine_start_skipped",
+              "warning",
+              "Coordinator start skipped",
+              { connectionId: connection.id, reason },
+            )
+          }
         } catch (error) {
           console.error(`[v0] [Coordinator] ✗ Failed to start ${connection.name}:`, error)
         }
       }
       
-      this.isGloballyRunning = true
-      console.log(`[v0] [Coordinator] ✓ Global engine started: ${successCount}/${validConnections.length} connections active`)
+      this.isGloballyRunning = successCount > 0
+      const globalStartSymbol = successCount > 0 ? "✓" : "⚠"
+      console.log(`[v0] [Coordinator] ${globalStartSymbol} Global engine started: ${successCount}/${validConnections.length} connections active`)
     } catch (error) {
       console.error("[v0] [Coordinator] Failed to start global engine:", error)
     }
@@ -1034,6 +1089,9 @@ export class GlobalTradeEngineCoordinator {
       // sweep and the operator Start route request engines. On the low-RAM dev
       // VM (4.39 GB, no swap) two engines running their prehistoric StrategySet
       // pass at once reliably OOM-kills the worker. Both bingx-x01 and bybit-x03
+      // are always inited + visible. Process all connections consistently in both dev and prod.
+      // Use connection enable/disable settings (is_enabled_dashboard) to manage scope
+      // instead of env-based filtering. Dev-only filtering masked prod bugs.
       // are always inited + visible, but in DEVELOPMENT only ONE engine may run
       // at a time. We keep any connection the operator explicitly enabled
       // (is_enabled_dashboard="1"); otherwise we default to the primary

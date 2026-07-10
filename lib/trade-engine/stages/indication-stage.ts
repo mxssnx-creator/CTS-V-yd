@@ -7,6 +7,8 @@ import type { ExchangeConnection } from "@/lib/types"
 
 const LOG_PREFIX = "[v0] [IndicationStage]"
 
+const getIndicationIndexKey = (connectionId: string) => `indication:index:${connectionId}`
+
 export interface IndicationSignal {
   connectionId: string
   connectionName: string
@@ -78,11 +80,13 @@ export async function processIndications(
         price: lastPrice,
       }
       signals.push(indication)
-      if (process.env.NODE_ENV !== "development") {
-        writes.push(
-          client.setex(`indication:${connection.id}:${symbol}:${timeframe}`, 86400, JSON.stringify(indication)),
-        )
-      }
+      // Always persist indications to Redis for tracking and UI display
+      const indicationKey = `indication:${connId}:${symbol}:${timeframe}`
+      writes.push(
+        client
+          .setex(indicationKey, 86400, JSON.stringify(indication))
+          .then(() => client.sadd(getIndicationIndexKey(connId), indicationKey)),
+      )
     }
     if (writes.length > 0) await Promise.all(writes)
 
@@ -257,7 +261,8 @@ export async function getCurrentIndications(
   const client = getRedisClient()
 
   try {
-    const keys = await client.keys(`indication:${connectionId}:*`)
+    const indexKey = getIndicationIndexKey(connectionId)
+    const keys = ((await client.smembers(indexKey).catch(() => [])) || []) as string[]
     if (keys.length === 0) return []
 
     // Fan-out GETs in parallel — indications can number in the
@@ -265,13 +270,19 @@ export async function getCurrentIndications(
     // cycle latency. Matches the pattern used by every position
     // getter (real / main / live / base stages).
     const rawValues = await Promise.all(
-      keys.map((k: string) => client.get(k).catch(() => null)),
+      keys.map((key: string) => client.get(key).catch(() => null)),
     )
     const indications: IndicationSignal[] = []
-    for (const data of rawValues) {
-      if (!data) continue
+    const staleKeys: string[] = []
+    for (let i = 0; i < rawValues.length; i++) {
+      const data = rawValues[i]
+      if (!data) {
+        staleKeys.push(keys[i])
+        continue
+      }
       try { indications.push(JSON.parse(data as string)) } catch { /* ignore */ }
     }
+    if (staleKeys.length > 0) await client.srem(indexKey, ...staleKeys).catch(() => 0)
     return indications
   } catch (err) {
     console.warn(`${LOG_PREFIX} Error getting indications: ${err}`)

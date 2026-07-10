@@ -66,16 +66,15 @@ async function getQueuedRefreshRequestList() {
 }
 
 async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnType<typeof loadTradeEngineCoordinator>>): Promise<number> {
-  const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest } = await import("./engine-refresh-queue")
+  const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest, isEngineRefreshRequestExpired } = await import("./engine-refresh-queue")
   const { getConnection } = await loadRedisDb()
 
   const refreshRequests = await getQueuedEngineRefreshRequests()
   let processed = 0
 
   for (const { request } of refreshRequests) {
-    const requestTime = new Date(request.timestamp).getTime()
-    if (!Number.isFinite(requestTime) || Date.now() - requestTime >= 120_000) {
-      console.log(`[v0] [AutoStart] Dropping expired refresh request for ${request.connectionId}`)
+    if (isEngineRefreshRequestExpired(request)) {
+      console.log(`[v0] [AutoStart] Dropping expired ${request.action} request for ${request.connectionId}`)
       await clearEngineRefreshRequest(request.connectionId)
       processed++
       continue
@@ -156,9 +155,23 @@ async function initializeTradeEngineAutoStartInternal(): Promise<void> {
   try {
     console.log("[v0] [Auto-Start] Initializing trade-engine synchronization...")
 
-    const { initRedis, ensureUniqueSiteInstance } = await loadRedisDb()
+    const { initRedis, ensureUniqueSiteInstance, getRedisClient } = await loadRedisDb()
     await initRedis()
     await ensureUniqueSiteInstance().catch(() => {})
+
+    // LIVE TRADING FIX: Clear stale operator_intent from previous runs
+    // If intent is explicitly "stopped", delete it so it defaults to "running"
+    // This ensures engines start automatically on each new deployment/restart
+    try {
+      const client = getRedisClient()
+      const state = await client.hgetall("trade_engine:global")
+      if (state?.operator_intent === "stopped") {
+        console.log("[v0] [Auto-Start] Clearing stale operator_intent='stopped' to enable autostart")
+        await client.hdel("trade_engine:global", "operator_intent")
+      }
+    } catch (redisErr) {
+      console.warn("[v0] [Auto-Start] Failed to clear stale intent:", redisErr)
+    }
 
     autoStartInitialized = true
     await runTradeEngineHealingSweep({ isStartup: true, armTimer: true })
@@ -214,14 +227,17 @@ async function runTradeEngineHealingSweepInternal({ isStartup }: HealingSweepOpt
       return { startedCount: 0, eligibleCount: 0, skipped: "paused" }
     }
 
-    if (operatorIntent !== "running") {
+    // PROD FIX: Uninitialized operator_intent now defaults to "running" (changed from "stopped")
+    // Only explicitly stopped/paused intents block autostart
+    const shouldRun = operatorIntent !== "stopped"
+    if (!shouldRun) {
       if (isStartup) {
         console.warn(
-          `[v0] [AutoStart] Startup sweep skipped: global engine not running (intent="${operatorIntent || "empty"}"). ` +
-            "Engine will start only when operator clicks Start.",
+          `[v0] [AutoStart] Startup sweep skipped: operator_intent="${operatorIntent}". ` +
+            "Engine will start only when operator explicitly resumes.",
         )
       }
-      return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent || "not_running" }
+      return { startedCount: 0, eligibleCount: 0, skipped: operatorIntent }
     }
 
     const coordinator = await loadTradeEngineCoordinator()

@@ -26,33 +26,64 @@ export async function GET() {
 
     console.log("[HEALTH] Redis health check passed")
 
-    // Get all connections from Redis
-    const connections = await getAllConnections()
-    const enabledConnections = connections.filter(c => c.is_enabled)
-
-    // Get trade engine states
+    // Get all connections from Redis (cached for 5 seconds)
     const client = getRedisClient()
+    const cacheKey = "health:cached_metrics"
+    let cachedMetrics = null
+    
+    try {
+      const cached = await client.get(cacheKey)
+      if (cached) {
+        cachedMetrics = JSON.parse(cached)
+        console.log("[HEALTH] Using cached metrics")
+      }
+    } catch (e) {
+      console.warn("[HEALTH] Cache read error (non-fatal):", e)
+    }
+
+    let connections = await getAllConnections()
     let runningEngines = 0
     let totalTrades = 0
     let totalPositions = 0
 
-    for (const connection of connections) {
-      try {
-        const flagKey = `engine_is_running:${connection.id}`
-        const flag = await client.get(flagKey)
-        const isRunning = flag === "1" || flag === "true"
-        if (isRunning) {
-          runningEngines++
-        }
+    if (cachedMetrics) {
+      // Use cached values
+      runningEngines = cachedMetrics.runningEngines
+      totalTrades = cachedMetrics.totalTrades
+      totalPositions = cachedMetrics.totalPositions
+    } else {
+      // Compute and cache (expensive operation)
+      for (const connection of connections) {
+        try {
+          const flagKey = `engine_is_running:${connection.id}`
+          const flag = await client.get(flagKey)
+          const isRunning = flag === "1" || flag === "true"
+          if (isRunning) {
+            runningEngines++
+          }
 
-        const trades = await client.smembers(`trades:${connection.id}`) || []
-        const positions = await client.smembers(`positions:${connection.id}`) || []
-        totalTrades += trades.length
-        totalPositions += positions.length
-      } catch (error) {
-        console.warn(`[HEALTH] Failed to get metrics for connection ${connection.id}:`, error)
+          const trades = await client.smembers(`trades:${connection.id}`) || []
+          const positions = await client.smembers(`positions:${connection.id}`) || []
+          totalTrades += trades.length
+          totalPositions += positions.length
+        } catch (error) {
+          console.warn(`[HEALTH] Failed to get metrics for connection ${connection.id}:`, error)
+        }
+      }
+      
+      // Cache for 5 seconds
+      try {
+        await client.setex(cacheKey, 5, JSON.stringify({
+          runningEngines,
+          totalTrades,
+          totalPositions,
+        }))
+      } catch (e) {
+        console.warn("[HEALTH] Cache write error (non-fatal):", e)
       }
     }
+
+    const enabledConnections = connections.filter(c => c.is_enabled)
 
     const status = report.status || (redisHealthy ? "healthy" : "degraded")
     const response = {

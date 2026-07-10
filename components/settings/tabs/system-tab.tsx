@@ -136,37 +136,128 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                 </p>
               </div>
 
-              {/* ── REAL-stage propagation cap ──────────────────────────
-                  This is the hard ceiling consumed by
-                  `StrategyCoordinator.evaluateRealSets`: after PF/DDT
-                  filtering and PF-descending sort, only the top N Sets
-                  propagate to Live evaluation. 12000 is the operational
-                  default — high enough that it rarely binds, yet bounds
-                  unbounded growth when the funnel widens. Range is
-                  1k–25k; step 500 keeps the slider usable while letting
-                  the operator dial in mid-range values. */}
-              <div className="space-y-2 pt-2 border-t border-dashed border-border/40">
-                <div className="flex items-center justify-between">
-                  <Label>Max Real Sets per Cycle</Label>
-                  <span className="text-sm font-semibold tabular-nums">
-                    {(settings.maxRealSets ?? 12000).toLocaleString()}
-                  </span>
+              {/* ── Strategy pipeline ceilings ──────────────────────────
+                  These are the same safety rails consumed by
+                  `StrategyCoordinator`: per-Set entry count, Main axis
+                  fan-out, Real-stage safety ceiling, operator Real pass-
+                  through cap, and Live dispatch cap. Keep them together so
+                  an operator can tune the whole Strategies pipeline from
+                  Settings → System instead of editing env vars. */}
+              <div className="space-y-4 pt-2 border-t border-dashed border-border/40">
+                <div className="space-y-1">
+                  <h4 className="text-sm font-semibold">Strategies Pipeline Ceilings</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Resource ceilings for Strategy Set creation and live dispatch.
+                    Lower values improve production liveness; higher values widen
+                    the strategy funnel on larger workers.
+                  </p>
                 </div>
-                <Slider
-                  value={[settings.maxRealSets ?? 12000]}
-                  onValueChange={(v) => handleSettingChange("maxRealSets", v[0])}
-                  min={1000}
-                  max={25000}
-                  step={500}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Hard ceiling on REAL-stage Sets that propagate to Live
-                  each cycle. After PF / DDT filtering and PF-descending
-                  priority sort, only the top N Sets survive. Default
-                  <strong> 12,000</strong>; raise if the funnel is wide and
-                  you observe the cap binding in logs, lower to keep
-                  evaluation tight on resource-constrained runs.
-                </p>
+
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Entries per Strategy Set</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyMaxEntriesPerSet ?? 250).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyMaxEntriesPerSet ?? 250]}
+                      onValueChange={(v) => handleSettingChange("strategyMaxEntriesPerSet", v[0])}
+                      min={50}
+                      max={750}
+                      step={50}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Maximum config entries packed into each Strategy Set.
+                      Default <strong>250</strong>.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Main Axis Sets per Symbol</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyMainAxisSetsCeiling ?? 50).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyMainAxisSetsCeiling ?? 50]}
+                      onValueChange={(v) => handleSettingChange("strategyMainAxisSetsCeiling", v[0])}
+                      min={10}
+                      max={5000}
+                      step={10}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Per-symbol ceiling for Main-stage position-count axis fan-out.
+                      Default <strong>50</strong> in production.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Real Sets Safety Ceiling</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyRealSetsSafetyCeiling ?? 100).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyRealSetsSafetyCeiling ?? 100]}
+                      onValueChange={(v) => {
+                        handleSettingChange("strategyRealSetsSafetyCeiling", v[0])
+                        if ((settings.maxRealSets ?? 100) > v[0]) handleSettingChange("maxRealSets", v[0])
+                      }}
+                      min={25}
+                      max={25000}
+                      step={25}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Hard memory-safety ceiling for Real-stage Sets.
+                      <code>maxRealSets</code> cannot exceed this value.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Max Real Sets per Cycle</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.maxRealSets ?? 100).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[Math.min(settings.maxRealSets ?? 100, settings.strategyRealSetsSafetyCeiling ?? 100)]}
+                      onValueChange={(v) => handleSettingChange("maxRealSets", v[0])}
+                      min={25}
+                      max={settings.strategyRealSetsSafetyCeiling ?? 100}
+                      step={25}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Operator cap on Real Sets that propagate toward Live after
+                      PF/DDT filtering and variant-fair ranking.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2 md:col-span-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Live Exchange Dispatch Sets</Label>
+                      <span className="text-sm font-semibold tabular-nums">
+                        {(settings.strategyLiveSetsCeiling ?? 90).toLocaleString()}
+                      </span>
+                    </div>
+                    <Slider
+                      value={[settings.strategyLiveSetsCeiling ?? 90]}
+                      onValueChange={(v) => handleSettingChange("strategyLiveSetsCeiling", v[0])}
+                      min={1}
+                      max={500}
+                      step={1}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Maximum qualifying Sets considered for live exchange order
+                      dispatch per symbol. BingX default <strong>90</strong> leaves
+                      room under its open-order limits for SL/TP control orders.
+                    </p>
+                  </div>
+                </div>
               </div>
             </div>
 

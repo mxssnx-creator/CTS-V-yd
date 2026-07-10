@@ -81,6 +81,8 @@ export interface PipelineDeps {
   asOfMs?: number
   asOfCandle?: any
   setsProcessor?: IndicationSetsProcessor
+  skipLiveDispatch?: boolean
+  enableStrategyFlow?: boolean
 }
 
 // ── Lazy-import cache for Phase 4 live-order path ───────────────────
@@ -298,6 +300,29 @@ async function executeReadyStrategiesAsLiveOrders(
  * Run one full per-symbol pipeline pass. Errors are isolated to the
  * result object — they never propagate so the caller's loop survives.
  */
+// Per-phase deadline: each individual phase gets its own timeout so one
+// slow Redis call in Phase 1 never wedges all 8 symbols for 120s.
+// Phase budgets: Phase1=20s, Phase2=8s, Phase3=25s (well under the 120s outer deadline).
+function withPhaseTimeout<T>(work: Promise<T>, label: string, ms: number): Promise<T> {
+  // When ms=Infinity, skip the timeout entirely — the outer cycle deadline
+  // (engine-manager) is the correct bound. setTimeout(fn, Infinity) would fire
+  // at 1ms in Node.js (V8 clamps Infinity to MAX_TIMEOUT), so we guard here.
+  if (!isFinite(ms) || ms <= 0) return work
+  return new Promise<T>((resolve, reject) => {
+    let done = false
+    const t = setTimeout(() => {
+      if (done) return
+      done = true
+      reject(new Error(`[phase-timeout] ${label} exceeded ${ms}ms`))
+    }, ms)
+    if (typeof (t as any).unref === "function") try { (t as any).unref() } catch { /* ok */ }
+    work.then(
+      (v) => { if (!done) { done = true; clearTimeout(t); resolve(v) } },
+      (e) => { if (!done) { done = true; clearTimeout(t); reject(e) } },
+    )
+  })
+}
+
 export async function runIndStratCycle(
   connectionId: string,
   symbol: string,
@@ -321,9 +346,13 @@ export async function runIndStratCycle(
     // ── Phase 1: Indication evaluation (UNIFIED) ──────────────────────
     // One method, both modes. asOfMs threads through to control which
     // candle slice and emission timestamp the processor uses.
-    const indications = await deps.indication
-      .processIndication(symbol, deps.asOfMs)
-      .catch((err) => {
+    // Hard per-phase timeout of 20s — prevents one stuck Redis fetch from
+    // blocking all other symbols until the outer 120s deadline fires.
+    const indications = await withPhaseTimeout(
+      deps.indication.processIndication(symbol, deps.asOfMs),
+      `Phase1/processIndication/${symbol}`,
+      20_000,
+    ).catch((err) => {
         console.error(
           `[v0] [SharedPipeline] processIndication failed for ${symbol} (mode=${mode}, asOfMs=${deps.asOfMs ?? "now"}):`,
           err instanceof Error ? err.message : String(err),
@@ -366,9 +395,14 @@ export async function runIndStratCycle(
     // Backdated candles must NEVER reach the pseudo-position close
     // engine — a 2-hour-old bar would trip TP/SL on every open paper
     // position instantly. Realtime mode marks against the live price.
+    // Timeout: 8s — exchange price fetch + Redis writes should be <2s normally.
     if (mode === "realtime") {
       try {
-        const pseudoUpdates = await deps.realtime.updateOpenPseudoPositionsForSymbol(symbol)
+        const pseudoUpdates = await withPhaseTimeout(
+          deps.realtime.updateOpenPseudoPositionsForSymbol(symbol),
+          `Phase2/pseudoUpdate/${symbol}`,
+          8_000,
+        )
         result.pseudoUpdates = pseudoUpdates
       } catch (pseudoErr) {
         console.error(
@@ -385,20 +419,33 @@ export async function runIndStratCycle(
     // evaluator when Phase 1 produced live indications (historical replay still
     // passes its backdated indication array), and let the next productive tick
     // advance the strategy/live stages.
+    // Phase3 has no inner timeout. processStrategy is CPU-bound and with 3800+
+    // sets takes 50-110s per symbol on single-threaded Node. A fixed inner
+    // timeout was too conservative and discarded valid indication work from
+    // Phase1/Phase2. The outer cycle deadline (120s dev / 75s prod) enforced
+    // by the engine is the correct bound: if the cycle runs long, the engine
+    // skips it and tries again next tick. Setting PHASE3_TIMEOUT_MS=Infinity
+    // disables the Promise.race in the caller.
+    const PHASE3_TIMEOUT_MS = Infinity
     const apiStrategyFlowEnabled =
       process.env.NODE_ENV !== "production" ||
       process.env.ENABLE_API_STRATEGY_FLOW === "1" ||
-      process.env.ENABLE_API_STRATEGY_FLOW === "true"
+      process.env.ENABLE_API_STRATEGY_FLOW === "true" ||
+      deps.enableStrategyFlow === true
     if (result.indicationCount > 0 && apiStrategyFlowEnabled) {
-      const stratResult = await deps.strategy
-        .processStrategy(symbol, indications)
-        .catch((err) => {
-          console.error(
-            `[v0] [SharedPipeline] processStrategy failed for ${symbol} (mode=${mode}):`,
-            err instanceof Error ? err.message : String(err),
-          )
-          return { strategiesEvaluated: 0, liveReady: 0 }
-        })
+      const stratResult = await withPhaseTimeout(
+        deps.strategy
+          .processStrategy(symbol, indications, deps.skipLiveDispatch === true)
+          .catch((err) => {
+            console.error(
+              `[v0] [SharedPipeline] processStrategy failed for ${symbol} (mode=${mode}):`,
+              err instanceof Error ? err.message : String(err),
+            )
+            return { strategiesEvaluated: 0, liveReady: 0 }
+          }),
+        `Phase3/processStrategy/${symbol}`,
+        PHASE3_TIMEOUT_MS,
+      )
       result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
       result.liveReady = stratResult.liveReady || 0
     }

@@ -19,6 +19,10 @@ These previously used `client.keys(` in engine/dashboard runtime paths and now r
 - `lib/trade-engine/stages/live-stage.ts`
   - `getLivePositions()` now relies on the bounded `live:positions:{connectionId}` list and no longer falls back to `KEYS`.
   - live-position updates refresh the bounded list index.
+- `lib/trade-engine/stages/indication-stage.ts`
+  - `getCurrentIndications()` now reads `indication:index:{connectionId}` with `smembers`.
+  - indication writes add each full `indication:{connectionId}:*` key to that index.
+  - stale index members are removed when their indication payload has expired.
 - `lib/engine-performance-monitor.ts`
   - detailed-size/timer inspection now uses a bounded `SCAN` helper instead of `KEYS`.
 - `lib/dashboard-workflow.ts`
@@ -45,4 +49,3 @@ Current remaining files with raw `client.keys(` calls:
 - `lib/production-seeder.ts` — seeding/reset maintenance.
 - `lib/startup-coordinator.ts` — startup reconciliation only.
 - `lib/strategy-config-manager.ts` — configuration enumeration.
-- `lib/trade-engine/stages/indication-stage.ts` — stage read path still needs an explicit indication index before it is safe for frequent production polling.

@@ -193,7 +193,7 @@ export async function recoordinateAfterSettingsChange(
       normalized === "minStep"
     )
   })
-  if (symbolsChanged) {
+  if (symbolsChanged || strategyOrCoordinationChanged) {
     try {
       const { ProgressionStateManager } = await import("@/lib/progression-state-manager")
       // Use the COUPLED recoordinate path (not the bare archive). It
@@ -208,11 +208,11 @@ export async function recoordinateAfterSettingsChange(
       // churn when the PATCH route also recoordinates.
       const result = await ProgressionStateManager.recoordinateForActualOne(id)
       console.log(
-        `[v0] [${opts.logTag}] Symbol set changed for ${id} → recoordinated progression (changed:${result?.changed ?? "?"}, reason:${result?.reason ?? "?"})`,
+        `[v0] [${opts.logTag}] Progress-affecting settings changed for ${id} → recoordinated progression (changed:${result?.changed ?? "?"}, reason:${result?.reason ?? "?"})`,
       )
     } catch (archiveErr) {
       console.warn(
-        `[v0] [${opts.logTag}] Failed to recoordinate progression after symbol change for ${id}:`,
+        `[v0] [${opts.logTag}] Failed to recoordinate progression after settings change for ${id}:`,
         archiveErr instanceof Error ? archiveErr.message : String(archiveErr),
       )
       // Continue — progression will still update under the old schema,
@@ -226,7 +226,7 @@ export async function recoordinateAfterSettingsChange(
   // data so the UI shows fresh prehistoric/realtime stats on next fetch.
   // This ensures the stats endpoint returns up-to-date progress reflecting
   // the new settings (not stale cached values from before the change).
-  if (progressAffectingChange && !symbolsChanged) {
+  if (progressAffectingChange && !(symbolsChanged || strategyOrCoordinationChanged)) {
     // For non-symbol changes, we don't archive (symbol changes do that above).
     // But we DO want to clear any cached progress data so the UI refreshes.
     // The progression data is persisted in Redis but won't auto-recalculate

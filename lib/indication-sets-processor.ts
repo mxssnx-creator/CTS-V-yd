@@ -73,6 +73,61 @@ const DEFAULT_INDICATION_TIMEOUT_MS = 1000
 
 const DEFAULT_OUTCOME_ATTACHMENT_CONCURRENCY = 20
 
+const RECORD_OUTCOME_SAMPLE_SCRIPT = `
+local sampleKey = KEYS[1]
+local statsKey = KEYS[2]
+local sampleJson = ARGV[1]
+local sampleProfit = tonumber(ARGV[2]) or 0
+local sampleLoss = tonumber(ARGV[3]) or 0
+local cap = tonumber(ARGV[4]) or 1000
+
+redis.call("RPUSH", sampleKey, sampleJson)
+local len = redis.call("LLEN", sampleKey)
+local overflow = len - cap
+local evictedProfit = 0
+local evictedLoss = 0
+local evictedCount = 0
+
+if overflow > 0 then
+  local evicted = redis.call("LRANGE", sampleKey, 0, overflow - 1)
+  for _, raw in ipairs(evicted) do
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+      evictedProfit = evictedProfit + math.max(tonumber(decoded["profit"]) or 0, 0)
+      evictedLoss = evictedLoss + math.max(tonumber(decoded["loss"]) or 0, 0)
+      evictedCount = evictedCount + 1
+    end
+  end
+  redis.call("LTRIM", sampleKey, -cap, -1)
+end
+
+local grossProfit = tonumber(redis.call("HGET", statsKey, "grossProfit"))
+local grossLoss = tonumber(redis.call("HGET", statsKey, "grossLoss"))
+local count = tonumber(redis.call("HGET", statsKey, "count"))
+
+if grossProfit == nil or grossLoss == nil or count == nil or grossProfit < 0 or grossLoss < 0 or count < 0 then
+  grossProfit = 0
+  grossLoss = 0
+  count = 0
+  local samples = redis.call("LRANGE", sampleKey, 0, -1)
+  for _, raw in ipairs(samples) do
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+      grossProfit = grossProfit + math.max(tonumber(decoded["profit"]) or 0, 0)
+      grossLoss = grossLoss + math.max(tonumber(decoded["loss"]) or 0, 0)
+      count = count + 1
+    end
+  end
+else
+  grossProfit = math.max(grossProfit + sampleProfit - evictedProfit, 0)
+  grossLoss = math.max(grossLoss + sampleLoss - evictedLoss, 0)
+  count = math.max(count + 1 - evictedCount, 0)
+end
+
+redis.call("HSET", statsKey, "grossProfit", tostring(grossProfit), "grossLoss", tostring(grossLoss), "count", tostring(count))
+return { tostring(grossProfit), tostring(grossLoss), tostring(count) }
+`
+
 type IndicationCandidate = { setKey: string; indication: any; config: any }
 
 async function mapLimit<T, R>(items: T[], limit: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -620,18 +675,32 @@ export class IndicationSetsProcessor {
       } catch { /* non-critical: dashboard falls back to cumulative */ }
 
       if (totalQualified > 0) {
-        console.log(
-          `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} ActiveAdvanced=${activeAdvancedResults?.qualified}/${activeAdvancedResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
-        )
+        // Throttle console log to once per 60 s per symbol.
+        // During historical replay a single cycle runs up to 30 steps; each
+        // step calls processAllIndicationSets and would emit this line, producing
+        // 30+ identical lines per symbol per cycle. One line per minute is enough.
+        const throttleKey = `${symbol}:${this.connectionId}`
+        const lastLogBucket = (this as any)._setsLogBucket
+        const nowBucket = Math.floor(Date.now() / 60_000)
+        if (!lastLogBucket || lastLogBucket[throttleKey] !== nowBucket) {
+          if (!(this as any)._setsLogBucket) (this as any)._setsLogBucket = {}
+          ;(this as any)._setsLogBucket[throttleKey] = nowBucket
+          console.log(
+            `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} ActiveAdvanced=${activeAdvancedResults?.qualified}/${activeAdvancedResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`
+          )
+        }
 
-        await logProgressionEvent(this.connectionId, "indications_sets", "info", `All indication types processed for ${symbol}`, {
-          direction: directionResults,
-          move: moveResults,
-          active: activeResults,
-          active_advanced: activeAdvancedResults,
-          optimal: optimalResults,
-          duration,
-        })
+        // Also throttle the Redis progression event — same 60s bucket.
+        if ((this as any)._setsLogBucket?.[throttleKey] === nowBucket) {
+          await logProgressionEvent(this.connectionId, "indications_sets", "info", `All indication types processed for ${symbol}`, {
+            direction: directionResults,
+            move: moveResults,
+            active: activeResults,
+            active_advanced: activeAdvancedResults,
+            optimal: optimalResults,
+            duration,
+          })
+        }
       }
     } catch (error) {
       console.error(`[v0] [IndicationSets] Failed to process sets for ${symbol}:`, error)
@@ -1109,42 +1178,93 @@ export class IndicationSetsProcessor {
     const key = `${setKey}:outcomes`
     const statsKey = `${setKey}:outcome_stats`
     const cap = 1000
-
+    const serializedSample = JSON.stringify(sample)
     const sampleProfit = this.toOutcomeAmount(sample?.profit)
     const sampleLoss = this.toOutcomeAmount(sample?.loss)
-    const newLength = await client.rpush(key, JSON.stringify(sample))
 
-    let evictedProfit = 0
-    let evictedLoss = 0
-    let evictedCount = 0
-    if (newLength > cap) {
-      const evictedRaw: string[] = await client.lrange(key, 0, newLength - cap - 1)
-      for (const item of evictedRaw) {
-        const parsed = this.parseOutcomeSample(item)
-        if (!parsed) continue
-        evictedProfit += parsed.profit
-        evictedLoss += parsed.loss
-        evictedCount++
+    const evalLua = (client as any)?.eval as
+      | ((script: string, options: { keys: string[]; arguments: string[] }) => Promise<any>)
+      | undefined
+    if (typeof evalLua === "function") {
+      const result = await evalLua.call(client, RECORD_OUTCOME_SAMPLE_SCRIPT, {
+        keys: [key, statsKey],
+        arguments: [serializedSample, String(sampleProfit), String(sampleLoss), String(cap)],
+      })
+      const grossProfit = Number(result?.[0] ?? 0)
+      const grossLoss = Number(result?.[1] ?? 0)
+      return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+    }
+
+    return this.recordOutcomeSampleWithWatch(client, key, statsKey, serializedSample, sampleProfit, sampleLoss, cap)
+  }
+
+  private async recordOutcomeSampleWithWatch(
+    client: any,
+    key: string,
+    statsKey: string,
+    serializedSample: string,
+    sampleProfit: number,
+    sampleLoss: number,
+    cap: number,
+  ): Promise<number> {
+    const canWatch = typeof client?.watch === "function" && typeof client?.unwatch === "function"
+    const maxAttempts = canWatch ? 8 : 1
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (canWatch) await client.watch(key, statsKey)
+      try {
+        const rawStats = await client.hgetall(statsKey)
+        const existingStats = this.parseOutcomeStats(rawStats)
+
+        const currentLength = Number(await client.llen(key)) || 0
+        const evictCount = Math.max(0, currentLength + 1 - cap)
+
+        if (!existingStats) {
+          const tx = client.multi()
+          tx.rpush(key, serializedSample)
+          if (evictCount > 0) tx.ltrim(key, -cap, -1)
+          const execResult = await tx.exec()
+          if (!canWatch || execResult !== null) {
+            return this.repairOutcomeStatsFromSamples(client, key, statsKey)
+          }
+          continue
+        }
+        let evictedProfit = 0
+        let evictedLoss = 0
+        let evictedCount = 0
+        if (evictCount > 0) {
+          const evictedRaw: string[] = await client.lrange(key, 0, evictCount - 1)
+          for (const item of evictedRaw) {
+            const parsed = this.parseOutcomeSample(item)
+            if (!parsed) continue
+            evictedProfit += parsed.profit
+            evictedLoss += parsed.loss
+            evictedCount++
+          }
+        }
+
+        const grossProfit = Math.max(0, existingStats.grossProfit + sampleProfit - evictedProfit)
+        const grossLoss = Math.max(0, existingStats.grossLoss + sampleLoss - evictedLoss)
+        const count = Math.max(0, existingStats.count + 1 - evictedCount)
+
+        const tx = client.multi()
+        tx.rpush(key, serializedSample)
+        if (evictCount > 0) tx.ltrim(key, -cap, -1)
+        tx.hset(statsKey, {
+          grossProfit: String(grossProfit),
+          grossLoss: String(grossLoss),
+          count: String(count),
+        })
+        const execResult = await tx.exec()
+        if (!canWatch || execResult !== null) {
+          return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+        }
+      } finally {
+        if (canWatch) await client.unwatch().catch(() => {})
       }
-      await client.ltrim(key, -cap, -1)
     }
 
-    const existingStats = this.parseOutcomeStats(await client.hgetall(statsKey))
-    if (!existingStats) {
-      return this.repairOutcomeStatsFromSamples(client, key, statsKey)
-    }
-
-    const grossProfit = Math.max(0, existingStats.grossProfit + sampleProfit - evictedProfit)
-    const grossLoss = Math.max(0, existingStats.grossLoss + sampleLoss - evictedLoss)
-    const count = Math.max(0, existingStats.count + 1 - evictedCount)
-
-    await client.hset(statsKey, {
-      grossProfit: String(grossProfit),
-      grossLoss: String(grossLoss),
-      count: String(count),
-    })
-
-    return this.profitFactorFromOutcomeStats(grossProfit, grossLoss)
+    throw new Error(`[IndicationSets] Failed to atomically record outcome sample for ${key} after retries`)
   }
 
   private toOutcomeAmount(value: any): number {
@@ -1294,20 +1414,36 @@ export class IndicationSetsProcessor {
             })
           }
           // Single read-modify-write per setKey regardless of how many
-          // pending items referenced it.
-          const existing = await client.get(setKey)
-          let entries: any[] = []
-          try { entries = existing ? JSON.parse(existing as string) : [] } catch { /* keep [] */ }
+          // pending items referenced it. Read through the shared helper so
+          // LIST-backed sets stay in the modern representation and legacy
+          // JSON-array strings are still readable during migration.
+          const entries = await this.readIndicationSetEntries(client, setKey)
           let patchCount = items.length
+          let patched = false
           for (let i = entries.length - 1; i >= 0 && patchCount > 0; i--) {
             if (entries[i]?.profitFactor === 0 && entries[i]?.metadata?.outcomePending) {
               const closed = items[items.length - patchCount].closed
               entries[i].profitFactor = pf
               entries[i].metadata = { ...entries[i].metadata, outcomePending: false, outcome: closed }
               patchCount--
+              patched = true
             }
           }
-          await client.set(setKey, JSON.stringify(entries))
+          if (!patched) return
+
+          // Preserve LIST-backed indication_set:* keys when closing pending
+          // realtime outcomes. DEL + RPUSH recreates the key as a Redis LIST
+          // instead of SET-ing a legacy JSON string, then applies the same
+          // compaction and index policy used by appendIndicationEntries().
+          const type = (setKey.split(":")[3] || "direction") as keyof IndicationSetLimits
+          const cfg = await this.resolveCompaction(type)
+          const serializedEntries = entries.map((entry) => JSON.stringify(entry))
+          await client.del(setKey)
+          const length = serializedEntries.length > 0 ? await client.rpush(setKey, ...serializedEntries) : 0
+          if (length >= compactionCeiling(cfg)) {
+            await client.ltrim(setKey, -cfg.floor, -1)
+          }
+          await this.indexSetKey(client, setKey, setKey.split(":")[2], type)
         }),
       )
 

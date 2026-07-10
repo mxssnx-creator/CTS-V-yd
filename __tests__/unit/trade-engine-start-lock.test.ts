@@ -118,6 +118,32 @@ describe("GlobalTradeEngineCoordinator.startEngine lock contention", () => {
     expect(quickStart).toContain('reason: "quickstart_start_skipped"')
     expect(startAll).toContain("queueEngineRefreshRequest")
     expect(startAll).toContain('reason: "start_all_start_skipped"')
+    expect(quickStart).toContain("const engineStarted = await coord.startEngine")
+    expect(quickStart).toContain("if (!engineStarted)")
+    expect(quickStart).toContain("engine_start_skipped")
+    expect(quickStart.indexOf("if (!engineStarted)")).toBeLessThan(quickStart.indexOf("Main Engine started for"))
+
+    expect(startAll).toContain("const engineStarted = await coordinator.startEngine")
+    expect(startAll).toContain("success: engineStarted")
+    expect(startAll).toContain('message: engineStarted ? "Engine started" : "Engine start skipped by coordinator"')
+    expect(startAll).toContain("if (engineStarted)")
+  })
+
+
+  test("queued start requests use action-aware expiry and are not dropped by refresh TTL", () => {
+    const queue = read("lib/engine-refresh-queue.ts")
+    const coordinator = read("lib/trade-engine.ts")
+    const autoStart = read("lib/trade-engine-auto-start.ts")
+
+    expect(queue).toContain("export const REFRESH_REQUEST_MAX_AGE_MS = 30_000")
+    expect(queue).toContain("export const START_REQUEST_MAX_AGE_MS = Number.POSITIVE_INFINITY")
+    expect(queue).toContain('request.action === "start" ? START_REQUEST_MAX_AGE_MS : REFRESH_REQUEST_MAX_AGE_MS')
+    expect(queue).toContain("if (!Number.isFinite(maxAgeMs)) return false")
+
+    expect(coordinator).toContain("isEngineRefreshRequestExpired(request, now)")
+    expect(coordinator).not.toContain("now - requestTime >= 30000")
+    expect(autoStart).toContain("isEngineRefreshRequestExpired(request)")
+    expect(autoStart).not.toContain("Date.now() - requestTime >= 120_000")
   })
 
 })

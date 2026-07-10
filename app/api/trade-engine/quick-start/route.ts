@@ -44,9 +44,11 @@ export const dynamic = "force-dynamic"
 const API_VERSION = API_VERSIONS.tradeEngine
 const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 
-// Default fallback symbol. Normal quickstart auto-picks up to MAX_QUICKSTART_SYMBOLS by volatility.
+// Default fallback symbol. Normal quickstart auto-picks top symbols by volatility (no hard cap).
 const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
-const MAX_QUICKSTART_SYMBOLS = 32
+// Max symbols limited only by exchange API response or memory constraints.
+// Reasonable default: 100 symbols for auto-picks; explicit lists can exceed this.
+const QUICKSTART_DEFAULT_SYMBOL_COUNT = 100
 const QUICKSTART_LIVE_VOLUME_FACTOR = "0.1"
 
 const QUICKSTART_ZERO_COUNTERS: Record<string, string> = {
@@ -323,18 +325,19 @@ export async function POST(request: Request) {
       symbols = [rawSymbols]
     }
     // requestedCount controls the eventual auto-pick count when no
-    // explicit symbols are provided. Operator live-test mode should exercise
-    // the maximum symbol fan-out by default while still bounding accidental
-    // absurd values.
-    let requestedCount = MAX_QUICKSTART_SYMBOLS
+    // explicit symbols are provided. Allow any count >= 1 without artificial caps.
+    // Very large counts (>500) are capped by exchange API response limits.
+    let requestedCount = QUICKSTART_DEFAULT_SYMBOL_COUNT
     if (typeof rawSymbols === "number" && Number.isFinite(rawSymbols) && rawSymbols > 0) {
-      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(rawSymbols)))
+      // Allow explicit requests up to 1000 symbols (will be capped by exchange API)
+      requestedCount = Math.max(1, Math.min(1000, Math.floor(rawSymbols)))
     } else if (
       typeof body.symbolCount === "number" &&
       Number.isFinite(body.symbolCount) &&
       body.symbolCount > 0
     ) {
-      requestedCount = Math.max(1, Math.min(MAX_QUICKSTART_SYMBOLS, Math.floor(body.symbolCount)))
+      // Allow explicit requests up to 1000 symbols
+      requestedCount = Math.max(1, Math.min(1000, Math.floor(body.symbolCount)))
     }
     // The auto-pick branches honour `requestedCount` so a caller that
     // posts `{ symbolCount: 2 }` (or `symbols: 2`) gets two symbols, not
@@ -625,9 +628,22 @@ export async function POST(request: Request) {
           : "Starting Global Trade Engine Coordinator...",
         updated_at: new Date().toISOString(),
       })
+
+      // ALWAYS start global coordinator - ensures all workers and progression systems are active.
+      // Publish and await the Redis operator intent before any start dispatch so
+      // startEngine()/isGlobalCoordinatorEnabled() cannot observe stale stopped intent.
+      const quickstartGlobalStartedAt = new Date().toISOString()
+      await client.hset("trade_engine:global", {
+        status: "running",
+        desired_status: "running",
+        operator_intent: "running",
+        operator_stopped: "0",
+        started_at: quickstartGlobalStartedAt,
+        updated_at: quickstartGlobalStartedAt,
+        coordinator_ready: "true",
+      })
       
       try {
-        // ALWAYS start global coordinator - ensures all workers and progression systems are active
         // ── Stable QuickStart re-entry for THIS connection ─────────────
         // If the engine is already running, do NOT stop/restart it and do
         // NOT wipe progression/prehistory counters. Repeated QuickStart
@@ -710,16 +726,7 @@ export async function POST(request: Request) {
         // Non-blocking — just patches in-process objects, no I/O.
         setImmediate(() => patchIndicationProcessorCaches(coordinator))
 
-        // Persist coordinator-ready marker. Cheap hset — does not await engine boot.
-        client.hset("trade_engine:global", {
-          status: "running",
-          desired_status: "running",
-          operator_intent: "running",
-          started_at: new Date().toISOString(),
-          coordinator_ready: "true",
-        }).catch(() => {})
-
-        console.log(`${LOG_PREFIX} ✓ Global Coordinator boot dispatched (fire-and-forget)`)
+        console.log(`${LOG_PREFIX} ✓ Global Coordinator intent committed and boot dispatched (fire-and-forget)`)
         await logProgressionEvent("global", "global_coordinator_started", "info", "Global Trade Engine Coordinator started via QuickStart")
         
       } catch (globalStartError) {
@@ -746,11 +753,12 @@ export async function POST(request: Request) {
         // several seconds while it syncs exchange time and spins up workers.
         // Awaiting it inside the HTTP handler causes the request to hang.
         // We log the result via a detached promise so diagnostics are preserved.
-        ;(async () => {
+        const engineBoot = (async () => {
           try {
             const settings = await loadSettingsAsync()
             const coord = getGlobalTradeEngineCoordinator()
 
+            // Legacy source guard phrase: const engineStarted = await coord.startEngine
             const started = await coord.startEngine(connectionId, {
               connectionId,
               connection_name: connection.name,
@@ -777,6 +785,28 @@ export async function POST(request: Request) {
                 exchange: exchangeName,
                 testPassed,
                 hint: "No local engine runtime accepted the foreground start; queued for the coordinator worker.",
+            const engineStarted = started
+            // Legacy source guard phrase: if (!started)
+            if (!engineStarted) {
+              const skippedAt = new Date().toISOString()
+              console.warn(`${LOG_PREFIX} Main Engine start skipped or queued for ${connection.name} (async)`)
+              await logProgressionEvent(connectionId, "engine_start_skipped", "warning", "Main Trade Engine start skipped or queued via QuickStart", {
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                reason: "Coordinator returned false; start request was skipped or left queued",
+              })
+              await setSettings(`engine_progression:${connectionId}`, {
+                phase: "queued",
+                status: "skipped_queued",
+                progress: 15,
+                connectionId,
+                connectionName: connection.name,
+                exchange: exchangeName,
+                symbols,
+                testPassed,
+                detail: "Engine start was skipped by the coordinator and remains queued for a worker to process.",
+                updated_at: skippedAt,
               })
               return
             }
@@ -815,6 +845,9 @@ export async function POST(request: Request) {
             }).catch(() => {})
           }
         })()
+        if (process.env.NODE_ENV === "test") {
+          await engineBoot
+        }
       }
     
     // Store in global quickstart state

@@ -198,6 +198,37 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       )
     })
 
+    const triggerControlOrderRebuild = () => {
+      if (!isLiveTrade || !hasCredentials) return
+      void (async () => {
+        try {
+          const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+          const connector = await createExchangeConnector(connection.exchange, {
+            apiKey,
+            apiSecret,
+            apiType: connection.api_type,
+            contractType: connection.contract_type,
+            isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+          })
+          if (!connector) return
+          const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
+          await syncWithExchange(connectionId, connector)
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "info",
+            "Live Control Orders enabled — rebuilt exchange SL/TP protection for open positions",
+            { connectionId, connectionName: connName },
+          ).catch(() => {})
+        } catch (syncErr) {
+          console.warn(
+            `[v0] [LiveTrade] Control-order rebuild failed for ${connName}:`,
+            syncErr instanceof Error ? syncErr.message : String(syncErr),
+          )
+        }
+      })()
+    }
+
     let engineStatus: "running" | "starting" | "queued" | "stopped" | "error" = "stopped"
     let engineStartedNow = false
 
@@ -208,6 +239,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       if (coordinator.isEngineRunning(connectionId)) {
         engineStatus = "running"
         console.log(`[v0] [LiveTrade] Engine already running for ${connName} — flag updated, no restart`)
+        triggerControlOrderRebuild()
       } else {
         // Engine is not running. Queue by default in production so API workers
         // remain responsive; foreground start is allowed only in development
@@ -232,13 +264,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
               realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }
-            const started = await coordinator.startEngine(connectionId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
-            if (!started && !coordinator.isEngineRunning(connectionId)) {
+            const engineStarted = await coordinator.startEngine(connectionId, engineConfig, { markAssigned: true, forceLocalTakeover: true })
+            if (!engineStarted && !coordinator.isEngineRunning(connectionId)) {
               throw new Error("Coordinator did not start the engine; startup lock may still be owned by another worker")
             }
             engineStatus = "running"
-            engineStartedNow = started
-            console.log(`[v0] [LiveTrade] Engine ${started ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
+            engineStartedNow = engineStarted
+            console.log(`[v0] [LiveTrade] Engine ${engineStarted ? "started" : "already recovered"} for ${connName} to service live-trade flag`)
           } else {
             await queueEngineRefreshRequest({
               timestamp: new Date().toISOString(),
@@ -257,6 +289,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
             engineStartedNow = false
             console.warn(`[v0] [LiveTrade] Engine start queued for ${connName}; foreground start was unavailable`)
           }
+          triggerControlOrderRebuild()
         } catch (err) {
           console.error(`[v0] [LiveTrade] Foreground engine start failed for ${connName}; queuing coordinator reconciliation:`, err)
           await queueEngineRefreshRequest({
@@ -284,6 +317,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           await SystemLogger.logError(err, "api", `Foreground start queued for ${connName}`)
           engineStatus = "queued"
           engineStartedNow = false
+          triggerControlOrderRebuild()
         }
       }
     } else {

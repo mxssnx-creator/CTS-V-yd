@@ -1252,7 +1252,7 @@ const migrations: Migration[] = [
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
 
-          // ── Cycle Counters (hincrby discipline — never overwrite!) ���������������
+          // ── Cycle Counters (hincrby discipline — never overwrite!) �����������������
           cycles_completed: have.cycles_completed ?? "0",
           successful_cycles: have.successful_cycles ?? "0",
           failed_cycles: have.failed_cycles ?? "0",
@@ -3852,8 +3852,39 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       }
     }
 
+    // CRITICAL: Also purge the open-index and closed-index LISTS for every
+    // connection. These lists contain position IDs from the previous run.
+    // After purging position hashes above, these IDs are dangling references —
+    // getLivePositions() fetches each ID and gets null (deleted hash), which
+    // the sync-tick then treats as a terminal position stuck in the open index.
+    // Clearing both lists on boot prevents this every-cycle purge noise.
+    const posIndexKeys: string[] = await client.keys("live:positions:*").catch(() => [])
+    let indexPurged = 0
+    for (const k of posIndexKeys) {
+      await client.del(k).catch(() => 0)
+      indexPurged++
+    }
+
+    // CRITICAL: Purge live:lock:* dedup keys from the previous run.
+    // These locks have a 5-minute TTL. If the server restarts before TTL
+    // expires, the position hashes are deleted (above) but the lock keys
+    // survive. The next dispatch for that symbol+direction tries to acquire,
+    // gets null (lock held), looks for an existing open position (finds none —
+    // it was deleted), and returns "rejected". Every subsequent signal defers
+    // for 5 minutes until the TTL expires. Purging at boot ensures a clean
+    // slate so the first cycle can place real orders immediately.
+    const lockKeys: string[] = await client.keys("live:lock:*").catch(() => [])
+    for (const k of lockKeys) {
+      await client.del(k).catch(() => 0)
+    }
+
     const symDesc = devSymCount === 1 ? "force_symbols=BTCUSDT" : `symbol_count=${devSymCount} (volatility_1h)`
-    console.log(`[v0] [Boot] Pinned ${symDesc} across all key namespaces${purged > 0 ? `, purged ${purged} stale live:position keys` : ""}`)
+    console.log(
+      `[v0] [Boot] Pinned ${symDesc} across all key namespaces` +
+      (purged > 0 ? `, purged ${purged} stale live:position keys` : "") +
+      (indexPurged > 0 ? `, cleared ${indexPurged} stale position index lists` : "") +
+      (lockKeys.length > 0 ? `, released ${lockKeys.length} stale dedup locks` : ""),
+    )
   }
 
   return { createdOrUpdated, credentialsInjected }

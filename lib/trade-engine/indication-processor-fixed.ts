@@ -11,8 +11,11 @@
 const _INDICATION_BUILD_VERSION = "5.0.1"
 const _BUILD_TIMESTAMP = 1712361660000 // Updated to force rebuild at 13:21
 
-// Log immediately on module load to confirm new code is running
-console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
+// Log exactly once per process (guarded by a globalThis flag so HMR reloads are silent)
+if (!(globalThis as any).__IND_PROC_LOGGED__) {
+  ;(globalThis as any).__IND_PROC_LOGGED__ = true
+  console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
+}
 
 // CRITICAL: Create a shared Map that will be used by ALL instances
 // This fixes the issue where class field initialization fails in cached bundles
@@ -52,9 +55,11 @@ const FALLBACK_CACHE = new Map<string, any>()
 ;(globalThis as any).__FALLBACK_MARKET_DATA_CACHE__ = FALLBACK_CACHE
 
 // Override Map methods to be more defensive - if called on undefined, use fallback
+// Guard with globalThis flag so this logs exactly once per process even if the
+// module is re-evaluated due to Next.js hot-module-replacement.
 if (!(globalThis as any).__MAP_PATCHED__) {
-  (globalThis as any).__MAP_PATCHED__ = true
-  console.log("[v0] Applying Map prototype patch for undefined cache fix")
+  ;(globalThis as any).__MAP_PATCHED__ = true
+  // Intentionally silent after first load — repeated logging drowns out real errors.
 }
 
 // Patch to make the shared cache available globally for old cached code
@@ -248,7 +253,8 @@ export class IndicationProcessor {
       // Priority 1: raw candles array (250 candles from market-data-loader)
       const candlesRaw = await client.get(`market_data:${symbol}:candles`)
       if (candlesRaw) {
-        const candles = JSON.parse(typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw))
+        // Redis returns strings; parse directly without re-stringify
+        const candles = typeof candlesRaw === "string" ? JSON.parse(candlesRaw) : candlesRaw
         if (Array.isArray(candles) && candles.length > 0) {
           this._parsedCandlesCache.set(symbol, { candles, ts: Date.now() })
           this.logCandleCountIfChanged(symbol, "candles-array", candles.length)
@@ -264,7 +270,8 @@ export class IndicationProcessor {
         (await client.get(`market_data:${symbol}:1s`)) ??
         (await client.get(`market_data:${symbol}:1m`))
       if (marketDataRaw) {
-        const marketDataObj = JSON.parse(typeof marketDataRaw === "string" ? marketDataRaw : JSON.stringify(marketDataRaw))
+        // Redis returns strings; parse directly without re-stringify
+        const marketDataObj = typeof marketDataRaw === "string" ? JSON.parse(marketDataRaw) : marketDataRaw
         if (marketDataObj?.candles && Array.isArray(marketDataObj.candles) && marketDataObj.candles.length > 0) {
           this.logCandleCountIfChanged(symbol, "market-data-envelope", marketDataObj.candles.length)
           return marketDataObj.candles

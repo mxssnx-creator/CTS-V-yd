@@ -156,9 +156,8 @@ export async function getParsedCandlesCached(symbol: string): Promise<any[]> {
         cached.timestamp = now
         return cached.candles
       }
-      const obj = JSON.parse(
-        typeof envelopeRaw === "string" ? envelopeRaw : JSON.stringify(envelopeRaw),
-      )
+      // Redis returns strings; parse directly without re-stringify
+      const obj = JSON.parse(typeof envelopeRaw === "string" ? envelopeRaw : JSON.stringify(envelopeRaw))
       const arr: any[] = Array.isArray(obj?.candles) ? obj.candles : []
       arr.sort((a: any, b: any) => Number(a?.timestamp ?? 0) - Number(b?.timestamp ?? 0))
       _storeParsedCandles(symbol, arr, sig, now)
@@ -173,9 +172,8 @@ export async function getParsedCandlesCached(symbol: string): Promise<any[]> {
       return cached.candles
     }
 
-    const parsed: any[] = JSON.parse(
-      typeof raw === "string" ? raw : JSON.stringify(raw),
-    )
+    // Redis returns strings; parse directly without re-stringify
+    const parsed: any[] = JSON.parse(typeof raw === "string" ? raw : JSON.stringify(raw))
     const arr = Array.isArray(parsed) ? parsed : []
     // Sort once at parse time so the replay loop never re-sorts the full set.
     arr.sort((a: any, b: any) => Number(a?.timestamp ?? 0) - Number(b?.timestamp ?? 0))

@@ -137,7 +137,9 @@ export class BingXConnector extends BaseExchangeConnector {
       this.sdkClient = new BingXClient(requestExecutor)
       this.sdkAccount = new ApiAccount(credentials.apiKey, credentials.apiSecret)
       
-      console.log("[BingX] SDK client initialized (trade service + account enabled)")
+      // CRITICAL FIX: Removed log spam that appeared 50+ times per cycle
+      // SDK is initialized once per process, this log was noisy during development
+      // console.log("[BingX] SDK client initialized (trade service + account enabled)")
     } catch (err) {
       console.warn("[BingX] SDK initialization warning:", err instanceof Error ? err.message : String(err))
       // Will fall back to manual REST
@@ -784,6 +786,9 @@ export class BingXConnector extends BaseExchangeConnector {
         await this.sdkInitPromise.catch(() => {})
         this.sdkInitPromise = null
       }
+      // SDK is the DEFAULT path for mainnet perpetual entry orders.
+      // Set DISABLE_BINGX_SDK_ORDERS=1 to force REST fallback (e.g. for debugging).
+      // REST is always used for: testnet, spot, reduce-only (close/SL/TP) orders.
       const sdkOrderAllowed =
         process.env.DISABLE_BINGX_SDK_ORDERS !== "1" &&
         !this.credentials.isTestnet &&
@@ -791,16 +796,10 @@ export class BingXConnector extends BaseExchangeConnector {
         !options.reduceOnly &&
         !!this.sdkClient &&
         !!this.sdkAccount
-      // Prefer the audited REST path for real order placement unless explicitly
-      // enabled. The SDK fast-path has different position-mode semantics across
-      // versions and was a prod/dev mismatch source for live orders; REST below
-      // carries our recvWindow, timestamp-resync, hedge/one-way fallback, and
-      // signed-query diagnostics.
-      if (sdkOrderAllowed && process.env.ENABLE_BINGX_SDK_ORDERS === "1") {
+      if (sdkOrderAllowed) {
         try {
           const bingxSymbol = this.toBingXSymbol(symbol)
-          const apiType = this.credentials.apiType || "perpetual_futures"
-          
+
           // SDK encapsulates the order placement with optimal timeout and retry
           const tradeService = (this.sdkClient as any).getTradeService?.() || (this.sdkClient as any).services?.TradeService
           if (!tradeService?.tradeOrder) throw new Error("BingX SDK tradeOrder service unavailable")
@@ -1142,9 +1141,12 @@ export class BingXConnector extends BaseExchangeConnector {
       )
 
       const endpoint = "/openApi/swap/v2/trade/order"
-      const { signature, queryString: signedQs } = this.signParams(params)
-      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
-      const response = await this.rateLimitedFetch(url, {
+      const buildStopUrl = (): string => {
+        params.timestamp = this.getTimestamp()
+        const { signature, queryString: signedQs } = this.signParams(params)
+        return `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
+      }
+      const response = await this.rateLimitedFetch(buildStopUrl, {
         method: "POST",
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
@@ -1269,32 +1271,30 @@ export class BingXConnector extends BaseExchangeConnector {
     }
   }
 
-  async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
+  async cancelOrder(
+    symbol: string,
+    orderId: string,
+  ): Promise<{ success: boolean; error?: string }> {
     try {
       // Sync server time before any signed request.
-      // The throttle inside syncServerTime (60 s) means concurrent cancel
-      // calls don't pile up on re-sync — the first triggers a real HTTP
-      // call, subsequent ones within the window return immediately.
       await this.syncServerTime()
 
       this.log(`Cancelling order ${orderId} for ${symbol}`)
 
-      // Perp swap: DELETE /openApi/swap/v2/trade/order (no separate cancel path).
-      // Spot: POST /openApi/spot/v1/trade/cancel (v1 spot still uses a subpath).
       const isSpot = this.credentials.apiType === "spot"
       const endpoint = isSpot ? "/openApi/spot/v1/trade/cancel" : "/openApi/swap/v2/trade/order"
       const method = isSpot ? "POST" : "DELETE"
       const bingxSymbol = this.toBingXSymbol(symbol)
       const baseUrl = this.getBaseUrl()
 
+      // LAZY URL BUILD: compute timestamp + signature inside the rate-limit slot
+      // at send time so they are always fresh (avoids 100421 timestamp errors).
       const buildUrl = () => {
         const params = { symbol: bingxSymbol, orderId, timestamp: this.getTimestamp() }
         const { signature, queryString: signedQs } = this.signParams(params)
         return `${baseUrl}${endpoint}?${signedQs}&signature=${signature}`
       }
 
-      // LAZY URL BUILD: pass the builder itself so timestamp + signature are
-      // computed inside the rate-limit slot at send time, not at queue time.
       const doRequest = () =>
         this.rateLimitedFetch(buildUrl, {
           method,
@@ -1339,10 +1339,20 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       if (!this.isBingXSuccess(data.code)) {
-        // "Order does not exist" codes — order was already filled/cancelled.
+        // "Order does not exist" / "order not exist" — already filled or cancelled.
+        // BingX uses different msg strings across API versions:
+        //   "order does not exist" (swap v2)
+        //   "order not exist"      (swap v2 alternate / some regions)
+        // Also catch code=109400 when msg contains "not exist" (distinct from the
+        // timestamp variant handled above which contains "timestamp").
         const code = String(data.code)
-        if (code === "100410" || code === "101400" || code === "80012" ||
-            (data.msg && String(data.msg).toLowerCase().includes("order does not exist"))) {
+        const msgLower = String(data.msg ?? "").toLowerCase()
+        const isOrderGone =
+          code === "100410" || code === "101400" || code === "80012" ||
+          msgLower.includes("order does not exist") ||
+          msgLower.includes("order not exist") ||
+          (code === "109400" && msgLower.includes("not exist"))
+        if (isOrderGone) {
           this.log(`Order ${orderId} already gone (code=${code}) — treating as cancelled`)
           return { success: true }
         }
@@ -1662,10 +1672,11 @@ export class BingXConnector extends BaseExchangeConnector {
     }
   }
 
-  async closePosition(symbol: string, positionSide?: "long" | "short"): Promise<{ success: boolean; error?: string }> {
+  async closePosition(
+    symbol: string,
+    positionSide?: "long" | "short",
+  ): Promise<{ success: boolean; error?: string }> {
     try {
-      this.log(`Closing position ${symbol}${positionSide ? ` (${positionSide})` : ""}`)
-
       // Pass the requested direction so getPosition() returns the correct
       // hedge-mode slot (LONG vs SHORT) rather than the first entry in the
       // array (which may be the opposite side or a zero-sized slot).
@@ -2662,7 +2673,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const succeeded = data.data?.success || []
       const failed = data.data?.failed || []
       
-      this.log(`✓ Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
+      this.log(`�� Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
       return {
         success: true,
         successful: succeeded,

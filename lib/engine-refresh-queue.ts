@@ -3,7 +3,25 @@ import { getRedisClient, getSettings, setSettings } from "./redis-db"
 export const ENGINE_REFRESH_REQUEST_PREFIX = "engine_coordinator:refresh_requested:"
 const ENGINE_REFRESH_REQUEST_INDEX = "engine_coordinator:refresh_requested:index"
 
-export type EngineRefreshAction = "start" | "stop" | "refresh"
+export type EngineRefreshAction = "start" | "stop" | "refresh" | "restart"
+
+export const REFRESH_REQUEST_MAX_AGE_MS = 30_000
+export const START_REQUEST_MAX_AGE_MS = Number.POSITIVE_INFINITY
+
+export function getEngineRefreshRequestMaxAgeMs(request: Pick<EngineRefreshRequest, "action">): number {
+  return request.action === "start" ? START_REQUEST_MAX_AGE_MS : REFRESH_REQUEST_MAX_AGE_MS
+}
+
+export function isEngineRefreshRequestExpired(
+  request: Pick<EngineRefreshRequest, "action" | "timestamp">,
+  now = Date.now(),
+): boolean {
+  const maxAgeMs = getEngineRefreshRequestMaxAgeMs(request)
+  if (!Number.isFinite(maxAgeMs)) return false
+
+  const requestTime = new Date(request.timestamp).getTime()
+  return !Number.isFinite(requestTime) || now - requestTime >= maxAgeMs
+}
 
 export interface EngineRefreshRequest {
   connectionId: string

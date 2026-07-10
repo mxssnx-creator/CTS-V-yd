@@ -10,6 +10,18 @@ export const dynamic = "force-dynamic"
 export const maxDuration = 30
 export const revalidate = 0
 
+// Rate-limit STATS-VALIDATION console.warn to once per 5 min per connection.
+// The stale real>main snapshot persists across many requests until the
+// coordinator writes a fresh cycle — spamming logs on every stats poll.
+const _statsValidationLastWarn: Map<string, number> = new Map()
+function throttledStatsWarn(key: string, msg: string): void {
+  const now = Date.now()
+  const last = _statsValidationLastWarn.get(key) ?? 0
+  if (now - last < 300_000) return
+  _statsValidationLastWarn.set(key, now)
+  console.warn(msg)
+}
+
   function n(v: unknown): number {
     const x = Number(v)
     return Number.isFinite(x) && x >= 0 ? x : 0
@@ -618,7 +630,7 @@ export async function GET(
       ? Math.max(1, existingRealActiveSamples)
       : existingRealActiveSamples
 
-    // ── Live-stage OPEN positions + Set-relation join ─────���───────────
+    // ── Live-stage OPEN positions + Set-relation join ─────���������───────────
     //
     // The operator asked for a coordination view that identifies which
     // Set each live exchange position came from. The live-stage
@@ -1152,6 +1164,12 @@ export async function GET(
       })
     )
     // Enforce cascade invariants for all public progression counters:
+    // BASE expands into MAIN variants, REAL is a filtered subset of MAIN, and
+    // LIVE is a dispatch subset of REAL. During live runs, per-stage writers can
+    // briefly update different fields in separate Redis calls, so a stats read
+    // may observe `real > main` (or `live > real`) for one request. Normalize the
+    // snapshot here instead of exposing an impossible state to the dashboard,
+    // validation scripts, and operators watching long-running progressions.
     // BASE expands into MAIN variants, REAL filters MAIN inputs and may also
     // create additional Real Sets through related/axis fan-out, and LIVE is a
     // dispatch subset of REAL. During live runs, per-stage writers can briefly
@@ -1164,7 +1182,8 @@ export async function GET(
     const realRelatedCreatedForCurrentSnapshot = n(progHash.strategies_real_last_created)
     const realCeiling = stratCounts.main + realRelatedCreatedForCurrentSnapshot
     if (stratCounts.main > 0 && stratCounts.real > realCeiling) {
-      console.warn(
+      throttledStatsWarn(
+        `${connectionId}:real-ceiling`,
         `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > ` +
         `main (${stratCounts.main}) + realRelatedCreated (${realRelatedCreatedForCurrentSnapshot}). ` +
         `Clamping real to pipeline-aware ceiling (${realCeiling}).`,
@@ -1179,7 +1198,8 @@ export async function GET(
     const realUpstreamInput = activeRealInput || stratCounts.main
     const realMaxAfterFanOut = realUpstreamInput + activeRealRelatedCreated
     if (realUpstreamInput > 0 && realMaxAfterFanOut > 0 && stratCounts.real > realMaxAfterFanOut) {
-      console.warn(
+      throttledStatsWarn(
+        `${connectionId}:real-fanout`,
         `[STATS-VALIDATION] ${connectionId}: real (${stratCounts.real}) > Real max after fan-out ` +
         `(${realMaxAfterFanOut}; main=${stratCounts.main}, input=${activeRealInput}, ` +
         `relatedCreated=${activeRealRelatedCreated}). Clamping real to fan-out max.`,
@@ -1189,10 +1209,6 @@ export async function GET(
       activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
     }
     if (stratCounts.real > 0 && stratCounts.live > stratCounts.real) {
-      console.warn(
-        `[STATS-VALIDATION] ${connectionId}: live (${stratCounts.live}) > real (${stratCounts.real}). ` +
-        `Clamping live to real for cascade consistency.`,
-      )
       stratCounts.live = stratCounts.real
       activeStratByStage.live = Math.min(activeStratByStage.live || 0, stratCounts.live)
       activeStratTotal = activeStratByStage.real || stratCounts.real || strategiesTotal
@@ -2200,7 +2216,7 @@ export async function GET(
       live: _liveBase > 0 ? Math.min(100, Math.round((_liveDispatched / _liveBase) * 1000) / 10) : 0,
     }
 
-    // ── REAL AVERAGES ────────────────────────────────────────────────────────
+    // ── REAL AVERAGES ────────────��───────────────────────────────────────────
     // Average real_samples:{id} ring buffer over 5-min window. Falls back to
     // live snapshot when no in-window samples exist (cold boot / fresh session).
     const _REAL_AVG_WINDOW_MS = 5 * 60 * 1000
@@ -2506,13 +2522,8 @@ export async function GET(
             // Validate constraint: eval <= sets
             const base = stratCounts.base || 0
             const eval_val = stratEvaluated.base || 0
-            if (eval_val > base && base > 0) {
-              console.warn(
-                `[STATS-VALIDATION] ${connectionId}: baseEvaluated (${eval_val}) > base (${base}). ` +
-                `Clamping to base.`,
-              )
-              return base
-            }
+            // Transient read-race: clamp silently (expected, not a bug).
+            if (eval_val > base && base > 0) return base
             return eval_val
           })(),
           mainEvaluated: (() => {
@@ -2528,13 +2539,8 @@ export async function GET(
             // interpretation), treat the main count itself as the evaluated count:
             // all main sets undergo full PF/DDT evaluation.
             if (main > 0 && eval_val < main) return main
-            if (eval_val > main && main > 0) {
-              console.warn(
-                `[STATS-VALIDATION] ${connectionId}: mainEvaluated (${eval_val}) > main (${main}). ` +
-                `Clamping to main.`,
-              )
-              return main
-            }
+            // Transient read-race: clamp silently (expected, not a bug).
+            if (eval_val > main && main > 0) return main
             return eval_val || main
           })(),
           realEvaluated: (() => {

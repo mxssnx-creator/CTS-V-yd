@@ -83,7 +83,7 @@ export class StrategyProcessor {
    * Process strategy - executes complete coordinated flow
    * BASE → Evaluate BASE → MAIN → REAL → LIVE with detailed calculations
    */
-  async processStrategy(symbol: string, indications: any[] = []): Promise<{ strategiesEvaluated: number; liveReady: number }> {
+  async processStrategy(symbol: string, indications: any[] = [], skipLiveDispatch: boolean = false): Promise<{ strategiesEvaluated: number; liveReady: number }> {
     try {
       await initRedis()
       
@@ -267,7 +267,7 @@ export class StrategyProcessor {
       // the input to that pipeline is now pre-filtered to validated
       // indications only.
       const coordinator = new StrategyCoordinator(this.connectionId)
-      const results = await coordinator.executeStrategyFlow(symbol, validIndications, false)
+      const results = await coordinator.executeStrategyFlow(symbol, validIndications, false, undefined, skipLiveDispatch)
 
       // ── Pipeline-aware counting ────────────────────────────────────────
       // BASE → MAIN → REAL → LIVE is a CASCADE FILTER, not four independent

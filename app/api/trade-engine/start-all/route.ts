@@ -95,6 +95,7 @@ async function handleStartAll() {
             reason: "start_all_start_skipped",
           })
         }
+        const engineStarted = await coordinator.startEngine(connection.id, engineConfig, { markAssigned: true, forceLocalTakeover: true })
 
         return {
           connectionId: connection.id,
@@ -102,6 +103,12 @@ async function handleStartAll() {
           exchange: connection.exchange,
           success: started,
           message: started ? "Engine started" : "Engine start queued for coordinator worker",
+          success: engineStarted,
+          message: engineStarted ? "Engine started" : "Engine start skipped by coordinator",
+        })
+
+        if (engineStarted) {
+          successCount++
         }
       } catch (error) {
         return {
