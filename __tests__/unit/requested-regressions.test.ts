@@ -462,6 +462,16 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("private static readonly _AXIS_LRU_MAX = (() =>")
   })
 
+  test("startup-debug reports coordinator start gate result", () => {
+    const source = read("app/api/trade-engine/startup-debug/route.ts")
+
+    expect(source).toContain("const started = await coordinator.startEngine(connection.id, engineConfig)")
+    expect(source).toContain("success: started")
+    expect(source).toContain('started\n            ? "Engine started successfully"')
+    expect(source).toContain(': "Engine start skipped by coordinator/runtime gate"')
+    expect(source).not.toMatch(/^\s*await coordinator\.startEngine\(connection\.id, engineConfig\)\n\n\s*results\.push/m)
+  })
+
   test("coordinator startEngine is queue-only in production API workers unless explicitly opted in", () => {
     const source = read("lib/trade-engine.ts")
 
