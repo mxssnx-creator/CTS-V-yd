@@ -73,6 +73,51 @@ describe("GlobalTradeEngineCoordinator.startEngine lock contention", () => {
     const quickStart = read("app/api/trade-engine/quick-start/route.ts")
     const startAll = read("app/api/trade-engine/start-all/route.ts")
 
+    expect(quickStart).toContain("const started = await coord.startEngine")
+    expect(quickStart).toContain("if (!started)")
+    expect(quickStart).toContain("engine_start_queued")
+    expect(quickStart.indexOf("if (!started)")).toBeLessThan(quickStart.indexOf("Main Engine started for"))
+
+    expect(startAll).toContain("const results = await Promise.all(activeConnections.map(async (connection) =>")
+    expect(startAll).toContain("const started = await coordinator.startEngine")
+    expect(startAll).toContain("success: started")
+    expect(startAll).toContain('message: started ? "Engine started" : "Engine start queued for coordinator worker"')
+    expect(startAll).toContain("const successCount = results.filter((result) => result.success).length")
+    expect(startAll).toContain('message: `Started ${successCount} of ${activeConnections.length} trade engines`')
+    expect(startAll).not.toContain("Engine start dispatched")
+  })
+
+
+  test("queued starts remain durable until a foreground-capable coordinator accepts ownership", () => {
+    const source = read("lib/trade-engine.ts")
+    const drain = source.slice(
+      source.indexOf("public async drainQueuedRefreshRequestsNow"),
+      source.indexOf("public invalidateSymbolsCacheForConnection"),
+    )
+    const startFromConfig = source.slice(
+      source.indexOf("private async startEngineFromConnectionConfig"),
+      source.indexOf("async toggleEngine"),
+    )
+    const autoStart = read("lib/trade-engine-auto-start.ts")
+    const quickStart = read("app/api/trade-engine/quick-start/route.ts")
+    const startAll = read("app/api/trade-engine/start-all/route.ts")
+
+    expect(drain).toContain("const started = await this.startEngineFromConnectionConfig(request.connectionId)")
+    expect(drain).toContain("remains queued")
+    expect(drain.indexOf("remains queued")).toBeLessThan(drain.indexOf("continue", drain.indexOf("remains queued")))
+    expect(drain.indexOf("continue", drain.indexOf("remains queued"))).toBeLessThan(drain.indexOf("await clearEngineRefreshRequest(request.connectionId)", drain.indexOf("remains queued")))
+    expect(startFromConfig).toContain("Promise<boolean>")
+    expect(startFromConfig).toContain("return await this.startEngine(connectionId, config)")
+    expect(startFromConfig).toContain("return false")
+    expect(drain).toContain("now - requestTime >= 120_000")
+    expect(autoStart).toContain("const startedCount = await coordinator.startMissingEngines([connection])")
+    expect(autoStart).toContain("remains queued")
+    expect(autoStart).toContain("continue")
+
+    expect(quickStart).toContain("queueEngineRefreshRequest")
+    expect(quickStart).toContain('reason: "quickstart_start_skipped"')
+    expect(startAll).toContain("queueEngineRefreshRequest")
+    expect(startAll).toContain('reason: "start_all_start_skipped"')
     expect(quickStart).toContain("const engineStarted = await coord.startEngine")
     expect(quickStart).toContain("if (!engineStarted)")
     expect(quickStart).toContain("engine_start_skipped")
@@ -114,5 +159,22 @@ describe("GlobalTradeEngineCoordinator.startEngine lock contention", () => {
     expect(assignedStart.indexOf("if (started === true)")).toBeLessThan(assignedStart.indexOf("queuedStartedConnections.push(conn.id)"))
   })
 
+
+
+  test("queued start requests use action-aware expiry and are not dropped by refresh TTL", () => {
+    const queue = read("lib/engine-refresh-queue.ts")
+    const coordinator = read("lib/trade-engine.ts")
+    const autoStart = read("lib/trade-engine-auto-start.ts")
+
+    expect(queue).toContain("export const REFRESH_REQUEST_MAX_AGE_MS = 30_000")
+    expect(queue).toContain("export const START_REQUEST_MAX_AGE_MS = Number.POSITIVE_INFINITY")
+    expect(queue).toContain('request.action === "start" ? START_REQUEST_MAX_AGE_MS : REFRESH_REQUEST_MAX_AGE_MS')
+    expect(queue).toContain("if (!Number.isFinite(maxAgeMs)) return false")
+
+    expect(coordinator).toContain("isEngineRefreshRequestExpired(request, now)")
+    expect(coordinator).not.toContain("now - requestTime >= 30000")
+    expect(autoStart).toContain("isEngineRefreshRequestExpired(request)")
+    expect(autoStart).not.toContain("Date.now() - requestTime >= 120_000")
+  })
 
 })

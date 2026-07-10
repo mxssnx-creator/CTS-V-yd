@@ -66,16 +66,15 @@ async function getQueuedRefreshRequestList() {
 }
 
 async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnType<typeof loadTradeEngineCoordinator>>): Promise<number> {
-  const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest } = await import("./engine-refresh-queue")
+  const { getQueuedEngineRefreshRequests, clearEngineRefreshRequest, isEngineRefreshRequestExpired } = await import("./engine-refresh-queue")
   const { getConnection } = await loadRedisDb()
 
   const refreshRequests = await getQueuedEngineRefreshRequests()
   let processed = 0
 
   for (const { request } of refreshRequests) {
-    const requestTime = new Date(request.timestamp).getTime()
-    if (!Number.isFinite(requestTime) || Date.now() - requestTime >= 120_000) {
-      console.log(`[v0] [AutoStart] Dropping expired refresh request for ${request.connectionId}`)
+    if (isEngineRefreshRequestExpired(request)) {
+      console.log(`[v0] [AutoStart] Dropping expired ${request.action} request for ${request.connectionId}`)
       await clearEngineRefreshRequest(request.connectionId)
       processed++
       continue
@@ -98,17 +97,27 @@ async function processQueuedEngineRefreshRequests(coordinator: Awaited<ReturnTyp
       `[v0] [AutoStart] Processing queued refresh request for ${request.connectionId}: ${request.action} ` +
         `(state_switch_version=${requestedVersion}, reason=${request.reason})`,
     )
-    await clearEngineRefreshRequest(request.connectionId)
-    processed++
 
     if (request.action === "stop") {
       await coordinator.stopEngine(request.connectionId, { operatorRequested: true })
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
     } else if (request.action === "start") {
       if (!coordinator.isEngineRunning?.(request.connectionId)) {
-        await coordinator.startMissingEngines([connection])
+        const startedCount = await coordinator.startMissingEngines([connection])
+        if (startedCount <= 0 && !coordinator.isEngineRunning?.(request.connectionId)) {
+          console.warn(
+            `[v0] [AutoStart] Start request for ${request.connectionId} remains queued — no foreground-capable runtime accepted ownership yet.`,
+          )
+          continue
+        }
       }
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
     } else {
       await coordinator.applyPendingChangesNow?.(request.connectionId)
+      await clearEngineRefreshRequest(request.connectionId)
+      processed++
     }
   }
 

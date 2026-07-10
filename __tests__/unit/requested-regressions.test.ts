@@ -462,6 +462,16 @@ describe("requested regression guardrails", () => {
     expect(source).toContain("private static readonly _AXIS_LRU_MAX = (() =>")
   })
 
+  test("startup-debug reports coordinator start gate result", () => {
+    const source = read("app/api/trade-engine/startup-debug/route.ts")
+
+    expect(source).toContain("const started = await coordinator.startEngine(connection.id, engineConfig)")
+    expect(source).toContain("success: started")
+    expect(source).toContain('started\n            ? "Engine started successfully"')
+    expect(source).toContain(': "Engine start skipped by coordinator/runtime gate"')
+    expect(source).not.toMatch(/^\s*await coordinator\.startEngine\(connection\.id, engineConfig\)\n\n\s*results\.push/m)
+  })
+
   test("coordinator startEngine is queue-only in production API workers unless explicitly opted in", () => {
     const source = read("lib/trade-engine.ts")
 
@@ -930,6 +940,10 @@ describe("requested regression guardrails", () => {
     expect(route).toContain('const dbSizeFn = (client as any).dbSize || (client as any).dbsize')
     expect(route).toContain('keyCount = Math.max(keyCount, allKeys.length)')
     expect(route).toContain('const stats = await getRedisStats()')
+    expect(route).toContain('client.dbSize().catch(() => 0)')
+    expect(route).toContain('const keys = Math.max(redisKeyCount, allKeys.length)')
+    expect(route).toContain('totalKeys: keys')
+    expect(route).toContain('redisInfo.match(/^used_memory:')
     expect(route).not.toContain('cpu: 0,')
     expect(route).not.toContain('memory: 0,')
 
@@ -947,6 +961,7 @@ describe("requested regression guardrails", () => {
     expect(panel).toContain('const memory = positiveNumber(mon.memory) ?? 0.1')
     expect(panel).toContain('positiveNumber(stats?.database?.totalKeys)')
     expect(panel).toContain('{data.redisKeys > 0 ? data.redisKeys : "—"}')
+    expect(helper).toContain('return loadPercent > 0 ? loadPercent : 0.1')
   })
 
 
@@ -999,6 +1014,7 @@ describe("requested regression guardrails", () => {
     expect(liveEnableBlock).toContain('is_active: "1"')
     expect(helper).toContain('os.totalmem')
     expect(helper).toContain('memory.rss')
+    expect(helper).toContain('return loadPercent > 0 ? loadPercent : 0.1')
   })
 
   test("Redis migrations remain sequential for production schema upgrades", () => {

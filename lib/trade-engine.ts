@@ -50,7 +50,12 @@ import {
   forceBreakProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
-import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests, recordEngineRefreshRequestFailure } from "./engine-refresh-queue"
+import {
+  clearEngineRefreshRequest,
+  getQueuedEngineRefreshRequests,
+  isEngineRefreshRequestExpired,
+  recordEngineRefreshRequestFailure,
+} from "./engine-refresh-queue"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -231,6 +236,14 @@ export class GlobalTradeEngineCoordinator {
     const explicitForegroundAllowed =
       process.env.ALLOW_API_TRADE_ENGINE_FOREGROUND === "1" &&
       process.env.ENABLE_TRADE_ENGINE_IN_PROCESS === "1"
+
+    if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1" || process.env.NEXT_RUNTIME === "edge") {
+      console.warn(
+        `[v0] [Coordinator] startEngine(${connectionId}) skipped — in-process trade engine runtime is disabled or running on edge.`,
+      )
+      return false
+    }
+
 
     if (process.env.DISABLE_TRADE_ENGINE_IN_PROCESS === "1" || process.env.NEXT_RUNTIME === "edge") {
       console.warn(
@@ -725,8 +738,10 @@ export class GlobalTradeEngineCoordinator {
 
     for (const { request } of targetedRequests) {
       const requestTime = new Date(request.timestamp).getTime()
-      if (!Number.isFinite(requestTime) || now - requestTime >= 30000) {
+      if (!Number.isFinite(requestTime) || now - requestTime >= 120_000) {
         console.log(`[v0] [Coordinator] Dropping expired refresh request for ${request.connectionId}`)
+      if (isEngineRefreshRequestExpired(request, now)) {
+        console.log(`[v0] [Coordinator] Dropping expired ${request.action} request for ${request.connectionId}`)
         await clearEngineRefreshRequest(request.connectionId)
         continue
       }
@@ -753,7 +768,13 @@ export class GlobalTradeEngineCoordinator {
           await this.stopEngine(request.connectionId, { operatorRequested: true })
         } else if (request.action === "start") {
           if (!this.isEngineRunning(request.connectionId)) {
-            await this.startEngineFromConnectionConfig(request.connectionId)
+            const started = await this.startEngineFromConnectionConfig(request.connectionId)
+            if (!started && !this.isEngineRunning(request.connectionId)) {
+              console.warn(
+                `[v0] [Coordinator] Start request for ${request.connectionId} remains queued — no in-process runtime accepted ownership yet.`,
+              )
+              continue
+            }
           }
         } else if (request.action === "restart") {
           if (!this.isEngineRunning(request.connectionId)) {
@@ -808,13 +829,14 @@ export class GlobalTradeEngineCoordinator {
    * indistinguishable from a fresh dashboard toggle except that it
    * carries a NEW progression epoch.
    *
-   * Returns silently on missing connection / missing settings; the
-   * watchdog will simply retry on the next pass.
+   * Returns true only when this process accepted ownership or already has a
+   * running engine. Queued start drains use false to keep the durable request
+   * pending for a foreground-capable coordinator worker.
    */
-  private async startEngineFromConnectionConfig(connectionId: string): Promise<void> {
+  private async startEngineFromConnectionConfig(connectionId: string): Promise<boolean> {
     try {
       if (!(await this.isGlobalCoordinatorEnabled(`startEngineFromConnectionConfig(${connectionId})`))) {
-        return
+        return false
       }
       const { getConnection } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
@@ -823,7 +845,7 @@ export class GlobalTradeEngineCoordinator {
         console.warn(
           `[v0] [Coordinator] restart skipped — connection ${connectionId} not found`,
         )
-        return
+        return false
       }
       const settings = await loadSettingsAsync()
       const config: EngineConfig = {
@@ -833,12 +855,13 @@ export class GlobalTradeEngineCoordinator {
         strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
         realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
       }
-      await this.startEngine(connectionId, config)
+      return await this.startEngine(connectionId, config)
     } catch (err) {
       console.warn(
         `[v0] [Coordinator] startEngineFromConnectionConfig failed for ${connectionId}:`,
         err instanceof Error ? err.message : String(err),
       )
+      return false
     }
   }
 

@@ -57,6 +57,9 @@ export function SystemMonitoringPanel() {
           cpu,
           memory,
           redisKeys: dbKeys,
+          cpu: Number(mon.cpu ?? mon.system?.cpuUsage ?? 0),
+          memory: Number(mon.memory ?? mon.system?.memoryUsage ?? 0),
+          redisKeys: Number(mon.database?.keys ?? mon.database?.totalKeys ?? 0),
           lastUpdate: new Date().toLocaleTimeString(),
         })
       }
