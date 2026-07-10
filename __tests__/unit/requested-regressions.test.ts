@@ -911,6 +911,10 @@ describe("requested regression guardrails", () => {
     expect(route).toContain('Redis unavailable while collecting system metrics')
     expect(route).toContain('cpu: resourceMetrics.cpuPercent')
     expect(route).toContain('memory: resourceMetrics.memoryPercent')
+    expect(route).toContain('client.dbSize().catch(() => 0)')
+    expect(route).toContain('const keys = Math.max(redisKeyCount, allKeys.length)')
+    expect(route).toContain('totalKeys: keys')
+    expect(route).toContain('redisInfo.match(/^used_memory:')
     expect(route).not.toContain('cpu: 0,')
     expect(route).not.toContain('memory: 0,')
 
@@ -919,6 +923,7 @@ describe("requested regression guardrails", () => {
     expect(helper).toContain('/sys/fs/cgroup/cpu.max')
     expect(helper).toContain('Math.max(0.1')
     expect(helper).toContain('memory.rss')
+    expect(helper).toContain('return loadPercent > 0 ? loadPercent : 0.1')
   })
 
 
@@ -971,6 +976,7 @@ describe("requested regression guardrails", () => {
     expect(liveEnableBlock).toContain('is_active: "1"')
     expect(helper).toContain('os.totalmem')
     expect(helper).toContain('memory.rss')
+    expect(helper).toContain('return loadPercent > 0 ? loadPercent : 0.1')
   })
 
   test("Redis migrations remain sequential for production schema upgrades", () => {
