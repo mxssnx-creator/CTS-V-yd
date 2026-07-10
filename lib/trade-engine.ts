@@ -50,7 +50,12 @@ import {
   forceBreakProgressionLock,
   type LockHandle,
 } from "./trade-engine/progression-lock"
-import { clearEngineRefreshRequest, getQueuedEngineRefreshRequests, recordEngineRefreshRequestFailure } from "./engine-refresh-queue"
+import {
+  clearEngineRefreshRequest,
+  getQueuedEngineRefreshRequests,
+  isEngineRefreshRequestExpired,
+  recordEngineRefreshRequestFailure,
+} from "./engine-refresh-queue"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -724,9 +729,8 @@ export class GlobalTradeEngineCoordinator {
     const now = Date.now()
 
     for (const { request } of targetedRequests) {
-      const requestTime = new Date(request.timestamp).getTime()
-      if (!Number.isFinite(requestTime) || now - requestTime >= 30000) {
-        console.log(`[v0] [Coordinator] Dropping expired refresh request for ${request.connectionId}`)
+      if (isEngineRefreshRequestExpired(request, now)) {
+        console.log(`[v0] [Coordinator] Dropping expired ${request.action} request for ${request.connectionId}`)
         await clearEngineRefreshRequest(request.connectionId)
         continue
       }
