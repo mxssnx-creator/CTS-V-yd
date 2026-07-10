@@ -41,13 +41,16 @@ export async function GET() {
           realtimeInterval,
         }
 
-        await coordinator.startEngine(connection.id, engineConfig)
+        const started = await coordinator.startEngine(connection.id, engineConfig)
 
         results.push({
           connectionId: connection.id,
           connectionName: connection.name,
-          success: true,
-          message: "Engine started successfully",
+          success: started,
+          queued: false,
+          message: started
+            ? "Engine started successfully"
+            : "Engine start skipped by coordinator/runtime gate",
         })
       } catch (error) {
         results.push({
