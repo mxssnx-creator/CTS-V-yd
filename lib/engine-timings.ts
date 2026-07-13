@@ -198,8 +198,12 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
    neutralizeMaxPerDirection:       200,  // up to 200 concurrent sets before shedding
    neutralizeVolumeMode:            "neutralize", // net-delta-only addition
   // ── Position Ceiling defaults ──────────────────────────────────────────
-   maxPositionsLong:                1,    // Default: 1 concurrent long position
-   maxPositionsShort:               1,    // Default: 1 concurrent short position
+  // Raised from 1→12 to support 12-symbol configurations where each symbol
+  // may carry an independent position in each direction simultaneously.
+  // The prior default of 1 prevented any multi-symbol live trading since a
+  // single open long on symbol A would block entries on symbols B–L.
+   maxPositionsLong:                12,   // Default: 12 concurrent long positions (one per symbol)
+   maxPositionsShort:               12,   // Default: 12 concurrent short positions (one per symbol)
 }
 
 // Hard min/max bounds — UI + API normalise to these to avoid pathological
@@ -243,9 +247,12 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
    neutralizeThresholdPct:      { min: 0,           max: 50                  },
    neutralizeMaxPerDirection:   { min: 1,           max: 500                 },
    neutralizeVolumeMode:        { min: 0,           max: 0  /* handled below */ },
-  // ── Position Ceiling bounds ───────────────────────────────────────────
-   maxPositionsLong:            { min: 1,           max: 50                  },
-   maxPositionsShort:           { min: 1,           max: 50                  },
+  // ── Position Ceiling bounds ──────────────────────────────────────────────
+  // Upper bound raised to 200 to allow up to 200 concurrent positions per
+  // direction — needed for high-symbol-count (12+) configurations where each
+  // symbol × variant may legitimately hold positions simultaneously.
+   maxPositionsLong:            { min: 1,           max: 200                 },
+   maxPositionsShort:           { min: 1,           max: 200                 },
 }
 
 // snake_case key in Redis hash → camelCase key in object. Both forms are

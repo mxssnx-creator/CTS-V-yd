@@ -767,12 +767,11 @@ export class StrategyCoordinator {
     // calibrated to prevent InlineLocalRedis growth past the 1200 MB
     // eviction trigger between 4s cleanup cycles.
     maxLiveSets: 400,
-    // Real Sets default to the safety ceiling (20000). "Unlimited" (Infinity)
-    // previously bypassed the OOM-protection ceiling because the enforcement
-    // used `??` (Infinity is not nullish) — next-server was OOM-killed at the
-    // 4GB heap limit during live multi-symbol runs. The evaluate path also
-    // hard-clamps with Math.min as defense in depth.
-    maxRealSets: 20000,
+    // maxRealSets: undefined means "use _realOutputCap from evaluateRealSets"
+    // (currently 1000 prod / 500 dev). Explicitly set via Settings to override.
+    // The old hardcoded 20000 was correct in theory but irrelevant because the
+    // _defaultRealCap of 60/100 always won in the Math.min formula.
+    maxRealSets: undefined,
     pruneStrategy: "hybrid",
   }
 
@@ -790,7 +789,11 @@ export class StrategyCoordinator {
   // Old code had hardcoded 100; treat ≤100 as unset so the singleton picks up
   // the dynamic default (5000 × memScale ≈ 8540 on the 8.4 GB VM) after restart.
   private strategyRealSetsSafetyCeiling: number | null = null
-  private strategyLiveSetsCeiling = 90
+  // Raised from 90 → 250 per symbol. With 12 symbols BingX's 200-open-order
+  // ceiling (100 positions × 2 SL/TP each) is enforced by the per-connection
+  // global cap in createLiveSets, not per-symbol. Per-symbol ceiling of 250
+  // allows all variants (default + block + dca + trailing) to dispatch freely.
+  private strategyLiveSetsCeiling = 250
 
   /**
    * Per-cycle cached coordination settings (axes + variants toggles).
@@ -1306,18 +1309,20 @@ export class StrategyCoordinator {
           ? intSetting(_rawAxisCeil, 50, 10, 50_000)
           : null
     // Only set when the connection explicitly provides a value; otherwise
-    // leave null so the standard dev/prod defaults (60/100 per symbol) apply.
+    // leave null so the new dev/prod defaults (500/1000 per symbol) apply.
     const _rawRealCeil = (s as any).strategyRealSetsSafetyCeiling
     this.strategyRealSetsSafetyCeiling =
       _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
-        ? intSetting(_rawRealCeil, 100, 25, 50_000)
+        ? intSetting(_rawRealCeil, 1000, 25, 50_000)
         : null
     // maxRealSets is uncapped (no Infinity default); let realSetsCap enforce the limit.
     this.config.maxRealSets = 
       _rawRealCeil != null && Number.isFinite(Number(_rawRealCeil)) && Number(_rawRealCeil) > 0
         ? intSetting((s as any).maxRealSets, Number(_rawRealCeil), 1, 50_000)
         : undefined
-      this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 90, 1, 1_000)
+      // Default raised from 90 → 250; max raised from 1_000 → 5_000 to allow
+      // high-symbol-count configs to dispatch more Live Sets per cycle.
+      this.strategyLiveSetsCeiling = intSetting((s as any).strategyLiveSetsCeiling, 250, 1, 5_000)
       this.config.maxLiveSets = this.strategyLiveSetsCeiling
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
@@ -1580,23 +1585,14 @@ export class StrategyCoordinator {
           ? this.neutralPositionContext()
           : await this.getPositionContext())
 
-      // ── OPTIMIZATION: Skip processing if position state unchanged ──
-      // Check fingerprint of position counts to skip redundant calculations when
-      // no new positions have opened/closed. Prevents recalculating P&F/DDT every
-      // cycle when the market hasn't generated new entries.
-      const posFingerprint = `${posCtx.continuousCount}|${posCtx.lastPosCount}|${posCtx.prevPosCount}`
-      const prevFingerprint = (this as any)._lastPosFingerprint?.[symbol]
-      if (prevFingerprint === posFingerprint && !isPrehistoric) {
-        // Position state unchanged AND indication count stable
-        if (indications.length === (this as any)._lastIndicationCount?.[symbol]) {
-          console.log(`[v0] [StrategyCoordinator] ${symbol}: position+indication state unchanged, skipping cycle`)
-          return results // Early exit — no recalculation needed
-        }
-      }
-      if (!(this as any)._lastPosFingerprint) (this as any)._lastPosFingerprint = {}
-      if (!(this as any)._lastIndicationCount) (this as any)._lastIndicationCount = {}
-      ;(this as any)._lastPosFingerprint[symbol] = posFingerprint
-      ;(this as any)._lastIndicationCount[symbol] = indications.length
+      // NOTE: The previous "state-unchanged skip" early-exit was REMOVED.
+      // Skipping the full BASE→MAIN→REAL→LIVE pipeline when position count
+      // fingerprints were stable caused Real and Live stages to never dispatch
+      // when no positions had opened/closed between cycles — which is the
+      // NORMAL state at low-activity periods and was starving the progression.
+      // Real/Live must run every cycle to correctly dispatch new positions.
+      // The existing per-axis LRU caches (_axisSetLru, coordIndex) handle the
+      // per-cycle performance cost without sacrificing correctness.
 
       // Refresh per-cycle trailing-matrix cache when this entry-point is
       // called standalone (the batch entry-point invalidates already).
@@ -3394,18 +3390,27 @@ export class StrategyCoordinator {
     realQualifying.sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
     
     // ── EARLY CAP: Apply before hedge netting to prevent memory accumulation ──
-    // The old cap applied AFTER hedge netting, wasting memory on thousands of sets
-    // that would be discarded. Cap the top-PF sets here so hedge netting works with
-    // a bounded input. This prevents 3244→60 set reduction happening after memory
-    // is already allocated. Constant defined inline since we need it before hedge-net.
-    const _defaultRealCap = process.env.NODE_ENV === "production" ? 100 : 60
+    // Cap is applied BEFORE hedge netting so memory is bounded before sorting.
+    //
+    // CALIBRATION (12-symbol BingX production, 5632 MB heap):
+    //   - Slim Real Sets (~100-200 bytes each after slim-path refactor) are safe
+    //     at much higher counts than full-blob Sets (2-5 KB each) that caused OOM.
+    //   - 1000 per symbol × 12 symbols × 200 bytes = ~2.4 MB peak — negligible.
+    //   - Old defaults (100 prod / 60 dev) throttled the progression so severely
+    //     that variants (block/dca/trailing) were never reaching Live dispatch.
+    //   - New defaults: 1000 prod / 500 dev. Operator can lower via
+    //     Settings → Strategies → strategyRealSetsSafetyCeiling or the
+    //     STRATEGY_REAL_SETS_CEILING env var for tighter RAM budgets.
+    const _defaultRealCap = process.env.NODE_ENV === "production" ? 1000 : 500
     const rawRealCeiling = Number(process.env.STRATEGY_REAL_SETS_CEILING ?? "")
     const _realOutputCap =
       (Number.isFinite(rawRealCeiling) && rawRealCeiling > 0 ? Math.floor(rawRealCeiling) : null) ??
-      (this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 100
+      (this.strategyRealSetsSafetyCeiling !== null && this.strategyRealSetsSafetyCeiling > 0
         ? this.strategyRealSetsSafetyCeiling
         : _defaultRealCap)
-    const realSetsCap = Math.min(this.config.maxRealSets ?? _realOutputCap, _realOutputCap)
+    const realSetsCap = this.config.maxRealSets != null && this.config.maxRealSets < _realOutputCap
+      ? this.config.maxRealSets
+      : _realOutputCap
     
     if (realQualifying.length > realSetsCap) {
       realQualifying.length = realSetsCap  // Truncate in-place to cap
@@ -4403,14 +4408,38 @@ export class StrategyCoordinator {
         const { getConnection } = await import("@/lib/redis-db")
         const conn = await getConnection(this.connectionId).catch(() => null)
         const exchange = String((conn as any)?.exchange || "").toLowerCase()
-        // BingX commonly enforces a 200-open-order ceiling. Each live position
-        // can carry two reduce-only control orders (SL + TP), so cap dispatch to
-        // 90 positions per cycle (≤180 controls) and leave room for manual orders,
-        // in-flight cancels, and venue-side lag.
-        const configuredLiveCap = this.config.maxLiveSets || this.strategyLiveSetsCeiling || 90
-        this._cachedExchangeMaxLive = exchange === "bingx"
-          ? Math.min(configuredLiveCap, 90)
-          : configuredLiveCap
+        const configuredLiveCap = this.config.maxLiveSets || this.strategyLiveSetsCeiling || 250
+
+        // ── BingX open-order ceiling allocation ─────────────────────────
+        // BingX enforces a 200-open-order limit per account (not per symbol).
+        // Each live position carries 2 reduce-only orders (SL + TP), so the
+        // account supports ≤100 live positions in total.
+        //
+        // OLD behaviour: hard-capped every symbol to 90 regardless of how many
+        // symbols are active. With 12 symbols this tried to dispatch 12×90=1080
+        // slots against a 100-position budget — flooding the quota every cycle.
+        //
+        // NEW behaviour: read the active symbol count and divide the global
+        // budget (90 positions, leaving 10 for manual/buffer) across symbols.
+        // Each symbol gets at least 1 slot and at most `configuredLiveCap`.
+        // This is a per-cycle computed cap; the cached value refreshes every 5 min.
+        if (exchange === "bingx") {
+          let symbolCount = 1
+          try {
+            const state = await import("@/lib/redis-db").then(m =>
+              m.getRedisClient().hget(`settings:trade_engine_state:${this.connectionId}`, "symbol_count")
+            ).catch(() => null)
+            const n = state ? parseInt(String(state), 10) : 0
+            if (n > 0) symbolCount = n
+          } catch { /* use 1 */ }
+          // BingX account budget: 90 live positions (200 orders ÷ 2 per pos = 100, minus 10 buffer).
+          // Divide evenly across active symbols, floor at 1, cap at configuredLiveCap.
+          const BINGX_TOTAL_POSITION_BUDGET = 90
+          const perSymbolBudget = Math.max(1, Math.floor(BINGX_TOTAL_POSITION_BUDGET / symbolCount))
+          this._cachedExchangeMaxLive = Math.min(configuredLiveCap, perSymbolBudget)
+        } else {
+          this._cachedExchangeMaxLive = configuredLiveCap
+        }
         this._cachedExchangeMaxLiveAt = now
       }
       maxLive = this._cachedExchangeMaxLive || 500
