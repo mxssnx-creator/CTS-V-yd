@@ -4031,7 +4031,7 @@ export class StrategyCoordinator {
           sets_progressing:         String(
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          // ── 4-perspective Real stats ───────────────────────��──────
+          // ── 4-perspective Real stats ──────���────────────────��──────
           // These are connection-wide (not per-symbol) so writing them
           // once per (symbol, cycle) is fine — every symbol computes the
           // same `realAccumulatedSum` and the same `strategies_real_total`.
@@ -4424,14 +4424,17 @@ export class StrategyCoordinator {
         // Each symbol gets at least 1 slot and at most `configuredLiveCap`.
         // This is a per-cycle computed cap; the cached value refreshes every 5 min.
         if (exchange === "bingx") {
+          // Read the active symbol count so we can allocate the BingX
+          // open-order budget evenly. Use getRedisClient() which is already
+          // imported at the top of this file — no dynamic import needed.
           let symbolCount = 1
           try {
-            const state = await import("@/lib/redis-db").then(m =>
-              m.getRedisClient().hget(`settings:trade_engine_state:${this.connectionId}`, "symbol_count")
-            ).catch(() => null)
-            const n = state ? parseInt(String(state), 10) : 0
+            const raw = await getRedisClient()
+              .hget(`settings:trade_engine_state:${this.connectionId}`, "symbol_count")
+              .catch(() => null)
+            const n = raw ? parseInt(String(raw), 10) : 0
             if (n > 0) symbolCount = n
-          } catch { /* use 1 */ }
+          } catch { /* fall back to 1 */ }
           // BingX account budget: 90 live positions (200 orders ÷ 2 per pos = 100, minus 10 buffer).
           // Divide evenly across active symbols, floor at 1, cap at configuredLiveCap.
           const BINGX_TOTAL_POSITION_BUDGET = 90
