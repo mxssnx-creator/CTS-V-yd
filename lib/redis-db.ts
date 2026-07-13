@@ -177,7 +177,7 @@ export class InlineLocalRedis implements RedisClientLike {
   //   • saveToDisk():       JSON-serialise data, write atomically (tmp + rename)
   //   • saveToDiskSync():   same, blocking — used in SIGTERM/SIGINT/beforeExit
   //   • loadFromDisk():     read + restore Maps/Sets; rename corrupt file aside
-  //   • startPersistence(): once-per-process 5-min interval + signal handlers
+  //   • startPersistence(): once-per-process 3-min interval + signal handlers
   //
   // Notes:
   //   • Defaults to `<cwd>/.v0-data/redis-snapshot.json`, falls back to
@@ -339,13 +339,13 @@ export class InlineLocalRedis implements RedisClientLike {
           console.log(`[v0] [Redis Persistence] Restored ${keys} keys from ${c.file}`)
           return true
         }
-        // Parsed but didn't fit — quarantine and continue.
-        try { await fs.rename(c.file, `${c.file}.corrupt-${Date.now()}`) } catch {}
+        // Parsed but didn't fit — delete it so it doesn't accumulate.
+        try { await fs.unlink(c.file) } catch {}
       } catch (err: any) {
         if (err?.code === "ENOENT") continue // no snapshot yet
         if (err instanceof SyntaxError) {
-          // Corrupt JSON — move it aside so we don't keep failing.
-          try { await fs.rename(c.file, `${c.file}.corrupt-${Date.now()}`) } catch {}
+          // Corrupt JSON — delete it so we don't keep failing.
+          try { await fs.unlink(c.file) } catch {}
           continue
         }
         // Other I/O error — try fallback.

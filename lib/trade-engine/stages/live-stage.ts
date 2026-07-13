@@ -1567,12 +1567,17 @@ async function placeProtectionOrder(
       )
       return orderId
     }
-    // code=110412 / 110413: "SL price must be > current price" (for long SL placed above mark)
-    // or "TP price must be < current price" (for short TP placed above mark after a spike).
-    // The protection price was valid at calculation time but the market moved past it between
-    // calculation and placement. Return the sentinel "PRICE_CROSSED" so the caller can
-    // force-close the position immediately instead of waiting for the next reconcile tick.
+    // code=110206: "Open TP/SL order amount has exceed the maximum quota"
+    // BingX limits the total number of open TP/SL orders per account. When full,
+    // return sentinel "QUOTA_EXCEEDED" so the caller can back off cleanly without
+    // flooding the exchange with retries (each one fails immediately and burns quota).
     const errMsg = String(result?.error || "")
+    if (errMsg.includes("110206") || /quota|maximum.*tp\/sl|tp\/sl.*maximum/i.test(errMsg)) {
+      console.warn(
+        `${tag} QUOTA_EXCEEDED (code=110206): BingX TP/SL quota full — protection deferred until quota frees`,
+      )
+      return "QUOTA_EXCEEDED"
+    }
     const is110412 = errMsg.includes("110412") || /SL price should (be|not be)|Stop Loss price should/i.test(errMsg)
     const is110413 = errMsg.includes("110413") || /TP price should (be|not be)|Take Profit price should/i.test(errMsg)
     if (is110412 || is110413) {
@@ -2168,14 +2173,18 @@ async function updateProtectionOrders(
         // have a confirmed numeric order id (not the "PRICE_CROSSED" sentinel
         // which means market already blew past the SL and a force-close should
         // happen on the next reconcile checkAndForceCloseOnSltpCross pass).
-        const slIdOk = id && id !== "PRICE_CROSSED" && id !== "position_exhausted"
+        // "QUOTA_EXCEEDED" (BingX code=110206) means account TP/SL quota full —
+        // preserve the existing orderId/price (do not clear to 0) so the
+        // drift-detector keeps suppressing re-arm retries during backoff.
+        const slIdOk = id && id !== "PRICE_CROSSED" && id !== "position_exhausted" && id !== "QUOTA_EXCEEDED"
         if (slIdOk) {
           pos.stopLossOrderId = id!
           pos.stopLossPrice = desiredSl
           pos.stopLossLastArmedAt = Date.now()
           result.changed = true
           result.slPlaced = true
-        } else {
+        } else if (id !== "QUOTA_EXCEEDED") {
+          // Only clear order state on hard failures, not quota backoff.
           pos.stopLossOrderId = undefined
           pos.stopLossPrice = 0
         }
@@ -2227,14 +2236,17 @@ async function updateProtectionOrders(
           "TakeProfit",
           pos.direction!,
         )
-        const tpIdOk = id && id !== "PRICE_CROSSED" && id !== "position_exhausted"
+        // QUOTA_EXCEEDED (BingX code=110206): preserve existing orderId/price
+        // to suppress re-arm retries — same pattern as SL leg above.
+        const tpIdOk = id && id !== "PRICE_CROSSED" && id !== "position_exhausted" && id !== "QUOTA_EXCEEDED"
         if (tpIdOk) {
           pos.takeProfitOrderId = id!
           pos.takeProfitPrice = desiredTp
           pos.takeProfitLastArmedAt = Date.now()
           result.changed = true
           result.tpPlaced = true
-        } else {
+        } else if (id !== "QUOTA_EXCEEDED") {
+          // Only clear order state on hard failures, not quota backoff.
           pos.takeProfitOrderId = undefined
           pos.takeProfitPrice = 0
         }
@@ -3803,10 +3815,21 @@ export async function executeLivePosition(
         return livePosition
       }
 
-      if (slOrderId) {
+      // QUOTA_EXCEEDED (BingX 110206): account TP/SL order quota full.
+      // Do not clear orderId/price — the reconcile loop will retry once
+      // the quota frees. Log a warning once rather than on every cycle.
+      if (slOrderId === "QUOTA_EXCEEDED" || tpOrderId === "QUOTA_EXCEEDED") {
+        console.warn(
+          `${LOG_PREFIX} QUOTA_EXCEEDED for ${realPosition.symbol} — protection deferred until BingX TP/SL quota frees`,
+        )
+        // Continue without clearing order IDs — protectionArmedQuantity remains
+        // unset so the next reconcile tick retries the missing leg.
+      }
+
+      if (slOrderId && slOrderId !== "QUOTA_EXCEEDED") {
         livePosition.stopLossOrderId = slOrderId
         livePosition.stopLossPrice = slPrice
-      } else if (slPrice > 0) {
+      } else if (slPrice > 0 && slOrderId !== "QUOTA_EXCEEDED") {
         // Surface the protection gap loudly so operators and the
         // dashboard see it; the next reconcile will retry.
         console.error(
@@ -3821,10 +3844,10 @@ export async function executeLivePosition(
         )
         pushStep(livePosition, "place_stop_loss", false, `initial SL placement failed @ ${slPrice}`)
       }
-      if (tpOrderId) {
+      if (tpOrderId && tpOrderId !== "QUOTA_EXCEEDED") {
         livePosition.takeProfitOrderId = tpOrderId
         livePosition.takeProfitPrice = tpPrice
-      } else if (tpPrice > 0) {
+      } else if (tpPrice > 0 && tpOrderId !== "QUOTA_EXCEEDED") {
         console.error(
           `${LOG_PREFIX} INITIAL TakeProfit placement FAILED for ${realPosition.symbol} — position is LIVE without TP until next reconcile tick`,
         )
@@ -4083,7 +4106,7 @@ export async function updateLivePositionFill(
  *      next pass — better than leaking the lock).
  *   3. Compute realized PnL + margin-based ROI (matches exchange ROE).
  *   4. Persist via savePosition() �� that helper already handles the
- *      open-index ���� closed-archive move idempotently. We do NOT touch
+ *      open-index ������ closed-archive move idempotently. We do NOT touch
  *      Redis directly any more (which previously left the position in
  *      the open index forever on manual close).
  *   5. Release the dedup lock so a subsequent signal can re-enter.
@@ -4423,6 +4446,21 @@ export async function closeLivePosition(
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
       if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
+      // Write realized PnL to progression total_profit (atomic float add).
+      // This is the authoritative total_profit write; the eval-cycle path
+      // always passes profit=0 so it never contributes to this metric.
+      if (pnl !== 0) {
+        try {
+          const progKey = `progression:${connectionId}`
+          const hif = (client as any).hincrbyfloat
+          if (typeof hif === "function") {
+            await hif.call(client, progKey, "total_profit", pnl).catch(async () => {
+              const cur = Number((await client.hget(progKey, "total_profit")) || "0")
+              await client.hset(progKey, { total_profit: String(cur + pnl) })
+            })
+          }
+        } catch { /* non-critical */ }
+      }
       // Only count as exchange-close failure when the connector actually
       // failed. `already_closed` means the exchange-side state already
       // matches our intent (SL/TP fired first), and `skipped` means we
@@ -5434,6 +5472,24 @@ export async function reconcileLivePositions(
             )
             if (realizedPnl > 0) {
               writes.push(client.hincrby(progKey, "live_wins_count", 1).catch(() => {}))
+            }
+            // Write realized PnL to total_profit — the ONLY authoritative path
+            // for profit tracking. ProgressionStateManager.incrementCycle always
+            // passes profit=0 from the eval loop; the real profit must come from
+            // the close event itself.
+            if (realizedPnl !== 0) {
+              const hif = (client as any).hincrbyfloat
+              if (typeof hif === "function") {
+                writes.push(
+                  hif.call(client, progKey, "total_profit", realizedPnl).catch(() => {
+                    // Fallback: read-modify-write
+                    return client.hget(progKey, "total_profit").then((v: any) => {
+                      const cur = Number(v || "0")
+                      return client.hset(progKey, { total_profit: String(cur + realizedPnl) })
+                    }).catch(() => {})
+                  })
+                )
+              }
             }
           }
           await Promise.all(writes)

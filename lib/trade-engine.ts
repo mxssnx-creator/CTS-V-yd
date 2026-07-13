@@ -185,7 +185,8 @@ export class GlobalTradeEngineCoordinator {
       this.isPaused = intent === "paused"
       this.isGloballyRunning = enabled && Array.from(this.engineManagers.values()).some((manager) => manager.isEngineRunning)
       if (!enabled) {
-        console.warn(
+        // Expected when coordinator is stopped — downgraded from warn to debug.
+        console.debug(
           `[v0] [Coordinator] ${context} skipped — global coordinator is not enabled ` +
             `(intent="${intent || "empty"}", legacy_status="${globalState?.status || "empty"}")`,
         )

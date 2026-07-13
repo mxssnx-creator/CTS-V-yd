@@ -12,5 +12,7 @@ __v0_jsx-dev-runtime.ts
 # Common ignores
 node_modules
 .next/
-.DS_Store.v0-data/redis-snapshot.json
-.v0-data/redis-snapshot.json
+.DS_Store
+
+# Redis file persistence — ignore all snapshot files including corrupt/tmp variants
+.v0-data/

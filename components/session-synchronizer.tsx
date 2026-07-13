@@ -1,114 +1,57 @@
 "use client"
 
 import { useEffect } from "react"
-import { initializeSessionRestoration, saveSessionState } from "@/lib/client-session-persistence"
 
 /**
- * SessionSynchronizer - Client component that ensures continuous session state
- * across page refreshes, navigations, and rebuilds.
+ * SessionSynchronizer — triggers server-side Redis snapshots at key moments
+ * so session state, engine progress and UI data survive page refreshes,
+ * tab switches, rebuilds, and restarts without any gap larger than 3 minutes.
  *
- * This component:
- * 1. Restores session state on initial load
- * 2. Periodically syncs session state to ensure data continuity
- * 3. Saves scroll positions and UI state
- * 4. Maintains navigation history
+ * Strategy:
+ *   - On mount: nothing (server already loaded snapshot at startup)
+ *   - Every 3 min: POST /api/persistence/save  (belt-and-suspenders alongside server timer)
+ *   - On visibilitychange → hidden: force-save immediately
+ *   - On beforeunload: fire-and-forget save via sendBeacon
  */
 export function SessionSynchronizer() {
   useEffect(() => {
-    // Initialize session on mount
-    initializeSessionRestoration()
-
-    // Periodically save session state (every 30 seconds)
-    const syncInterval = setInterval(() => {
-      saveSessionState({
-        timestamp: Date.now(),
-      })
-    }, 30 * 1000)
-
-    // Save session on page visibility change (tab becomes visible)
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        console.log("[v0] Page became visible, syncing session state")
-        saveSessionState({
-          timestamp: Date.now(),
-        })
+    const forceSave = async () => {
+      try {
+        await fetch("/api/persistence/save", { method: "POST" })
+      } catch {
+        // Ignore — server-side timer is the fallback
       }
     }
 
-    // Save session before unload (page refresh/close)
+    // Belt-and-suspenders: also save from the client side every 3 minutes
+    const interval = setInterval(forceSave, 3 * 60 * 1000)
+
+    // Save as soon as the tab is hidden (user switches away or closes)
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        forceSave()
+      }
+    }
+
+    // sendBeacon is more reliable than fetch during page unload
     const handleBeforeUnload = () => {
       try {
-        saveSessionState({
-          timestamp: Date.now(),
-        })
+        navigator.sendBeacon("/api/persistence/save", JSON.stringify({ ts: Date.now() }))
       } catch {
-        // Ignore errors during unload
+        // Fallback: best-effort fetch
+        forceSave()
       }
     }
 
-    // Save scroll position when user scrolls
-    const handleScroll = () => {
-      try {
-        const scrollTop = window.scrollY || document.documentElement.scrollTop
-        const mainContent = document.querySelector("main")
-        if (mainContent) {
-          // Save main content scroll position
-          saveSessionState({
-            scrollPositions: {
-              main: mainContent.scrollTop,
-              window: scrollTop,
-            },
-          })
-        }
-      } catch {
-        // Ignore scroll tracking errors
-      }
-    }
-
-    document.addEventListener("visibilitychange", handleVisibilityChange)
+    document.addEventListener("visibilitychange", handleVisibility)
     window.addEventListener("beforeunload", handleBeforeUnload)
-    window.addEventListener("scroll", handleScroll, { passive: true })
 
-    // Cleanup
     return () => {
-      clearInterval(syncInterval)
-      document.removeEventListener("visibilitychange", handleVisibilityChange)
+      clearInterval(interval)
+      document.removeEventListener("visibilitychange", handleVisibility)
       window.removeEventListener("beforeunload", handleBeforeUnload)
-      window.removeEventListener("scroll", handleScroll)
     }
   }, [])
 
-  return null // This component doesn't render anything
-}
-
-/**
- * ProgressTracker - Ensures trading engine progress persists across sessions
- */
-export function ProgressTracker() {
-  useEffect(() => {
-    // Monitor trading engine progress
-    const checkProgress = async () => {
-      try {
-        const response = await fetch("/api/persistence/status")
-        if (response.ok) {
-          const data = await response.json()
-          console.log("[v0] Persistence status:", {
-            keys: data.database?.keys,
-            memory_mb: data.database?.memory_mb,
-            last_snapshot: data.recovery?.last_snapshot,
-          })
-        }
-      } catch (error) {
-        // Silently ignore - this is just status monitoring
-      }
-    }
-
-    // Check on mount and periodically
-    checkProgress()
-    const interval = setInterval(checkProgress, 5 * 60 * 1000) // Every 5 minutes
-
-    return () => clearInterval(interval)
-  }, [])
-
-  return null // This component doesn't render anything
+  return null
 }

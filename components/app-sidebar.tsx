@@ -157,11 +157,11 @@ export function AppSidebar() {
       <SidebarHeader className="border-b border-sidebar-border">
         <div className="flex items-center justify-between px-2 py-2">
           <div className="flex items-center gap-2">
-            <div className="size-7 rounded-lg bg-gradient-to-br from-primary to-accent flex items-center justify-center">
-              <span className="text-primary-foreground font-bold text-xs">CT</span>
+            <div className="size-7 rounded-lg sidebar-logo-badge flex items-center justify-center">
+              <span className="text-white font-bold text-xs">CT</span>
             </div>
             <div className="flex flex-col group-data-[collapsible=icon]:hidden">
-              <span className="font-semibold text-xs">CTS v3</span>
+              <span className="font-semibold text-xs text-sidebar-foreground">CTS v3</span>
               <span className="text-[10px] text-muted-foreground">Trading System</span>
             </div>
           </div>
