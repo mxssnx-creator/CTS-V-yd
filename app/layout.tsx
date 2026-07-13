@@ -3,6 +3,7 @@ import "./globals.css"
 import { Providers } from "@/components/providers"
 import { IndicationGeneratorProvider } from "@/components/indication-generator-hook"
 import { EngineAutoInitializer } from "@/components/engine-auto-initializer"
+import { SessionSynchronizer } from "@/components/session-synchronizer"
 
 // Build timestamp: 2026-04-10T13:07
 export const metadata: Metadata = {
@@ -19,6 +20,7 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body className="font-sans antialiased">
         <EngineAutoInitializer />
+        <SessionSynchronizer />
         <Providers>
           <IndicationGeneratorProvider>
             {children}

@@ -1549,6 +1549,16 @@ export class TradeEngineManager {
     await this.setRunningFlag(false)
     await this.updateProgressionPhase("stopped", 0, "Engine stopped")
 
+    // Persist immediately on stop so the final progression state (counters,
+    // last_update, phase) survives a rebuild or page refresh within 3 minutes.
+    try {
+      const { persistNow } = await import("@/lib/redis-db")
+      await persistNow()
+      console.log("[v0] [Engine] Snapshot persisted on stop")
+    } catch {
+      // Non-critical — the periodic 3-min timer is the fallback
+    }
+
     console.log("[v0] Trade engine stopped and timers cleared")
   }
 
