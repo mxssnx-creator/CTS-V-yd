@@ -4,6 +4,7 @@ import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { SystemLogger } from "@/lib/system-logger"
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { currentStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 
 export const dynamic = "force-dynamic"
 
@@ -185,6 +186,8 @@ export async function POST(request: NextRequest) {
     let startedConnections: string[] = []
     let liveTradeEnabledConnections: string[] = []
     let liveTradeRequestedConnections: string[] = []
+    let queuedResumedConnections: string[] = []
+    let queuedStartedConnections: string[] = []
     try {
       const { getConnection, updateConnection, getAllConnections } = await import("@/lib/redis-db")
       const { loadSettingsAsync } = await import("@/lib/settings-storage")
@@ -217,12 +220,13 @@ export async function POST(request: NextRequest) {
                     live_trade_requested: "1",
                   }
 
-              await updateConnection(connId, {
+              const updatedConn = {
                 ...conn,
                 ...liveTradeUpdate,
                 paused_by_global: "0",
                 updated_at: new Date().toISOString(),
-              })
+              }
+              await updateConnection(connId, updatedConn)
               if (staleLiveTradeBlockReason) {
                 await logProgressionEvent(
                   connId,
@@ -249,7 +253,7 @@ export async function POST(request: NextRequest) {
               )
               
               // Restart the engine
-              await coordinator.startEngine(connId, {
+              const started = await coordinator.startEngine(connId, {
                 connectionId: connId,
                 connection_name: conn.name,
                 exchange: conn.exchange,
@@ -264,11 +268,23 @@ export async function POST(request: NextRequest) {
               } else {
                 liveTradeRequestedConnections.push(connId)
               }
-              resumedConnections.push(connId)
-              console.log(
-                `[v0] [Trade Engine] Resumed paused connection: ${connId} ${conn.name} ` +
-                `(live_trade_${credentialCheck.valid ? "enabled" : "requested_only"}${credentialCheck.reason ? `: ${credentialCheck.reason}` : ""})`,
-              )
+              if (started === true) {
+                resumedConnections.push(connId)
+                console.log(
+                  `[v0] [Trade Engine] Resumed paused connection: ${connId} ${conn.name} ` +
+                  `(live_trade_${credentialCheck.valid ? "enabled" : "requested_only"}${credentialCheck.reason ? `: ${credentialCheck.reason}` : ""})`,
+                )
+              } else {
+                await queueEngineRefreshRequest({
+                  connectionId: connId,
+                  action: "start",
+                  state_switch_version: currentStateSwitchVersion(updatedConn),
+                  reason: "global_resume_start_skipped",
+                  timestamp: new Date().toISOString(),
+                })
+                queuedResumedConnections.push(connId)
+                console.log(`[v0] [Trade Engine] Queued resumed connection start after coordinator skipped local start: ${connId} ${conn.name}`)
+              }
             }
           } catch (resumeErr) {
             console.warn("[v0] [Trade Engine] Failed to resume connection:", connId, resumeErr)
@@ -284,7 +300,8 @@ export async function POST(request: NextRequest) {
       for (const conn of allConnections) {
         // Only handle assigned main connections that are enabled
         if (conn.is_assigned === "1" && conn.is_enabled_dashboard === "1" &&
-            !resumedConnections.includes(conn.id)) {
+            !resumedConnections.includes(conn.id) &&
+            !queuedResumedConnections.includes(conn.id)) {
           try {
             // Ensure live trade is enabled
             const staleLiveTradeBlockReason = String((conn as any).live_trade_blocked_reason || "").trim()
@@ -325,7 +342,7 @@ export async function POST(request: NextRequest) {
             )
             
             // Start the engine for this connection
-            await coordinator.startEngine(conn.id, {
+            const started = await coordinator.startEngine(conn.id, {
               connectionId: conn.id,
               connection_name: conn.name,
               exchange: conn.exchange,
@@ -340,11 +357,23 @@ export async function POST(request: NextRequest) {
             } else {
               liveTradeRequestedConnections.push(conn.id)
             }
-            startedConnections.push(conn.id)
-            console.log(
-              `[v0] [Trade Engine] Started assigned connection: ${conn.id} ${conn.name} ` +
-              `(live_trade_${credentialCheck.valid ? "enabled" : "requested_only"}${credentialCheck.reason ? `: ${credentialCheck.reason}` : ""})`,
-            )
+            if (started === true) {
+              startedConnections.push(conn.id)
+              console.log(
+                `[v0] [Trade Engine] Started assigned connection: ${conn.id} ${conn.name} ` +
+                `(live_trade_${credentialCheck.valid ? "enabled" : "requested_only"}${credentialCheck.reason ? `: ${credentialCheck.reason}` : ""})`,
+              )
+            } else {
+              await queueEngineRefreshRequest({
+                connectionId: conn.id,
+                action: "start",
+                state_switch_version: currentStateSwitchVersion(updatedConn),
+                reason: "global_start_skipped",
+                timestamp: new Date().toISOString(),
+              })
+              queuedStartedConnections.push(conn.id)
+              console.log(`[v0] [Trade Engine] Queued assigned connection start after coordinator skipped local start: ${conn.id} ${conn.name}`)
+            }
           } catch (startErr) {
             console.warn("[v0] [Trade Engine] Failed to start assigned connection:", conn.id, startErr)
           }
@@ -399,21 +428,28 @@ export async function POST(request: NextRequest) {
     const liveTradeMsg = liveTradeEnabledConnections.length > 0 || liveTradeRequestedConnections.length > 0
       ? ` Live trading enabled for ${liveTradeEnabledConnections.length} connection(s); requested-only for ${liveTradeRequestedConnections.length} connection(s).`
       : ""
+    const queuedMsg = queuedResumedConnections.length > 0 || queuedStartedConnections.length > 0
+      ? ` Queued ${queuedResumedConnections.length} resumed and ${queuedStartedConnections.length} assigned connection start request(s).`
+      : ""
     
-    console.log("[v0] [Trade Engine] Global Coordinator is running and ready." + resumeMsg + startedMsg + liveTradeMsg)
+    console.log("[v0] [Trade Engine] Global Coordinator is running and ready." + resumeMsg + startedMsg + liveTradeMsg + queuedMsg)
     await SystemLogger.logTradeEngine(
-      `Global Coordinator started.${resumeMsg}${startedMsg}${liveTradeMsg}`,
+      `Global Coordinator started.${resumeMsg}${startedMsg}${liveTradeMsg}${queuedMsg}`,
       "info",
-      { resumedConnections, startedConnections, liveTradeEnabledConnections, liveTradeRequestedConnections }
+      { resumedConnections, startedConnections, queuedResumedConnections, queuedStartedConnections, liveTradeEnabledConnections, liveTradeRequestedConnections }
     )
 
     return NextResponse.json({
       success: true,
-      message: `Global Trade Engine Coordinator started and ready.${resumeMsg}${startedMsg}${liveTradeMsg}`,
+      message: `Global Trade Engine Coordinator started and ready.${resumeMsg}${startedMsg}${liveTradeMsg}${queuedMsg}`,
       coordinator_status: "running",
       alreadyRunning: wasAlreadyRunning,
       resumedConnections,
       startedConnections,
+      queuedResumedConnections,
+      queuedStartedConnections,
+      queuedResumedCount: queuedResumedConnections.length,
+      queuedStartedCount: queuedStartedConnections.length,
       liveTradeEnabledConnections,
       liveTradeRequestedConnections,
     })

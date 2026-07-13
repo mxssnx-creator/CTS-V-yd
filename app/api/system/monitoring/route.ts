@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getRedisStats } from "@/lib/redis-db"
 import { getSystemResourceMetrics } from "@/lib/system-resource-metrics"
 
 export const dynamic = "force-dynamic"
@@ -11,20 +11,63 @@ export async function GET() {
     let client: ReturnType<typeof getRedisClient> | null = null
 
     let allKeys: string[] = []
+    let keyCount = 0
+    let redisKeyCount = 0
+    let redisInfo = ""
     let redisAvailable = false
     try {
       await initRedis()
       client = getRedisClient()
-      const keysResult = await client.keys("*")
+      try {
+        const dbSizeFn = (client as any).dbSize || (client as any).dbsize
+        if (typeof dbSizeFn === "function") {
+          keyCount = Number(await dbSizeFn.call(client)) || 0
+        }
+      } catch {
+        keyCount = 0
+      }
+      try {
+        const keysResult = await client.keys("*")
+        allKeys = Array.isArray(keysResult) ? keysResult : []
+      } catch (keysError) {
+        console.warn("[Monitoring] Redis KEYS unavailable while collecting key breakdown:", keysError instanceof Error ? keysError.message : String(keysError))
+        allKeys = []
+      }
+      keyCount = Math.max(keyCount, allKeys.length)
+      if (keyCount === 0) {
+        try {
+          const stats = await getRedisStats()
+          keyCount = Math.max(keyCount, Number(stats.keyCount) || 0)
+        } catch {
+          // Keep the direct dbSize/KEYS result when stats are unavailable.
+        }
+      }
+      const [dbSizeResult, infoResult, keysResult] = await Promise.all([
+        client.dbSize().catch(() => 0),
+        client.info().catch(() => ""),
+        // Key names are only needed for category breakdowns. Some production
+        // Redis providers restrict KEYS, so DB size above remains the source of
+        // truth for the info bar's DB count.
+        client.keys("*").catch(() => [] as string[]),
+      ])
+      redisKeyCount = Number(dbSizeResult) || 0
+      redisInfo = typeof infoResult === "string" ? infoResult : ""
       allKeys = Array.isArray(keysResult) ? keysResult : []
       redisAvailable = true
     } catch (redisError) {
       console.warn("[Monitoring] Redis unavailable while collecting system metrics:", redisError instanceof Error ? redisError.message : String(redisError))
       allKeys = []
+      keyCount = 0
       redisAvailable = false
     }
     
-    const keys = allKeys.length
+    const keys = keyCount
+      redisKeyCount = 0
+      redisInfo = ""
+      redisAvailable = false
+    }
+    
+    const keys = Math.max(redisKeyCount, allKeys.length)
     const sets = allKeys.filter((k: string) => k.includes(":set") || k.includes("_set")).length
     const positionKeys = allKeys.filter((k: string) => k.includes("position")).length
     const indicationKeys = allKeys.filter((k: string) => 
@@ -36,25 +79,31 @@ export async function GET() {
 
     let estimatedDbBytes = 0
     try {
-      const sampleKeys = allKeys.slice(0, 20)
-      let sampledBytes = 0
-      for (const key of sampleKeys) {
-        sampledBytes += key.length
-        const strValue = client ? await client.get(key).catch(() => null) : null
-        if (typeof strValue === "string" && strValue.length > 0) {
-          sampledBytes += strValue.length
-          continue
-        }
-        const hashValue = client ? await client.hgetall(key).catch(() => null) : null
-        if (hashValue && typeof hashValue === "object") {
-          for (const [field, value] of Object.entries(hashValue)) {
-            sampledBytes += String(field).length + String(value).length
+      const usedMemoryMatch = redisInfo.match(/^used_memory:(\d+)/m)
+      const usedMemoryBytes = usedMemoryMatch ? Number(usedMemoryMatch[1]) : 0
+      if (Number.isFinite(usedMemoryBytes) && usedMemoryBytes > 0) {
+        estimatedDbBytes = usedMemoryBytes
+      } else {
+        const sampleKeys = allKeys.slice(0, 20)
+        let sampledBytes = 0
+        for (const key of sampleKeys) {
+          sampledBytes += key.length
+          const strValue = client ? await client.get(key).catch(() => null) : null
+          if (typeof strValue === "string" && strValue.length > 0) {
+            sampledBytes += strValue.length
+            continue
+          }
+          const hashValue = client ? await client.hgetall(key).catch(() => null) : null
+          if (hashValue && typeof hashValue === "object") {
+            for (const [field, value] of Object.entries(hashValue)) {
+              sampledBytes += String(field).length + String(value).length
+            }
           }
         }
+        estimatedDbBytes = sampleKeys.length > 0
+          ? Math.max(0, Math.round((sampledBytes / sampleKeys.length) * Math.max(keys, 1)))
+          : 0
       }
-      estimatedDbBytes = sampleKeys.length > 0
-        ? Math.max(0, Math.round((sampledBytes / sampleKeys.length) * Math.max(keys, 1)))
-        : 0
     } catch {
       estimatedDbBytes = 0
     }
@@ -150,8 +199,11 @@ export async function GET() {
       heapTotal: Math.round(resourceMetrics.heapTotalBytes / 1024),
       rss: Math.round(resourceMetrics.rssBytes / 1024),
       database: {
+        status: redisAvailable ? "connected" : "unavailable",
         size: estimatedDbBytes,
+        sizeMb: Math.round((estimatedDbBytes / 1024 / 1024) * 100) / 100,
         keys,
+        totalKeys: keys,
         sets,
         positions1h: positionKeys,
         entries1h: indicationKeys + strategyKeys,
