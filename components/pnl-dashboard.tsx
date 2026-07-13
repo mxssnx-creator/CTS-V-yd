@@ -75,8 +75,17 @@ export function PnLDashboard({ connectionId = "bingx-x01" }: { connectionId?: st
   const formatCurrency = (value: number) => {
     const sign = value >= 0 ? "+" : "-"
     const abs = Math.abs(value)
-    if (abs >= 1) return `${sign}$${abs.toFixed(2)}`
-    return `${sign}$${abs.toFixed(8)}`
+    if (abs >= 1000) return `${sign}$${abs.toFixed(2)}`
+    if (abs >= 1) return `${sign}$${abs.toFixed(4)}`
+    if (abs >= 0.01) return `${sign}$${abs.toFixed(5)}`
+    return `${sign}$${abs.toFixed(6)}`
+  }
+
+  const formatPrice = (value: number) => {
+    if (value >= 1000) return `$${value.toFixed(2)}`
+    if (value >= 1) return `$${value.toFixed(4)}`
+    if (value >= 0.01) return `$${value.toFixed(5)}`
+    return `$${value.toFixed(6)}`
   }
 
   const formatPercent = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`
@@ -145,7 +154,7 @@ export function PnLDashboard({ connectionId = "bingx-x01" }: { connectionId?: st
             <p className="text-lg font-semibold text-green-600">{formatCurrency(stats.largest_win)}</p>
             <p className="text-lg font-semibold text-red-600">{formatCurrency(stats.largest_loss)}</p>
           </div>
-          <p className="text-xs text-muted-foreground">Range: {isFinite(stats.largest_win) && isFinite(stats.largest_loss) ? Math.abs(stats.largest_win - stats.largest_loss).toFixed(8) : "N/A"}</p>
+          <p className="text-xs text-muted-foreground">Range: {isFinite(stats.largest_win) && isFinite(stats.largest_loss) ? formatCurrency(Math.abs(stats.largest_win - stats.largest_loss)) : "N/A"}</p>
         </div>
 
         <div className="rounded-lg border border-border bg-card p-4">
@@ -188,8 +197,8 @@ export function PnLDashboard({ connectionId = "bingx-x01" }: { connectionId?: st
                   <td className={`px-3 py-2 font-semibold ${pos.direction === "long" ? "text-blue-600" : "text-red-600"}`}>
                     {pos.direction === "long" ? "L" : "S"}
                   </td>
-                  <td className="px-3 py-2 text-right text-muted-foreground">${pos.entry_price.toFixed(8)}</td>
-                  <td className="px-3 py-2 text-right text-muted-foreground">${pos.exit_price.toFixed(8)}</td>
+                  <td className="px-3 py-2 text-right text-muted-foreground">{formatPrice(pos.entry_price)}</td>
+                  <td className="px-3 py-2 text-right text-muted-foreground">{formatPrice(pos.exit_price)}</td>
                   <td className={`px-3 py-2 text-right font-semibold ${pos.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
                     {formatCurrency(pos.pnl)}
                   </td>

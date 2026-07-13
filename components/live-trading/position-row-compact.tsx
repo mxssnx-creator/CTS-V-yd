@@ -163,8 +163,8 @@ export function PositionRowCompact({ position, onClose, onModify, index }: Posit
             <div className="bg-slate-900/50 rounded p-2 border border-slate-700/50">
               <div className="text-slate-400 font-semibold mb-1 text-xs">Position Details</div>
               <div className="space-y-0.5 text-slate-300 font-mono text-xs">
-                <div>Entry: <span className="text-cyan-400">{position.entryPrice.toFixed(8)}</span></div>
-                <div>Current: <span className="text-green-400">{position.currentPrice.toFixed(8)}</span></div>
+                <div>Entry: <span className="text-cyan-400">{position.entryPrice >= 1 ? position.entryPrice.toFixed(4) : position.entryPrice.toFixed(6)}</span></div>
+                <div>Current: <span className="text-green-400">{position.currentPrice >= 1 ? position.currentPrice.toFixed(4) : position.currentPrice.toFixed(6)}</span></div>
                 <div>Qty: <span className="text-blue-400">{position.quantity.toFixed(6)}</span></div>
                 <div>Lev: <span className="text-amber-400">{position.leverage}x</span></div>
               </div>
@@ -175,12 +175,12 @@ export function PositionRowCompact({ position, onClose, onModify, index }: Posit
               <div className="text-slate-400 font-semibold mb-1 text-xs">Take Profit / Stop Loss</div>
               <div className="space-y-0.5 text-slate-300 font-mono text-xs">
                 {position.takeProfitPrice ? (
-                  <div>TP: <span className="text-green-400">{position.takeProfitPrice.toFixed(8)}</span></div>
+                  <div>TP: <span className="text-green-400">{position.takeProfitPrice >= 1 ? position.takeProfitPrice.toFixed(4) : position.takeProfitPrice.toFixed(6)}</span></div>
                 ) : (
                   <div>TP: <span className="text-slate-500">Not Set</span></div>
                 )}
                 {position.stopLossPrice ? (
-                  <div>SL: <span className="text-red-400">{position.stopLossPrice.toFixed(8)}</span></div>
+                  <div>SL: <span className="text-red-400">{position.stopLossPrice >= 1 ? position.stopLossPrice.toFixed(4) : position.stopLossPrice.toFixed(6)}</span></div>
                 ) : (
                   <div>SL: <span className="text-slate-500">Not Set</span></div>
                 )}
