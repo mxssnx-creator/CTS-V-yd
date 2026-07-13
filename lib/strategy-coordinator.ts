@@ -2671,11 +2671,12 @@ export class StrategyCoordinator {
         }
       }
       if (axisCapHit) {
-        console.warn(
+        // Expected at normal operation when axis sets exceed ceiling — downgraded
+        // from warn to debug to prevent log spam every cycle.
+        console.debug(
           `[v0] [StrategyCoordinator] ${this.connectionId} ${symbol} axis fan-out hit ` +
           `safety ceiling ${MAIN_AXIS_SETS_CEILING} (OOM-protection); ` +
-          `remaining Base defaults skipped this cycle. Highest-priority ` +
-          `(smallest prev/cont) projections retained.`,
+          `remaining Base defaults skipped this cycle.`,
         )
       }
       if (axisSetsAdded > 0) {
@@ -3406,15 +3407,8 @@ export class StrategyCoordinator {
         : _defaultRealCap)
     const realSetsCap = Math.min(this.config.maxRealSets ?? _realOutputCap, _realOutputCap)
     
-    console.log(`[v0] [DEBUG] EARLY CAP: realQualifying=${realQualifying.length} cap=${realSetsCap} env=${process.env.NODE_ENV}`)
     if (realQualifying.length > realSetsCap) {
-      console.warn(
-        `[v0] [RealStage] ${this.connectionId}: Capping ${realQualifying.length} → ${realSetsCap} before hedge netting`
-      )
-      realQualifying.length = realSetsCap  // Truncate in-place
-      console.log(`[v0] [DEBUG] EARLY CAP: After truncate realQualifying=${realQualifying.length}`)
-    } else {
-      console.log(`[v0] [DEBUG] EARLY CAP: No truncation needed (${realQualifying.length} <= ${realSetsCap})`)
+      realQualifying.length = realSetsCap  // Truncate in-place to cap
     }
     
     const realSorted = realQualifying   // alias — hedge-net reads realSorted
@@ -3691,10 +3685,11 @@ export class StrategyCoordinator {
       }
       // Restore global PF-desc ordering for the downstream hedge/dispatch path.
       realSets = reserved.concat(fill).sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
-      console.warn(
+      // Expected when Real Sets exceed the configured cap — downgraded from
+      // warn to debug to prevent log spam every cycle.
+      console.debug(
         `[v0] [RealStage] ${this.connectionId}: ${realPostHedge.length} Real Sets exceeds ` +
-        `safety ceiling ${realSetsCap}; kept top ${realSetsCap} by rank with per-variant ` +
-        `reserve (floor ${floorPerVariant}/variant: ${JSON.stringify(keptPerVariant)}). ` +
+        `safety ceiling ${realSetsCap}; kept top ${realSetsCap} by rank. ` +
         `Set maxRealSets in Settings to override.`,
       )
     }
