@@ -177,7 +177,7 @@ export class InlineLocalRedis implements RedisClientLike {
   //   • saveToDisk():       JSON-serialise data, write atomically (tmp + rename)
   //   • saveToDiskSync():   same, blocking — used in SIGTERM/SIGINT/beforeExit
   //   • loadFromDisk():     read + restore Maps/Sets; rename corrupt file aside
-  //   • startPersistence(): once-per-process 5-min interval + signal handlers
+  //   • startPersistence(): once-per-process 3-min interval + signal handlers
   //
   // Notes:
   //   • Defaults to `<cwd>/.v0-data/redis-snapshot.json`, falls back to

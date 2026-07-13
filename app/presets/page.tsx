@@ -98,8 +98,8 @@ export default function PresetsPage() {
   const stats = useMemo(() => {
     const total = presets.length
     const enabled = presets.filter((p) => p.enabled).length
-    const avgProfit = presets.reduce((sum, p) => sum + p.stats.avgProfit, 0) / total
-    const avgWinRate = presets.reduce((sum, p) => sum + p.stats.winRate, 0) / total
+    const avgProfit = total > 0 ? presets.reduce((sum, p) => sum + p.stats.avgProfit, 0) / total : 0
+    const avgWinRate = total > 0 ? presets.reduce((sum, p) => sum + p.stats.winRate, 0) / total : 0
 
     return { total, enabled, avgProfit, avgWinRate }
   }, [presets])
