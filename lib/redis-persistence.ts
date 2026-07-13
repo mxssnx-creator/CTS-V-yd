@@ -55,15 +55,15 @@ function serializeRedisData(redisData: any): PersistenceData["dataSnapshot"] {
       strings: Object.fromEntries(redisData.strings || new Map()),
       hashes: Object.fromEntries(redisData.hashes || new Map()),
       sets: Object.fromEntries(
-        Array.from(redisData.sets || new Map()).map(([k, v]: [string, Set<string>]) => [
+        (Array.from(redisData.sets || new Map()) as [string, Set<string>][]).map(([k, v]) => [
           k,
           Array.from(v),
         ])
       ),
       lists: Object.fromEntries(redisData.lists || new Map()),
       sorted_sets: Object.fromEntries(
-        Array.from(redisData.sorted_sets || new Map()).map(
-          ([k, v]: [string, { entries: Array<{ score: number; member: string }> }]) => [k, v.entries]
+        (Array.from(redisData.sorted_sets || new Map()) as [string, { entries: Array<{ score: number; member: string }> }][]).map(
+          ([k, v]) => [k, v.entries]
         )
       ),
       ttl: Object.fromEntries(redisData.ttl || new Map()),

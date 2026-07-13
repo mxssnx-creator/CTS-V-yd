@@ -144,7 +144,7 @@ export function setSectionExpanded(sectionId: string, expanded: boolean): void {
  */
 export function isSectionExpanded(sectionId: string, defaultValue: boolean = true): boolean {
   const state = getSessionState()
-  const sections = state.expandedSections || {}
+  const sections = state?.expandedSections ?? {}
   return sections[sectionId] ?? defaultValue
 }
 
@@ -215,8 +215,9 @@ export function initializeSessionRestoration(): void {
     // Restore scroll positions
     if (state.scrollPositions && Object.keys(state.scrollPositions).length > 0) {
       // Wait for DOM to settle, then restore scroll
+      const scrollPositions = state.scrollPositions
       setTimeout(() => {
-        Object.entries(state.scrollPositions || {}).forEach(([pageId, position]) => {
+        Object.entries(scrollPositions).forEach(([pageId, position]) => {
           const element = document.getElementById(pageId)
           if (element && typeof position === "number") {
             element.scrollTop = position
