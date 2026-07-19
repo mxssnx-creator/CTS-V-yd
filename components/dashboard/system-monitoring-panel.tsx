@@ -54,9 +54,6 @@ export function SystemMonitoringPanel() {
           // Primary: indication cycles (live hash); fallback: strategy cycles
           engineCycles: mon.engines?.indications?.cycleCount || mon.engines?.strategies?.cycleCount || 0,
           activePositions: mon.database?.positions1h || 0,
-          cpu,
-          memory,
-          redisKeys: dbKeys,
           cpu: Number(mon.cpu ?? mon.system?.cpuUsage ?? 0),
           memory: Number(mon.memory ?? mon.system?.memoryUsage ?? 0),
           redisKeys: Number(mon.database?.keys ?? mon.database?.totalKeys ?? 0),

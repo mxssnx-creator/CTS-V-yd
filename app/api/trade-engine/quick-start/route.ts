@@ -8,7 +8,6 @@ import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { loadSettingsAsync } from "@/lib/settings-storage"
 import { fetchTopSymbols, normaliseSort } from "@/lib/top-symbols"
-import { currentStateSwitchVersion, queueEngineRefreshRequest } from "@/lib/engine-refresh-queue"
 
 function toNumber(value: unknown): number {
   const n = Number(value)
@@ -770,21 +769,6 @@ export async function POST(request: Request) {
               realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
             }, { markAssigned: true, forceLocalTakeover: true })
 
-            if (!started) {
-              await queueEngineRefreshRequest({
-                timestamp: new Date().toISOString(),
-                connectionId,
-                action: "start",
-                state_switch_version: currentStateSwitchVersion(connection),
-                reason: "quickstart_start_skipped",
-              })
-              console.warn(`${LOG_PREFIX} Main Engine start skipped for ${connection.name} (async); queued for coordinator worker`)
-              await logProgressionEvent(connectionId, "engine_start_queued", "warning", "Main Trade Engine start queued via QuickStart", {
-                connectionId,
-                connectionName: connection.name,
-                exchange: exchangeName,
-                testPassed,
-                hint: "No local engine runtime accepted the foreground start; queued for the coordinator worker.",
             const engineStarted = started
             // Legacy source guard phrase: if (!started)
             if (!engineStarted) {
